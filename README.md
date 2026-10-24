@@ -11,16 +11,16 @@
   <img src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4?style=flat-square" alt="Windows 10 и 11 x64">
   <img src="https://img.shields.io/badge/.NET-8-512BD4?style=flat-square" alt=".NET 8">
   <img src="https://img.shields.io/badge/UI-WPF-FF6B59?style=flat-square" alt="Нативный интерфейс WPF">
-  <a href="https://github.com/senduora/ymusic-native/releases"><img src="https://img.shields.io/github/v/release/senduora/ymusic-native?style=flat-square&color=FF6B59" alt="Последняя версия"></a>
+  <a href="https://github.com/senduora/yamuse/releases"><img src="https://img.shields.io/github/v/release/senduora/ymusic-native?style=flat-square&color=FF6B59" alt="Последняя версия"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-7EC699?style=flat-square" alt="Лицензия MIT"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/senduora/ymusic-native/releases/latest/download/YMusic.Native-win-Setup.exe"><strong>Скачать для Windows</strong></a>
+  <a href="https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Setup.exe"><strong>Скачать для Windows</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/senduora/ymusic-native/releases/latest/download/YMusic.Native-win-Portable.zip">Portable</a>
+  <a href="https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Portable.zip">Portable</a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/senduora/ymusic-native/releases">История версий</a>
+  <a href="https://github.com/senduora/yamuse/releases">История версий</a>
   &nbsp;·&nbsp;
   <a href="CREDITS.md">Источники и лицензии</a>
 </p>
@@ -44,13 +44,13 @@
 
 ## Установка
 
-1. Скачайте [YMusic.Native-win-Setup.exe](https://github.com/senduora/ymusic-native/releases/latest/download/YMusic.Native-win-Setup.exe).
+1. Скачайте [YMusic.Native-win-Setup.exe](https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Setup.exe).
 2. Запустите установщик и откройте Yamuse.
 3. Нажмите «Войти» и завершите вход на странице Яндекса.
 
 Установщик включает .NET Runtime и устанавливает приложение для текущего пользователя. Для доступа к музыке используется ваш аккаунт Яндекса.
 
-Для запуска из папки скачайте [Portable-архив](https://github.com/senduora/ymusic-native/releases/latest/download/YMusic.Native-win-Portable.zip), распакуйте его и откройте `YMusic.Native.exe`.
+Для запуска из папки скачайте [Portable-архив](https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Portable.zip), распакуйте его и откройте `YMusic.Native.exe`.
 
 ## Обновления
 
@@ -75,8 +75,8 @@
 Нужны **Windows** и **.NET 8 SDK**.
 
 ```powershell
-git clone https://github.com/senduora/ymusic-native.git
-cd ymusic-native
+git clone https://github.com/senduora/yamuse.git
+cd yamuse
 dotnet run --project src/YMusic.Native/YMusic.Native.csproj -c Release
 ```
 
