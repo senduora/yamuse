@@ -33,6 +33,7 @@ internal sealed class NativePlayer : IDisposable
     public string? FadingLocalPath => LocalPath(_fading);
     public double Volume { get => _volume; set => SetVolume(value); }
     public double SpeedRatio { get; private set; } = 1;
+    public double CrossfadeSeconds { get; private set; } = 3;
     public TimeSpan Position => _current?.Player.Position ?? TimeSpan.Zero;
     public TimeSpan Duration => _current?.Player.NaturalDuration.HasTimeSpan == true ? _current.Player.NaturalDuration.TimeSpan : TimeSpan.Zero;
     public event EventHandler? Ended;
@@ -133,7 +134,7 @@ internal sealed class NativePlayer : IDisposable
     public bool TryPlayPrepared(Uri source, TimeSpan crossfade)
     {
         ValidateSource(source); ObjectDisposedException.ThrowIf(_disposed, this);
-        if (crossfade < TimeSpan.Zero || crossfade > TimeSpan.FromSeconds(8)) throw new ArgumentOutOfRangeException(nameof(crossfade));
+        if (crossfade < TimeSpan.Zero || crossfade > TimeSpan.FromSeconds(10)) throw new ArgumentOutOfRangeException(nameof(crossfade));
         if (_prepared is not { Ready: true } next || !string.Equals(next.RequestedSource.AbsoluteUri, source.AbsoluteUri, StringComparison.Ordinal)) return false;
         FinishTransition(); // A second promotion can never leave three players playing.
         var opening = _opening; _opening = null; opening?.Cancel();
@@ -193,6 +194,11 @@ internal sealed class NativePlayer : IDisposable
         if (_current is not null) _current.Player.SpeedRatio = speed;
         if (_prepared is not null) _prepared.Player.SpeedRatio = speed;
         if (_fading is not null) _fading.Player.SpeedRatio = speed;
+    }
+    public void SetCrossfade(double seconds)
+    {
+        if (!double.IsFinite(seconds) || seconds is < 0 or > 10) throw new ArgumentOutOfRangeException(nameof(seconds));
+        CrossfadeSeconds = seconds;
     }
     private double FadeFraction => _fading is null ? 1 : Math.Clamp((_fadeElapsed + _fadeClock.Elapsed).TotalSeconds / _fadeDuration.TotalSeconds, 0, 1);
     private void ApplyGains()

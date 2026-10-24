@@ -10,9 +10,9 @@
 
 ```powershell
 & .\tools\packaging\Pack-Installer.ps1 `
-  -Version 0.3.8 `
-  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.3.8') `
-  -WorkFolder (Join-Path $PWD 'work\package-0.3.8') `
+  -Version 0.3.9 `
+  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.3.9') `
+  -WorkFolder (Join-Path $PWD 'work\package-0.3.9') `
   -PackageCache (Join-Path $PWD 'work\verified-packages') `
   -PublishedFolder $checkedSelfContainedPublish `
   -ExpectedProductSha256 $checkedProductHash
@@ -24,7 +24,7 @@
 
 Для получения одинакового product DLL при проверках и publish держите один project/obj/RID: сначала `build -c Release -r win-x64 --self-contained false`, затем restore/publish с тем же RID и `--self-contained true`. В обеих фазах импортируйте `-p:DirectoryBuildTargetsPath=<полный путь к PinnedRuntime.targets>`. Между фазами нельзя менять исходники; после publish сравните SHA-256 DLL с проверенным. На synthetic WPF с App.xaml и embedded PDB идентичность подтверждена, но это не заменяет сравнения реальной финальной сборки.
 
-На выходе: `YMusic.Native-win-Setup.exe`, `YMusic.Native-<version>-full.nupkg`, `YMusic.Native-win-Portable.zip`, `releases.win.json`, контрольные метаданные и хеши. Скрипт **не** запускает Setup, не создаёт Release/репозиторий, не делает commit/push и не удаляет предыдущие сборки. `OutputFolder` и `WorkFolder` должны быть новыми/пустыми. Удаление промежуточных файлов не выполняется автоматически.
+На выходе: `Yamuse-win-Setup.exe`, `Yamuse-<version>-full.nupkg`, `Yamuse-win-Portable.zip`, `releases.win.json`, контрольные метаданные и хеши. Скрипт **не** запускает Setup, не создаёт Release/репозиторий, не делает commit/push и не удаляет предыдущие сборки. `OutputFolder` и `WorkFolder` должны быть новыми/пустыми. Удаление промежуточных файлов не выполняется автоматически.
 
 Набор self-contained содержит runtime для компьютеров без установленного .NET. Это увеличивает установщик и место на диске; оно не означает, что все файлы runtime одновременно загружаются в RAM. Отдельного updater-сервиса в фоне нет. RAM/startup реального клиента после упаковки отдельно не измерены.
 
@@ -54,7 +54,7 @@ CheckForUpdatesAsync в закреплённом SDK не принимает Can
 
 `Inspect-Package.ps1` читает nupkg/nuspec, сравнивает package id/version, размер/SHA-256 Release assets и читает манифест Setup как PE DATAFILE. Дополнительно сверяются product DLL и все шесть license/notice по SHA-256 внутри nupkg, включая `Third-Party-Notices.txt` и собственную MIT-лицензию `Yamuse-LICENSE.txt`. Встроенный полный nupkg внутри unsigned Setup подтверждается его SHA-256. Новый обязательный аргумент `-ReferencePublishedFolder` указывает на тот же проверенный publish: apphost сравнивается побайтово, его ProductName/FileDescription и native icon resources, а также иконка Setup должны соответствовать Yamuse. `Pack-Installer.ps1` передаёт reference и ожидаемые SHA автоматически. Setup не выполняется. Результат — `package-evidence.json`, `package.nuspec.xml`, `setup.manifest.xml`.
 
-`Legal/Velopack-LICENSE.txt` — точный first-party [LICENSE](https://github.com/velopack/velopack/blob/92d6a1c91716729d449034df5c50307dcce39493/LICENSE) commit из nuspec Velopack 1.2.161, с copyright Caelan Sayler/Velopack Ltd. Также поставляются неизменённые NETCore LICENSE/THIRD-PARTY-NOTICES и WindowsDesktop LICENSE из подписанных runtime nupkg 8.0.32. Csproj копирует их в output/publish, packscript — в staging. Эти лицензии относятся к зависимостям; лицензию собственного YMusic Native пользователь ещё не выбирал.
+`Legal/Velopack-LICENSE.txt` — точный first-party [LICENSE](https://github.com/velopack/velopack/blob/92d6a1c91716729d449034df5c50307dcce39493/LICENSE) commit из nuspec Velopack 1.2.161, с copyright Caelan Sayler/Velopack Ltd. Также поставляются неизменённые NETCore LICENSE/THIRD-PARTY-NOTICES и WindowsDesktop LICENSE из подписанных runtime nupkg 8.0.32. Csproj копирует их в output/publish, packscript — в staging. Эти лицензии относятся к зависимостям; собственный код Yamuse распространяется по лицензии MIT (см. LICENSE).
 
 Установщик smoke не подписан Authenticode (`NotSigned`); NuGet repository signature исходных инструментов не является подписью нашего Setup. Signing certificate не предоставлен и не придумывается. Реальную установку/обновление/удаление и сохранение данных после них нужно проверять отдельно в разрешённом изолированном профиле/VM. Живой профиль и старый открытый клиент в этой работе не менялись.
 

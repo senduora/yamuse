@@ -16,9 +16,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Setup.exe"><strong>Скачать для Windows</strong></a>
+  <a href="https://github.com/senduora/yamuse/releases/latest/download/Yamuse-win-Setup.exe"><strong>Скачать для Windows</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Portable.zip">Portable</a>
+  <a href="https://github.com/senduora/yamuse/releases/latest/download/Yamuse-win-Portable.zip">Portable</a>
   &nbsp;·&nbsp;
   <a href="https://github.com/senduora/yamuse/releases">История версий</a>
   &nbsp;·&nbsp;
@@ -35,23 +35,24 @@
 | **Музыка под настроение** | Моя волна и отдельная волна по коллекции. |
 | **Поиск** | Треки, исполнители, альбомы, сборники, редакционные подборки и плейлисты — с отдельными категориями выдачи. |
 | **Исполнители и альбомы** | Карточки музыкантов, популярные треки, месячная аудитория из данных сервиса, дискография и похожие исполнители. Артисты открываются из списков и плеера, альбомы — из колонки в списке треков. |
-| **Воспроизведение** | Очередь, перемешивание, повтор, предзагрузка следующего трека и плавные переходы. Выбор качества: «Превосходное», «Оптимальное», «Экономичное». |
+| **Воспроизведение** | Очередь, перемешивание, повтор, предзагрузка следующего трека и кроссфейд с настройкой от 0 до 10 секунд. Выбор качества: «Превосходное», «Оптимальное», «Экономичное». |
 | **Офлайн** | Скачивание отдельных треков и целых плейлистов, сохранение статуса загрузки, до 10 одновременных загрузок и автоскачивание избранного по настройке. |
 | **Обложки и тексты** | Обложки в коллекции и плеере, встроенный текст песни и подсветка строк при наличии таймкодов. |
 | **Мини-плеер** | Компактное окно с обложкой, таймлайном, лайком, громкостью и переключением треков. Можно закрепить поверх остальных окон. |
+| **Оформление и настройки** | Аккуратные карточки, мягкие состояния наведения и читаемые подписи. Настройки звука, загрузок и приложения открываются в основном окне. |
 | **Удобство Windows** | Значок в трее, системные медиакнопки, тёмные заголовки окон, плавная прокрутка и переходы между экранами. |
 
 Интерфейс работает на WPF, воспроизведение — через системный аудиоплеер Windows. В основе клиента — C# и .NET 8.
 
 ## Установка
 
-1. Скачайте [YMusic.Native-win-Setup.exe](https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Setup.exe).
+1. Скачайте [Yamuse-win-Setup.exe](https://github.com/senduora/yamuse/releases/latest/download/Yamuse-win-Setup.exe).
 2. Запустите установщик и откройте Yamuse.
 3. Нажмите «Войти» и завершите вход на странице Яндекса.
 
 Установщик включает .NET Runtime и устанавливает приложение для текущего пользователя. Для доступа к музыке используется ваш аккаунт Яндекса.
 
-Для запуска из папки скачайте [Portable-архив](https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Portable.zip), распакуйте его и откройте `YMusic.Native.exe`.
+Для запуска из папки скачайте [Portable-архив](https://github.com/senduora/yamuse/releases/latest/download/Yamuse-win-Portable.zip), распакуйте его и откройте `YMusic.Native.exe`.
 
 ## Обновления
 
@@ -90,7 +91,7 @@ dotnet run --project tests/YMusic.Native.Checks/YMusic.Native.Checks.csproj -c R
 Упаковка установщика и файлов обновления:
 
 ```powershell
-./tools/packaging/Pack-Installer.ps1 -Version 0.3.8 -OutputFolder ./artifacts/setup -WorkFolder ./work/package
+./tools/packaging/Pack-Installer.ps1 -Version 0.3.9 -OutputFolder ./artifacts/setup -WorkFolder ./work/package
 ```
 
 Подробности сборки и упаковки — в [руководстве](tools/packaging/README.md).

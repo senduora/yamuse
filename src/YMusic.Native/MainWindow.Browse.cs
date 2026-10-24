@@ -14,6 +14,9 @@ public partial class MainWindow
 
     private void RememberBrowseView()
     {
+        // A player link can be used while Settings covers Home or an artist page.
+        // Capture the underlying music view's offset, not the Settings scroll position.
+        SetSettingsVisible(false);
         if (_browseHistory.Count >= 24) _browseHistory.Clear();
         var list = _catalogShowing ? (ItemsControl)CatalogList : TracksList;
         _browseHistory.Push(new(_section, CollectionTitle.Text, _tracks.ToArray(), _catalogItems.ToArray(),
@@ -74,7 +77,7 @@ public partial class MainWindow
         return null;
     }
 
-    private FrameworkElement CurrentContent() => _lyricsOpen ? LyricsPanel : _section switch
+    private FrameworkElement CurrentContent() => _settingsOpen ? SettingsPanel : _lyricsOpen ? LyricsPanel : _section switch
     {
         "wave" => WavePanel, "home" => HomePanel, "artist-detail" => ArtistPanel, _ => ContentGrid
     };

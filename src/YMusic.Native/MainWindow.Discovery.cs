@@ -42,6 +42,7 @@ public partial class MainWindow
     private void Lyrics_Click(object sender, RoutedEventArgs e)
     {
         if (_current is null) return;
+        SetSettingsVisible(false);
         SetLyricsVisible(!_lyricsOpen);
         if (_lyricsOpen && _lyricsCts is null) RefreshLyrics();
     }

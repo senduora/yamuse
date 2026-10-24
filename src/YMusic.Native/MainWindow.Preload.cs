@@ -2,7 +2,7 @@ namespace YMusic.Native;
 
 public partial class MainWindow
 {
-    private const double CrossfadeSeconds = 3;
+    private double CrossfadeSeconds => _player.CrossfadeSeconds;
     private CancellationTokenSource? _preloadCts;
     private Task? _preloadTask;
     private PreloadIdentity? _preloadIdentity;
@@ -103,7 +103,7 @@ public partial class MainWindow
             || prepared.Identity.Quality != SelectedQuality) return false;
         _player.FinishTransition();
         var remaining = Math.Max(0, (_player.Duration - _player.Position).TotalSeconds / _player.SpeedRatio);
-        var fade = _player.IsPlaying ? Math.Min(automatic ? CrossfadeSeconds : .22, remaining) : 0;
+        var fade = _player.IsPlaying ? Math.Min(automatic ? CrossfadeSeconds : CrossfadeSeconds > 0 ? .22 : 0, remaining) : 0;
         if (!_player.TryPlayPrepared(prepared.Source, TimeSpan.FromSeconds(fade))) return false;
         if (fade > 0)
         {

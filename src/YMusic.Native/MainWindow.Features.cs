@@ -38,7 +38,11 @@ public partial class MainWindow
     private async void Wave_Click(object sender, RoutedEventArgs e) => await OpenWaveAsync(WaveMode.Personal);
     private void Offline_Click(object sender, RoutedEventArgs e) => ShowOffline();
     private void SetSection(string section, string title)
+        => ApplySection(section, title, closeSettings: true);
+
+    private void ApplySection(string section, string title, bool closeSettings)
     {
+        if (closeSettings) SetSettingsVisible(false);
         SetLyricsVisible(false);
         _featureCts?.Cancel();
         HideCatalog();
@@ -70,7 +74,7 @@ public partial class MainWindow
         }
         UpdatePlaylistDownloadedStatus();
         UpdateBrowseButtons();
-        Motion.Enter(CurrentContent());
+        if (!_settingsOpen) Motion.Enter(CurrentContent());
     }
     private void ShowRows(IEnumerable<TrackRow> rows)
     {

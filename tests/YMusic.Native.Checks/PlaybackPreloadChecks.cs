@@ -204,11 +204,11 @@ internal static partial class Program
         public int MediaCalls => Volatile.Read(ref _mediaCalls);
         public PreloadFeedback[] Feedback { get { lock (_sync) return _feedback.ToArray(); } }
         public bool BufferEmpty => !Directory.Exists(Path.Combine(DirectoryPath, "player-buffer")) || !Directory.EnumerateFiles(Path.Combine(DirectoryPath, "player-buffer")).Any();
-        public PreloadIntegrationFixture(string name, bool signedIn = true)
+        public PreloadIntegrationFixture(string name, bool signedIn = true, byte[]? media = null)
         {
             _prefix = "preload-" + name + "-" + Guid.NewGuid().ToString("N");
             DirectoryPath = Path.Combine(_directory, _prefix); Directory.CreateDirectory(DirectoryPath);
-            _media = File.ReadAllBytes(WriteWave(_prefix + ".wav", 12));
+            _media = media ?? File.ReadAllBytes(WriteWave(_prefix + ".wav", 12));
             var handler = new FakeHandler(Respond);
             var mediaHandler = new FakeHandler((request, _) =>
             {

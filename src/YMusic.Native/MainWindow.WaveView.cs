@@ -26,11 +26,13 @@ public partial class MainWindow
 
     private void UpdateMainContentVisibility()
     {
-        LyricsPanel.Visibility = _lyricsOpen ? Visibility.Visible : Visibility.Collapsed;
-        WavePanel.Visibility = !_lyricsOpen && _section == "wave" ? Visibility.Visible : Visibility.Collapsed;
-        HomePanel.Visibility = !_lyricsOpen && _section == "home" ? Visibility.Visible : Visibility.Collapsed;
-        ArtistPanel.Visibility = !_lyricsOpen && _section == "artist-detail" ? Visibility.Visible : Visibility.Collapsed;
-        ContentGrid.Visibility = !_lyricsOpen && _section is not ("wave" or "home" or "artist-detail") ? Visibility.Visible : Visibility.Collapsed;
+        SettingsPanel.Visibility = _settingsOpen ? Visibility.Visible : Visibility.Collapsed;
+        LyricsPanel.Visibility = !_settingsOpen && _lyricsOpen ? Visibility.Visible : Visibility.Collapsed;
+        var browseVisible = !_settingsOpen && !_lyricsOpen;
+        WavePanel.Visibility = browseVisible && _section == "wave" ? Visibility.Visible : Visibility.Collapsed;
+        HomePanel.Visibility = browseVisible && _section == "home" ? Visibility.Visible : Visibility.Collapsed;
+        ArtistPanel.Visibility = browseVisible && _section == "artist-detail" ? Visibility.Visible : Visibility.Collapsed;
+        ContentGrid.Visibility = browseVisible && _section is not ("wave" or "home" or "artist-detail") ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void UpdateWavePresentation()
