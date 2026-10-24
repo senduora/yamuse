@@ -504,7 +504,6 @@ public partial class MainWindow : Window
         if (_current is null) Artwork.SetSourceUri(PlayerCover, null);
         UpdateWindowsMedia();
         UpdateQueueControls();
-        UpdatePlaylistDownloadedStatus();
         UpdateWavePresentation();
         RefreshNextPreparation();
         UpdateShellState();
@@ -545,6 +544,9 @@ public partial class MainWindow : Window
         EmptyTitle.Text = _query.Length > 0 ? "Ничего не найдено" : _section == "offline" ? "Пока ничего не скачано" : _section == "wave" ? "Запускаем Мою волну" : _session is not null ? "В избранном пока нет треков" : "Здесь появится избранное";
         EmptyDescription.Text = _query.Length > 0 ? "Попробуйте другое название или исполнителя" : _section == "offline" ? "Выберите трек и нажмите «Скачать»" : _session is not null ? "Если коллекция ещё загружается, подождите немного" : "Войдите в Яндекс, чтобы загрузить любимые треки";
         UpdateCatalogCount();
+        // A selection or transport change does not change thousands of offline files.
+        // Refresh this status when the list changes; downloads/removals also refresh it explicitly.
+        UpdatePlaylistDownloadedStatus();
         UpdateControls();
     }
     private void Busy(bool start)
@@ -606,6 +608,8 @@ public partial class MainWindow : Window
     }
     private async void Window_KeyDown(object sender, KeyEventArgs e)
     {
+        if (e.Key == Key.Escape && _settingsOpen) { e.Handled = true; SettingsClose_Click(sender, e); return; }
+        if (_settingsOpen && e.Key is not (Key.MediaPlayPause or Key.MediaNextTrack or Key.MediaPreviousTrack)) return;
         if (e.Key == Key.Escape && _lyricsOpen) { e.Handled = true; SetLyricsVisible(false); PlayerLyricsButton.Focus(); return; }
         if (e.OriginalSource is TextBoxBase or Slider) return;
         if (_windows?.IsAvailable == true && e.Key is Key.MediaPlayPause or Key.MediaNextTrack or Key.MediaPreviousTrack) return;

@@ -14,6 +14,7 @@ internal sealed record PlayerPreferences
     public bool MinimizeToTray { get; init; }
     public bool AutoDownloadFavorites { get; init; } // Opt in; existing settings default to false.
     public int ConcurrentDownloads { get; init; } = DefaultConcurrentDownloads;
+    public double CrossfadeSeconds { get; init; } = 3;
 }
 
 // This file contains playback preferences only; authentication remains in SessionStore.
@@ -99,7 +100,8 @@ internal sealed class PreferencesStore
             Quality = Enum.IsDefined(preferences.Quality) ? preferences.Quality : AudioQuality.Excellent,
             Volume = double.IsFinite(preferences.Volume) ? Math.Clamp(preferences.Volume, 0, 1) : 0.5,
             PlaybackSpeed = double.IsFinite(preferences.PlaybackSpeed) ? Math.Clamp(preferences.PlaybackSpeed, 0.5, 2) : 1,
-            ConcurrentDownloads = Math.Clamp(preferences.ConcurrentDownloads, 1, 10)
+            ConcurrentDownloads = Math.Clamp(preferences.ConcurrentDownloads, 1, 10),
+            CrossfadeSeconds = double.IsFinite(preferences.CrossfadeSeconds) ? Math.Clamp(preferences.CrossfadeSeconds, 0, 10) : 3
         };
     }
 

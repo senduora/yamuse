@@ -148,7 +148,8 @@ public partial class MainWindow
     }
     private void ShowPlaylist(PlaylistDetails details)
     {
-        SetSection("playlist-detail", details.Title);
+        // A response fills the underlying view while an open Settings draft stays intact.
+        ApplySection("playlist-detail", details.Title, closeSettings: false);
         CatalogSearchPanel.Visibility = Visibility.Collapsed;
         CreatePlaylistButton.Visibility = Visibility.Collapsed;
         _activePlaylist = details; CollectionTitle.Text = details.Title;

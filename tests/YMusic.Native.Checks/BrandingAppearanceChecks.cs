@@ -17,7 +17,7 @@ internal static partial class Program
 {
     private static async Task CheckBrandingAppearance038()
     {
-        await Run("Branding038: main and actual modal Settings expose Yamuse icons and supported dark native caption attributes", BrandingNativeAppearance038);
+        await Run("Branding038: main exposes Yamuse branding and a dark caption; Settings stay inside that window", BrandingNativeAppearance038);
         await Run("Branding038: actual root mini binding forwards cover volume like seek pause and next through one player and queue", BrandingRootMini038);
     }
 
@@ -30,46 +30,20 @@ internal static partial class Program
         var logo=SaVisuals<Image>(owner).Single(image=>AutomationProperties.GetName(image)=="Логотип Yamuse");
         Assert(logo.Source is BitmapSource {PixelWidth:>0,PixelHeight:>0}&&logo.IsVisible, "sidebar Yamuse bitmap resource did not render");
         var mainNative=BrandingNativeFacts(owner,"main");
-        Exception? callbackFailure=null;object? settingsNative=null;object? capture=null;bool modalEntered=false;
-        var completed=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var timeout=new DispatcherTimer(DispatcherPriority.Send,owner.Dispatcher){Interval=TimeSpan.FromSeconds(10)};
-        timeout.Tick+=(_,_)=>
+        SaInvoke(owner, "Settings_Click", Control<Button>(owner, "SettingsButton"), new RoutedEventArgs(Button.ClickEvent));
+        await Task.Delay(180); owner.UpdateLayout();
+        Assert(Control<Grid>(owner, "SettingsPanel").IsVisible && owner.OwnedWindows.Count == 0 && owner.IsEnabled,
+            "Settings did not stay in the enabled main window");
+        Assert(ReferenceEquals(PresentationSource.FromVisual(Control<Grid>(owner, "SettingsPanel")), PresentationSource.FromVisual(owner)),
+            "Settings created another presentation source");
+        App.Capture(owner, Path.Combine(_directory, "settings-inline.png"));
+        SaClick(Control<Button>(owner, "SettingsCancelButton"));
+        Assert(!Control<Grid>(owner, "SettingsPanel").IsVisible, "Settings did not close");
+        File.WriteAllText(Path.Combine(_directory, "branding038-native-appearance.json"), JsonSerializer.Serialize(new
         {
-            callbackFailure??=new InvalidOperationException("actual Settings modal callback timed out");
-            foreach(var window in owner.OwnedWindows.Cast<Window>().Where(window=>window.Title=="Настройки · Yamuse").ToArray())window.Close();
-            timeout.Stop();completed.TrySetResult();
-        };
-        _ = owner.Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle,new Action(async()=>
-        {
-            Window? dialog=null;
-            try
-            {
-                await Until(()=>owner.OwnedWindows.Cast<Window>().Any(window=>window.Title=="Настройки · Yamuse"&&window.IsVisible));
-                dialog=owner.OwnedWindows.Cast<Window>().Single(window=>window.Title=="Настройки · Yamuse"&&window.IsVisible);
-                modalEntered=!BrandingIsWindowEnabled(new WindowInteropHelper(owner).Handle)&&dialog.IsVisible;
-                Assert(modalEntered, "Settings did not enter the real ShowDialog modal loop");
-                dialog.ShowActivated=false;dialog.WindowStartupLocation=WindowStartupLocation.Manual;dialog.Left=-16000;dialog.Top=0;
-                await Task.Delay(180);dialog.UpdateLayout();
-                Assert(dialog.Icon is {IsFrozen:true}&&dialog.Title=="Настройки · Yamuse", "Settings brand title/icon differs from main");
-                settingsNative=BrandingNativeFacts(dialog,"settings");
-                var settingsCapture=BrandingPrintWindow(dialog,Path.Combine(_directory,"branding038-settings-native.png"));capture=settingsCapture;
-                File.WriteAllText(Path.Combine(_directory,"branding038-settings-capture.json"),JsonSerializer.Serialize(settingsCapture,new JsonSerializerOptions{WriteIndented=true}));
-                Assert(settingsCapture.Captured&&settingsCapture.NonClientGeometryIncluded&&settingsCapture.CaptionPixelsVerified,
-                    "own Settings PrintWindow capture did not verify the actual nonclient caption pixels; inspect sanitized capture facts and PNG");
-            }
-            catch(Exception error){callbackFailure=error;}
-            finally{dialog?.Close();timeout.Stop();completed.TrySetResult();}
-        }));
-        timeout.Start();
-        try{SaInvoke(owner,"Settings_Click",Control<Button>(owner,"SettingsButton"),new RoutedEventArgs(Button.ClickEvent));await completed.Task;}
-        finally{timeout.Stop();}
-        if(callbackFailure is not null)throw callbackFailure;
-        Assert(modalEntered&&settingsNative is not null, "Settings native caption was not inspected");
-        File.WriteAllText(Path.Combine(_directory,"branding038-native-appearance.json"),JsonSerializer.Serialize(new
-        {
-            main=mainNative,settings=settingsNative,modalShowDialog=true,capture,
-            syntheticAccountOnly=true,systemThemeChanged=false,externalWindowsCaptured=false
-        },new JsonSerializerOptions{WriteIndented=true}));
+            main = mainNative, settingsInsideMain = true, ownedWindows = owner.OwnedWindows.Count,
+            syntheticAccountOnly = true, systemThemeChanged = false, externalWindowsCaptured = false
+        }, new JsonSerializerOptions { WriteIndented = true }));
     }
 
     private static object BrandingNativeFacts(Window window,string fixtureKind)
