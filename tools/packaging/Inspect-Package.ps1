@@ -10,6 +10,9 @@ param([Parameter(Mandatory)][string]$OutputFolder,
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $outputPath = [IO.Path]::GetFullPath($OutputFolder)
+foreach ($name in @('Yamuse-win-Setup.exe','Yamuse-win-Portable.zip',"Yamuse-$ExpectedVersion-full.nupkg")) {
+    if (!(Test-Path -LiteralPath (Join-Path $outputPath $name) -PathType Leaf)) { throw 'Branded Yamuse download is missing.' }
+}
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $referencePath = [IO.Path]::GetFullPath($ReferencePublishedFolder)
 $sourceIcon = Join-Path $projectRoot 'src\YMusic.Native\Assets\Yamuse.ico'

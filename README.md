@@ -16,9 +16,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Setup.exe"><strong>Скачать для Windows</strong></a>
+  <a href="https://github.com/senduora/yamuse/releases/latest/download/Yamuse-win-Setup.exe"><strong>Скачать для Windows</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Portable.zip">Portable</a>
+  <a href="https://github.com/senduora/yamuse/releases/latest/download/Yamuse-win-Portable.zip">Portable</a>
   &nbsp;·&nbsp;
   <a href="https://github.com/senduora/yamuse/releases">История версий</a>
   &nbsp;·&nbsp;
@@ -45,13 +45,13 @@
 
 ## Установка
 
-1. Скачайте [YMusic.Native-win-Setup.exe](https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Setup.exe).
+1. Скачайте [Yamuse-win-Setup.exe](https://github.com/senduora/yamuse/releases/latest/download/Yamuse-win-Setup.exe).
 2. Запустите установщик и откройте Yamuse.
 3. Нажмите «Войти» и завершите вход на странице Яндекса.
 
 Установщик включает .NET Runtime и устанавливает приложение для текущего пользователя. Для доступа к музыке используется ваш аккаунт Яндекса.
 
-Для запуска из папки скачайте [Portable-архив](https://github.com/senduora/yamuse/releases/latest/download/YMusic.Native-win-Portable.zip), распакуйте его и откройте `YMusic.Native.exe`.
+Для запуска из папки скачайте [Portable-архив](https://github.com/senduora/yamuse/releases/latest/download/Yamuse-win-Portable.zip), распакуйте его и откройте `YMusic.Native.exe`.
 
 ## Обновления
 

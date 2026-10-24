@@ -138,6 +138,7 @@ if (!(Test-Path -LiteralPath $stageIcon) -or (Get-FileHash -LiteralPath $stageIc
 # uses LocalAppData, and requires no administrator elevation.
 & $vpk pack --packId $packId --packVersion $Version --packDir $stage --mainExe 'YMusic.Native.exe' --packTitle 'Yamuse' --packAuthors 'senduora' --icon $stageIcon --runtime win-x64 --channel win --shortcuts 'Desktop,StartMenuRoot' --outputDir $outputPath
 if ($LASTEXITCODE -ne 0) { throw "vpk pack failed with exit code $LASTEXITCODE." }
+& (Join-Path $PSScriptRoot 'Rename-ReleaseAssets.ps1') -OutputFolder $outputPath -Version $Version | Out-Null
 & (Join-Path $PSScriptRoot 'Inspect-Package.ps1') -OutputFolder $outputPath -ExpectedVersion $Version -ExpectedPackId $packId -ExpectedProductSha256 $productHash -ExpectedProjectNoticesSha256 $projectNoticesHash -ExpectedProjectLicenseSha256 $projectLicenseHash -ExpectedIconSha256 $iconHash -ReferencePublishedFolder $stage
 if (!$?) { throw 'Package inspection failed.' }
 [pscustomobject]@{
