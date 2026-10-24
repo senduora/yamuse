@@ -17,7 +17,7 @@ public partial class App : Application
             _instanceMutex = new Mutex(true, @"Local\YMusic.Native.Prototype", out var created);
             if (!created)
             {
-                MessageBox.Show("Прототип уже открыт. Переключитесь на его окно.", "YMusic Native", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show("Yamuse уже открыт. Переключитесь на его окно.", AppBranding.Name, MessageBoxButton.OK, MessageBoxImage.Information);
                 Shutdown();
                 return;
             }

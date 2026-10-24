@@ -85,7 +85,13 @@ else {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'update-feed.json') -Destination $configStage
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'licenses') -Destination $configStage -Recurse
     Copy-Item -LiteralPath (Join-Path $projectRoot 'THIRD-PARTY-NOTICES.txt') -Destination (Join-Path $workingPath 'source\THIRD-PARTY-NOTICES.txt')
-    # This project has no asset/source subdirectories. Never copy bin/obj,
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination (Join-Path $workingPath 'source\LICENSE')
+    $assetsStage = Join-Path $sourceStage 'Assets'
+    New-Item -ItemType Directory -Path $assetsStage -Force | Out-Null
+    foreach ($assetName in @('Yamuse.ico','Yamuse.png','Yamuse.svg')) {
+        Copy-Item -LiteralPath (Join-Path (Join-Path $source 'Assets') $assetName) -Destination $assetsStage
+    }
+    # Copy only source files and the explicit branding assets. Never copy bin/obj,
     # account data, a previous package, or the live portable app directory.
     Get-ChildItem -LiteralPath $source -File | Where-Object {
         $_.Extension -in @('.cs','.xaml','.csproj','.manifest','.ico','.resx') -or $_.Name -eq 'packages.lock.json'
@@ -118,15 +124,24 @@ $projectNoticesHash = (Get-FileHash -LiteralPath $projectNoticesSource -Algorith
 $projectNoticesStage = Join-Path $legalStage 'Third-Party-Notices.txt'
 Copy-Item -LiteralPath $projectNoticesSource -Destination $projectNoticesStage
 if ((Get-FileHash -LiteralPath $projectNoticesStage -Algorithm SHA256).Hash -ne $projectNoticesHash) { throw 'Third-party notices changed while staging.' }
+$projectLicenseSource = Join-Path $projectRoot 'LICENSE'
+$projectLicenseHash = (Get-FileHash -LiteralPath $projectLicenseSource -Algorithm SHA256).Hash
+$projectLicenseStage = Join-Path $legalStage 'Yamuse-LICENSE.txt'
+Copy-Item -LiteralPath $projectLicenseSource -Destination $projectLicenseStage
+if ((Get-FileHash -LiteralPath $projectLicenseStage -Algorithm SHA256).Hash -ne $projectLicenseHash) { throw 'Yamuse license changed while staging.' }
+$sourceIcon = Join-Path $projectRoot 'src\YMusic.Native\Assets\Yamuse.ico'
+$iconHash = (Get-FileHash -LiteralPath $sourceIcon -Algorithm SHA256).Hash
+$stageIcon = Join-Path $stage 'Assets\Yamuse.ico'
+if (!(Test-Path -LiteralPath $stageIcon) -or (Get-FileHash -LiteralPath $stageIcon -Algorithm SHA256).Hash -ne $iconHash) { throw 'Published Yamuse icon is missing or differs from the approved source.' }
 
 # No --framework: .NET 8 is bundled. No --msi: the standard Setup is per-user,
 # uses LocalAppData, and requires no administrator elevation.
-& $vpk pack --packId $packId --packVersion $Version --packDir $stage --mainExe 'YMusic.Native.exe' --packTitle 'YMusic Native' --packAuthors 'YMusic Native' --runtime win-x64 --channel win --shortcuts 'Desktop,StartMenuRoot' --outputDir $outputPath
+& $vpk pack --packId $packId --packVersion $Version --packDir $stage --mainExe 'YMusic.Native.exe' --packTitle 'Yamuse' --packAuthors 'senduora' --icon $stageIcon --runtime win-x64 --channel win --shortcuts 'Desktop,StartMenuRoot' --outputDir $outputPath
 if ($LASTEXITCODE -ne 0) { throw "vpk pack failed with exit code $LASTEXITCODE." }
-& (Join-Path $PSScriptRoot 'Inspect-Package.ps1') -OutputFolder $outputPath -ExpectedVersion $Version -ExpectedPackId $packId -ExpectedProductSha256 $productHash -ExpectedProjectNoticesSha256 $projectNoticesHash
+& (Join-Path $PSScriptRoot 'Inspect-Package.ps1') -OutputFolder $outputPath -ExpectedVersion $Version -ExpectedPackId $packId -ExpectedProductSha256 $productHash -ExpectedProjectNoticesSha256 $projectNoticesHash -ExpectedProjectLicenseSha256 $projectLicenseHash -ExpectedIconSha256 $iconHash -ReferencePublishedFolder $stage
 if (!$?) { throw 'Package inspection failed.' }
 [pscustomobject]@{
-    version=$Version; packId=$packId; velopack=$velopackVersion; runtime=$runtimeVersion; productDllSha256=$productHash; projectNoticesSha256=$projectNoticesHash;
+    version=$Version; packId=$packId; product='Yamuse'; authors='senduora'; velopack=$velopackVersion; runtime=$runtimeVersion; productDllSha256=$productHash; projectNoticesSha256=$projectNoticesHash; projectLicenseSha256=$projectLicenseHash; iconSha256=$iconHash;
     sdk=(& dotnet --version); configuration='Self-contained Windows x64, public GitHub feed, explicit apply';
     workFolder=$workingPath; packageSource='https://api.nuget.org/v3/index.json';
     packages=@($pinnedPackages | ForEach-Object { [pscustomobject]@{file=[IO.Path]::GetFileName($_);sha256=(Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash} })

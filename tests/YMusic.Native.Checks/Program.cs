@@ -438,6 +438,8 @@ internal static partial class Program
         await CheckCompactLayout();
         await CheckAlbumMetadata037();
         await CheckTrackLinks037();
+        await CheckMiniPlayer();
+        await CheckBrandingAppearance038();
         await Run("Diagnostics contain resources and timings, without credentials or account data", () =>
         {
             var path = Path.Combine(_directory, "sanitized-diagnostics.json");

@@ -13,6 +13,7 @@ internal sealed class TextDialog : Window
     {
         Owner = owner; Title = title; WindowStartupLocation = WindowStartupLocation.CenterOwner; SizeToContent = SizeToContent.WidthAndHeight;
         ResizeMode = ResizeMode.NoResize; ShowInTaskbar = false; Style = (Style)Application.Current.FindResource(typeof(Window));
+        WindowAppearance.Apply(this);
         var panel = new StackPanel { Margin = new Thickness(24) };
         panel.Children.Add(new TextBlock { Text = title, FontSize = 20 }); _text.Text = initial; panel.Children.Add(_text);
         if (privacy) panel.Children.Add(_visibility);
@@ -34,6 +35,7 @@ internal sealed class PlaylistDialog : Window
     {
         Owner = owner; Title = "Выберите плейлист"; Width = 480; Height = 430; WindowStartupLocation = WindowStartupLocation.CenterOwner;
         ShowInTaskbar = false; Style = (Style)Application.Current.FindResource(typeof(Window));
+        WindowAppearance.Apply(this);
         var grid = new Grid { Margin = new Thickness(20) };
         grid.RowDefinitions.Add(new RowDefinition()); grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         _items = new ListBox { ItemsSource = playlists, DisplayMemberPath = "Title" }; grid.Children.Add(_items);

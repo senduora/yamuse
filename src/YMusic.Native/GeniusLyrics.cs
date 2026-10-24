@@ -29,7 +29,7 @@ internal sealed class GeniusLyricsClient : IDisposable
             AllowAutoRedirect = false, UseCookies = false, Credentials = null,
             AutomaticDecompression = DecompressionMethods.All
         }) { Timeout = Timeout.InfiniteTimeSpan };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("YMusicNative/1.0");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd("Yamuse/0.3.8");
     }
 
     public async Task<GeniusLyrics?> FindAsync(string title, string artist, CancellationToken cancellationToken)
