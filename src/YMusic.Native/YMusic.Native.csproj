@@ -5,10 +5,15 @@
     <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>0.3.7</Version>
+    <Version>0.3.8</Version>
+    <Product>Yamuse</Product>
+    <Title>Yamuse</Title>
+    <AssemblyTitle>Yamuse</AssemblyTitle>
+    <Description>Неофициальный нативный клиент Яндекс Музыки для Windows.</Description>
     <StartupObject>YMusic.Native.Program</StartupObject>
     <AssemblyName>YMusic.Native</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\Yamuse.ico</ApplicationIcon>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <DebugType>embedded</DebugType>
   </PropertyGroup>
@@ -18,5 +23,9 @@
     <None Include="..\..\tools\packaging\update-feed.json" Link="update-feed.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <None Include="..\..\tools\packaging\licenses\*.txt" Link="Legal\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <None Include="..\..\THIRD-PARTY-NOTICES.txt" Link="Legal\Third-Party-Notices.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE" Link="Legal\Yamuse-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Resource Include="Assets\Yamuse.ico" />
+    <Resource Include="Assets\Yamuse.png" />
+    <None Update="Assets\Yamuse.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

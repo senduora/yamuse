@@ -10,9 +10,9 @@
 
 ```powershell
 & .\tools\packaging\Pack-Installer.ps1 `
-  -Version 0.3.7 `
-  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.3.7') `
-  -WorkFolder (Join-Path $PWD 'work\package-0.3.7') `
+  -Version 0.3.8 `
+  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.3.8') `
+  -WorkFolder (Join-Path $PWD 'work\package-0.3.8') `
   -PackageCache (Join-Path $PWD 'work\verified-packages') `
   -PublishedFolder $checkedSelfContainedPublish `
   -ExpectedProductSha256 $checkedProductHash
@@ -52,7 +52,7 @@ CheckForUpdatesAsync в закреплённом SDK не принимает Can
 
 `Pack-Installer.ps1` получает только фиксированные файлы NuGet по официальным HTTPS URL, сравнивает встроенные SHA-256 и запускает `dotnet nuget verify --all`. Затем CLI ставится из проверенного локального пакета, restore staging использует локальный feed. Источники/версии/хеши сохраняются в `build-provenance.json`; runtime/host Microsoft проверены по author+repository signature, Velopack/vpk — по repository signature NuGet.
 
-`Inspect-Package.ps1` читает nupkg/nuspec, сравнивает package id/version, размер/SHA-256 Release assets и читает манифест Setup как PE DATAFILE. Дополнительно сверяются product DLL и все пять license/notice по SHA-256 внутри nupkg, включая `Third-Party-Notices.txt` проекта, а встроенный полный nupkg внутри unsigned Setup побайтово подтверждается его SHA-256. Setup не выполняется. Результат — `package-evidence.json`, `package.nuspec.xml`, `setup.manifest.xml`. Финальный synthetic smoke 0.3.7 прошёл: 476 entries, Setup 85 972 751 байт, full package 78 458 639 байт. Это пакет fixture-приложения с App.xaml resource, не итоговый установщик музыкального клиента.
+`Inspect-Package.ps1` читает nupkg/nuspec, сравнивает package id/version, размер/SHA-256 Release assets и читает манифест Setup как PE DATAFILE. Дополнительно сверяются product DLL и все шесть license/notice по SHA-256 внутри nupkg, включая `Third-Party-Notices.txt` и собственную MIT-лицензию `Yamuse-LICENSE.txt`. Встроенный полный nupkg внутри unsigned Setup подтверждается его SHA-256. Новый обязательный аргумент `-ReferencePublishedFolder` указывает на тот же проверенный publish: apphost сравнивается побайтово, его ProductName/FileDescription и native icon resources, а также иконка Setup должны соответствовать Yamuse. `Pack-Installer.ps1` передаёт reference и ожидаемые SHA автоматически. Setup не выполняется. Результат — `package-evidence.json`, `package.nuspec.xml`, `setup.manifest.xml`.
 
 `Legal/Velopack-LICENSE.txt` — точный first-party [LICENSE](https://github.com/velopack/velopack/blob/92d6a1c91716729d449034df5c50307dcce39493/LICENSE) commit из nuspec Velopack 1.2.161, с copyright Caelan Sayler/Velopack Ltd. Также поставляются неизменённые NETCore LICENSE/THIRD-PARTY-NOTICES и WindowsDesktop LICENSE из подписанных runtime nupkg 8.0.32. Csproj копирует их в output/publish, packscript — в staging. Эти лицензии относятся к зависимостям; лицензию собственного YMusic Native пользователь ещё не выбирал.
 

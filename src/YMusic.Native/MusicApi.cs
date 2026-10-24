@@ -34,7 +34,7 @@ internal sealed partial class MusicApi : IDisposable
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, "https://oauth.yandex.ru/device/code")
         {
-            Content = Form(("client_id", ClientId), ("device_id", deviceId), ("device_name", "YMusic Native Prototype"))
+            Content = Form(("client_id", ClientId), ("device_id", deviceId), ("device_name", "Yamuse"))
         };
         using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
         using var json = await ReadJsonAsync(response, cancellationToken).ConfigureAwait(false);

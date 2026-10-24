@@ -1,5 +1,5 @@
 <Window x:Class="YMusic.Native.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:local="clr-namespace:YMusic.Native"
-        Title="YMusic Native" Style="{StaticResource {x:Type Window}}" Width="1280" Height="860" MinWidth="1050" MinHeight="680" WindowStartupLocation="CenterScreen" UseLayoutRounding="True" PreviewKeyDown="Window_KeyDown">
+        Title="Yamuse" Style="{StaticResource {x:Type Window}}" Width="1280" Height="860" MinWidth="1050" MinHeight="680" WindowStartupLocation="CenterScreen" UseLayoutRounding="True" PreviewKeyDown="Window_KeyDown">
 
   <Window.Resources>
     <local:CatalogGroupLabel x:Key="CatalogGroupLabel"/>
@@ -53,7 +53,7 @@
       <Grid>
         <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
         <StackPanel Margin="10,0,0,0">
-          <StackPanel Orientation="Horizontal"><Border Background="{StaticResource AccentBrush}" Width="34" Height="34" CornerRadius="10" Margin="0,0,11,0"><StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center"><Rectangle Fill="#271A18" Width="3" Height="10" RadiusX="1.5" RadiusY="1.5" Margin="0,0,3,0"/><Rectangle Fill="#271A18" Width="3" Height="19" RadiusX="1.5" RadiusY="1.5" Margin="0,0,3,0"/><Rectangle Fill="#271A18" Width="3" Height="14" RadiusX="1.5" RadiusY="1.5"/></StackPanel></Border><TextBlock Text="YMusic" FontSize="24" FontWeight="SemiBold" VerticalAlignment="Center"/></StackPanel>
+          <StackPanel Orientation="Horizontal"><Image Source="Assets/Yamuse.png" Width="36" Height="36" Margin="0,0,11,0" AutomationProperties.Name="Логотип Yamuse"/><TextBlock Text="Yamuse" FontSize="24" FontWeight="SemiBold" VerticalAlignment="Center"/></StackPanel>
           <TextBlock Text="Нативный плеер для Windows" FontSize="10" Foreground="{StaticResource MutedBrush}" Margin="0,10,0,0"/>
         </StackPanel>
         <ScrollViewer x:Name="NavigationScroll" Grid.Row="1" Margin="0,24,0,12" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"><StackPanel>
@@ -428,13 +428,13 @@
     <Border x:Name="MetricsBar" Grid.Row="2" Grid.ColumnSpan="2" Background="#121317" BorderBrush="#282A31" BorderThickness="0,1,0,0" Padding="22,0">
       <DockPanel LastChildFill="True">
         <Button x:Name="SaveMetricsButton" DockPanel.Dock="Right" Content="Сохранить замер" Click="SaveDiagnostics_Click" Style="{StaticResource QuietButton}" Padding="8,0" Height="24" FontSize="10" ToolTip="Сохранить JSON с ресурсами приложения, без данных аккаунта"/>
-        <StackPanel x:Name="MetricsRow" Orientation="Horizontal" VerticalAlignment="Center" ToolTip="Ресурсы процесса YMusic Native">
+        <StackPanel x:Name="MetricsRow" Orientation="Horizontal" VerticalAlignment="Center" ToolTip="Ресурсы процесса Yamuse">
           <TextBlock Text="РЕСУРСЫ ПЛЕЕРА" Foreground="#777D89" FontSize="9" Margin="0,0,18,0" VerticalAlignment="Center"/>
           <TextBlock x:Name="MemoryText" Text="RAM всего — МБ" Foreground="#ACAEB8" FontSize="10" VerticalAlignment="Center" Margin="0,0,18,0" ToolTip="Общий рабочий набор: собственная и общая физическая память процесса. В диспетчере задач столбец «Память» обычно показывает только частный рабочий набор."/>
           <TextBlock x:Name="CpuText" Text="CPU —" Foreground="#ACAEB8" FontSize="10" VerticalAlignment="Center" Margin="0,0,18,0" ToolTip="CPU процесса в процентах всей мощности ПК"/>
           <TextBlock x:Name="PrivateText" Text="Commit — МБ" Foreground="#777D89" FontSize="10" VerticalAlignment="Center" Margin="0,0,18,0" ToolTip="Выделенная виртуальная память процесса · private bytes. Часть может находиться вне RAM; это не частный рабочий набор из диспетчера задач."/>
           <TextBlock x:Name="StartupText" Text="Запуск —" Foreground="#777D89" FontSize="10" VerticalAlignment="Center" Margin="0,0,18,0" ToolTip="Время от старта процесса до первого отображения окна"/>
-          <TextBlock Text="v0.3.7" Foreground="#656A76" FontSize="10" VerticalAlignment="Center"/>
+          <TextBlock Text="v0.3.8" Foreground="#656A76" FontSize="10" VerticalAlignment="Center"/>
         </StackPanel>
       </DockPanel>
     </Border>

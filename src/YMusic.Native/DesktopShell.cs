@@ -1,13 +1,12 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Windows;
-using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Media;
 
 namespace YMusic.Native;
 
-internal enum ShellAction { PlayPause, Next, Previous, Exit }
+internal enum ShellAction { PlayPause, Next, Previous, Exit, ToggleLike }
 
 // All windows and commands belong to this process. There are no global hooks,
 // background processes, WebView, Windows Forms, or startup registration.
@@ -20,26 +19,27 @@ internal sealed class DesktopShell : IDisposable
     private readonly HwndSource _source;
     private readonly Guid _iconGuid = Guid.NewGuid();
     private readonly uint _taskbarCreated;
-    private readonly nint _icon;
+    private readonly AppBranding.OwnedIcon _icon;
     private bool _minimizeToTray;
     private bool _version4;
     private bool _exitRequested;
     private bool _ownerClosed;
     private int _disposed;
     private WindowState _restoreState;
-    private Window? _mini;
-    private TextBlock? _miniTitle;
-    private TextBlock? _miniArtist;
-    private Button? _miniPlay;
-    private Button? _miniNext;
-    private Button? _miniPrevious;
+    private MiniPlayerWindow? _mini;
     private string _title = "";
     private string _artist = "";
     private bool _isPlaying;
     private bool _canNext;
     private bool _canPrevious;
+    private ImageSource? _cover;
+    private double _positionSeconds, _durationSeconds, _volumePercent = 70;
+    private bool _canSeek, _isLiked, _canLike;
+    private string? _trackKey;
 
     public event Action<ShellAction>? Command;
+    public event Action<double>? SeekRequested;
+    public event Action<double>? VolumeRequested;
     public bool IsAvailable { get; private set; }
     public string? FailureReason { get; private set; }
     internal nint WindowHandle { get; }
@@ -80,7 +80,7 @@ internal sealed class DesktopShell : IDisposable
         _source = HwndSource.FromHwnd(WindowHandle) ?? throw new InvalidOperationException("Недоступно окно приложения.");
         _source.AddHook(WindowProcedure);
         _taskbarCreated = RegisterWindowMessage("TaskbarCreated");
-        _icon = LoadIcon(0, (nint)32512); // Shared Windows icon; do not destroy it.
+        _icon = AppBranding.CreateTrayIcon(WindowHandle);
         owner.Closing += OwnerClosing;
         owner.Closed += OwnerClosed;
         owner.StateChanged += OwnerStateChanged;
@@ -90,13 +90,18 @@ internal sealed class DesktopShell : IDisposable
     {
         OnWindowThread(() =>
         {
-            _title = (title ?? "").Replace('\0', ' ');
-            _artist = (artist ?? "").Replace('\0', ' ');
+            var nextTitle = (title ?? "").Replace('\0', ' ');
+            var nextArtist = (artist ?? "").Replace('\0', ' ');
+            if (_title == nextTitle && _artist == nextArtist && _isPlaying == isPlaying
+                && _canNext == canNext && _canPrevious == canPrevious) return;
+            var tipChanged = _title != nextTitle || _artist != nextArtist;
+            _title = nextTitle;
+            _artist = nextArtist;
             _isPlaying = isPlaying;
             _canNext = canNext;
             _canPrevious = canPrevious;
             UpdateMiniPlayer();
-            if (IsAvailable)
+            if (IsAvailable && tipChanged)
             {
                 var data = CreateIconData();
                 if (!Shell_NotifyIcon(1, ref data)) DisableUnavailableTray();
@@ -111,7 +116,7 @@ internal sealed class DesktopShell : IDisposable
             if (_ownerClosed) return;
             if (!_owner.IsVisible) _owner.Show();
             if (_owner.WindowState == WindowState.Minimized) _owner.WindowState = _restoreState;
-            _owner.Activate();
+            if (_owner.ShowActivated) _owner.Activate();
         });
     }
 
@@ -127,78 +132,75 @@ internal sealed class DesktopShell : IDisposable
         });
     }
 
+    public void UpdateDetails(ImageSource? cover, double positionSeconds, double durationSeconds,
+        bool canSeek, bool isLiked, bool canLike, double volumePercent, string? trackKey = null)
+    {
+        OnWindowThread(() =>
+        {
+            _cover = cover;
+            _durationSeconds = double.IsFinite(durationSeconds) ? Math.Max(0, durationSeconds) : 0;
+            _positionSeconds = double.IsFinite(positionSeconds) ? Math.Clamp(positionSeconds, 0, _durationSeconds) : 0;
+            _canSeek = canSeek && _durationSeconds > 0;
+            _isLiked = isLiked;
+            _canLike = canLike;
+            _volumePercent = double.IsFinite(volumePercent) ? Math.Clamp(volumePercent, 0, 100) : 0;
+            _trackKey = trackKey;
+            UpdateMiniPlayerDetails();
+        });
+    }
+
     public void ShowMiniPlayer()
     {
         OnWindowThread(() =>
         {
-            if (_mini is not null) { _mini.Show(); _mini.Activate(); return; }
-            var window = new Window
-            {
-                Title = "Мини-плеер · YMusic Native", Width = 390, Height = 190,
-                ResizeMode = ResizeMode.NoResize, WindowStyle = WindowStyle.ToolWindow,
-                WindowStartupLocation = WindowStartupLocation.CenterScreen,
-                ShowInTaskbar = false, Background = new SolidColorBrush(Color.FromRgb(24, 24, 29)),
-                Foreground = Brushes.White, FontFamily = new FontFamily("Segoe UI")
-            };
-            var grid = new Grid { Margin = new Thickness(14, 10, 14, 10) };
-            grid.RowDefinitions.Add(new() { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new() { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new() { Height = new GridLength(1, GridUnitType.Star) });
-            grid.RowDefinitions.Add(new() { Height = GridLength.Auto });
-            _miniTitle = new TextBlock { FontSize = 16, FontWeight = FontWeights.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis };
-            _miniArtist = new TextBlock { FontSize = 12, Foreground = Brushes.LightGray, Margin = new Thickness(0, 3, 0, 7), TextTrimming = TextTrimming.CharacterEllipsis };
-            grid.Children.Add(_miniTitle);
-            Grid.SetRow(_miniArtist, 1); grid.Children.Add(_miniArtist);
-            var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-            _miniPrevious = MiniButton("Назад", () => Dispatch(ShellAction.Previous));
-            _miniPlay = MiniButton("Играть", () => Dispatch(ShellAction.PlayPause));
-            _miniNext = MiniButton("Далее", () => Dispatch(ShellAction.Next));
-            buttons.Children.Add(_miniPrevious); buttons.Children.Add(_miniPlay); buttons.Children.Add(_miniNext);
-            Grid.SetRow(buttons, 2); grid.Children.Add(buttons);
-            var footer = new DockPanel { Margin = new Thickness(0, 7, 0, 0), LastChildFill = false };
-            var open = new Button { Content = "Открыть", Padding = new Thickness(8, 2, 8, 2), HorizontalAlignment = HorizontalAlignment.Right };
-            open.Click += (_, _) => ShowMainWindow();
-            DockPanel.SetDock(open, Dock.Right); footer.Children.Add(open);
-            var topmost = new CheckBox { Content = "Поверх окон", Foreground = Brushes.LightGray, VerticalAlignment = VerticalAlignment.Center };
-            topmost.Checked += (_, _) => window.Topmost = true;
-            topmost.Unchecked += (_, _) => window.Topmost = false;
-            footer.Children.Add(topmost); Grid.SetRow(footer, 3); grid.Children.Add(footer);
-            window.Content = grid;
-            window.Closed += (_, _) =>
-            {
-                if (!ReferenceEquals(_mini, window)) return;
-                _mini = null; _miniTitle = _miniArtist = null;
-                _miniPlay = _miniNext = _miniPrevious = null;
-            };
+            if (_ownerClosed) return;
+            if (_mini is not null) { _mini.Show(); if (_mini.ShowActivated) _mini.Activate(); return; }
+            var window = new MiniPlayerWindow();
+            window.Command += Dispatch;
+            window.SeekRequested += MiniSeekRequested;
+            window.VolumeRequested += MiniVolumeRequested;
+            window.ShowMainRequested += ShowMainWindow;
+            window.Closed += MiniClosed;
             _mini = window;
             UpdateMiniPlayer();
+            UpdateMiniPlayerDetails();
+            WindowAppearance.Apply(window);
             window.Show();
         });
     }
 
-    private static Button MiniButton(string text, Action action)
+    private void MiniSeekRequested(double seconds)
     {
-        var button = new Button { Content = text, MinWidth = 90, Padding = new Thickness(8, 6, 8, 6), Margin = new Thickness(4, 0, 4, 0) };
-        button.Click += (_, _) => action();
-        return button;
+        if (Volatile.Read(ref _disposed) == 0 && _canSeek && double.IsFinite(seconds))
+            SeekRequested?.Invoke(Math.Clamp(seconds, 0, Math.Max(0, _durationSeconds)));
     }
 
-    private void UpdateMiniPlayer()
+    private void MiniVolumeRequested(double percent)
     {
-        if (_mini is null) return;
-        _miniTitle!.Text = string.IsNullOrWhiteSpace(_title) ? "YMusic Native" : _title;
-        _miniArtist!.Text = string.IsNullOrWhiteSpace(_artist) ? "Выберите музыку в основном окне" : _artist;
-        _miniPlay!.Content = _isPlaying ? "Пауза" : "Играть";
-        _miniPlay.IsEnabled = !string.IsNullOrWhiteSpace(_title);
-        _miniNext!.IsEnabled = _canNext;
-        _miniPrevious!.IsEnabled = _canPrevious;
+        if (Volatile.Read(ref _disposed) == 0 && double.IsFinite(percent))
+            VolumeRequested?.Invoke(Math.Clamp(percent, 0, 100));
     }
+
+    private void MiniClosed(object? sender, EventArgs args)
+    {
+        if (sender is not MiniPlayerWindow window) return;
+        window.Command -= Dispatch;
+        window.SeekRequested -= MiniSeekRequested;
+        window.VolumeRequested -= MiniVolumeRequested;
+        window.ShowMainRequested -= ShowMainWindow;
+        window.Closed -= MiniClosed;
+        if (ReferenceEquals(_mini, window)) _mini = null;
+    }
+
+    private void UpdateMiniPlayer() => _mini?.Update(_title, _artist, _isPlaying, _canNext, _canPrevious);
+    private void UpdateMiniPlayerDetails() => _mini?.UpdateDetails(_cover, _positionSeconds, _durationSeconds,
+        _canSeek, _isLiked, _canLike, _volumePercent, _trackKey);
 
     private bool TryAddTray()
     {
         if (IsAvailable) return true;
         var data = CreateIconData();
-        if (_icon == 0 || !Shell_NotifyIcon(0, ref data))
+        if (_icon.IsInvalid || _icon.IsClosed || !Shell_NotifyIcon(0, ref data))
         {
             FailureReason = "Область уведомлений Windows недоступна. Окно остаётся доступным.";
             return false;
@@ -229,13 +231,13 @@ internal sealed class DesktopShell : IDisposable
 
     private NotifyIconData CreateIconData()
     {
-        var tip = string.IsNullOrWhiteSpace(_title) ? "YMusic Native" : $"{_title} — {_artist}";
+        var tip = string.IsNullOrWhiteSpace(_title) ? AppBranding.Name : $"{_title} — {_artist}";
         if (tip.Length > 127) tip = tip[..(char.IsHighSurrogate(tip[126]) ? 126 : 127)];
         return new()
         {
             Size = (uint)Marshal.SizeOf<NotifyIconData>(), Window = WindowHandle, Id = TrayId,
             Flags = NifMessage | NifIcon | NifTip | NifGuid, CallbackMessage = TrayCallback,
-            Icon = _icon, Tip = tip, Info = "", InfoTitle = "", Guid = _iconGuid
+            Icon = _icon.DangerousGetHandle(), Tip = tip, Info = "", InfoTitle = "", Guid = _iconGuid
         };
     }
 
@@ -264,7 +266,7 @@ internal sealed class DesktopShell : IDisposable
         if (menu == 0) return;
         try
         {
-            _ = AppendMenu(menu, 0, 1, "Открыть YMusic Native");
+            _ = AppendMenu(menu, 0, 1, "Открыть " + AppBranding.Name);
             _ = AppendMenu(menu, 0, 2, "Мини-плеер");
             _ = AppendMenu(menu, 0x800, 0, null);
             _ = AppendMenu(menu, string.IsNullOrWhiteSpace(_title) ? 0x1u : 0u, 3, _isPlaying ? "Пауза" : "Играть");
@@ -294,7 +296,8 @@ internal sealed class DesktopShell : IDisposable
         if (Volatile.Read(ref _disposed) != 0) return;
         if (action == ShellAction.PlayPause && string.IsNullOrWhiteSpace(_title)
             || action == ShellAction.Next && !_canNext
-            || action == ShellAction.Previous && !_canPrevious) return;
+            || action == ShellAction.Previous && !_canPrevious
+            || action == ShellAction.ToggleLike && (!_canLike || string.IsNullOrWhiteSpace(_title))) return;
         if (action == ShellAction.Exit) _exitRequested = true;
         Command?.Invoke(action);
         if (action == ShellAction.Exit && !_ownerClosed) RequestExit();
@@ -339,11 +342,15 @@ internal sealed class DesktopShell : IDisposable
             _owner.Closed -= OwnerClosed;
             _owner.StateChanged -= OwnerStateChanged;
             _mini?.Close();
+            _cover = null;
+            _icon.Dispose();
             Command = null;
+            SeekRequested = null;
+            VolumeRequested = null;
         }
         if (_owner.Dispatcher.CheckAccess()) DisposeCore();
         else if (!_owner.Dispatcher.HasShutdownStarted && !_owner.Dispatcher.HasShutdownFinished) _owner.Dispatcher.Invoke(DisposeCore);
-        else RemoveTray();
+        else { RemoveTray(); _icon.Dispose(); }
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -366,7 +373,6 @@ internal sealed class DesktopShell : IDisposable
     [DllImport("shell32.dll", EntryPoint = "Shell_NotifyIconW", CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)] private static extern bool Shell_NotifyIcon(uint message, ref NotifyIconData data);
     [DllImport("user32.dll", EntryPoint = "RegisterWindowMessageW", CharSet = CharSet.Unicode)] private static extern uint RegisterWindowMessage(string message);
-    [DllImport("user32.dll", EntryPoint = "LoadIconW")] private static extern nint LoadIcon(nint instance, nint name);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(nint hwnd, out int processId);
     [DllImport("user32.dll")] private static extern nint CreatePopupMenu();
     [DllImport("user32.dll", EntryPoint = "AppendMenuW", CharSet = CharSet.Unicode)]

@@ -49,9 +49,19 @@ public partial class MainWindow
                         if (_player.Position.TotalSeconds > 3) { CommitSeek(0); }
                         else await AdvanceAsync(-1, false);
                         break;
+                    case ShellAction.ToggleLike: await ToggleCurrentLikeAsync(); break;
                     case ShellAction.Exit: _shell.RequestExit(); break;
                 }
             };
+            _shell.SeekRequested += seconds => { if (!_closed && SeekSlider.IsEnabled) { CommitSeek(seconds); UpdateShellState(); } };
+            _shell.VolumeRequested += percent => { if (!_closed && double.IsFinite(percent)) VolumeSlider.Value = Math.Clamp(percent, 0, 100); };
+            if (System.ComponentModel.DependencyPropertyDescriptor.FromProperty(Image.SourceProperty, typeof(Image)) is { } coverSource)
+            {
+                EventHandler coverChanged = (_, _) => UpdateShellState();
+                coverSource.AddValueChanged(PlayerCover, coverChanged);
+                Closed += (_, _) => coverSource.RemoveValueChanged(PlayerCover, coverChanged);
+            }
+            UpdateShellState();
         }
         catch (Exception ex) { _diagnostics.LastErrorType = "DesktopShell:" + ex.GetType().Name; }
     }
@@ -77,7 +87,8 @@ public partial class MainWindow
         panel.Children.Add(CreateUpdateSettingsPanel());
         panel.Children.Add(new TextBlock { Text = "Пробел — пауза. Enter — открыть выбранное. Медиаклавиши работают через Windows.\nМузыка сохраняется в Документы\\YMusic Native\\Music по кнопке скачивания или при включённом автоскачивании избранного.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 20) });
         var apply = new Button { Content = "Сохранить" }; panel.Children.Add(apply);
-        var dialog = new Window { Title = "Настройки · YMusic Native", Owner = this, Width = 520, Height = Math.Min(680, SystemParameters.WorkArea.Height), MinWidth = 420, MinHeight = Math.Min(360, SystemParameters.WorkArea.Height), WindowStartupLocation = WindowStartupLocation.CenterOwner, Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto }, Style = (Style)FindResource(typeof(Window)) };
+        var dialog = new Window { Title = "Настройки · Yamuse", Owner = this, Width = 520, Height = Math.Min(680, SystemParameters.WorkArea.Height), MinWidth = 420, MinHeight = Math.Min(360, SystemParameters.WorkArea.Height), WindowStartupLocation = WindowStartupLocation.CenterOwner, Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto }, Style = (Style)FindResource(typeof(Window)) };
+        WindowAppearance.Apply(dialog);
         apply.Click += (_, _) =>
         {
             _player.SetSpeed(speed.SelectedItem is double ratio ? ratio : 1);

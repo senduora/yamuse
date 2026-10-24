@@ -62,6 +62,7 @@ public partial class MainWindow : Window
         _player = player ?? new NativePlayer();
         _accountCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         InitializeComponent();
+        WindowAppearance.Apply(this);
         _view = CollectionViewSource.GetDefaultView(_tracks);
         _view.Filter = value => value is TrackRow row && (_query.Length == 0 || row.Matches(_query));
         TracksList.ItemsSource = _view;
@@ -83,7 +84,7 @@ public partial class MainWindow : Window
         _player.Failed += (_, _) => { _progressTimer.Stop(); ReportWaveEnd(false); _diagnostics.Stage = "playback_error"; SetStatus("Windows прервала воспроизведение. Попробуйте снова или выберите другой трек.", true); UpdateControls(); };
         ContentRendered += OnReady;
         Closed += OnClosed;
-        SourceInitialized += (_, _) => { var dark = 1; _ = DwmSetWindowAttribute(new WindowInteropHelper(this).Handle, 20, ref dark, sizeof(int)); InitializeWindows(); InitializeShell(); };
+        SourceInitialized += (_, _) => { InitializeWindows(); InitializeShell(); };
     }
 
     private async void OnReady(object? sender, EventArgs e)
@@ -506,7 +507,7 @@ public partial class MainWindow : Window
         UpdatePlaylistDownloadedStatus();
         UpdateWavePresentation();
         RefreshNextPreparation();
-        _shell?.Update(_current?.Title ?? "", _current?.Artist ?? "", _player.IsPlaying, NextButton.IsEnabled, PreviousButton.IsEnabled);
+        UpdateShellState();
     }
     private void HighlightTrack(TrackRow? current)
     {
@@ -521,13 +522,14 @@ public partial class MainWindow : Window
         DurationText.Text = FormatTime(duration);
         SeekSlider.IsEnabled = !_loadingStream && _player.HasSource && duration.TotalSeconds > 0;
         UpdateLyrics(position.TotalSeconds);
+        UpdateShellState();
         TryAutomaticTransition();
     }
     private static string FormatTime(TimeSpan time) => time.TotalHours >= 1 ? time.ToString(@"h\:mm\:ss") : time.ToString(@"m\:ss");
     private void Seek_Start(object sender, MouseButtonEventArgs e) { if (SeekSlider.IsEnabled) { _seekDragging = true; PositionText.Text = FormatTime(TimeSpan.FromSeconds(SeekSlider.Value)); } }
     private void Seek_End(object sender, MouseButtonEventArgs e) => FinishSeek(true);
     private void Seek_KeyUp(object sender, KeyEventArgs e) { if (SeekSlider.IsEnabled && e.Key is Key.Left or Key.Right or Key.Home or Key.End or Key.PageDown or Key.PageUp) CommitSeek(SeekSlider.Value); }
-    private void Volume_Changed(object sender, RoutedPropertyChangedEventArgs<double> e) { _player.SetVolume(e.NewValue / 100); SavePreferences(); }
+    private void Volume_Changed(object sender, RoutedPropertyChangedEventArgs<double> e) { _player.SetVolume(e.NewValue / 100); SavePreferences(); UpdateShellState(); }
     private void Filter_TextChanged(object sender, TextChangedEventArgs e)
     {
         if (FilterHint is null) return;
@@ -642,5 +644,4 @@ public partial class MainWindow : Window
         _diagnostics.Dispose(); _api.Dispose();
         // Cancellation sources and refresh lock are released by their outstanding async operations.
     }
-    [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
 }

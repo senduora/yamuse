@@ -202,8 +202,10 @@ public partial class MainWindow
         if (TracksList.SelectedItem is TrackRow row) await SetTrackLikeAsync(row, liked);
     }
     private async void PlayerLike_Click(object sender, RoutedEventArgs e)
+        => await ToggleCurrentLikeAsync();
+    private async Task ToggleCurrentLikeAsync()
     {
-        if (_current is not { } row || !_favoriteIdsKnown) return;
+        if (_current is not { } row || !_favoriteIdsKnown || !PlayerLikeButton.IsEnabled) return;
         await SetTrackLikeAsync(row, !_favoriteTrackIds.Contains(row.Id));
     }
     private void UpdatePlayerLikeState()
@@ -216,6 +218,7 @@ public partial class MainWindow
         var label = liked ? "Убрать из Мне нравится" : "Добавить в Мне нравится";
         PlayerLikeButton.ToolTip = _session is not null && !_favoriteIdsKnown ? "Загружаем отметки Мне нравится…" : label;
         System.Windows.Automation.AutomationProperties.SetName(PlayerLikeButton, label);
+        UpdateShellState();
     }
     private async Task SetTrackLikeAsync(TrackRow row, bool liked)
     {

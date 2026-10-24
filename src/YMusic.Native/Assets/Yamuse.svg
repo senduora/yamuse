@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">Yamuse</title>
+  <defs><linearGradient id="coral" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FF816E"/><stop offset="1" stop-color="#F65E69"/></linearGradient></defs>
+  <rect width="256" height="256" rx="64" fill="url(#coral)"/>
+  <g fill="none" stroke="#FFF4EC" stroke-width="24" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M72 78 C91 78 104 113 128 119 C152 113 165 78 184 78"/>
+    <path d="M128 119 V182"/>
+  </g>
+</svg>

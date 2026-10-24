@@ -58,7 +58,7 @@ internal sealed class LrclibLyricsClient : IDisposable
             if (_http.DefaultRequestHeaders.Authorization is not null || _http.DefaultRequestHeaders.Contains("Cookie"))
                 throw new InvalidOperationException("Для LRCLIB нужен HTTP-клиент без учётных заголовков.");
             using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-            request.Headers.UserAgent.ParseAdd("YMusicNativePrototype/0.3.7");
+            request.Headers.UserAgent.ParseAdd("Yamuse/0.3.8");
             request.Headers.Accept.ParseAdd("application/json");
             _nextRequestUtc = DateTimeOffset.UtcNow.AddMilliseconds(250);
             using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
