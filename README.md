@@ -20,7 +20,7 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/senduora/yamuse/releases/latest/download/Yamuse-win-Portable.zip">Portable</a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/senduora/yamuse/releases">История версий</a>
+  <a href="docs/releases/">История версий</a>
   &nbsp;·&nbsp;
   <a href="CREDITS.md">Источники и лицензии</a>
 </p>
