@@ -64,7 +64,7 @@
 
 | Данные | Папка |
 | --- | --- |
-| Музыка и офлайн-индексы | `Документы\Yamuse\Music` |
+| Музыка и офлайн-индексы | `Документы\YMusic Native\Music` |
 | Авторизация и настройки | `%LOCALAPPDATA%\YMusic.Native.Prototype` |
 | Установленное приложение | `%LOCALAPPDATA%\YMusic.Native` |
 
