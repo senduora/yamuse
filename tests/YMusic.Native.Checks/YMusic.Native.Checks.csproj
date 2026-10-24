@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0-windows10.0.19041.0</TargetFramework><UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+    <AssemblyName>YMusic.Native.Checks</AssemblyName>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup><ProjectReference Include="..\..\src\YMusic.Native\YMusic.Native.csproj" /></ItemGroup>
+  <ItemGroup><EmbeddedResource Include="..\..\src\YMusic.Native\App.xaml" LogicalName="YMusic.Native.Checks.AppStyles.xaml" /></ItemGroup>
+</Project>

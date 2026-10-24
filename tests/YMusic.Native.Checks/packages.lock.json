@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net8.0-windows10.0.19041": {
+      "Velopack": {
+        "type": "Transitive",
+        "resolved": "1.2.161",
+        "contentHash": "OpHNacIumnkhaaX3ZlQ/TCR4YPOJvud2/PAOoWb6o+mIrLwIVA275I5wAgt4q/1O2VrJeDwR1qFQyqzG4lUArg=="
+      },
+      "ymusic.native": {
+        "type": "Project",
+        "dependencies": {
+          "Velopack": "[1.2.161, 1.2.161]"
+        }
+      }
+    },
+    "net8.0-windows10.0.19041/win-x64": {}
+  }
+}

@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <RuntimeFrameworkVersion>8.0.32</RuntimeFrameworkVersion>
+  </PropertyGroup>
+  <Target Name="PinPackagingWindowsSdkReference" BeforeTargets="ProcessFrameworkReferences">
+    <ItemGroup>
+      <!-- RuntimeFrameworkVersion is global in SDK 8.0.301; the Windows SDK
+           projection is a separate package, not a .NET 8 runtime framework. -->
+      <FrameworkReference Condition="'%(FrameworkReference.Identity)' == 'Microsoft.Windows.SDK.NET.Ref'" RuntimeFrameworkVersion="10.0.19041.31" />
+    </ItemGroup>
+  </Target>
+</Project>

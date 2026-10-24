@@ -1,0 +1,63 @@
+YMusic Native Prototype — third-party notices
+
+YandexMusic for .NET
+https://github.com/jrfrigat/YandexMusic
+Protocol reference and adapted endpoint/signing/parsing code:
+commit 8c929094386137669766632f9cc2c97d3b05f670.
+Endpoints: OAuth Device Flow, tracks/download-info, signing, radio sessions,
+catalog, playlists, landing, lyrics and library endpoints.
+MIT License
+
+Copyright (c) 2026 FrigaT
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Microsoft.Windows.SDK.NET.Ref 10.0.19041.31
+Runtime projections: Microsoft.Windows.SDK.NET.dll and WinRT.Runtime.dll.
+Copyright Microsoft Corporation. All rights reserved.
+Windows SDK license: https://aka.ms/WinSDKLicenseURL
+Package: https://www.nuget.org/packages/Microsoft.Windows.SDK.NET.Ref/10.0.19041.31
+The framework-dependent development build uses the installed .NET Desktop Runtime.
+The Windows x64 installer bundles Microsoft.NETCore.App and Microsoft.WindowsDesktop.App 8.0.32.
+The bundled runtime license and notices are included in Legal/.
+
+Velopack 1.2.161 (MIT), installer and update library:
+https://github.com/velopack/velopack
+https://www.nuget.org/packages/Velopack/1.2.161
+The complete copyright and MIT license are included in Legal/Velopack-LICENSE.txt.
+
+Additional protocol references (no Python packages are bundled):
+https://github.com/MarshalX/yandex-music-api
+https://github.com/llistochek/yandex-music-downloader
+https://github.com/alexxit/yandexstation
+OAuth Device Flow documentation:
+https://yandex.ru/dev/id/doc/en/codes/screen-code-oauth
+Protocol and UX comparison for 0.3.5 (no foreign application code or dependencies bundled):
+trashee, MIT, bb798e7a4c49f0985f33a80f31b0d27b9da03ec1:
+https://github.com/onemorefix1337/trashee
+aeviww/yandex-music-client, GPL-3.0, a7a27b79e750047f225f5b6a499297cca84af2c7:
+https://github.com/aeviww/yandex-music-client
+acherkashin/yandex-music-open-api, package declares Apache-2.0, 914ac07f205d58d9fbd0c5d479f450cba5a1c0ad:
+https://github.com/acherkashin/yandex-music-open-api
+MarshalX/yandex-music-api, LGPL-3.0, 9ca132e5c18a72aab779c1fc68c169380a9357d0:
+https://github.com/MarshalX/yandex-music-api
+The C# LRCLIB client is implemented independently against the service documentation:
+https://lrclib.net/docs
+Artist/profile routes additionally checked against public installed Yandex Music5.124.1 code.
+No browser profiles, cookies or official-client tokens are bundled.
