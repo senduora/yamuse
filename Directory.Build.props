@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup Condition="'$(PrototypeArtifactsPath)' != ''">
+    <BaseIntermediateOutputPath>$(PrototypeArtifactsPath)\obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(PrototypeArtifactsPath)\bin\$(MSBuildProjectName)\</BaseOutputPath>
+  </PropertyGroup>
+</Project>
