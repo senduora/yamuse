@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4?style=flat-square" alt="Windows 10 и 11 x64">
   <img src="https://img.shields.io/badge/.NET-8-512BD4?style=flat-square" alt=".NET 8">
   <img src="https://img.shields.io/badge/UI-WPF-FF6B59?style=flat-square" alt="Нативный интерфейс WPF">
-  <a href="https://github.com/senduora/yamuse/releases"><img src="https://img.shields.io/github/v/release/senduora/ymusic-native?style=flat-square&color=FF6B59" alt="Последняя версия"></a>
+  <a href="https://github.com/senduora/yamuse/releases"><img src="https://img.shields.io/github/v/release/senduora/yamuse?style=flat-square&color=FF6B59" alt="Последняя версия"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-7EC699?style=flat-square" alt="Лицензия MIT"></a>
 </p>
 
