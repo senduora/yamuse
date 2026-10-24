@@ -66,6 +66,9 @@ internal sealed partial class MusicApi
     }
 
     public async Task<IReadOnlyList<TrackRow>> GetAlbumTracksAsync(Session session, string albumId, CancellationToken cancellationToken)
+        => (await GetAlbumDetailsAsync(session, albumId, cancellationToken).ConfigureAwait(false)).Tracks;
+
+    public async Task<AlbumDetails> GetAlbumDetailsAsync(Session session, string albumId, CancellationToken cancellationToken)
     {
         using var json = await ApiAsync(HttpMethod.Get, $"/albums/{CatalogId(albumId)}/with-tracks", session, null, cancellationToken).ConfigureAwait(false);
         var album = CatalogResult(json);
@@ -78,7 +81,8 @@ internal sealed partial class MusicApi
             foreach (var track in volume.EnumerateArray())
                 rows.Add(CatalogTrack(track, rows.Count + 1, albumId));
         }
-        return rows;
+        return new(albumId, CatalogMetadataText(album, "title"), CatalogArtistNames(album), rows,
+            EntityArtwork(album, "album"), CatalogOptionalYear(album), CatalogOptionalDate(album, "releaseDate"));
     }
 
     public async Task<IReadOnlyList<TrackRow>> GetArtistTracksAsync(Session session, string artistId, int page, CancellationToken cancellationToken)
@@ -95,7 +99,11 @@ internal sealed partial class MusicApi
     {
         using var json = await ApiAsync(HttpMethod.Get, $"/users/{CatalogId(owner)}/playlists/{CatalogId(kind)}", session, null, cancellationToken).ConfigureAwait(false);
         var result = CatalogResult(json);
-        var info = CatalogPlaylistHeader(result, owner, kind);
+        var info = CatalogPlaylistHeader(result, owner, kind) with
+        {
+            CoverUri = EntityArtwork(result, "playlist"), OwnerName = CatalogPlaylistOwnerName(result),
+            Created = CatalogOptionalDate(result, "created"), Modified = CatalogOptionalDate(result, "modified")
+        };
         var entries = CatalogArray(result, "tracks", "треков плейлиста");
         if (CatalogNonNegativeInt(result, "trackCount", "плейлиста") != entries.GetArrayLength())
             throw new MusicException("Получен неполный список плейлиста. Изменения не отправлены.");
@@ -384,6 +392,34 @@ internal sealed partial class MusicApi
     private static string CatalogArtistNames(JsonElement row)
         => row.TryGetProperty("artists", out var artists) && artists.ValueKind == JsonValueKind.Array
             ? string.Join(", ", artists.EnumerateArray().Select(a => Text(a, "name")).Where(n => n.Length > 0)) : "";
+
+    // Optional presentation metadata cannot make a previously readable collection fail.
+    // Accept only the documented field types and ISO dates; never infer a release from tracks or titles.
+    private static string CatalogMetadataText(JsonElement row, string property)
+        => row.ValueKind == JsonValueKind.Object && row.TryGetProperty(property, out var value)
+            && value.ValueKind == JsonValueKind.String ? value.GetString()?.Trim() ?? "" : "";
+
+    private static int? CatalogOptionalYear(JsonElement row)
+        => row.TryGetProperty("year", out var value) && value.ValueKind == JsonValueKind.Number
+            && value.TryGetInt32(out var year) && year is >= 1 and <= 9999 ? year : null;
+
+    private static DateOnly? CatalogOptionalDate(JsonElement row, string property)
+    {
+        var value = CatalogMetadataText(row, property);
+        if (DateOnly.TryParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var date)) return date;
+        string[] formats = ["yyyy-MM-dd'T'HH:mm:sszzz", "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFzzz",
+            "yyyy-MM-dd'T'HH:mm:ss'Z'", "yyyy-MM-dd'T'HH:mm:ss.FFFFFFF'Z'"];
+        return DateTimeOffset.TryParseExact(value, formats, CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal, out var timestamp) ? DateOnly.FromDateTime(timestamp.DateTime) : null;
+    }
+
+    private static string? CatalogPlaylistOwnerName(JsonElement row)
+    {
+        if (!row.TryGetProperty("owner", out var owner) || owner.ValueKind != JsonValueKind.Object) return null;
+        foreach (var property in new[] { "name", "displayName", "login" })
+            if (CatalogMetadataText(owner, property) is { Length: > 0 } name) return name;
+        return null;
+    }
 
     private static string CatalogOwner(JsonElement row)
     {

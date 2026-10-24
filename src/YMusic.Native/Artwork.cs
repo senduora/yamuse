@@ -22,8 +22,7 @@ public static class Artwork
     // Internal injection point keeps deterministic checks away from the user's cache and network.
     internal static ArtworkCache Cache
     {
-        get => _cache ??= new(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "YMusic.Native.Prototype", "artwork"));
+        get => _cache ??= new(Path.Combine(BrandPaths.Current.DataDirectory, "artwork"));
         set => _cache = value;
     }
 
@@ -101,10 +100,10 @@ public static class Artwork
 
 internal static class ArtworkUri
 {
-    private const string Placeholder = "ymusic-artwork-size-placeholder";
-    internal static int Size(int size) => size <= 64 ? 64 : size <= 128 ? 128 : 256;
-    // UI/decode buckets are not CDN rendition names. Yandex artwork uses 100/200/400px renditions.
-    private static int CdnSize(int size) => Size(size) switch { 64 => 100, 128 => 200, _ => 400 };
+    private const string Placeholder = "yamuse-artwork-size-placeholder";
+    internal static int Size(int size) => size <= 64 ? 64 : size <= 128 ? 128 : size <= 256 ? 256 : 1024;
+    // Keep small list covers cheap; the expanded player requests its own large rendition.
+    private static int CdnSize(int size) => Size(size) switch { 64 => 100, 128 => 200, 256 => 400, _ => 1000 };
     internal static string? Metadata(string? value)
     {
         if (string.IsNullOrWhiteSpace(value) || value.Length > 2048 || value.Any(char.IsControl)) return null;
@@ -123,9 +122,14 @@ internal static class ArtworkUri
             UriKind.Absolute, out uri!) && Valid(uri);
     }
     internal static bool Valid(Uri uri) => uri.IsAbsoluteUri && uri.Scheme == Uri.UriSchemeHttps
-        && uri.IsDefaultPort && uri.UserInfo.Length == 0 && uri.Fragment.Length == 0 && uri.Query.Length == 0
+        && uri.IsDefaultPort && uri.UserInfo.Length == 0 && uri.Fragment.Length == 0 && ValidVersion(uri.Query)
         && uri.AbsoluteUri.Length <= 2048 && uri.AbsolutePath.Length > 1
         && uri.DnsSafeHost.ToLowerInvariant() is "avatars.yandex.net" or "avatars.mds.yandex.net" or "avatars.mdst.yandex.net";
+
+    // Personal-playlist covers carry a bare numeric cache version, e.g. ?1730453322475.
+    // Keep it in the request and cache key; arbitrary query parameters remain unsupported.
+    private static bool ValidVersion(string query) => query.Length == 0
+        || query.Length is > 1 and <= 21 && query.AsSpan(1).IndexOfAnyExcept("0123456789") < 0;
 }
 
 /// <summary>Anonymous, bounded, shared cache. Frozen results can cross dispatcher threads.</summary>
@@ -156,7 +160,7 @@ internal sealed class ArtworkCache : IDisposable
             PooledConnectionLifetime = TimeSpan.FromMinutes(5), ConnectTimeout = TimeSpan.FromSeconds(8)
         }) { Timeout = TimeSpan.FromSeconds(20), MaxResponseContentBufferSize = MaximumResponseBytes };
         // Deliberately independent of MusicApi: no OAuth, cookies, referrer or signed audio URL.
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("YMusicNativePrototype-Artwork/0.3");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd("Yamuse-Artwork/0.3");
         _http.DefaultRequestHeaders.Accept.ParseAdd("image/*");
     }
 
@@ -164,8 +168,10 @@ internal sealed class ArtworkCache : IDisposable
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!ArtworkUri.TryCreate(source, size, out var uri)) return null;
-        // Fixed-size CDN URLs share one decode (at most 256px) across all UI sizes.
-        var key = uri.AbsoluteUri;
+        // Small views still share one bounded decode. The expanded player keeps
+        // a distinct large bitmap even when metadata specifies a fixed CDN URL.
+        var decodeSize = ArtworkUri.Size(size) > 256 ? 1024 : 256;
+        var key = uri.AbsoluteUri + (decodeSize > 256 ? "|decode1024" : "");
         Pending pending;
         lock (_sync)
         {
@@ -178,7 +184,7 @@ internal sealed class ArtworkCache : IDisposable
             {
                 pending = new Pending();
                 _pending.Add(key, pending);
-                pending.Task = Task.Run(() => LoadAsync(uri, key, pending));
+                pending.Task = Task.Run(() => LoadAsync(uri, key, pending, decodeSize));
                 _ = pending.Task.ContinueWith(_ =>
                 {
                     lock (_sync) if (pending.Waiters == 0) pending.Cancellation.Dispose();
@@ -202,7 +208,7 @@ internal sealed class ArtworkCache : IDisposable
         }
     }
 
-    private async Task<BitmapSource?> LoadAsync(Uri uri, string key, Pending pending)
+    private async Task<BitmapSource?> LoadAsync(Uri uri, string key, Pending pending, int decodeSize)
     {
         var cancellationToken = pending.Cancellation.Token;
         var acquired = false;
@@ -215,13 +221,13 @@ internal sealed class ArtworkCache : IDisposable
             BitmapSource? bitmap = null;
             if (bytes is not null)
             {
-                try { bitmap = Decode(bytes); }
+                try { bitmap = Decode(bytes, decodeSize); }
                 catch (Exception ex) when (DecodeFailure(ex)) { DeleteFile(path); }
             }
             if (bitmap is null)
             {
                 bytes = await DownloadAsync(uri, cancellationToken).ConfigureAwait(false);
-                bitmap = Decode(bytes);
+                bitmap = Decode(bytes, decodeSize);
                 cancellationToken.ThrowIfCancellationRequested();
                 await WriteDiskAsync(path, bytes, cancellationToken).ConfigureAwait(false);
             }
@@ -297,7 +303,7 @@ internal sealed class ArtworkCache : IDisposable
         }
     }
 
-    internal static BitmapSource Decode(byte[] bytes)
+    internal static BitmapSource Decode(byte[] bytes, int maximumSize = 256)
     {
         if (bytes.Length is <= 0 or > MaximumResponseBytes) throw new InvalidDataException("Invalid artwork size.");
         using var stream = new MemoryStream(bytes, false);
@@ -311,11 +317,12 @@ internal sealed class ArtworkCache : IDisposable
         bitmap.BeginInit();
         bitmap.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
         bitmap.CacheOption = BitmapCacheOption.OnLoad;
-        if (frame.PixelWidth >= frame.PixelHeight) bitmap.DecodePixelWidth = Math.Min(256, frame.PixelWidth);
-        else bitmap.DecodePixelHeight = Math.Min(256, frame.PixelHeight);
+        var targetSize = maximumSize > 256 ? 1024 : 256;
+        if (frame.PixelWidth >= frame.PixelHeight) bitmap.DecodePixelWidth = Math.Min(targetSize, frame.PixelWidth);
+        else bitmap.DecodePixelHeight = Math.Min(targetSize, frame.PixelHeight);
         bitmap.StreamSource = stream;
         bitmap.EndInit();
-        if (bitmap.PixelWidth > 256 || bitmap.PixelHeight > 256) throw new InvalidDataException("Artwork decode exceeds the target size.");
+        if (bitmap.PixelWidth > targetSize || bitmap.PixelHeight > targetSize) throw new InvalidDataException("Artwork decode exceeds the target size.");
         bitmap.Freeze();
         return bitmap;
     }

@@ -165,7 +165,7 @@ public partial class MainWindow
                 if (_lyricsNote is not null) _lyricsNote.Text = track.Artist + "\n" + (ex is MusicException ? ex.Message : "Не удалось загрузить текст. Нажмите «Обновить текст», чтобы повторить.");
             }
         }
-        finally { if (ReferenceEquals(_lyricsCts, cts)) _lyricsCts = null; cts.Dispose(); }
+        finally { if (ReferenceEquals(_lyricsCts, cts)) _lyricsCts = null; cts.Dispose(); RefreshExpandedLyrics(); }
     }
     private void ApplyLyrics(TrackRow track, CachedLyrics cached)
     {
@@ -189,10 +189,11 @@ public partial class MainWindow
         }
         UpdateLyrics(_player.Position.TotalSeconds);
         if (_lyricsOpen) Motion.Enter(LyricsList, 4);
+        RefreshExpandedLyrics();
     }
     private void UpdateLyrics(double position)
     {
-        if (_lyricsList is null || _lyricLines.Count == 0) return;
+        if (_lyricsList is null || _lyricLines.Count == 0) { RefreshExpandedLyrics(); return; }
         var index = -1;
         var low = 0; var high = _lyricLines.Count - 1;
         while (low <= high)
@@ -203,6 +204,7 @@ public partial class MainWindow
         }
         var changed = _lyricsList.SelectedIndex != index;
         if (changed) _lyricsList.SelectedIndex = index;
+        RefreshExpandedLyrics();
         if (!_lyricsOpen || index < 0 || DateTimeOffset.UtcNow < _lyricsFollowUntil) return;
         if (!changed && _lyricsFollowUntil == default) return;
         _lyricsFollowUntil = default;

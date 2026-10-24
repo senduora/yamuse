@@ -7,4 +7,8 @@ internal sealed record CatalogItem(string Id, string Kind, string Title, string 
 internal sealed record CatalogPage(IReadOnlyList<CatalogItem> Items, int Page, bool HasMore);
 
 internal sealed record PlaylistDetails(string Owner, string Kind, string Title, string Description,
-    int Revision, IReadOnlyList<TrackRow> Tracks, bool IsGenerated = false, string Visibility = "");
+    int Revision, IReadOnlyList<TrackRow> Tracks, bool IsGenerated = false, string Visibility = "",
+    string? CoverUri = null, string? OwnerName = null, DateOnly? Created = null, DateOnly? Modified = null);
+
+internal sealed record AlbumDetails(string Id, string Title, string Artists, IReadOnlyList<TrackRow> Tracks,
+    string? CoverUri = null, int? Year = null, DateOnly? ReleaseDate = null);

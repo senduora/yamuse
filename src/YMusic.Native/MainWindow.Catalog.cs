@@ -44,7 +44,9 @@ public partial class MainWindow
         TracksList.Visibility = Visibility.Collapsed; CatalogList.Visibility = Visibility.Visible;
         CatalogList.ItemsSource = _catalogItems;
         if (!append) _catalogItems.Clear();
-        foreach (var item in items) _catalogItems.Add(item);
+        var snapshot = items.ToArray();
+        ApplyOfflineStates(snapshot.Select(item => item.Track).OfType<TrackRow>());
+        foreach (var item in snapshot) _catalogItems.Add(item);
         GroupCatalogResults();
         FilterBox.IsEnabled = false; FilterHint.Text = "Дважды нажмите на результат, чтобы открыть";
         PlaySelectionButton.Content = "Открыть";
@@ -107,7 +109,7 @@ public partial class MainWindow
         if (item.Kind == "artist") { await OpenArtistAsync(item.Id, item.Title, remember); return; }
         if (remember) RememberBrowseView();
         _openedCatalogItem = item; _artistPage = 0;
-        SetSection(item.Kind + "-detail", item.Title);
+        NavigateSection(item.Kind + "-detail", item.Title, remember: false);
         await CatalogReadAsync(async (session, token) =>
         {
             if (item.Kind == "playlist")
@@ -116,9 +118,14 @@ public partial class MainWindow
                 token.ThrowIfCancellationRequested(); ShowPlaylist(details);
                 return;
             }
+            if (item.Kind == "album")
+            {
+                var album = await _api.GetAlbumDetailsAsync(session, item.Id, token);
+                token.ThrowIfCancellationRequested(); ShowRows(album.Tracks); ShowCollectionHero(album, item.Title);
+                SetStatus($"Загружено {album.Tracks.Count:N0} треков"); return;
+            }
             IReadOnlyList<TrackRow> rows = item.Kind switch
             {
-                "album" => await _api.GetAlbumTracksAsync(session, item.Id, token),
                 "artist" => await _api.GetArtistTracksAsync(session, item.Id, 0, token),
                 "track" => await _api.GetTracksAsync(session, [new LikedId(item.Id, item.AlbumId)], 0, token),
                 _ => throw new MusicException("Этот тип результата пока не поддерживается.")
@@ -154,6 +161,7 @@ public partial class MainWindow
         CreatePlaylistButton.Visibility = Visibility.Collapsed;
         _activePlaylist = details; CollectionTitle.Text = details.Title;
         ShowRows(details.Tracks);
+        ShowCollectionHero(details);
         var writable = _account?.Uid == details.Owner && !details.IsGenerated;
         PlaylistActions.Visibility = Visibility.Visible;
         RenamePlaylistButton.Visibility = DeletePlaylistButton.Visibility = RemovePlaylistTrackButton.Visibility = writable ? Visibility.Visible : Visibility.Collapsed;
@@ -219,6 +227,7 @@ public partial class MainWindow
         var label = liked ? "Убрать из Мне нравится" : "Добавить в Мне нравится";
         PlayerLikeButton.ToolTip = _session is not null && !_favoriteIdsKnown ? "Загружаем отметки Мне нравится…" : label;
         System.Windows.Automation.AutomationProperties.SetName(PlayerLikeButton, label);
+        RefreshDownloadUnlikeAction();
         UpdateShellState();
     }
     private async Task SetTrackLikeAsync(TrackRow row, bool liked)
@@ -226,13 +235,28 @@ public partial class MainWindow
         if (_account is null || _demo || row.Id.Length == 0) return;
         var uid = _account.Uid;
         await CatalogMutationAsync(async (session, token) => { await _api.SetTrackLikeAsync(session, uid, TrackReference(row), liked, token); return true; },
-            result =>
-            {
-                if (liked) _favoriteTrackIds.Add(row.Id); else _favoriteTrackIds.Remove(row.Id);
-                _favoriteIdsKnown = true; UpdatePlayerLikeState();
-                SetStatus(liked ? "Трек добавлен в избранное" : "Трек убран из избранного");
-                _ = RefreshLibraryAsync();
-            }, requireSameView: false);
+            result => ApplyConfirmedTrackLike(row, liked), requireSameView: false);
+    }
+    private void ApplyConfirmedTrackLike(TrackRow row, bool liked, bool showStatus = true)
+    {
+        if (liked) _favoriteTrackIds.Add(row.Id);
+        else
+        {
+            var wasLiked = _favoriteTrackIds.Remove(row.Id);
+            _libraryRemovedLikes?.Add(row.Id);
+            var removed = _favoritesCache.RemoveAll(t => t.Id == row.Id);
+            _diagnostics.TotalTracks = Math.Max(0, _diagnostics.TotalTracks - (wasLiked ? Math.Max(1, removed) : removed));
+            _diagnostics.LoadedTracks = _favoritesCache.Count;
+            if (_pendingAutoFavorites is { } pending)
+            { var remaining = pending.Tracks.Where(t => t.Id != row.Id).ToArray(); _pendingAutoFavorites = remaining.Length == 0 ? null : pending with { Tracks = remaining }; }
+            if (_section == "favorites")
+            { for (var i = _tracks.Count - 1; i >= 0; i--) if (_tracks[i].Id == row.Id) _tracks.RemoveAt(i); UpdateCount(); }
+        }
+        _favoriteIdsKnown = true; UpdatePlayerLikeState();
+        if (_account?.Uid == _downloadQueueAccountUid && _accountGeneration == _downloadQueueAccountGeneration)
+        { _downloadQueue.SetCollectionLike(row.Id, liked); RefreshDownloadCenter(); }
+        if (showStatus) SetStatus(liked ? "Трек добавлен в избранное" : "Трек убран из избранного");
+        if (liked) _ = RefreshLibraryAsync();
     }
     private async void CreatePlaylist_Click(object sender, RoutedEventArgs e)
     {

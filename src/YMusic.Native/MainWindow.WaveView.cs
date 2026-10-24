@@ -33,6 +33,18 @@ public partial class MainWindow
         HomePanel.Visibility = browseVisible && _section == "home" ? Visibility.Visible : Visibility.Collapsed;
         ArtistPanel.Visibility = browseVisible && _section == "artist-detail" ? Visibility.Visible : Visibility.Collapsed;
         ContentGrid.Visibility = browseVisible && _section is not ("wave" or "home" or "artist-detail") ? Visibility.Visible : Visibility.Collapsed;
+        var downloads = _section == "download-center";
+        DownloadCenterPanel.Visibility = browseVisible && downloads ? Visibility.Visible : Visibility.Collapsed;
+        if (downloads)
+        {
+            TracksList.Visibility = CatalogList.Visibility = EmptyState.Visibility = Visibility.Collapsed;
+            CatalogSearchPanel.Visibility = LoginPanel.Visibility = CodePanel.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            TracksList.Visibility = _catalogShowing ? Visibility.Collapsed : Visibility.Visible;
+            CatalogList.Visibility = _catalogShowing ? Visibility.Visible : Visibility.Collapsed;
+        }
     }
 
     private void UpdateWavePresentation()

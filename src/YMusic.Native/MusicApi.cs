@@ -26,7 +26,7 @@ internal sealed partial class MusicApi : IDisposable
             UseCookies = false,
             PooledConnectionLifetime = TimeSpan.FromMinutes(5)
         }) { Timeout = TimeSpan.FromSeconds(25), MaxResponseContentBufferSize = 16 * 1024 * 1024 };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("YMusicNativePrototype/0.3");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd("Yamuse/0.3.14");
         _http.DefaultRequestHeaders.AcceptLanguage.ParseAdd("ru");
     }
 

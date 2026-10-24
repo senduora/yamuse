@@ -42,6 +42,7 @@ public partial class MainWindow
             if (_section == "search" && !_collectionsSearch && _searchType == "all")
                 view.GroupDescriptions.Add(new PropertyGroupDescription(nameof(CatalogItem.Kind)));
         }
+        ApplyListSorting(false);
         UpdateSearchCategories();
     }
 

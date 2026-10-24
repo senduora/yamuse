@@ -26,7 +26,8 @@ internal static partial class Program
             await Until(() => fixture.Queue.CurrentOccurrenceToken != fixture.FirstOccurrence);
             Assert(ReferenceEquals(fixture.Queue.Current, next) && ReferenceEquals(decoder, PreloadSlot(fixture.Player, "_current")), "progress threshold did not reuse prepared decoder");
             Assert(fixture.ResolveCalls == 0 && fixture.MediaCalls == 0 && fixture.Player.IsPlaying, "offline promotion reopened online");
-            Assert(Control<TextBlock>(fixture.Window, "StatusText").Text.Contains("Офлайн"), "offline promotion status missing");
+            Assert(Control<TextBlock>(fixture.Window, "QualityText").Text.StartsWith("Офлайн · ", StringComparison.Ordinal)
+                && Control<TextBlock>(fixture.Window, "StatusText").Text == "", "promoted offline source must appear beside player quality");
             fixture.Player.Stop();
             Assert(File.Exists(fixture.Library.ResolvePath(saved.FileName)) && File.Exists(first.LocalPath), "player released a user/offline file by deleting it");
         });

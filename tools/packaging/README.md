@@ -10,9 +10,9 @@
 
 ```powershell
 & .\tools\packaging\Pack-Installer.ps1 `
-  -Version 0.3.9 `
-  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.3.9') `
-  -WorkFolder (Join-Path $PWD 'work\package-0.3.9') `
+  -Version 0.3.14 `
+  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.3.14') `
+  -WorkFolder (Join-Path $PWD 'work\package-0.3.14') `
   -PackageCache (Join-Path $PWD 'work\verified-packages') `
   -PublishedFolder $checkedSelfContainedPublish `
   -ExpectedProductSha256 $checkedProductHash
@@ -32,9 +32,13 @@
 
 Стандартный Setup.exe Velopack — per-user, с `%LOCALAPPDATA%\YMusic.Native` и уровнем `asInvoker`, без `--msi` и без загрузки prerequisites. Создаются ярлыки Desktop/StartMenuRoot и штатная запись удаления. Эти действия подтверждены контрактом Velopack и метаданными пакета; установка/удаление в живом профиле в этой работе не выполнялись.
 
-Идентификатор пакета **YMusic.Native** намеренно отличается от существующей папки данных **YMusic.Native.Prototype**. При обновлении заменяется только установленное приложение; наше состояние остаётся в `%LOCALAPPDATA%\YMusic.Native.Prototype`, музыка — в `Документы\YMusic Native\Music`. Не добавлены uninstall hooks, очистка этих папок или импорт данных. При обычном штатном удалении Velopack затрагивает корень установленного пакета, поэтому внешние папки сохраняются. Пользовательский `--installto` в папку данных использовать нельзя.
+Идентификатор пакета **YMusic.Native** сохраняется для совместимости с уже установленными выпусками. Данные Yamuse находятся в `%LOCALAPPDATA%\Yamuse`, музыка — в `Документы\Yamuse\Music`. При первом старте новая версия безопасно переносит прежние папки без повторного скачивания музыки; пользовательский `--installto` в папку данных использовать нельзя.
 
-Bootstrap расположен в `Program.Main`, выбран через StartupObject, и выполняет `VelopackApp.Build().SetArgs(args).SetAutoApplyOnStartup(false).Run()` до создания `App`, `InitializeComponent` и `Run`. Fast install/update/uninstall hooks завершаются до открытия WPF/данных. Auto-apply при запуске явно выключен: скачанное обновление ожидает отдельного действия пользователя. При упаковке CLI проверил наличие `VelopackApp.Run` в entry point.
+Полное удаление запускается кнопкой в настройках установленного приложения. После явного подтверждения приложение завершает загрузки и воспроизведение, выходит, а отдельный этап очищает фиксированные пользовательские папки и вызывает штатный `Update.exe --uninstall`. Музыка удаляется по собственному индексу с проверкой размера и SHA-256. Посторонние и изменённые файлы сохраняются с сообщением; при занятом файле индекс остаётся для повторной попытки. Переходы через внешние junction/symlink запрещены, удаление файлов выполняется через проверенные handles.
+
+При обычном запуске и после обновления `UninstallSupport` заменяет только известную штатную команду в существующей HKCU-записи удаления Yamuse на `current\YMusic.Native.exe --uninstall`. Поэтому удаление через параметры Windows после запуска приложения использует такое же подтверждение и очистку. Portable не регистрирует удаление. Прямой вызов нативного `Update.exe --uninstall` по контракту Velopack удаляет только установленный пакет; интерактивную очистку данных нужно запускать через Yamuse.
+
+Bootstrap расположен в `Program.Main`, выбран через StartupObject, и выполняет `VelopackApp.Build().SetArgs(args).SetAutoApplyOnStartup(false)` с регистрацией after-update callback и `Run()` до создания `App`, `InitializeComponent` и `Run`. Fast hooks завершаются до открытия WPF/данных. Команды полного удаления обрабатываются до старта приложения; защитный marker не позволяет заново создавать данные во время передачи управления штатному деинсталлятору. Auto-apply при запуске явно выключен: скачанное обновление ожидает отдельного действия пользователя. При упаковке CLI проверяет наличие `VelopackApp.Run` в entry point.
 
 ## API для настроек
 

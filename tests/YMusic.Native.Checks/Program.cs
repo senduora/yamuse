@@ -326,7 +326,9 @@ internal static partial class Program
                 var rows = Control<ListView>(window, "TracksList");
                 Assert(rows.Items.Count == 1, "offline row not visible");
                 await window.PlayTrackAsync((TrackRow)rows.Items[0]); await Task.Delay(250);
-                Assert(Control<TextBlock>(window, "StatusText").Text.Contains("Офлайн") && noNetwork.Seen.Count == 0, "offline playback failed");
+                Assert(((TrackRow)rows.Items[0]).IsPlaying && noNetwork.Seen.Count == 0, "offline playback failed or attempted API access");
+                Assert(Control<TextBlock>(window, "QualityText").Text.StartsWith("Офлайн · ", StringComparison.Ordinal)
+                    && Control<TextBlock>(window, "StatusText").Text == "", "offline source must appear beside player quality");
             }
             finally { window.Close(); }
             Assert(File.Exists(library.ResolvePath(saved.FileName)), "closing player deleted user's offline file");
@@ -443,6 +445,21 @@ internal static partial class Program
         await CheckCrossfadeOnly();
         await CheckClientPresentation();
         await CheckPlaylistSettings();
+        await CheckHomeArtwork();
+        await CheckUninstall();
+        await CheckDownloadCenter();
+        await CheckPlaybackPersistence();
+        await CheckScrollPerformance();
+        await CheckLoudness();
+        await CheckProgressivePlayback();
+        await CheckListSorting();
+        await CheckUnavailableLikes();
+        await CheckBulkUnavailableLikes();
+        await CheckBrandMigration();
+        await CheckCollectionHero();
+        await CheckExpandedPlayer();
+        await CheckControlChrome();
+        await CheckNavigation014();
         await Run("Diagnostics contain resources and timings, without credentials or account data", () =>
         {
             var path = Path.Combine(_directory, "sanitized-diagnostics.json");

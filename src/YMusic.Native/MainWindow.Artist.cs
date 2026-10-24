@@ -17,7 +17,7 @@ public partial class MainWindow
         if (remember) RememberBrowseView();
         _artistDetails = null; _artistLiked = null;
         _openedCatalogItem = new(id, "artist", name ?? "Исполнитель", "");
-        SetSection("artist-detail", name ?? "Исполнитель");
+        NavigateSection("artist-detail", name ?? "Исполнитель", remember: false);
         ArtistName.Text = name ?? "Исполнитель";
         ArtistMonthlyText.Text = ""; ArtistMonthlyText.Visibility = Visibility.Collapsed;
         ArtistDescription.Text = ""; ArtistDescription.Visibility = Visibility.Collapsed;

@@ -12,8 +12,10 @@ public partial class MainWindow
             foreach (var track in tracks)
             {
                 var saved = _offline.Find(track);
+                var wasDownloaded = track.IsDownloaded;
                 track.DownloadedPath = saved is null ? null : _offline.ResolvePath(saved.FileName);
                 track.DownloadedQuality = saved is null ? null : OfflineQuality(saved);
+                if (wasDownloaded != track.IsDownloaded) QueueDownloadedSortRefresh();
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or MusicException)
@@ -22,7 +24,7 @@ public partial class MainWindow
     private static string OfflineQuality(OfflineItem item) => item.Codec.StartsWith("flac", StringComparison.Ordinal) ? "Lossless · FLAC" : item.Codec.ToUpperInvariant().Replace("-MP4", "") + (item.Bitrate > 0 ? $" · {item.Bitrate} кбит/с" : "");
     private void RefreshDownloadedMarks()
     {
-        ApplyOfflineStates(_tracks.Concat(_favoritesCache).Concat(_waveTracks).Concat(_queue).Distinct());
+        ApplyOfflineStates(_tracks.Concat(_favoritesCache).Concat(_waveTracks).Concat(_queue).Concat(_catalogItems.Select(i => i.Track).OfType<TrackRow>()).Distinct());
         if (_current is not null) ApplyOfflineStates([_current]);
         UpdatePlaylistDownloadedStatus();
     }
@@ -71,10 +73,22 @@ public partial class MainWindow
     private Task StartDownloadBatchAsync(IEnumerable<TrackRow> tracks, string label, PlaylistDetails? playlist, bool automatic)
     {
         if (_downloadCts is not null || _offlineMaintenance || _session is null || _closed) return Task.CompletedTask;
-        var selected = tracks.DistinctBy(t => t.Id, StringComparer.Ordinal).ToArray();
+        if (automatic && (_downloadsAutoSuspended || _downloadQueue.HasPaused)) return Task.CompletedTask;
+        _downloadQueue.Replace(tracks, label, playlist is { Owner: LocalFavoritesOwner, Kind: LocalFavoritesKind });
+        _downloadQueuePlaylist = playlist;
+        _downloadQueueQuality = SelectedQuality; _downloadQueueAutomatic = automatic;
+        _downloadQueueAccountGeneration = _accountGeneration;
+        _downloadQueueAccountUid = _account?.Uid;
+        _downloadsAutoSuspended = false;
+        return RunDownloadQueueAsync(retryFailed: false);
+    }
+    private Task RunDownloadQueueAsync(bool retryFailed)
+    {
+        var selected = _downloadQueue.BeginRun(retryFailed);
+        if (selected.Length == 0) { RefreshDownloadCenter(); return Task.CompletedTask; }
         var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, _accountCts.Token);
-        _downloadCts = cts; _downloadIsAutomatic = automatic;
-        var quality = SelectedQuality;
+        _downloadCts = cts; _downloadIsAutomatic = _downloadQueueAutomatic;
+        var quality = _downloadQueueQuality;
         var concurrentDownloads = Math.Clamp(_concurrentDownloads, 1, 10);
         _offline.ConcurrentDownloads = concurrentDownloads;
         _downloadTask = RunBatchAsync();
@@ -84,30 +98,40 @@ public partial class MainWindow
         {
             // Publish _downloadTask before any completion or auto-follow-up can run.
             await Task.Yield();
-            Busy(true); UpdateControls(); UpdatePlaylistDownloadedStatus();
-            var completed = 0; var failed = 0; var unavailable = 0; var next = 0;
-            var activeBytes = new Dictionary<string, long>(StringComparer.Ordinal);
-            long finishedBytes = 0;
-            void ProgressStatus()
-            {
-                if (ReferenceEquals(_downloadCts, cts) && !cts.IsCancellationRequested && !_closed)
-                    SetStatus($"{label} · {completed + failed + unavailable}/{selected.Length} · активно {activeBytes.Count}/{concurrentDownloads} · {(finishedBytes + activeBytes.Values.Sum()) / 1048576.0:F1} МБ");
-            }
+            UpdateControls(); UpdatePlaylistDownloadedStatus(); RefreshDownloadCenter();
+            _downloadProgressTimer?.Start();
+            var next = 0;
             try
             {
-                if (playlist is not null) await _offline.RememberPlaylistAsync(playlist, quality, cts.Token);
+                cts.Token.ThrowIfCancellationRequested();
+                if (_downloadQueuePlaylist is { } playlist) await _offline.RememberPlaylistAsync(playlist, quality, cts.Token);
                 // The fixed worker pool follows this batch's settings snapshot. Metadata stays
                 // in the snapshot; audio is streamed to disk with bounded buffers.
                 await Task.WhenAll(Enumerable.Range(0, Math.Min(concurrentDownloads, selected.Length)).Select(_ => WorkerAsync()));
-                SetStatus($"{label} · сохранено {completed} из {selected.Length}" + (failed > 0 ? $" · ошибок {failed}" : "") + (unavailable > 0 ? $" · недоступно {unavailable}" : ""), failed + unavailable > 0);
+                _downloadsAutoSuspended = _downloadQueue.HasPaused;
+                if (_downloadQueue.Entries.Any(entry => entry.State == DownloadEntryState.Failed)) _pendingAutoFavorites = null;
+                SetStatus(_downloadQueue.Summary, _downloadQueue.Entries.Any(entry => entry.State is DownloadEntryState.Failed or DownloadEntryState.Unavailable));
             }
             catch (OperationCanceledException) when (cts.IsCancellationRequested)
-            { if (!_closed && _session is not null && !_offlineMaintenance) SetStatus($"Загрузка отменена · сохранено {completed} из {selected.Length}. Можно продолжить позже."); }
-            catch (Exception ex) { if (!_closed) ShowError(ex); }
+            {
+                _downloadsAutoSuspended = true; _pendingAutoFavorites = null;
+                if (!_closed && _session is not null && !_offlineMaintenance) SetStatus("Загрузка на паузе. Откройте «Загрузки», чтобы продолжить очередь.");
+            }
+            catch (Exception ex)
+            {
+                _pendingAutoFavorites = null;
+                _diagnostics.LastErrorType = "DownloadQueue:" + ex.GetType().Name;
+                foreach (var entry in selected.Where(entry => entry.Active || entry.State == DownloadEntryState.Queued))
+                    entry.SetState(DownloadEntryState.Failed, DownloadFailure.Describe(ex));
+                if (!_closed) SetStatus(DownloadFailure.Describe(ex), true);
+            }
             finally
             {
+                _downloadProgressTimer?.Stop(); _downloadProgress.Clear();
+                if (_downloadQueueAccountGeneration != _accountGeneration) _downloadQueue.Suspend();
+                _downloadQueue.EndRun(cts.IsCancellationRequested);
                 if (ReferenceEquals(_downloadCts, cts)) { _downloadCts = null; _downloadTask = null; _downloadIsAutomatic = false; }
-                cts.Dispose(); Busy(false); UpdateControls(); RefreshDownloadedMarks();
+                cts.Dispose(); UpdateControls(); RefreshDownloadedMarks(); RefreshDownloadCenter(); RefreshDownloadStorage();
                 TryStartPendingAutoFavorites();
             }
 
@@ -116,28 +140,32 @@ public partial class MainWindow
                 while (next < selected.Length)
                 {
                     cts.Token.ThrowIfCancellationRequested();
-                    var track = selected[next++];
-                    if (automatic && _deletedUntilFavoritesRefresh.Contains(track.Id)) continue;
-                    if (_offline.Find(track) is not null) { completed++; ProgressStatus(); continue; }
-                    if (!track.Available) { unavailable++; ProgressStatus(); continue; }
-                    activeBytes[track.Id] = 0; ProgressStatus();
+                    var entry = selected[next++]; var track = entry.Track;
+                    if (entry.SkipFavoritesDownload) continue;
+                    if (_downloadQueueAutomatic && _deletedUntilFavoritesRefresh.Contains(track.Id))
+                    { entry.SetState(DownloadEntryState.Removed); continue; }
                     try
                     {
+                        entry.Begin(); RefreshDownloadCenter();
+                        if (_offline.Find(track) is { } existing) { entry.Complete(existing.Bytes); continue; }
+                        if (!track.Available)
+                        { entry.SetState(DownloadEntryState.Unavailable, "Трек недоступен в каталоге. Обновите список и проверьте доступность в сервисе."); continue; }
                         var session = await EnsureSessionAsync(cts.Token);
+                        cts.Token.ThrowIfCancellationRequested();
+                        if (_downloadQueueAccountGeneration != _accountGeneration) { SuspendDownloadQueueForAccountChange(); cts.Token.ThrowIfCancellationRequested(); }
                         var audio = await _api.ResolveAudioAsync(session, track.RequestId, quality, cts.Token);
-                        var progress = new Progress<AudioProgress>(p =>
-                        {
-                            if (ReferenceEquals(_downloadCts, cts) && !cts.IsCancellationRequested && activeBytes.ContainsKey(track.Id))
-                            { activeBytes[track.Id] = p.Bytes; ProgressStatus(); }
-                        });
+                        cts.Token.ThrowIfCancellationRequested();
+                        entry.SetState(DownloadEntryState.Downloading);
+                        var progress = new DownloadProgressSink(); _downloadProgress[entry] = progress;
                         var saved = await _offline.SaveAsync(track, audio, cts.Token, progress);
-                        finishedBytes += saved.Bytes; completed++;
-                        ApplyOfflineStates(_tracks.Concat(_favoritesCache).Concat(_waveTracks).Concat(_queue).Where(t => t.Id == track.Id).Distinct());
+                        entry.Complete(saved.Bytes);
+                        ApplyOfflineStates(_tracks.Concat(_favoritesCache).Concat(_waveTracks).Concat(_queue).Concat(_catalogItems.Select(i => i.Track).OfType<TrackRow>()).Where(t => t.Id == track.Id).Distinct());
                         if (_current?.Id == track.Id) ApplyOfflineStates([_current]);
                     }
                     catch (OperationCanceledException) when (cts.IsCancellationRequested) { throw; }
-                    catch (Exception ex) { failed++; _diagnostics.LastErrorType = "Download:" + ex.GetType().Name; }
-                    finally { activeBytes.Remove(track.Id); ProgressStatus(); }
+                    catch (Exception ex)
+                    { entry.SetState(DownloadEntryState.Failed, DownloadFailure.Describe(ex)); _diagnostics.LastErrorType = "Download:" + ex.GetType().Name; }
+                    finally { _downloadProgress.Remove(entry); RefreshDownloadCenter(); }
                 }
             }
         }
@@ -153,13 +181,13 @@ public partial class MainWindow
         _favoritesSnapshotReady = true;
         _deletedUntilFavoritesRefresh.Clear();
         UpdatePlaylistDownloadedStatus();
-        if (!_autoFavoritesEnabled || _session is null || _demo || _closed || _offlineMaintenance) return;
+        if (!_autoFavoritesEnabled || _session is null || _demo || _closed || _offlineMaintenance || _downloadsAutoSuspended || _downloadQueue.HasPaused) return;
         _pendingAutoFavorites = FavoritesDownloadSnapshot();
         TryStartPendingAutoFavorites();
     }
     private void TryStartPendingAutoFavorites()
     {
-        if (!_autoFavoritesEnabled || _pendingAutoFavorites is not { } snapshot || _downloadCts is not null || _offlineMaintenance || _session is null || _closed) return;
+        if (!_autoFavoritesEnabled || _pendingAutoFavorites is not { } snapshot || _downloadCts is not null || _offlineMaintenance || _session is null || _closed || _downloadsAutoSuspended || _downloadQueue.HasPaused) return;
         _pendingAutoFavorites = null; // No automatic retry loop after errors or cancellation.
         _ = StartDownloadBatchAsync(snapshot.Tracks, "Автоскачивание «Мне нравится»", snapshot, automatic: true);
     }
@@ -176,7 +204,7 @@ public partial class MainWindow
         else
         {
             _pendingAutoFavorites = null;
-            if (_downloadIsAutomatic) _downloadCts?.Cancel();
+            if (_downloadIsAutomatic) PauseDownloadQueue();
             SetStatus("Автоскачивание выключено. Уже сохранённая музыка останется офлайн.");
         }
     }
@@ -187,10 +215,11 @@ public partial class MainWindow
         _deletedUntilFavoritesRefresh.Add(track.Id);
         try
         {
-            _downloadCts?.Cancel();
+            SuspendDownloadQueueForAccountChange();
             if (_downloadTask is { } task) await task;
             ReleaseOfflinePlayback(track.Id);
             var result = await _offline.RemoveTrackAsync(track.Id, _lifetime.Token);
+            _downloadQueue.Removed(track.Id); RefreshDownloadCenter(); RefreshDownloadStorage();
             RefreshOfflineView(); RefreshDownloadedMarks();
             SetStatus(RemovalStatus(result) + (_autoFavoritesEnabled ? " · автоскачивание вернёт трек после следующего обновления избранного" : ""), result.Preserved + result.Failed > 0);
         }
@@ -217,10 +246,11 @@ public partial class MainWindow
         try
         {
             _autoFavoritesEnabled = false; AutoFavoritesCheckBox.IsChecked = false; SavePreferences();
-            _downloadCts?.Cancel();
+            SuspendDownloadQueueForAccountChange();
             if (_downloadTask is { } task) await task;
             ReleaseOfflinePlayback(null);
             var result = await _offline.ClearAsync(_lifetime.Token);
+            _downloadQueue.Removed(null); RefreshDownloadCenter(); RefreshDownloadStorage();
             RefreshOfflineView(); RefreshDownloadedMarks();
             SetStatus(RemovalStatus(result) + " · автоскачивание выключено", result.Preserved + result.Failed > 0);
         }

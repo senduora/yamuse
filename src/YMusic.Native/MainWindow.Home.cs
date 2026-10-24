@@ -43,7 +43,7 @@ public partial class MainWindow
         var section = element.Tag as HomeSection ?? (element.DataContext as HomeShelf)?.Source;
         if (section is null) return;
         RememberBrowseView();
-        SetSection("home-shelf", section.Title);
+        NavigateSection("home-shelf", section.Title, remember: false);
         ShowCatalogItems(section.Items);
         SetStatus($"{section.Title} · {section.Items.Count:N0}");
     }

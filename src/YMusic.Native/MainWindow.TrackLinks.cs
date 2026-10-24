@@ -11,19 +11,17 @@ public partial class MainWindow
     private void UpdatePlayerArtistLinks()
     {
         if (PlayerArtistPanel is null) return;
+        PlayerCoverButton.Tag = PlayerTitleButton.Tag = _current;
+        PlayerCoverButton.IsEnabled = PlayerTitleButton.IsEnabled = _current is not null && _session is not null;
         var visible = _current is { } track && (track.Artists.Count > 0 || !string.IsNullOrWhiteSpace(track.Artist));
-        if (!ReferenceEquals(PlayerArtistLinks.Content, _current)) PlayerArtistLinks.Content = _current;
+        if (!ReferenceEquals(PlayerArtistLinks.Content, _current))
+        {
+            PlayerArtistLinks.Content = _current;
+            PlayerArtistPanel.ContextMenu = _current is { Artists.Count: > 0 } current ? CreateTrackArtistsMenu(PlayerArtistPanel, current.Artists) : null;
+        }
         PlayerArtistPanel.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
         PlayerArtistPanel.IsEnabled = _session is not null;
         TrackArtist.Visibility = visible ? Visibility.Collapsed : Visibility.Visible;
-        PlayerArtistsMenuButton.Visibility = _current?.Artists.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
-    }
-
-    private void PlayerArtistsMenu_Click(object sender, RoutedEventArgs e)
-    {
-        e.Handled = true;
-        if (sender is Button button && _current is { Artists.Count: > 0 } track && _session is not null)
-            ShowTrackArtistsMenu(button, track.Artists);
     }
 
     private void ShowTrackArtistsMenu(Button button, IReadOnlyList<ArtistReference> artists)
@@ -33,10 +31,10 @@ public partial class MainWindow
         menu.IsOpen = true;
     }
 
-    private ContextMenu CreateTrackArtistsMenu(Button button, IReadOnlyList<ArtistReference> artists)
+    private ContextMenu CreateTrackArtistsMenu(FrameworkElement anchor, IReadOnlyList<ArtistReference> artists)
     {
         var generation = _accountGeneration;
-        var menu = new ContextMenu { PlacementTarget = button };
+        var menu = new ContextMenu { PlacementTarget = anchor };
         foreach (var artist in artists)
         {
             var item = new MenuItem { Header = artist.Name };
@@ -53,6 +51,21 @@ public partial class MainWindow
     {
         e.Handled = true;
         if (sender is not Button { Tag: TrackRow track }) return;
+        await OpenTrackAlbumAsync(track);
+    }
+    private async void CatalogTitle_Click(object sender, RoutedEventArgs e)
+    {
+        e.Handled = true;
+        if (sender is not Button { Tag: CatalogItem item }) return;
+        if (item.Kind == "track")
+        {
+            var track = item.Track ?? new TrackRow { Id = item.Id, RequestId = new LikedId(item.Id, item.AlbumId).RequestId, Title = item.Title, AlbumId = item.AlbumId };
+            await OpenTrackAlbumAsync(track);
+        }
+        else await OpenCatalogAsync(item);
+    }
+    private async Task OpenTrackAlbumAsync(TrackRow track)
+    {
         if (_session is null) { SetStatus("Для открытия альбома подключитесь к Яндексу."); return; }
         var generation = _accountGeneration;
         var view = _viewGeneration;

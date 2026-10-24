@@ -35,7 +35,7 @@ internal static partial class Program
         var before=link.RenderSize;
         link.Focus(); window.UpdateLayout(); await Task.Delay(190);
         Assert(link.RenderSize==before && link.BorderThickness==new Thickness(0),"focus changed the text link's size or created a pill border");
-        Assert(link.FocusVisualStyle is not null,"keyboard focus indication was removed");
+        Assert(link.FocusVisualStyle is null && link.Template.FindName("LinkUnderline",link) is null,"text links must use accent color rather than a focus frame or underline");
         foreach(var (width,height) in new[]{(1280,860),(1050,680)})
         {
             window.Width=width;window.Height=height;window.UpdateLayout();await Task.Delay(290);
@@ -58,9 +58,9 @@ internal static partial class Program
         var buttons=SaVisuals<Button>(panel).Where(button=>button.Tag is ArtistReference).ToArray();
         Assert(panel.IsVisible && buttons.Length==2 && Control<TextBlock>(window,"TrackArtist").Visibility==Visibility.Collapsed,"player artists are still plain text");
         Assert(buttons.Select(button=>((ArtistReference)button.Tag).Id).SequenceEqual(new[]{"artist-42","artist-99"}),"player artist identity/order changed");
-        var more=Control<Button>(window,"PlayerArtistsMenuButton");
-        Assert(more.IsVisible,"wrapped artist names have no complete-list action");
-        var menu=(ContextMenu)typeof(MainWindow).GetMethod("CreateTrackArtistsMenu",BindingFlags.NonPublic|BindingFlags.Instance)!.Invoke(window,[more,track.Artists])!;
+        Assert(window.FindName("PlayerArtistsMenuButton") is null && !SaVisuals<Button>(panel).Any(button=>button.Content?.ToString()=="⋯"),"player retained the extra artist menu button");
+        Assert(SaVisuals<TextBlock>(panel).Count(text=>text.Text==", "&&text.IsVisible)==1,"artist names need one visible comma between two participants");
+        var menu=panel.ContextMenu!;
         Assert(menu.Items.Cast<MenuItem>().Select(item=>item.Header.ToString()).SequenceEqual(track.Artists.Select(artist=>artist.Name)),"player artist menu omits a participant");
         // Invoke the actual item handler without opening an offscreen native popup.
         ((MenuItem)menu.Items[1]).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
@@ -71,7 +71,7 @@ internal static partial class Program
         await Until(()=>SaField<ArtistDetails?>(window,"_artistDetails")?.Id=="artist-42" && SaField<CancellationTokenSource?>(window,"_featureCts") is null);
         await SaCapture(window,"player-artist-links");
         window.SignOut();window.UpdateLayout();
-        Assert(!panel.IsVisible && Control<ContentControl>(window,"PlayerArtistLinks").Content is null && !more.IsVisible,"signout retained the previous player's artist links");
+        Assert(!panel.IsVisible && Control<ContentControl>(window,"PlayerArtistLinks").Content is null && panel.ContextMenu is null,"signout retained the previous player's artist links");
     }
 
     private static async Task TlAlbumNavigation()
@@ -86,7 +86,7 @@ internal static partial class Program
         var viewer=SaVisuals<ScrollViewer>(list).First();var offset=viewer.VerticalOffset;
         var queue=SaField<PlaybackQueue>(window,"_playbackQueue");queue.SetItems([rows[3]],rows[3]);var version=queue.Version;
         var container=(ListViewItem)list.ItemContainerGenerator.ContainerFromItem(rows[8])!;
-        var button=SaVisuals<Button>(container).First(button=>ReferenceEquals(button.Tag,rows[8]) && Equals(button.ToolTip,"Открыть альбом"));
+        var button=SaVisuals<Button>(container).First(button=>ReferenceEquals(button.Tag,rows[8]) && Equals(button.ToolTip,"Открыть альбом") && SaVisuals<TextBlock>(button).Any(text=>text.Text==rows[8].Album));
         Assert(SaVisuals<TextBlock>(button).Any(text=>text.Text==rows[8].Album),"album column lost its title");
         SaClick(button);
         await Until(()=>SaField<string>(window,"_section")=="album-detail" && SaField<CancellationTokenSource?>(window,"_featureCts") is null);

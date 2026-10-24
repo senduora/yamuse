@@ -7,23 +7,38 @@ namespace YMusic.Native;
 public partial class App : Application
 {
     private Mutex? _instanceMutex;
-    internal static string DataDirectory { get; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "YMusic.Native.Prototype");
+    internal static string DataDirectory => BrandPaths.Current.DataDirectory;
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
         var demo = e.Args.Contains("--demo", StringComparer.OrdinalIgnoreCase);
         if (!demo)
         {
-            _instanceMutex = new Mutex(true, @"Local\YMusic.Native.Prototype", out var created);
+            _instanceMutex = new Mutex(true, BrandPaths.LegacyInstanceMutex, out var created);
             if (!created)
             {
                 MessageBox.Show("Yamuse уже открыт. Переключитесь на его окно.", AppBranding.Name, MessageBoxButton.OK, MessageBoxImage.Information);
                 Shutdown();
                 return;
             }
+            try { BrandPaths.Current.MigrateLegacyData(); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+            {
+                MessageBox.Show("Не удалось перенести данные в папки Yamuse. Приложение не будет открывать данные.\n\n" + error.Message +
+                    "\n\nУстраните причину и повторите запуск: завершённая часть переноса сохранена.",
+                    AppBranding.Name, MessageBoxButton.OK, MessageBoxImage.Warning);
+                Shutdown();
+                return;
+            }
         }
-        var window = new MainWindow(demo);
+        // A demo preview must not create the branded profile before the first
+        // normal launch migrates the user's existing account and settings.
+        var window = demo
+            ? new MainWindow(demo: true, restore: false,
+                diagnosticsDirectory: Path.Combine(Path.GetTempPath(), "Yamuse", "demo-" + Environment.ProcessId))
+            : new MainWindow();
         MainWindow = window;
+        window.InitializeFullUninstall();
         if (!demo && e.Args.Contains("--login", StringComparer.OrdinalIgnoreCase))
             window.ContentRendered += async (_, _) => await window.StartLoginAsync();
         var captureIndex = Array.IndexOf(e.Args, "--capture");

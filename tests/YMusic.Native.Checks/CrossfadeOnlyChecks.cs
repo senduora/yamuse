@@ -17,9 +17,10 @@ internal static partial class Program
         await Run("Crossfade: actual overlap remains active beyond eight seconds and completes once at ten", CrossfadeNaturalCompletion);
         await Run("Crossfade: playback uses native Windows media and only the declared application dependency", () =>
         {
-            var allowed = new[] { "PresentationCore", "PresentationFramework", "WindowsBase", "Velopack", "WinRT.Runtime", "Microsoft.Windows.SDK.NET", "Microsoft.CSharp", "Microsoft.Win32.Primitives" };
+            var allowed = new[] { "PresentationCore", "PresentationFramework", "WindowsBase", "Velopack", "WinRT.Runtime", "Microsoft.Windows.SDK.NET", "Microsoft.CSharp", "Microsoft.Win32.Primitives", "Microsoft.Win32.Registry" };
             var references = typeof(NativePlayer).Assembly.GetReferencedAssemblies();
-            Assert(references.All(a => a.Name!.StartsWith("System.", StringComparison.Ordinal) || allowed.Contains(a.Name)), "undeclared assembly reference");
+            var undeclared = references.Where(a => !a.Name!.StartsWith("System.", StringComparison.Ordinal) && !allowed.Contains(a.Name)).ToArray();
+            Assert(undeclared.Length == 0, "undeclared assembly reference: " + string.Join(", ", undeclared.Select(a => a.Name)));
             Assert(references.Any(a => a.Name == "PresentationCore"), "native media reference missing");
             return Task.CompletedTask;
         });
@@ -41,7 +42,7 @@ internal static partial class Program
         store.Save(imported);var json=File.ReadAllText(store.FilePath);
         using var document = JsonDocument.Parse(json);
         var fields = document.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n).ToArray();
-        Assert(fields.SequenceEqual(new[] { "autoDownloadFavorites", "concurrentDownloads", "crossfadeSeconds", "minimizeToTray", "playbackSpeed", "quality", "volume" }), "saved schema differs");
+        Assert(fields.SequenceEqual(new[] { "autoDownloadFavorites", "concurrentDownloads", "crossfadeSeconds", "minimizeToTray", "normalizeVolume", "playbackSpeed", "quality", "volume" }), "saved schema differs");
         using var player=new NativePlayer(); Assert(player.CrossfadeSeconds==3,"native default differs");
         player.SetCrossfade(10);
         Assert(!player.TryPlayPrepared(new Uri(Path.Combine(directory,"not-open.wav")),TimeSpan.FromSeconds(10)),"missing next source promoted");
