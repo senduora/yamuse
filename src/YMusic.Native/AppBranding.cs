@@ -10,6 +10,7 @@ namespace YMusic.Native;
 internal static class AppBranding
 {
     internal const string Name = "Yamuse";
+    public static string VersionLabel { get; } = "v" + (typeof(AppBranding).Assembly.GetName().Version?.ToString(3) ?? "0.0.0");
     private static readonly Lazy<ImageSource> Icon = new(LoadWindowIcon);
     internal static ImageSource WindowIcon => Icon.Value;
 
@@ -56,7 +57,7 @@ internal static class AppBranding
             catch (Exception error) when (error is IOException or InvalidOperationException or NotSupportedException or ArgumentException) { }
         }
         var drawing = new DrawingGroup();
-        drawing.Children.Add(new GeometryDrawing(new SolidColorBrush(Color.FromRgb(255, 112, 94)), null,
+        drawing.Children.Add(new GeometryDrawing(new SolidColorBrush(Color.FromRgb(234, 87, 28)), null,
             new RectangleGeometry(new Rect(0, 0, 64, 64), 17, 17)));
         drawing.Children.Add(new GeometryDrawing(new SolidColorBrush(Color.FromRgb(30, 25, 30)), null,
             Geometry.Parse("M19,18 L26,18 32,29 38,18 45,18 35,36 35,47 29,47 29,36 Z")));

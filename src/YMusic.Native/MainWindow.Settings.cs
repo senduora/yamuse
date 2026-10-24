@@ -13,7 +13,7 @@ public partial class MainWindow
     private DesktopShell? _shell;
     private void LoadPreferences()
     {
-        if (_restore && !_demo) _preferenceStore = new PreferencesStore(App.DataDirectory);
+        if (_restore && !_demo) _preferenceStore ??= new PreferencesStore(App.DataDirectory);
         try
         {
             var preferences = _preferenceStore?.Load() ?? new PlayerPreferences();
@@ -21,6 +21,7 @@ public partial class MainWindow
             VolumeSlider.Value = preferences.Volume * 100;
             _player.SetSpeed(preferences.PlaybackSpeed);
             _player.SetCrossfade(preferences.CrossfadeSeconds);
+            _player.SetNormalization(preferences.NormalizeVolume);
             _minimizeToTray = preferences.MinimizeToTray;
             _autoFavoritesEnabled = preferences.AutoDownloadFavorites;
             _concurrentDownloads = preferences.ConcurrentDownloads;
@@ -32,7 +33,7 @@ public partial class MainWindow
     private void SavePreferences()
     {
         if (!_preferencesReady || _preferenceStore is null) return;
-        try { _preferenceStore.Save(new() { Quality = SelectedQuality, Volume = VolumeSlider.Value / 100, PlaybackSpeed = _player.SpeedRatio, MinimizeToTray = _minimizeToTray, AutoDownloadFavorites = _autoFavoritesEnabled, ConcurrentDownloads = _concurrentDownloads, CrossfadeSeconds = _player.CrossfadeSeconds }); }
+        try { _preferenceStore.Save(new() { Quality = SelectedQuality, Volume = VolumeSlider.Value / 100, PlaybackSpeed = _player.SpeedRatio, MinimizeToTray = _minimizeToTray, AutoDownloadFavorites = _autoFavoritesEnabled, ConcurrentDownloads = _concurrentDownloads, CrossfadeSeconds = _player.CrossfadeSeconds, NormalizeVolume = _player.NormalizeVolume }); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { _diagnostics.LastErrorType = "PreferencesSave:" + ex.GetType().Name; SetStatus("Не удалось сохранить настройки на диске.", true); }
     }
     private void InitializeShell()
@@ -77,11 +78,16 @@ public partial class MainWindow
         SettingsSpeed.SelectedItem = _player.SpeedRatio;
         CrossfadeSetting.Value = _player.CrossfadeSeconds;
         ShowSettingsCrossfade();
+        SettingsNormalizeVolume.IsChecked = _player.NormalizeVolume;
         SettingsTray.IsChecked = _minimizeToTray;
         SettingsAutoFavorites.IsChecked = _autoFavoritesEnabled;
         SettingsDownloads.ItemsSource ??= Enumerable.Range(1, 10).ToArray();
         SettingsDownloads.SelectedItem = _concurrentDownloads;
         SettingsUpdates.Content ??= CreateUpdateSettingsPanel();
+        SettingsUninstall.IsEnabled = _uninstallListener is not null;
+        SettingsUninstall.ToolTip = SettingsUninstall.IsEnabled
+            ? "Удалить приложение, сохранённый вход, настройки, кэш и скачанную музыку"
+            : "Полное удаление доступно в установленной версии Yamuse";
         SetLyricsVisible(false);
         SetSettingsVisible(true);
         SettingsScroll.ScrollToTop();
@@ -103,6 +109,8 @@ public partial class MainWindow
         SettingsButton.Focus();
     }
 
+    private async void SettingsUninstall_Click(object sender, RoutedEventArgs e) => await ConfirmFullUninstallAsync();
+
     private void SettingsCrossfade_Changed(object sender, RoutedPropertyChangedEventArgs<double> e) => ShowSettingsCrossfade();
     private void ShowSettingsCrossfade()
     {
@@ -121,6 +129,7 @@ public partial class MainWindow
         if (!_settingsOpen) return;
         _player.SetSpeed(SettingsSpeed.SelectedItem is double ratio ? ratio : 1);
         _player.SetCrossfade(CrossfadeSetting.Value);
+        _player.SetNormalization(SettingsNormalizeVolume.IsChecked == true);
         QualityCombo.SelectedIndex = SettingsQuality.SelectedIndex;
         _minimizeToTray = SettingsTray.IsChecked == true;
         if (_shell is not null) { _shell.MinimizeToTray = _minimizeToTray; _minimizeToTray = _shell.MinimizeToTray; }

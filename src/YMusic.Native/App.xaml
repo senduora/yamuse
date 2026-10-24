@@ -3,7 +3,7 @@
     <SolidColorBrush x:Key="BackgroundBrush" Color="#101114" />
     <SolidColorBrush x:Key="PanelBrush" Color="#17191D" />
     <SolidColorBrush x:Key="MutedBrush" Color="#ADB0BA" />
-    <SolidColorBrush x:Key="AccentBrush" Color="#FF705E" />
+    <SolidColorBrush x:Key="AccentBrush" Color="#EA571C" />
     <SolidColorBrush x:Key="TrackBrush" Color="#34363D" />
     <Style TargetType="Window"><Setter Property="FontFamily" Value="Segoe UI"/><Setter Property="FontSize" Value="14"/><Setter Property="Background" Value="{StaticResource BackgroundBrush}"/><Setter Property="Foreground" Value="#F3F1F0"/><Setter Property="TextOptions.TextFormattingMode" Value="Ideal"/><Setter Property="TextOptions.TextRenderingMode" Value="Grayscale"/><Setter Property="UseLayoutRounding" Value="True"/></Style>
     <Style TargetType="Image"><Setter Property="RenderOptions.BitmapScalingMode" Value="HighQuality"/></Style>
@@ -16,37 +16,43 @@
     <Style x:Key="SettingsNote" TargetType="TextBlock"><Setter Property="Foreground" Value="{StaticResource MutedBrush}"/><Setter Property="FontSize" Value="13"/><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="LineHeight" Value="20"/></Style>
     <Style TargetType="ScrollViewer"><Setter Property="local:SmoothScroll.Enabled" Value="True"/></Style>
     <Style x:Key="KeyboardButtonFocus" TargetType="Control">
-      <Setter Property="Template"><Setter.Value><ControlTemplate><Border BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="8" Margin="2" IsHitTestVisible="False"/></ControlTemplate></Setter.Value></Setter>
+      <Setter Property="Template"><Setter.Value><ControlTemplate><Border BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="7" Margin="2" IsHitTestVisible="False" SnapsToDevicePixels="True"/></ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style x:Key="KeyboardLinkFocus" TargetType="Control">
-      <Setter Property="Template"><Setter.Value><ControlTemplate><Border BorderBrush="{StaticResource AccentBrush}" BorderThickness="0,0,0,1" Margin="0,0,5,1" IsHitTestVisible="False"/></ControlTemplate></Setter.Value></Setter>
+      <Setter Property="Template"><Setter.Value><ControlTemplate><Border BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="4" Margin="1" IsHitTestVisible="False" SnapsToDevicePixels="True"/></ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style TargetType="Button">
-      <Setter Property="Background" Value="#25282F"/><Setter Property="Foreground" Value="#E9E7E7"/><Setter Property="Padding" Value="14,8"/><Setter Property="BorderThickness" Value="1"/><Setter Property="BorderBrush" Value="Transparent"/><Setter Property="Cursor" Value="Hand"/><Setter Property="FocusVisualStyle" Value="{StaticResource KeyboardButtonFocus}"/><Setter Property="HorizontalContentAlignment" Value="Center"/><Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="Background" Value="#25282F"/><Setter Property="Foreground" Value="#E9E7E7"/><Setter Property="Padding" Value="14,8"/><Setter Property="BorderThickness" Value="1"/><Setter Property="BorderBrush" Value="Transparent"/><Setter Property="Cursor" Value="Hand"/><Setter Property="FocusVisualStyle" Value="{x:Null}"/><Setter Property="HorizontalContentAlignment" Value="Center"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="SnapsToDevicePixels" Value="True"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
         <Grid x:Name="ButtonSurface">
-          <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="10"/>
-          <Border x:Name="ButtonHover" Background="White" CornerRadius="10" local:Motion.Opacity="0" IsHitTestVisible="False"/>
-          <ContentPresenter Margin="{TemplateBinding Padding}" RecognizesAccessKey="True" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+          <Border x:Name="ButtonChrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="9">
+            <ContentPresenter x:Name="ButtonContent" Margin="{TemplateBinding Padding}" RecognizesAccessKey="True" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+          </Border>
+          <Border x:Name="ButtonHover" Background="White" CornerRadius="8" Margin="1" local:Motion.Opacity="0" IsHitTestVisible="False"/>
+          <Border x:Name="ButtonKeyboardFocus" BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="7" Margin="2" Opacity="0" IsHitTestVisible="False"/>
         </Grid>
         <ControlTemplate.Triggers>
           <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ButtonHover" Property="local:Motion.Opacity" Value="0.065"/></Trigger>
           <Trigger Property="IsPressed" Value="True"><Setter TargetName="ButtonHover" Property="local:Motion.Opacity" Value="0.12"/><Setter TargetName="ButtonSurface" Property="local:Motion.Opacity" Value="0.85"/></Trigger>
+          <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="ButtonKeyboardFocus" Property="Opacity" Value="1"/></Trigger>
           <Trigger Property="IsEnabled" Value="False"><Setter TargetName="ButtonSurface" Property="local:Motion.Opacity" Value="0.35"/></Trigger>
         </ControlTemplate.Triggers>
       </ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style x:Key="TextLink" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
       <Setter Property="Background" Value="Transparent"/><Setter Property="Foreground" Value="{StaticResource MutedBrush}"/><Setter Property="BorderThickness" Value="0"/>
-      <Setter Property="Padding" Value="0,2,5,2"/><Setter Property="HorizontalContentAlignment" Value="Left"/><Setter Property="FocusVisualStyle" Value="{StaticResource KeyboardLinkFocus}"/>
+      <Setter Property="Padding" Value="4,3"/><Setter Property="HorizontalContentAlignment" Value="Left"/><Setter Property="FocusVisualStyle" Value="{x:Null}"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
-        <Grid x:Name="LinkSurface" Background="Transparent">
-          <ContentPresenter x:Name="LinkContent" Margin="{TemplateBinding Padding}" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center" RecognizesAccessKey="False"/>
-          <Border x:Name="LinkUnderline" Background="{TemplateBinding Foreground}" Height="1" VerticalAlignment="Bottom" Margin="0,0,5,1" local:Motion.Opacity="0" IsHitTestVisible="False"/>
+        <Grid x:Name="LinkSurface">
+          <Border x:Name="LinkChrome" Background="Transparent" CornerRadius="6" Padding="{TemplateBinding Padding}">
+            <ContentPresenter x:Name="LinkContent" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center" RecognizesAccessKey="False"/>
+          </Border>
+          <Border x:Name="LinkKeyboardFocus" BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="4" Margin="1" Opacity="0" IsHitTestVisible="False"/>
         </Grid>
         <ControlTemplate.Triggers>
-          <Trigger Property="IsMouseOver" Value="True"><Setter Property="Foreground" Value="#F3F1F0"/><Setter TargetName="LinkUnderline" Property="local:Motion.Opacity" Value="0.7"/></Trigger>
+          <Trigger Property="IsMouseOver" Value="True"><Setter Property="Foreground" Value="#F37843"/></Trigger>
           <Trigger Property="IsPressed" Value="True"><Setter TargetName="LinkSurface" Property="local:Motion.Opacity" Value="0.65"/></Trigger>
+          <Trigger Property="IsKeyboardFocused" Value="True"><Setter Property="Foreground" Value="{StaticResource AccentBrush}"/><Setter TargetName="LinkKeyboardFocus" Property="Opacity" Value="1"/></Trigger>
           <Trigger Property="IsEnabled" Value="False"><Setter TargetName="LinkSurface" Property="Opacity" Value="0.4"/></Trigger>
         </ControlTemplate.Triggers>
       </ControlTemplate></Setter.Value></Setter>
@@ -62,7 +68,7 @@
     <Style x:Key="NavIcon" TargetType="TextBlock"><Setter Property="FontFamily" Value="Segoe MDL2 Assets"/><Setter Property="FontSize" Value="16"/><Setter Property="Width" Value="28"/><Setter Property="VerticalAlignment" Value="Center"/></Style>
     <Style x:Key="PlayerButton" TargetType="Button" BasedOn="{StaticResource QuietButton}"><Setter Property="Width" Value="34"/><Setter Property="Height" Value="34"/><Setter Property="Padding" Value="0"/></Style>
     <Style x:Key="RoundPlayButton" TargetType="Button" BasedOn="{StaticResource AccentButton}"><Setter Property="Width" Value="44"/><Setter Property="Height" Value="44"/><Setter Property="Padding" Value="0"/>
-      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Grid x:Name="PlaySurface" RenderTransformOrigin="0.5,0.5"><Grid.RenderTransform><ScaleTransform x:Name="PlayScale"/></Grid.RenderTransform><Ellipse x:Name="Disc" local:Motion.Fill="{TemplateBinding Background}"/><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/><Ellipse x:Name="FocusRing" Stroke="{StaticResource AccentBrush}" StrokeThickness="1" Margin="-4" local:Motion.Opacity="0" IsHitTestVisible="False"/></Grid><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Disc" Property="local:Motion.Fill" Value="#FF8C7E"/></Trigger><Trigger Property="IsPressed" Value="True"><Setter TargetName="Disc" Property="local:Motion.Opacity" Value="0.7"/><Setter TargetName="PlaySurface" Property="local:Motion.Scale" Value="0.95"/></Trigger><Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="FocusRing" Property="local:Motion.Opacity" Value="1"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.35"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Grid x:Name="PlaySurface" RenderTransformOrigin="0.5,0.5"><Grid.RenderTransform><ScaleTransform x:Name="PlayScale"/></Grid.RenderTransform><Ellipse x:Name="Disc" local:Motion.Fill="{TemplateBinding Background}"/><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/><Ellipse x:Name="FocusRing" Stroke="{StaticResource AccentBrush}" StrokeThickness="1" Margin="-4" local:Motion.Opacity="0" IsHitTestVisible="False"/></Grid><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Disc" Property="local:Motion.Fill" Value="#F37843"/></Trigger><Trigger Property="IsPressed" Value="True"><Setter TargetName="Disc" Property="local:Motion.Opacity" Value="0.7"/><Setter TargetName="PlaySurface" Property="local:Motion.Scale" Value="0.95"/></Trigger><Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="FocusRing" Property="local:Motion.Opacity" Value="1"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.35"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style TargetType="TextBox"><Setter Property="Background" Value="#1A1C21"/><Setter Property="Foreground" Value="#F3F1F0"/><Setter Property="BorderBrush" Value="#303239"/><Setter Property="BorderThickness" Value="1"/><Setter Property="Padding" Value="13,10"/><Setter Property="CaretBrush" Value="{StaticResource AccentBrush}"/><Setter Property="SelectionBrush" Value="#664238"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="TextBox"><Border x:Name="InputBorder" Background="{TemplateBinding Background}" local:Motion.BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="9"><ScrollViewer x:Name="PART_ContentHost"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="InputBorder" Property="local:Motion.BorderBrush" Value="#555861"/></Trigger><Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="InputBorder" Property="local:Motion.BorderBrush" Value="{StaticResource AccentBrush}"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter TargetName="InputBorder" Property="Opacity" Value="0.4"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
@@ -89,15 +95,30 @@
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="CheckBox"><Grid Background="Transparent"><Grid.ColumnDefinitions><ColumnDefinition Width="24"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions><Border x:Name="CheckFrame" Width="16" Height="16" HorizontalAlignment="Left" VerticalAlignment="Center" Background="#1A1C21" BorderBrush="#646976" BorderThickness="1" CornerRadius="4"><Path x:Name="CheckMark" Data="M 3,7 L 6,10 L 11,4" Stroke="#211613" StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Visibility="Collapsed"/></Border><ContentPresenter Grid.Column="1" VerticalAlignment="Center" RecognizesAccessKey="True"/></Grid><ControlTemplate.Triggers><Trigger Property="IsChecked" Value="True"><Setter TargetName="CheckFrame" Property="Background" Value="{StaticResource AccentBrush}"/><Setter TargetName="CheckFrame" Property="BorderBrush" Value="{StaticResource AccentBrush}"/><Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/></Trigger><Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="CheckFrame" Property="BorderBrush" Value="{StaticResource AccentBrush}"/><Setter TargetName="CheckFrame" Property="BorderThickness" Value="2"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.35"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style TargetType="ComboBoxItem">
-      <Setter Property="Foreground" Value="#F3F1F0"/><Setter Property="Background" Value="#25272D"/><Setter Property="Padding" Value="10,8"/>
-      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ComboBoxItem"><Border x:Name="Item" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}" CornerRadius="7"><ContentPresenter/></Border><ControlTemplate.Triggers><Trigger Property="IsHighlighted" Value="True"><Setter TargetName="Item" Property="Background" Value="#45474F"/></Trigger><Trigger Property="IsSelected" Value="True"><Setter TargetName="Item" Property="Background" Value="#45474F"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
+      <Setter Property="Foreground" Value="#F3F1F0"/><Setter Property="Background" Value="Transparent"/><Setter Property="Padding" Value="12,8"/><Setter Property="Margin" Value="0,1"/><Setter Property="BorderBrush" Value="Transparent"/><Setter Property="BorderThickness" Value="1"/><Setter Property="FocusVisualStyle" Value="{x:Null}"/><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ComboBoxItem"><Grid x:Name="ItemSurface">
+        <Border x:Name="Item" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}" CornerRadius="7"><ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/></Border>
+        <Border x:Name="ItemKeyboardFocus" BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="5" Margin="2" Opacity="0" IsHitTestVisible="False"/>
+      </Grid><ControlTemplate.Triggers>
+        <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="Item" Property="Background" Value="#34373F"/></Trigger>
+        <Trigger Property="IsSelected" Value="True"><Setter TargetName="Item" Property="Background" Value="#3D2A21"/><Setter TargetName="Item" Property="BorderBrush" Value="#6D3F2B"/><Setter Property="Foreground" Value="#FFB18F"/></Trigger>
+        <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="ItemKeyboardFocus" Property="Opacity" Value="1"/></Trigger>
+        <Trigger Property="IsEnabled" Value="False"><Setter TargetName="ItemSurface" Property="Opacity" Value="0.4"/></Trigger>
+      </ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style TargetType="ComboBox">
-      <Setter Property="Foreground" Value="#F3F1F0"/><Setter Property="Background" Value="#25272D"/><Setter Property="Padding" Value="10,8"/>
-      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ComboBox"><Grid>
-        <ToggleButton Focusable="False" IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"><ToggleButton.Template><ControlTemplate TargetType="ToggleButton"><Border Background="#25272D" CornerRadius="10" Padding="12,9"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="18"/></Grid.ColumnDefinitions><ContentPresenter TextElement.Foreground="#F3F1F0" Content="{Binding SelectionBoxItem, RelativeSource={RelativeSource AncestorType=ComboBox}}" VerticalAlignment="Center"/><TextBlock Grid.Column="1" Text="⌄" HorizontalAlignment="Right" Foreground="#9699A4"/></Grid></Border></ControlTemplate></ToggleButton.Template></ToggleButton>
-        <Popup x:Name="PART_Popup" IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True" Focusable="False"><Border Background="#25272D" BorderBrush="#393E47" BorderThickness="1" CornerRadius="10" Padding="4" Margin="0,5,0,0" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"><ScrollViewer MaxHeight="260"><ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/></ScrollViewer></Border></Popup>
-      </Grid></ControlTemplate></Setter.Value></Setter>
+      <Setter Property="Foreground" Value="#F3F1F0"/><Setter Property="Background" Value="#25272D"/><Setter Property="Padding" Value="12,7"/><Setter Property="BorderBrush" Value="#393E47"/><Setter Property="BorderThickness" Value="1"/><Setter Property="FocusVisualStyle" Value="{x:Null}"/><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="MinHeight" Value="32"/><Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ComboBox"><Grid x:Name="ComboSurface">
+        <Border x:Name="ComboChrome" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="9"/>
+        <ToggleButton x:Name="DropDownToggle" Focusable="False" IsTabStop="False" FocusVisualStyle="{x:Null}" Padding="{TemplateBinding Padding}" Foreground="{TemplateBinding Foreground}" BorderThickness="{TemplateBinding BorderThickness}" IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"><ToggleButton.Template><ControlTemplate TargetType="ToggleButton"><Border Background="Transparent" BorderThickness="{TemplateBinding BorderThickness}" BorderBrush="Transparent" Padding="{TemplateBinding Padding}"><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="18"/></Grid.ColumnDefinitions><ContentPresenter Margin="0,0,8,0" TextElement.Foreground="{TemplateBinding Foreground}" Content="{Binding SelectionBoxItem, RelativeSource={RelativeSource AncestorType=ComboBox}}" ContentTemplate="{Binding SelectionBoxItemTemplate, RelativeSource={RelativeSource AncestorType=ComboBox}}" ContentStringFormat="{Binding SelectionBoxItemStringFormat, RelativeSource={RelativeSource AncestorType=ComboBox}}" VerticalAlignment="Center"/><TextBlock Grid.Column="1" Text="⌄" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="#ADB0BA"/></Grid></Border></ControlTemplate></ToggleButton.Template></ToggleButton>
+        <Border x:Name="ComboKeyboardFocus" BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="7" Margin="2" Opacity="0" IsHitTestVisible="False"/>
+        <Popup x:Name="PART_Popup" IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True" Focusable="False"><Border Background="#25272D" BorderBrush="#393E47" BorderThickness="1" CornerRadius="10" Padding="4" Margin="0,5,0,0" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"><ScrollViewer MaxHeight="260" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"><ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/></ScrollViewer></Border></Popup>
+      </Grid><ControlTemplate.Triggers>
+        <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ComboChrome" Property="Background" Value="#2C3038"/><Setter TargetName="ComboChrome" Property="BorderBrush" Value="#555861"/></Trigger>
+        <Trigger Property="IsDropDownOpen" Value="True"><Setter TargetName="ComboChrome" Property="BorderBrush" Value="#F37843"/></Trigger>
+        <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="ComboKeyboardFocus" Property="Opacity" Value="1"/></Trigger>
+        <Trigger Property="IsEnabled" Value="False"><Setter TargetName="ComboSurface" Property="Opacity" Value="0.4"/></Trigger>
+      </ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style TargetType="ContextMenu"><Setter Property="Background" Value="#25272D"/><Setter Property="Foreground" Value="#F3F1F0"/></Style>
   </Application.Resources>

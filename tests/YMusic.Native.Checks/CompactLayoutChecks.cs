@@ -89,7 +89,8 @@ internal static partial class Program
             foreach (var (width, height) in ClSizes)
             {
                 await ClResize(window, width, height);
-                var list = Control<ListView>(window, "TracksList"); var title = Control<TextBlock>(window, "CollectionTitle");
+                var list = Control<ListView>(window, "TracksList");
+                var title = mode == "playlist" ? ClVisuals<TextBlock>(Control<ContentControl>(window, "CollectionHero")).Single(text => text.Name == "CollectionHeroTitle") : Control<TextBlock>(window, "CollectionTitle");
                 Assert(list.IsVisible && list.ActualHeight >= 250, $"{mode} list has insufficient visible height at {width}x{height}: {list.ActualHeight:0.##}");
                 Assert(title.IsVisible && ClRect(title, window).Top < ClRect(Control<WrapPanel>(window, "CollectionToolbar"), window).Top
                     && ClRect(title, window).Top < ClRect(list, window).Top, "collection title moved below its toolbar or list");

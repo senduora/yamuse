@@ -33,6 +33,8 @@ Yamuse использует открытые компоненты, докуме�
 | Источник | Использование |
 | --- | --- |
 | [Яндекс Музыка](https://music.yandex.ru/) | Каталог, коллекция, рекомендации, воспроизведение, обложки и доступные тексты. |
+| [Windows MediaPlayer](https://learn.microsoft.com/uwp/api/windows.media.playback.mediaplayer) и [Media Foundation Source Reader](https://learn.microsoft.com/windows/win32/medfound/processing-media-data-with-the-source-reader) | Системное воспроизведение потоков и декодирование аудио для локального измерения громкости. Используются через API Windows; дополнительные декодеры не поставляются. |
+| [ITU-R BS.1770](https://www.itu.int/rec/R-REC-BS.1770/en) | Описание K-взвешивания и порогового отбора блоков при оценке громкости; собственная реализация алгоритма на C#. |
 | [Яндекс OAuth](https://yandex.ru/dev/id/doc/en/codes/screen-code-oauth) | Документация входа через код на странице авторизации. |
 | [LRCLIB](https://lrclib.net/docs) | Дополнительный источник текста и синхронных таймкодов. Клиент написан на C# по документации сервиса. |
 | [Genius](https://genius.com/) | Поиск страницы песни и дополнительный источник текста. |

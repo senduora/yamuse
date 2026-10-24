@@ -56,7 +56,6 @@ internal sealed class DesktopShell : IDisposable
             {
                 if (!TryAddTray()) return; // Never hide without a working restore path.
                 _minimizeToTray = true;
-                if (_owner.WindowState == WindowState.Minimized) _owner.Hide();
             }
             else
             {
@@ -306,7 +305,6 @@ internal sealed class DesktopShell : IDisposable
     private void OwnerStateChanged(object? sender, EventArgs e)
     {
         if (_owner.WindowState != WindowState.Minimized) _restoreState = _owner.WindowState;
-        else if (_minimizeToTray && IsAvailable) _owner.Hide();
     }
 
     private void OwnerClosing(object? sender, CancelEventArgs e)

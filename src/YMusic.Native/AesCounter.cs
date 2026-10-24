@@ -11,11 +11,15 @@ internal sealed class AesCounter : IDisposable
     private readonly byte[] _keystream = new byte[4096];
     private UInt128 _counter;
     private int _offset = 4096;
-    public AesCounter(string hexKey)
+    public AesCounter(string hexKey, long byteOffset = 0)
     {
+        if (byteOffset < 0) throw new ArgumentOutOfRangeException(nameof(byteOffset));
         var key = Convert.FromHexString(hexKey);
         try { if (key.Length is not (16 or 24 or 32)) throw new MusicException("Некорректный ключ аудиопотока."); _aes.Key = key; }
         finally { CryptographicOperations.ZeroMemory(key); }
+        _counter = (UInt128)(byteOffset / 16);
+        var skip = (int)(byteOffset % 16);
+        if (skip > 0) Transform(new byte[skip]);
     }
     public void Transform(Span<byte> bytes)
     {

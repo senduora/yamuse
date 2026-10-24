@@ -36,7 +36,9 @@ internal static partial class Program
                 var clock = System.Diagnostics.Stopwatch.StartNew();
                 await window.PlayTrackAsync(sameServerTrack); clock.Stop();
                 Assert(native.IsPlaying && sameServerTrack.IsDownloaded && sameServerTrack.CanPlay && sameServerTrack.DownloadBadge == "✓", "saved track not recognized across album context/restart");
-                Assert(noNetwork.Seen.Count == 0 && Control<TextBlock>(window, "StatusText").Text.Contains("Офлайн"), "downloaded audio performed network lookup");
+                Assert(noNetwork.Seen.Count == 0, "downloaded audio performed network lookup");
+                Assert(Control<TextBlock>(window, "QualityText").Text.StartsWith("Офлайн · ", StringComparison.Ordinal)
+                    && Control<TextBlock>(window, "StatusText").Text == "", "downloaded source must appear beside player quality");
                 File.WriteAllText(Path.Combine(_directory, "offline-local-start.json"), JsonSerializer.Serialize(new { localOpenMs = clock.Elapsed.TotalMilliseconds, networkRequests = 0, fullFileHashOnPlayback = false, persistedMark = true }));
             }
             finally { window.Close(); }
@@ -74,7 +76,9 @@ internal static partial class Program
                 var list = Control<ListView>(offlineWindow, "TracksList");
                 Assert(list.Items.Count == 2 && reopened.GetPlaylistStatus("12345", "42").Complete, "playlist status not persisted");
                 await offlineWindow.PlayTrackAsync((TrackRow)list.Items[0]);
-                Assert(noNetwork.Seen.Count == 0 && Control<TextBlock>(offlineWindow, "StatusText").Text.Contains("Офлайн"), "offline playlist did not play locally");
+                Assert(noNetwork.Seen.Count == 0 && ((TrackRow)list.Items[0]).IsPlaying, "offline playlist did not play locally");
+                Assert(Control<TextBlock>(offlineWindow, "QualityText").Text.StartsWith("Офлайн · ", StringComparison.Ordinal)
+                    && Control<TextBlock>(offlineWindow, "StatusText").Text == "", "offline playlist source must appear beside player quality");
             }
             finally { offlineWindow.Close(); }
         });

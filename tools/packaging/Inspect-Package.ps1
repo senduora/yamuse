@@ -212,8 +212,8 @@ $evidence = [pscustomobject]@{
     setupFileVersion=$setup.VersionInfo.FileVersion; setupProduct=$setup.VersionInfo.ProductName;
     setupExecutionLevel='asInvoker'; setupExecuted=$false;
     setupSignature=(Get-AuthenticodeSignature -LiteralPath $setup.FullName).Status.ToString();
-    installRoot='%LOCALAPPDATA%\YMusic.Native'; preservedData='%LOCALAPPDATA%\YMusic.Native.Prototype';
-    preservedMusic='Documents\YMusic Native\Music';
+    installRoot='%LOCALAPPDATA%\YMusic.Native'; preservedData='%LOCALAPPDATA%\Yamuse';
+    preservedMusic='Documents\Yamuse\Music';
     files=@(Get-ChildItem -LiteralPath $outputPath -File | Where-Object { $_.Name -ne 'package-evidence.json' } | ForEach-Object {
         [pscustomobject]@{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash}
     }); packageEntries=$inventory

@@ -9,7 +9,12 @@ internal static class Program
     {
         // Fast install/update/uninstall hooks must finish before any WPF or user
         // data is opened. A downloaded update never interrupts a normal launch.
-        VelopackApp.Build().SetArgs(args).SetAutoApplyOnStartup(false).Run();
+        VelopackApp.Build().SetArgs(args).SetAutoApplyOnStartup(false)
+            .OnAfterUpdateFastCallback(_ => { UninstallSupport.RegisterWindowsUninstall(); })
+            .Run();
+
+        if (UninstallSupport.TryHandleCommand(args)) return;
+        UninstallSupport.RegisterWindowsUninstall();
 
         var app = new App();
         app.InitializeComponent();

@@ -64,7 +64,7 @@ public partial class MainWindow
         if (_section != "queue") return;
         var index = SelectedQueueIndex(); var to = index + direction;
         if (index < 0 || to < 0 || to >= _queue.Count) return;
-        _playbackQueue.Move(index, to); ShowQueue(); TracksList.SelectedIndex = to; UpdateControls();
+        _playbackQueue.Move(index, to); ShowQueue(); SelectVisibleQueueOccurrence(to); UpdateControls();
     }
     private void UpdateQueueControls()
     {

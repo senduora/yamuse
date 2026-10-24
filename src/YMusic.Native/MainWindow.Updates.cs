@@ -65,6 +65,8 @@ public partial class MainWindow
                 if (updates.State.Status == AppUpdateStatus.Downloaded)
                 {
                     SavePreferences();
+                    SavePlaybackState();
+                    SuspendDownloadQueueForAccountChange();
                     // Let an in-progress atomic offline write finish before the
                     // updater exits this process. Preserve the user's stored opt-in.
                     var autoBefore = _autoFavoritesEnabled;

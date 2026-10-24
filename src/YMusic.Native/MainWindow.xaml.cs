@@ -36,6 +36,7 @@ public partial class MainWindow : Window
     private Account? _account;
     private CancellationTokenSource? _authCts;
     private CancellationTokenSource? _libraryCts;
+    private HashSet<string>? _libraryRemovedLikes;
     private CancellationTokenSource? _playCts;
     private DeviceCode? _deviceCode;
     private string _deviceId = Guid.NewGuid().ToString("N");
@@ -51,7 +52,7 @@ public partial class MainWindow : Window
     private readonly HashSet<string> _favoriteTrackIds = new(StringComparer.Ordinal);
     private bool _favoriteIdsKnown;
 
-    internal MainWindow(bool demo = false, MusicApi? api = null, SessionStore? store = null, bool restore = true, string? diagnosticsDirectory = null, OfflineLibrary? offline = null, NativePlayer? player = null)
+    internal MainWindow(bool demo = false, MusicApi? api = null, SessionStore? store = null, bool restore = true, string? diagnosticsDirectory = null, OfflineLibrary? offline = null, NativePlayer? player = null, PreferencesStore? preferences = null)
     {
         _demo = demo;
         _restore = restore;
@@ -60,9 +61,11 @@ public partial class MainWindow : Window
         _diagnosticsDirectory = diagnosticsDirectory ?? App.DataDirectory;
         _offline = offline ?? new OfflineLibrary();
         _player = player ?? new NativePlayer();
+        _preferenceStore = preferences;
         _accountCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         InitializeComponent();
         WindowAppearance.Apply(this);
+        InitializeSortingSources();
         _view = CollectionViewSource.GetDefaultView(_tracks);
         _view.Filter = value => value is TrackRow row && (_query.Length == 0 || row.Matches(_query));
         TracksList.ItemsSource = _view;
@@ -70,8 +73,11 @@ public partial class MainWindow : Window
         InitializeDesign();
         InitializeLyrics();
         LoadPreferences();
+        InitializeSorting();
+        InitializePlaybackPersistence();
+        DownloadCenterPanel.Content = DownloadCenterView;
         _metricsTimer.Tick += (_, _) => UpdateMetrics();
-        _progressTimer.Tick += (_, _) => UpdateProgress();
+        _progressTimer.Tick += (_, _) => { UpdateProgress(); PersistPlaybackStateIfDue(); };
         _filterTimer.Tick += (_, _) =>
         {
             _filterTimer.Stop();
@@ -187,6 +193,7 @@ public partial class MainWindow : Window
         RefreshButton.Visibility = Visibility.Visible;
         FilterBox.IsEnabled = true;
         TrySaveSession(session);
+        RestorePlaybackState(account.Uid);
         await RefreshLibraryAsync();
     }
 
@@ -236,6 +243,7 @@ public partial class MainWindow : Window
         _libraryCts?.Cancel();
         var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         _libraryCts = cts;
+        var removedDuringRefresh = _libraryRemovedLikes = new HashSet<string>(StringComparer.Ordinal);
         var clock = Stopwatch.StartNew();
         Busy(true);
         RefreshButton.IsEnabled = false;
@@ -248,12 +256,12 @@ public partial class MainWindow : Window
             var ids = await _api.GetLikedIdsAsync(session, uid, cts.Token);
             cts.Token.ThrowIfCancellationRequested();
             _favoriteTrackIds.Clear();
-            _favoriteTrackIds.UnionWith(ids.Select(id => id.Id));
+            _favoriteTrackIds.UnionWith(ids.Where(id => !removedDuringRefresh.Contains(id.Id)).Select(id => id.Id));
             _favoriteIdsKnown = true;
             UpdatePlayerLikeState();
             _favoritesCache.Clear();
             if (_section == "favorites") _tracks.Clear();
-            _diagnostics.TotalTracks = ids.Count;
+            _diagnostics.TotalTracks = ids.Count(id => !removedDuringRefresh.Contains(id.Id));
             _diagnostics.LoadedTracks = 0;
             UpdateCount();
             for (var offset = 0; offset < ids.Count; offset += 100)
@@ -262,7 +270,7 @@ public partial class MainWindow : Window
                 var rows = await _api.GetTracksAsync(session, batch, offset, cts.Token);
                 cts.Token.ThrowIfCancellationRequested();
                 ApplyOfflineStates(rows);
-                foreach (var row in rows) { row.IsPlaying = _player.HasSource && _current?.RequestId == row.RequestId; _favoritesCache.Add(row); if (_section == "favorites") _tracks.Add(row); }
+                foreach (var row in rows.Where(row => !removedDuringRefresh.Contains(row.Id))) { row.IsPlaying = _player.HasSource && _current?.RequestId == row.RequestId; _favoritesCache.Add(row); if (_section == "favorites") _tracks.Add(row); }
                 _diagnostics.LoadedTracks = _favoritesCache.Count;
                 if (offset == 0) _diagnostics.Timing("favorites_first_batch_ms", clock.Elapsed.TotalMilliseconds);
                 if (_section == "favorites") SetStatus($"Загружено {_favoritesCache.Count:N0} из {ids.Count:N0} треков…");
@@ -282,7 +290,7 @@ public partial class MainWindow : Window
         }
         finally
         {
-            if (ReferenceEquals(_libraryCts, cts)) { _libraryCts = null; RefreshButton.IsEnabled = true; }
+            if (ReferenceEquals(_libraryCts, cts)) { _libraryCts = null; _libraryRemovedLikes = null; RefreshButton.IsEnabled = true; }
             cts.Dispose();
             Busy(false);
         }
@@ -291,6 +299,8 @@ public partial class MainWindow : Window
     private void Logout_Click(object sender, RoutedEventArgs e) => SignOut();
     internal void SignOut()
     {
+        SuspendDownloadQueueForAccountChange();
+        var playbackCleared = ClearPlaybackState();
         ResetFeatures();
         _accountCts.Cancel();
         _authCts?.Cancel(); _libraryCts?.Cancel(); _playCts?.Cancel();
@@ -313,7 +323,7 @@ public partial class MainWindow : Window
         TrackTitle.Text = "Выберите трек"; TrackArtist.Text = "Двойной щелчок или кнопка «Слушать»"; QualityText.Text = "";
         Artwork.SetSourceUri(PlayerCover, null);
         UpdateProgress(); UpdateCount(); UpdateControls();
-        try { _store.Clear(); SetStatus("Вы вышли из аккаунта. Сохранённый вход удалён с этого компьютера."); }
+        try { _store.Clear(); SetStatus(playbackCleared ? "Вы вышли из аккаунта. Сохранённый вход удалён с этого компьютера." : "Вы вышли из аккаунта. Не удалось удалить сохранённую очередь; проверьте доступ к папке данных.", !playbackCleared); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             SetStatus("Вход завершён в этом окне, но не удалось удалить сохранённую сессию. Закройте приложение и удалите session.dpapi в папке данных.", true);
@@ -348,6 +358,7 @@ public partial class MainWindow : Window
     private async Task PlayTrackCoreAsync(TrackRow track, PreparedPlayback? prepared, bool automatic)
     {
         if (_closed) return;
+        ForgetRestoredPositionFor(track);
         ApplyOfflineStates([track]);
         var localPath = track.LocalPath ?? track.DownloadedPath;
         var localQuality = track.LocalQuality ?? track.DownloadedQuality;
@@ -396,8 +407,8 @@ public partial class MainWindow : Window
             });
             if (!promoted)
             {
-                if (localPath is not null) await _player.OpenAsync(new Uri(localPath), cts.Token);
-                else await _player.OpenAsync(audio!, cts.Token, bufferProgress);
+                if (localPath is not null) await _player.OpenPausedAsync(new Uri(localPath), cts.Token);
+                else await _player.OpenPausedAsync(audio!, cts.Token, bufferProgress);
             }
             cts.Token.ThrowIfCancellationRequested();
             if (track.DurationMs > 60_000 && _player.Duration.TotalSeconds is > 0 and <= 35)
@@ -405,15 +416,21 @@ public partial class MainWindow : Window
                 _player.Stop();
                 throw new MusicException("Длительность потока похожа на фрагмент. Проверьте подписку; воспроизведение остановлено.");
             }
+            if (!promoted)
+            {
+                ApplyRestoredPositionAfterOpen(track);
+                _player.Toggle();
+            }
             _diagnostics.Timing("play_requested_to_media_open_ms", clock.Elapsed.TotalMilliseconds);
             var playingOffline = promoted ? prepared!.Offline : localPath is not null;
             _diagnostics.Stage = playingOffline ? "playing_offline" : "playing";
             track.IsPlaying = true;
             HighlightTrack(track);
-            QualityText.Text = promoted ? prepared!.QualityLabel : localQuality ?? audio?.QualityLabel ?? "Локальное аудио";
-            SetStatus(playingOffline ? "Офлайн · локальный аудиофайл" : _waveSources.ContainsKey(track) ? _waveBatch?.Mode == WaveMode.Collection ? "Волна по коллекции · персональные рекомендации" : "Моя волна · персональные рекомендации" : "Воспроизведение · очередь треков");
+            QualityText.Text = (playingOffline ? "Офлайн · " : "") + (promoted ? prepared!.QualityLabel : localQuality ?? audio?.QualityLabel ?? "Локальное аудио");
+            SetStatus(playingOffline ? "" : _waveSources.ContainsKey(track) ? _waveBatch?.Mode == WaveMode.Collection ? "Волна по коллекции · персональные рекомендации" : "Моя волна · персональные рекомендации" : "Воспроизведение · очередь треков");
             BeginWaveListening(track);
             _progressTimer.Start();
+            SavePlaybackState();
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
         catch (Exception ex) { _diagnostics.Stage = "playback_error"; ShowError(ex); }
@@ -435,6 +452,7 @@ public partial class MainWindow : Window
             return;
         }
         _player.Toggle();
+        SavePlaybackState();
         SetWavePaused(!_player.IsPlaying);
         _diagnostics.Stage = _player.IsPlaying ? "playing" : "paused";
         SetStatus(_player.IsPlaying ? "Воспроизведение · очередь из избранного" : "Пауза");
@@ -500,6 +518,8 @@ public partial class MainWindow : Window
         UpdateLyricsTimer();
         PlayerLyricsButton.IsEnabled = _current is not null;
         UpdatePlayerArtistLinks();
+        ExpandPlayerButton.IsEnabled = _current is not null;
+        RefreshExpandedPlayer();
         if (_current is null && _lyricsOpen) SetLyricsVisible(false);
         if (_current is null) Artwork.SetSourceUri(PlayerCover, null);
         UpdateWindowsMedia();
@@ -514,13 +534,14 @@ public partial class MainWindow : Window
     }
     private void UpdateProgress()
     {
-        var duration = _player.Duration;
+        var duration = RestoredPlaybackDuration ?? _player.Duration;
         var position = DisplayPosition(_player.Position);
         if (!_seekDragging) { SeekSlider.Maximum = Math.Max(1, duration.TotalSeconds); SeekSlider.Value = position.TotalSeconds; }
         PositionText.Text = FormatTime(_seekDragging ? TimeSpan.FromSeconds(SeekSlider.Value) : position);
         DurationText.Text = FormatTime(duration);
         SeekSlider.IsEnabled = !_loadingStream && _player.HasSource && duration.TotalSeconds > 0;
         UpdateLyrics(position.TotalSeconds);
+        RefreshExpandedPlayer();
         UpdateShellState();
         TryAutomaticTransition();
     }
@@ -540,7 +561,7 @@ public partial class MainWindow : Window
         var visible = _query.Length == 0 ? _tracks.Count : _view.Cast<object>().Count();
         var total = _section == "favorites" ? _diagnostics.TotalTracks : _tracks.Count;
         CountText.Text = _session is not null || _demo || _section == "offline" ? (_query.Length > 0 ? $"Найдено {visible:N0} · загружено {_tracks.Count:N0} из {total:N0}" : $"{_tracks.Count:N0} из {total:N0} треков") : "Любимые треки из вашего аккаунта";
-        EmptyState.Visibility = visible > 0 ? Visibility.Collapsed : Visibility.Visible;
+        EmptyState.Visibility = visible > 0 || _section == "download-center" ? Visibility.Collapsed : Visibility.Visible;
         EmptyTitle.Text = _query.Length > 0 ? "Ничего не найдено" : _section == "offline" ? "Пока ничего не скачано" : _section == "wave" ? "Запускаем Мою волну" : _session is not null ? "В избранном пока нет треков" : "Здесь появится избранное";
         EmptyDescription.Text = _query.Length > 0 ? "Попробуйте другое название или исполнителя" : _section == "offline" ? "Выберите трек и нажмите «Скачать»" : _session is not null ? "Если коллекция ещё загружается, подождите немного" : "Войдите в Яндекс, чтобы загрузить любимые треки";
         UpdateCatalogCount();
@@ -582,13 +603,11 @@ public partial class MainWindow : Window
         if (_closed) return;
         var sample = _diagnostics.Sample();
         MemoryText.Text = $"RAM всего {sample.WorkingSetBytes / 1048576.0:F0} МБ";
-        PrivateText.Text = $"Commit {sample.PrivateBytes / 1048576.0:F0} МБ";
         CpuText.Text = $"CPU {sample.CpuPercent:F2}%";
-        StartupText.Text = $"Запуск {_diagnostics.WindowReadyMs / 1000:F2} с";
     }
     private void SaveDiagnostics_Click(object sender, RoutedEventArgs e)
     {
-        var dialog = new Microsoft.Win32.SaveFileDialog { Filter = "Диагностика JSON|*.json", FileName = $"YMusic-metrics-{DateTime.Now:yyyyMMdd-HHmmss}.json", AddExtension = true };
+        var dialog = new Microsoft.Win32.SaveFileDialog { Filter = "Диагностика JSON|*.json", FileName = $"Yamuse-metrics-{DateTime.Now:yyyyMMdd-HHmmss}.json", AddExtension = true };
         if (dialog.ShowDialog(this) != true) return;
         try { _diagnostics.Save(dialog.FileName); SetStatus("Замер сохранён. Файл содержит ресурсы и время загрузки без данных аккаунта."); }
         catch (Exception ex) { ShowError(ex); }
@@ -608,6 +627,7 @@ public partial class MainWindow : Window
     }
     private async void Window_KeyDown(object sender, KeyEventArgs e)
     {
+        if (e.Key == Key.Escape && IsExpandedPlayerOpen) { e.Handled = true; CloseExpandedPlayer(); return; }
         if (e.Key == Key.Escape && _settingsOpen) { e.Handled = true; SettingsClose_Click(sender, e); return; }
         if (_settingsOpen && e.Key is not (Key.MediaPlayPause or Key.MediaNextTrack or Key.MediaPreviousTrack)) return;
         if (e.Key == Key.Escape && _lyricsOpen) { e.Handled = true; SetLyricsVisible(false); PlayerLyricsButton.Focus(); return; }
@@ -634,7 +654,10 @@ public partial class MainWindow : Window
     }
     private void OnClosed(object? sender, EventArgs e)
     {
+        SavePlaybackState();
+        SuspendDownloadQueueForAccountChange();
         _closed = true;
+        CloseSorting();
         _lifetime.Cancel(); _authCts?.Cancel(); _libraryCts?.Cancel(); _playCts?.Cancel();
         CancelNextPreparation();
         _accountCts.Cancel();

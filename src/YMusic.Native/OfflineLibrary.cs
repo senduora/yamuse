@@ -39,7 +39,7 @@ internal sealed class OfflineLibrary : IDisposable
     { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, MaxDepth = 48, WriteIndented = true };
     internal OfflineLibrary(string? directory = null, AudioBuffer? downloader = null)
     {
-        DirectoryPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "YMusic Native", "Music")));
+        DirectoryPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory ?? BrandPaths.Current.MusicDirectory));
         _indexPath = Path.Combine(DirectoryPath, "library.index.json");
         _playlistIndexPath = Path.Combine(DirectoryPath, "playlists.index.json");
         _directoryState = DirectoryLocks.GetOrAdd(DirectoryPath, _ => new DirectoryState());

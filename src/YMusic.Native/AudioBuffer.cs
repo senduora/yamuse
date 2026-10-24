@@ -8,11 +8,12 @@ internal sealed record AudioProgress(long Bytes, long? Total);
 
 // Fetch anonymously in managed HTTP. WPF only receives a local path, so its native
 // network pipeline never sends Windows credentials or trips the Internet-zone gate.
-internal sealed class AudioBuffer : IDisposable
+internal sealed partial class AudioBuffer : IDisposable
 {
     internal const long MaximumBytes = 256L * 1024 * 1024;
     private readonly HttpClient _http;
     private readonly string _directory;
+    internal string DirectoryPath => _directory;
     internal AudioBuffer(string? directory = null, HttpMessageHandler? handler = null)
     {
         _directory = directory ?? Path.Combine(App.DataDirectory, "buffer");

@@ -12,7 +12,7 @@ namespace YMusic.Native;
 internal sealed class MiniPlayerWindow : Window
 {
     private static readonly Brush Muted = Brush("#989BA7");
-    private static readonly Brush Accent = Brush("#FF705E");
+    private static readonly Brush Accent = Brush("#EA571C");
     private readonly TextBlock _coverPlaceholder;
     private readonly Button _previous;
     private readonly Button _next;
@@ -250,11 +250,11 @@ internal sealed class MiniPlayerWindow : Window
               <Grid x:Name="Surface" Background="Transparent">
                 <Border Height="4" Margin="5,0" CornerRadius="2" Background="#3A3C45" VerticalAlignment="Center"/>
                 <Track x:Name="PART_Track" Orientation="Horizontal" IsDirectionReversed="False">
-                  <Track.DecreaseRepeatButton><RepeatButton Command="Slider.DecreaseLarge" Background="#FF705E" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Height="4" Margin="5,0,0,0" CornerRadius="2" Background="{TemplateBinding Background}" VerticalAlignment="Center"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.DecreaseRepeatButton>
-                  <Track.Thumb><Thumb Width="10" Height="10"><Thumb.Template><ControlTemplate TargetType="Thumb"><Ellipse Fill="#FF705E"/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
+                  <Track.DecreaseRepeatButton><RepeatButton Command="Slider.DecreaseLarge" Background="#EA571C" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Height="4" Margin="5,0,0,0" CornerRadius="2" Background="{TemplateBinding Background}" VerticalAlignment="Center"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.DecreaseRepeatButton>
+                  <Track.Thumb><Thumb Width="10" Height="10"><Thumb.Template><ControlTemplate TargetType="Thumb"><Ellipse Fill="#EA571C"/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
                   <Track.IncreaseRepeatButton><RepeatButton Command="Slider.IncreaseLarge" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Background="Transparent"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.IncreaseRepeatButton>
                 </Track>
-                <Border x:Name="Focus" CornerRadius="6" BorderBrush="#FF705E" BorderThickness="1" Opacity="0" IsHitTestVisible="False"/>
+                <Border x:Name="Focus" CornerRadius="6" BorderBrush="#EA571C" BorderThickness="1" Opacity="0" IsHitTestVisible="False"/>
               </Grid>
               <ControlTemplate.Triggers><Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Focus" Property="Opacity" Value="0.7"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter TargetName="Surface" Property="Opacity" Value="0.35"/></Trigger></ControlTemplate.Triggers>
             </ControlTemplate>

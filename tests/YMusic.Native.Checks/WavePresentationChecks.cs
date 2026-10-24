@@ -187,14 +187,16 @@ internal static partial class Program
             Assert(ReferenceEquals(shuffle.Content, shuffleContent) && ReferenceEquals(repeat.Content, repeatContent)
                 && !WaveVisuals<TextBlock>((Grid)shuffleContent).Any() && WaveVisuals<TextBlock>((Grid)repeatContent).All(text => text.Text == "1"), "toggle injected clipped Вкл text into compact controls");
             WaveInvoke(window, "UpdateMetrics");
-            Assert(Control<TextBlock>(window, "MemoryText").Text.StartsWith("RAM всего ", StringComparison.Ordinal) && Control<TextBlock>(window, "PrivateText").Text.StartsWith("Commit ", StringComparison.Ordinal), "memory footer labels remain ambiguous");
+            Assert(Control<TextBlock>(window, "MemoryText").Text.StartsWith("RAM всего ", StringComparison.Ordinal) && Control<TextBlock>(window, "CpuText").Text.StartsWith("CPU ", StringComparison.Ordinal)
+                && Control<StackPanel>(window, "MetricsRow").Children.Count == 3
+                && Control<StackPanel>(window, "MetricsRow").Children[0] is TextBlock { Name: "VersionText" }, "resource footer must show version, RAM and CPU in order");
             foreach (var name in new[] { "TracksList", "CatalogList", "LyricsList" })
             {
                 var list = Control<ItemsControl>(window, name);
                 Assert(VirtualizingPanel.GetIsVirtualizing(list) && VirtualizingPanel.GetVirtualizationMode(list) == VirtualizationMode.Recycling
                     && VirtualizingPanel.GetScrollUnit(list) == ScrollUnit.Pixel && ScrollViewer.GetCanContentScroll(list), name + " lost pixel recycling virtualization");
             }
-            File.WriteAllText(System.IO.Path.Combine(_directory, "wave-controls-readback.json"), JsonSerializer.Serialize(new { iconsOnly = true, shuffleAccentAndDot = true, repeatAllOneOff = true, accessibleNamesMatchState = true, ramLabel = "RAM всего", privateBytesLabel = "Commit", pixelRecyclingLists = new[] { "TracksList", "CatalogList", "LyricsList" } }));
+            File.WriteAllText(System.IO.Path.Combine(_directory, "wave-controls-readback.json"), JsonSerializer.Serialize(new { iconsOnly = true, shuffleAccentAndDot = true, repeatAllOneOff = true, accessibleNamesMatchState = true, ramLabel = "RAM всего", cpuLabel = "CPU", pixelRecyclingLists = new[] { "TracksList", "CatalogList", "LyricsList" } }));
         }
         finally { window.Close(); }
         return Task.CompletedTask;

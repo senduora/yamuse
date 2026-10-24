@@ -89,6 +89,23 @@ internal sealed class PlaybackQueue
         Touch(itemsChanged: true);
     }
 
+    // Restore an exact occurrence without playing, skipping an unavailable current
+    // row, or treating equal IDs as the same entry. Navigation history is ephemeral.
+    public void RestoreItems(IEnumerable<TrackRow> tracks, int currentIndex, bool shuffle, RepeatMode repeat)
+    {
+        var rows = Materialize(tracks);
+        if (currentIndex < -1 || currentIndex >= rows.Length) throw new ArgumentOutOfRangeException(nameof(currentIndex));
+        if (!Enum.IsDefined(repeat)) throw new ArgumentOutOfRangeException(nameof(repeat));
+        _entries.Clear(); _presentTokens.Clear(); _past.Clear(); _future.Clear();
+        _shuffleBag.Clear(); _playNext.Clear(); _cycleVisited.Clear();
+        foreach (var row in rows) _entries.Add(NewEntry(row));
+        _current = currentIndex < 0 ? null : _entries[currentIndex];
+        _shuffle = shuffle; _repeat = repeat;
+        MarkVisited(_current);
+        if (_shuffle) BuildShuffleBag();
+        Touch(itemsChanged: true);
+    }
+
     public bool Select(TrackRow track)
     {
         ArgumentNullException.ThrowIfNull(track);

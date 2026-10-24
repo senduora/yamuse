@@ -37,7 +37,7 @@ internal sealed class SessionStore(string directory)
         {
             Marshal.Copy(input, 0, blob.Data, input.Length);
             DataBlob output;
-            var success = protect ? CryptProtectData(ref blob, "YMusic Native Prototype", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 1, out output)
+            var success = protect ? CryptProtectData(ref blob, "Yamuse", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 1, out output)
                 : CryptUnprotectData(ref blob, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 1, out output);
             if (!success) throw new CryptographicException(Marshal.GetLastWin32Error());
             try

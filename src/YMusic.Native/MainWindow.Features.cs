@@ -37,8 +37,12 @@ public partial class MainWindow
     }
     private async void Wave_Click(object sender, RoutedEventArgs e) => await OpenWaveAsync(WaveMode.Personal);
     private void Offline_Click(object sender, RoutedEventArgs e) => ShowOffline();
-    private void SetSection(string section, string title)
-        => ApplySection(section, title, closeSettings: true);
+    private void SetSection(string section, string title) => NavigateSection(section, title, remember: true);
+    private void NavigateSection(string section, string title, bool remember)
+    {
+        if (remember && !_restoringBrowse && _featuresReady && _account is not null && section != _section) RememberBrowseView();
+        ApplySection(section, title, closeSettings: true);
+    }
 
     private void ApplySection(string section, string title, bool closeSettings)
     {
@@ -46,11 +50,12 @@ public partial class MainWindow
         SetLyricsVisible(false);
         _featureCts?.Cancel();
         HideCatalog();
+        HideCollectionHero();
         _section = section;
         CollectionOptionsPopup.IsOpen = false;
-        CollectionToolbar.Visibility = section == "search" ? Visibility.Collapsed : Visibility.Visible;
-        CollectionSummary.Visibility = section == "search" ? Visibility.Collapsed : Visibility.Visible;
-        TrackFilterPanel.Visibility = section == "search" ? Visibility.Collapsed : Visibility.Visible;
+        CollectionToolbar.Visibility = section is "search" or "download-center" ? Visibility.Collapsed : Visibility.Visible;
+        CollectionSummary.Visibility = section is "search" or "download-center" ? Visibility.Collapsed : Visibility.Visible;
+        TrackFilterPanel.Visibility = section is "search" or "download-center" ? Visibility.Collapsed : Visibility.Visible;
         PlaylistDownloadText.Text = "";
         UpdateMainContentVisibility();
         _viewGeneration++;
@@ -65,7 +70,7 @@ public partial class MainWindow
         FavoritesNav.Background = section == "favorites" ? active : Brushes.Transparent;
         WaveNav.Background = section == "wave" ? active : Brushes.Transparent;
         OfflineNav.Background = section == "offline" ? active : Brushes.Transparent;
-        foreach (var (name, button) in new (string, Button)[] { ("home", HomeNav), ("wave", WaveNav), ("collection-wave", CollectionWaveNav), ("favorites", FavoritesNav), ("offline", OfflineNav), ("search", SearchNav), ("playlists", PlaylistsNav), ("albums", AlbumsNav), ("artists", ArtistsNav), ("queue", QueueNav), ("offline-playlists", OfflinePlaylistsNav), ("queue-history", QueueHistoryNav) })
+        foreach (var (name, button) in new (string, Button)[] { ("home", HomeNav), ("wave", WaveNav), ("collection-wave", CollectionWaveNav), ("favorites", FavoritesNav), ("offline", OfflineNav), ("download-center", DownloadCenterNav), ("search", SearchNav), ("playlists", PlaylistsNav), ("albums", AlbumsNav), ("artists", ArtistsNav), ("queue", QueueNav), ("offline-playlists", OfflinePlaylistsNav), ("queue-history", QueueHistoryNav) })
         {
             var selected = section == name || section == "home-shelf" && name == "home" || section == "playlist-detail" && name == "playlists" || section == "album-detail" && name == "albums" || section is "artist-detail" or "artist-tracks" && name == "artists" || section == "offline-playlist-detail" && name == "offline-playlists";
             if (name is "wave" or "collection-wave") selected = section == "wave" && (_waveViewMode == WaveMode.Collection ? name == "collection-wave" : name == "wave");
@@ -74,6 +79,7 @@ public partial class MainWindow
         }
         UpdatePlaylistDownloadedStatus();
         UpdateBrowseButtons();
+        ApplyListSorting(false);
         if (!_settingsOpen) Motion.Enter(CurrentContent());
     }
     private void ShowRows(IEnumerable<TrackRow> rows)
@@ -85,6 +91,7 @@ public partial class MainWindow
         ApplyOfflineStates(snapshot);
         _tracks.Clear();
         foreach (var row in snapshot) { row.IsPlaying = _player.HasSource && _current?.RequestId == row.RequestId; _tracks.Add(row); }
+        ApplyListSorting(false);
         _view.Refresh(); UpdateCount();
         Motion.Enter(TracksList);
     }
@@ -94,7 +101,7 @@ public partial class MainWindow
         {
             SetSection("offline", "Скачанное");
             ShowRows(_offline.Tracks());
-            SetStatus("Офлайн-библиотека · Документы\\YMusic Native\\Music");
+            SetStatus("Офлайн-библиотека · Документы\\Yamuse\\Music");
         }
         catch (Exception ex) { ShowError(ex); }
     }

@@ -15,6 +15,7 @@ internal sealed record PlayerPreferences
     public bool AutoDownloadFavorites { get; init; } // Opt in; existing settings default to false.
     public int ConcurrentDownloads { get; init; } = DefaultConcurrentDownloads;
     public double CrossfadeSeconds { get; init; } = 3;
+    public bool NormalizeVolume { get; init; }
 }
 
 // This file contains playback preferences only; authentication remains in SessionStore.

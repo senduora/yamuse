@@ -41,6 +41,21 @@ public static class SmoothScroll
         if (States.TryGetValue(viewer, out var state)) state.Stop();
     }
 
+    // Hermite interpolation preserves the visible velocity when another wheel
+    // packet extends the target. Restarting ease-out with 3 * distance / duration
+    // on every packet creates a new speed jump each time, even at a steady rate.
+    internal static (double Offset, double Velocity) Interpolate(double start, double target,
+        double initialVelocity, double progress)
+    {
+        var t = Math.Clamp(progress, 0, 1);
+        var distance = target - start;
+        var tangent = Math.Clamp(initialVelocity * DurationMilliseconds,
+            Math.Min(0, 3 * distance), Math.Max(0, 3 * distance));
+        var offset = start + distance * t * t * (3 - 2 * t) + tangent * t * (1 - t) * (1 - t);
+        var velocity = (distance * 6 * t * (1 - t) + tangent * (1 - t) * (1 - 3 * t)) / DurationMilliseconds;
+        return (offset, velocity);
+    }
+
     private static void OnEnabledChanged(DependencyObject target, DependencyPropertyChangedEventArgs args)
     {
         if (target is not ScrollViewer viewer) return;
@@ -83,7 +98,7 @@ public static class SmoothScroll
         for (DependencyObject? current = source; current is not null; current = Parent(current))
         {
             if (current is not ScrollViewer viewer || viewer.ScrollableHeight <= Epsilon) continue;
-            var offset = States.TryGetValue(viewer, out var state) && state.IsAnimating
+            var offset = States.TryGetValue(viewer, out var state) && state.HasPendingOffset
                 ? state.TargetOffset : viewer.VerticalOffset;
             if (delta > 0 ? offset > Epsilon : offset < viewer.ScrollableHeight - Epsilon) return viewer;
         }
@@ -122,10 +137,16 @@ public static class SmoothScroll
         private double _startOffset;
         private double _requestedOffset;
         private bool _scrollPending;
+        private bool _precisionPending;
+        private double _precisionOrigin;
+        private double _precisionRemainder;
         private long _started;
         private TimeSpan? _renderStarted;
         private TimeSpan? _lastRenderingTime;
+        private double _initialVelocity;
+        private double _velocity;
         internal bool IsAnimating { get; private set; }
+        internal bool HasPendingOffset => IsAnimating || _precisionPending;
         internal double TargetOffset { get; private set; }
 
         internal ScrollState(ScrollViewer viewer)
@@ -150,22 +171,45 @@ public static class SmoothScroll
         private void OnWheel(object sender, MouseWheelEventArgs args)
         {
             if (args.Handled || args.Delta == 0 || Keyboard.Modifiers != ModifierKeys.None ||
-                !_viewer.IsLoaded || !_viewer.IsVisible || !_viewer.IsEnabled || !Motion.CanAnimate) return;
+                !_viewer.IsLoaded || !_viewer.IsVisible || !_viewer.IsEnabled) return;
             var source = args.OriginalSource as DependencyObject ?? _viewer;
             if (NativeInputOwner(source) || !ReferenceEquals(WheelOwner(source, args.Delta), _viewer) ||
                 !PixelScrolling(_viewer)) return;
+            if (!Motion.CanAnimate && Math.Abs(args.Delta) >= 120) return;
             var lines = SystemParameters.WheelScrollLines;
             if (lines == 0) return;
             var distance = -args.Delta / 120d * (lines < 0 ? _viewer.ViewportHeight : lines * 16d);
-            var current = _viewer.VerticalOffset;
+            var current = _precisionPending ? TargetOffset : _viewer.VerticalOffset + _precisionRemainder;
             // Reverse immediately from the visible position instead of first paying
             // off an accumulated target in the old direction.
             var basis = IsAnimating && Math.Sign(distance) == Math.Sign(TargetOffset - current)
                 ? TargetOffset : current;
             var target = Math.Clamp(basis + distance, 0, _viewer.ScrollableHeight);
             if (Math.Abs(target - current) <= Epsilon) return;
+            // High-resolution wheel packets already describe fine movement at
+            // the device's cadence. Queue their exact pixel distance once instead
+            // of turning each small packet into another 280 ms animation tail.
+            if (Math.Abs(args.Delta) < 120)
+            {
+                var origin = _precisionPending ? _precisionOrigin : _viewer.VerticalOffset;
+                Cancel();
+                _precisionOrigin = origin;
+                TargetOffset = Math.Clamp(current + distance, 0, _viewer.ScrollableHeight);
+                _precisionPending = true;
+                _viewer.ScrollToVerticalOffset(TargetOffset);
+                args.Handled = true;
+                return;
+            }
+            if (_precisionPending)
+            {
+                _requestedOffset = current;
+                _scrollPending = true;
+                _precisionPending = false;
+            }
+            var continuing = IsAnimating && Math.Sign(distance) == Math.Sign(TargetOffset - current);
+            _initialVelocity = continuing ? _velocity : 3 * (target - current) / DurationMilliseconds;
             _startOffset = current;
-            if (!IsAnimating) _requestedOffset = current;
+            if (!IsAnimating && !_scrollPending) _requestedOffset = current;
             TargetOffset = target;
             _started = Stopwatch.GetTimestamp();
             _renderStarted = null;
@@ -179,10 +223,18 @@ public static class SmoothScroll
 
         internal void AnimateTo(double target)
         {
-            var current = _viewer.VerticalOffset;
+            var current = _precisionPending ? TargetOffset : _viewer.VerticalOffset;
             if (Math.Abs(target - current) <= Epsilon) return;
+            if (_precisionPending)
+            {
+                _requestedOffset = current;
+                _scrollPending = true;
+                _precisionPending = false;
+            }
             _startOffset = current;
-            if (!IsAnimating) _requestedOffset = current;
+            _initialVelocity = IsAnimating && Math.Sign(target - current) == Math.Sign(TargetOffset - current)
+                ? _velocity : 3 * (target - current) / DurationMilliseconds;
+            if (!IsAnimating && !_scrollPending) _requestedOffset = current;
             TargetOffset = target;
             _started = Stopwatch.GetTimestamp();
             _renderStarted = null;
@@ -214,8 +266,7 @@ public static class SmoothScroll
             if (_scrollPending) return;
             var elapsed = elapsedMilliseconds / DurationMilliseconds;
             var progress = Math.Clamp(elapsed, 0, 1);
-            var eased = 1 - Math.Pow(1 - progress, 3);
-            _requestedOffset = _startOffset + (TargetOffset - _startOffset) * eased;
+            (_requestedOffset, _velocity) = Interpolate(_startOffset, TargetOffset, _initialVelocity, progress);
             // Match layout's physical-pixel rounding before deciding whether a
             // command can change the viewport. A fixed 1-DIP cutoff suppresses
             // visible one-pixel frames on high-DPI displays.
@@ -240,13 +291,32 @@ public static class SmoothScroll
 
         private void OnScrollChanged(object sender, ScrollChangedEventArgs args)
         {
-            if (!IsAnimating || !ReferenceEquals(args.OriginalSource, _viewer)) return;
+            if (!ReferenceEquals(args.OriginalSource, _viewer)) return;
+            if (!HasPendingOffset)
+            {
+                if (args.VerticalChange != 0) _precisionRemainder = 0;
+                return;
+            }
             if (args.ExtentHeightChange != 0 || args.ViewportHeightChange != 0)
             {
                 Cancel();
                 return;
             }
             if (args.VerticalChange == 0) return;
+            if (_precisionPending)
+            {
+                if (Math.Abs(_viewer.VerticalOffset - TargetOffset) <= OffsetTolerance)
+                {
+                    // Carry the subpixel remainder across acknowledged packets;
+                    // rounding each tiny delta independently doubles or loses
+                    // distance on displays such as 125% scaling.
+                    _precisionRemainder = TargetOffset - _viewer.VerticalOffset;
+                    _precisionPending = false;
+                }
+                else if (_viewer.VerticalOffset < Math.Min(_precisionOrigin, TargetOffset) - OffsetTolerance ||
+                    _viewer.VerticalOffset > Math.Max(_precisionOrigin, TargetOffset) + OffsetTolerance) Cancel();
+                return;
+            }
             if (_scrollPending && Math.Abs(_viewer.VerticalOffset - _requestedOffset) <= OffsetTolerance)
                 _scrollPending = false;
             else Cancel(); // A native key, scrollbar or external ScrollTo owns this move.
@@ -264,9 +334,12 @@ public static class SmoothScroll
 
         private void Cancel()
         {
-            if (!IsAnimating) return;
+            _precisionPending = false;
+            _precisionRemainder = 0;
+            if (!IsAnimating) { _scrollPending = false; return; }
             IsAnimating = false;
             _scrollPending = false;
+            _velocity = 0;
             CompositionTarget.Rendering -= OnRendering;
         }
 

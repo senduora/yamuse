@@ -78,10 +78,12 @@ public partial class MainWindow
         SeekSlider.Value = target;
         PositionText.Text = FormatTime(TimeSpan.FromSeconds(target));
         UpdateLyrics(target);
+        SavePlaybackState();
     }
 
     private TimeSpan DisplayPosition(TimeSpan nativePosition)
     {
+        if (RestoredPlaybackPosition is { } restored) return restored;
         if (_pendingSeek is not { } target) return nativePosition;
         if (!_player.HasSource || Math.Abs(nativePosition.TotalSeconds - target) < .8 || _seekClock.ElapsedMilliseconds > 1500)
         { _pendingSeek = null; return nativePosition; }
