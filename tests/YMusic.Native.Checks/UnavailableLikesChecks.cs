@@ -117,7 +117,7 @@ internal static partial class Program
         internal ListView List=>((Grid)Control<ContentControl>(Window,"DownloadCenterPanel").Content).Children.OfType<ListView>().Single();
         internal Button Unlike=>SaVisuals<Button>(Window.DownloadCenterView).Single(b=>b.Name=="DownloadUnlikeButton");
         internal Button Retry=>SaVisuals<Button>(Window.DownloadCenterView).Single(b=>b.Name=="DownloadRetryButton");
-        internal MenuItem Menu=>List.ContextMenu.Items.OfType<MenuItem>().Single();
+        internal MenuItem Menu=>List.ContextMenu.Items.OfType<MenuItem>().Single(item => item.Header?.ToString()?.StartsWith("Убрать из «Мне нравится»", StringComparison.Ordinal) == true);
         internal UlFixture(string name)
         {
             DirectoryPath=Path.Combine(_directory,"unavailable-likes-"+name);Directory.CreateDirectory(DirectoryPath);

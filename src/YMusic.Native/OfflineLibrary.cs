@@ -2,6 +2,8 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Collections.Concurrent;
+using System.Buffers;
+using System.ComponentModel;
 
 namespace YMusic.Native;
 
@@ -91,14 +93,18 @@ internal sealed class OfflineLibrary : IDisposable
     }
 
     public OfflinePlaylistStatus GetPlaylistStatus(string owner, string kind, IReadOnlyList<TrackRow>? currentTracks = null)
+        => InspectPlaylistStatus(owner, kind, currentTracks, CancellationToken.None);
+
+    internal OfflinePlaylistStatus InspectPlaylistStatus(string owner, string kind, IReadOnlyList<TrackRow>? currentTracks, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
         var snapshot = GetPlaylists().FirstOrDefault(p => p.Owner == owner && p.Kind == kind);
         if (snapshot is null) return new(currentTracks?.Count ?? 0, 0, false, false, false);
         var tracks = currentTracks is null ? snapshot.Tracks : currentTracks.Select(TrackMetadata).ToArray();
         var changed = tracks.Count != snapshot.Tracks.Count
             || !tracks.Zip(snapshot.Tracks).All(pair => SameTrackMetadata(pair.First, pair.Second));
         var library = LoadLibrary();
-        var downloaded = tracks.Count(t => t.Available && Find(ToRow(t), library) is not null);
+        var downloaded = tracks.Count(t => { token.ThrowIfCancellationRequested(); return t.Available && Find(ToRow(t), library) is not null; });
         // Quality is retained as requested metadata. Completion uses actual valid files,
         // independently of the UI's currently selected quality or codec fallback.
         return new(tracks.Count, downloaded, tracks.Count > 0 && !changed && downloaded == tracks.Count, changed, true);
@@ -200,50 +206,85 @@ internal sealed class OfflineLibrary : IDisposable
     public Task<OfflineRemovalResult> RemoveTrackAsync(string trackId, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(trackId);
-        return RemoveAsync(trackId, cancellationToken);
+        return Task.Run(() => RemoveAsync(trackId, cancellationToken, null), cancellationToken);
     }
-    public Task<OfflineRemovalResult> ClearAsync(CancellationToken cancellationToken) => RemoveAsync(null, cancellationToken);
+    public Task<OfflineRemovalResult> ClearAsync(CancellationToken cancellationToken) => ClearAsync(cancellationToken, null);
+    public Task<OfflineRemovalResult> ClearAsync(CancellationToken cancellationToken, IProgress<OfflineCleanupProgress>? progress)
+        => Task.Run(() => RemoveAsync(null, cancellationToken, progress), cancellationToken);
 
-    private async Task<OfflineRemovalResult> RemoveAsync(string? trackId, CancellationToken cancellationToken)
+    private async Task<OfflineRemovalResult> RemoveAsync(string? trackId, CancellationToken cancellationToken, IProgress<OfflineCleanupProgress>? progress)
     {
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        var staged = new List<(OfflineItem Item, string Original, string Quarantine)>();
+        var staged = new ConcurrentBag<StagedRemoval>();
         var removed = 0; var preserved = 0; var failed = 0; var committed = false;
         var retained = new List<OfflineItem>();
+        UninstallPathGuard.AncestorLease? ancestors = null;
         try
         {
             EnsureSafeDirectory();
+            // Reuse the application's handle guard: a drive root is never a
+            // cleanup target, and every existing ancestor stays pinned until
+            // all checked objects have been restored or deleted.
+            _ = UninstallPathGuard.Canonical(DirectoryPath);
             var library = LoadLibrary(force: true);
             // Both indexes are preflighted before a single file is moved.
             var playlists = LoadPlaylists(force: true);
             var selected = library.Items.Where(i => trackId is null || i.Id == trackId).ToArray();
             var remaining = library.Items.Where(i => trackId is not null && i.Id != trackId).ToList();
+            var candidates = selected.DistinctBy(i => i.FileName, StringComparer.OrdinalIgnoreCase).ToArray();
+            var referenced = remaining.Select(i => i.FileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var verified = 0; long verifiedBytes = 0;
+            var totalBytes = candidates.Sum(i => i.Bytes);
+            var resultGate = new object();
+            void Report(string phase)
+                => progress?.Report(new(verified, candidates.Length, removed, preserved, failed, verifiedBytes, totalBytes, phase));
+            Report("verify");
+            EnsureSafeDirectory(create: true);
+            ancestors = UninstallPathGuard.HoldExistingAncestors(_indexPath);
             _directoryState.Generation++; // An already running Save cannot republish after removal.
-            foreach (var item in selected.DistinctBy(i => i.FileName, StringComparer.OrdinalIgnoreCase))
+            // At most two simultaneous media reads. A single seek-limited disk
+            // may not benefit from concurrency; avoiding a second full read is
+            // the main saving on both HDD and SSD.
+            await Parallel.ForEachAsync(candidates, new ParallelOptions { MaxDegreeOfParallelism = 2, CancellationToken = cancellationToken }, async (item, token) =>
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                token.ThrowIfCancellationRequested();
                 var path = ResolvePath(item.FileName);
-                if (!File.Exists(path)) { preserved++; continue; }
-                if (remaining.Any(i => i.FileName.Equals(item.FileName, StringComparison.OrdinalIgnoreCase))) { preserved++; continue; }
+                FileStream? file = null;
                 try
                 {
-                    if (!ValidFile(item)) { preserved++; continue; }
-                    if ((File.GetAttributes(path) & FileAttributes.ReadOnly) != 0) { failed++; retained.Add(item); continue; }
+                    if (!File.Exists(path) || referenced.Contains(item.FileName) || !ValidFile(item))
+                    { lock (resultGate) preserved++; return; }
+                    if ((File.GetAttributes(path) & FileAttributes.ReadOnly) != 0)
+                    { lock (resultGate) { failed++; retained.Add(item); } return; }
                     var quarantine = ResolvePath(".ym-delete-" + Guid.NewGuid().ToString("N") + ".pending");
-                    // Deny writers during verification and rename. Delete sharing allows
-                    // our rename while holding the handle to the checked bytes.
-                    await using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                    if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0 || file.Length != item.Bytes
-                        || Convert.ToHexString(await SHA256.HashDataAsync(file, cancellationToken).ConfigureAwait(false)).ToLowerInvariant() != item.Sha256)
-                    { preserved++; continue; }
+                    // READ|DELETE, FILE_SHARE_READ, OPEN_REPARSE_POINT. The
+                    // native guard validates the opened object itself. Keep
+                    // this exact handle alive through commit and deletion so
+                    // nobody can mutate or replace the verified bytes.
+                    var handle = UninstallPathGuard.OpenOwnedFile(path, read: true);
+                    try { file = new FileStream(handle, FileAccess.Read, bufferSize: 1, isAsync: false); }
+                    catch { handle.Dispose(); throw; }
+                    if (file.Length != item.Bytes
+                        || !await RemovalHashMatchesAsync(file, item.Sha256, token).ConfigureAwait(false))
+                    { lock (resultGate) preserved++; return; }
+                    token.ThrowIfCancellationRequested();
                     EnsureSafeDirectory();
-                    File.Move(path, quarantine);
-                    staged.Add((item, path, quarantine));
+                    ManagedCacheCleanup.RenameByHandle(file.SafeFileHandle, quarantine);
+                    staged.Add(new(item, path, quarantine, file));
+                    file = null; // Ownership transfers to staged until final commit/rollback.
+                    lock (resultGate) verifiedBytes += item.Bytes;
                 }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { failed++; retained.Add(item); }
-            }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
+                { lock (resultGate) { failed++; retained.Add(item); } }
+                finally
+                {
+                    file?.Dispose();
+                    lock (resultGate) { verified++; Report("verify"); }
+                }
+            }).ConfigureAwait(false);
             remaining.AddRange(retained);
             cancellationToken.ThrowIfCancellationRequested();
+            Report("commit");
             // Clear resets snapshots too; deleting one track retains snapshot metadata
             // and its completion is recomputed from actual remaining managed files.
             IndexStamp? snapshotWritten = null;
@@ -270,21 +311,18 @@ internal sealed class OfflineLibrary : IDisposable
                 try
                 {
                     EnsureSafeDirectory();
-                    await using var file = new FileStream(entry.Quarantine, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                    if ((File.GetAttributes(entry.Quarantine) & FileAttributes.ReparsePoint) != 0 || file.Length != entry.Item.Bytes
-                        || Convert.ToHexString(await SHA256.HashDataAsync(file, CancellationToken.None).ConfigureAwait(false)).ToLowerInvariant() != entry.Item.Sha256)
-                    { RestoreStaged(entry.Original, entry.Quarantine); preserved++; continue; }
-                    File.Delete(entry.Quarantine); removed++;
+                    // Index commit is the cancellation boundary. After it, the
+                    // small delete/restore phase completes with no audio reads.
+                    UninstallPathGuard.DeleteByHandle(entry.File.SafeFileHandle);
+                    entry.File.Dispose(); removed++;
                 }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
                 {
-                    var restoredPath = RestoreStaged(entry.Original, entry.Quarantine); failed++;
-                    if (restoredPath is not null)
-                    {
-                        var restored = entry.Item with { FileName = Path.GetFileName(restoredPath) };
-                        if (await HasExpectedHashAsync(restored, CancellationToken.None).ConfigureAwait(false)) retained.Add(restored);
-                    }
+                    var restoredPath = RestoreStaged(entry); failed++;
+                    // The same protected handle still proves the digest.
+                    retained.Add(entry.Item with { FileName = Path.GetFileName(restoredPath) });
                 }
+                finally { Report("delete"); }
             }
             // Failed managed files remain discoverable for a later retry. The
             // second commit merges fresh external/unrelated entries instead of
@@ -298,14 +336,36 @@ internal sealed class OfflineLibrary : IDisposable
                 if (repaired.Count != latest.Items.Count)
                     await WriteIndexAsync(_indexPath, repaired, LibraryJson, latest.Stamp, CancellationToken.None).ConfigureAwait(false);
             }
+            Report("complete");
             return new(removed, preserved, failed, selected.Length - retained.Count);
         }
         finally
         {
-            if (!committed) foreach (var entry in staged) RestoreStaged(entry.Original, entry.Quarantine);
+            foreach (var entry in staged)
+            {
+                if (!committed) RestoreStaged(entry);
+                entry.File.Dispose();
+            }
+            ancestors?.Dispose();
             lock (_cacheLock) { _libraryCache = null; _playlistCache = null; }
             _writeLock.Release();
         }
+    }
+
+    private static async Task<bool> RemovalHashMatchesAsync(FileStream file, string expected, CancellationToken token)
+    {
+        // Staged streams retain only their protected handle. A read buffer belongs
+        // to one of the two active workers, never to every retained media file.
+        var buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+        try
+        {
+            using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            int read;
+            while ((read = await file.ReadAsync(buffer.AsMemory(0, 256 * 1024), token).ConfigureAwait(false)) != 0)
+                digest.AppendData(buffer, 0, read);
+            return Convert.ToHexString(digest.GetHashAndReset()).Equals(expected, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { ArrayPool<byte>.Shared.Return(buffer); }
     }
 
     private async Task<bool> HasExpectedHashAsync(OfflineItem item, CancellationToken cancellationToken)
@@ -318,17 +378,18 @@ internal sealed class OfflineLibrary : IDisposable
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
     }
-    private string? RestoreStaged(string original, string quarantine)
+    private string RestoreStaged(StagedRemoval entry)
     {
         try
         {
             EnsureSafeDirectory();
-            if (!File.Exists(quarantine)) return File.Exists(original) ? original : null;
-            var recovered = File.Exists(original) ? ResolvePath(".ym-recovered-" + Guid.NewGuid().ToString("N") + Path.GetExtension(original)) : original;
-            File.Move(quarantine, recovered); return recovered;
+            var recovered = File.Exists(entry.Original) ? ResolvePath(".ym-recovered-" + Guid.NewGuid().ToString("N") + Path.GetExtension(entry.Original)) : entry.Original;
+            ManagedCacheCleanup.RenameByHandle(entry.File.SafeFileHandle, recovered); return recovered;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or MusicException) { return null; /* Keep the uniquely named file for recovery. */ }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or MusicException or Win32Exception)
+        { return entry.Quarantine; /* Keep the uniquely named, verified file for recovery. */ }
     }
+    private sealed record StagedRemoval(OfflineItem Item, string Original, string Quarantine, FileStream File);
     private void SafeDeleteStaged(string? path)
     {
         if (path is null) return;

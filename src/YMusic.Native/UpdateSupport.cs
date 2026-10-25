@@ -15,8 +15,8 @@ internal enum AppUpdateStatus
 internal sealed record AppUpdateState(AppUpdateStatus Status, bool FeedConfigured, bool IsInstalled,
     string CurrentVersion, string? AvailableVersion, int? ProgressPercent, string Message);
 
-// Created lazily when settings are opened. No timer, automatic check, download,
-// application, or account storage access is part of this service.
+// The window checks once on startup and owns all user interactions. This service
+// has no timer, automatic download/application, or account storage access.
 internal sealed class UpdateSupport
 {
     private static readonly Lazy<UpdateSupport> Instance = new(() => new(
@@ -46,7 +46,7 @@ internal sealed class UpdateSupport
             invalid ? "Файл настройки обновлений некорректен."
             : repository is null ? "Источник обновлений пока не настроен."
             : !isInstalled ? "Обновления доступны после установки приложения. Сейчас запущена переносимая версия."
-            : "Проверка обновлений запускается вручную.");
+            : "Обновления проверяются при запуске. Можно проверить их вручную.");
     }
 
     internal Task<AppUpdateState> CheckAsync(CancellationToken cancellationToken = default)
@@ -101,12 +101,23 @@ internal sealed class UpdateSupport
                 return Set(AppUpdateStatus.Error, "Сначала проверьте наличие обновления.");
             var version = State.AvailableVersion;
             Set(AppUpdateStatus.Downloading, "Скачиваем обновление. Музыка продолжает играть.", version, 0);
-            await _backend.DownloadAsync(percent =>
+            var progressGate = new object();
+            var acceptingProgress = true;
+            try
             {
-                var value = Math.Clamp(percent, 0, 100);
-                Set(AppUpdateStatus.Downloading, "Скачиваем обновление. Музыка продолжает играть.", version, value);
-                progress?.Report(value);
-            }, cancellationToken).ConfigureAwait(false);
+                await _backend.DownloadAsync(percent =>
+                {
+                    lock (progressGate)
+                    {
+                        if (!acceptingProgress || cancellationToken.IsCancellationRequested) return;
+                        var value = Math.Clamp(percent, 0, 100);
+                        Set(AppUpdateStatus.Downloading, "Скачиваем обновление. Музыка продолжает играть.", version, value);
+                        progress?.Report(value);
+                    }
+                }, cancellationToken).ConfigureAwait(false);
+            }
+            finally { lock (progressGate) acceptingProgress = false; }
+            cancellationToken.ThrowIfCancellationRequested();
             return Set(AppUpdateStatus.Downloaded, "Обновление загружено. Установите его, когда закончите слушать.", version, 100);
         }
         catch (OperationCanceledException)

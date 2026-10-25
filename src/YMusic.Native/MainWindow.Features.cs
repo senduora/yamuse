@@ -9,7 +9,7 @@ public partial class MainWindow
 {
     private readonly List<TrackRow> _favoritesCache = [];
     private readonly List<TrackRow> _waveTracks = [];
-    private readonly Dictionary<TrackRow, (string SessionId, string BatchId)> _waveSources = new();
+    private readonly Dictionary<TrackRow, (string SessionId, string BatchId, WaveMode Mode, string? TrackSeedId)> _waveSources = new();
     private readonly OfflineLibrary _offline;
     private CancellationTokenSource? _featureCts;
     private CancellationTokenSource? _downloadCts;
@@ -28,7 +28,7 @@ public partial class MainWindow
     private AudioQuality SelectedQuality => QualityCombo.SelectedIndex switch { 2 => AudioQuality.Economical, 1 => AudioQuality.Optimal, _ => AudioQuality.Excellent };
     private sealed record WaveListening(TrackRow Track, string SessionId, string BatchId, Stopwatch Clock);
 
-    private void InitializeFeatures() { CatalogList.ItemsSource = _catalogItems; _featuresReady = true; }
+    private void InitializeFeatures() { CatalogList.ItemsSource = _catalogItems; InitializeTrackWaveActions(); _featuresReady = true; }
     private void Favorites_Click(object sender, RoutedEventArgs e)
     {
         SetSection("favorites", "Мне нравится");
@@ -66,14 +66,14 @@ public partial class MainWindow
         RefreshButton.Visibility = _session is not null || section == "offline" ? Visibility.Visible : Visibility.Collapsed;
         RefreshButton.ToolTip = section == "wave" ? "Новая волна" : "Обновить раздел";
         FilterHint.Text = section switch { "favorites" => "Поиск в избранном", "offline" => "Поиск в скачанном", "wave" => "Поиск в очереди волны", _ => "Поиск в этом списке" };
-        var active = new SolidColorBrush(Color.FromRgb(51, 37, 34));
+        var active = (Brush)FindResource("AccentSoftBrush");
         FavoritesNav.Background = section == "favorites" ? active : Brushes.Transparent;
         WaveNav.Background = section == "wave" ? active : Brushes.Transparent;
         OfflineNav.Background = section == "offline" ? active : Brushes.Transparent;
         foreach (var (name, button) in new (string, Button)[] { ("home", HomeNav), ("wave", WaveNav), ("collection-wave", CollectionWaveNav), ("favorites", FavoritesNav), ("offline", OfflineNav), ("download-center", DownloadCenterNav), ("search", SearchNav), ("playlists", PlaylistsNav), ("albums", AlbumsNav), ("artists", ArtistsNav), ("queue", QueueNav), ("offline-playlists", OfflinePlaylistsNav), ("queue-history", QueueHistoryNav) })
         {
             var selected = section == name || section == "home-shelf" && name == "home" || section == "playlist-detail" && name == "playlists" || section == "album-detail" && name == "albums" || section is "artist-detail" or "artist-tracks" && name == "artists" || section == "offline-playlist-detail" && name == "offline-playlists";
-            if (name is "wave" or "collection-wave") selected = section == "wave" && (_waveViewMode == WaveMode.Collection ? name == "collection-wave" : name == "wave");
+            if (name is "wave" or "collection-wave") selected = section == "wave" && (_waveViewMode == WaveMode.Collection ? name == "collection-wave" : _waveViewMode == WaveMode.Personal && name == "wave");
             button.Background = selected ? active : Brushes.Transparent;
             button.Foreground = selected ? (Brush)FindResource("AccentBrush") : new SolidColorBrush(Color.FromRgb(184, 186, 195));
         }
@@ -82,6 +82,7 @@ public partial class MainWindow
         ApplyListSorting(false);
         if (!_settingsOpen) Motion.Enter(CurrentContent());
     }
+    private bool _updatingTrackRows;
     private void ShowRows(IEnumerable<TrackRow> rows)
     {
         _catalogShowing = false; CatalogList.Visibility = Visibility.Collapsed; TracksList.Visibility = Visibility.Visible;
@@ -89,10 +90,18 @@ public partial class MainWindow
         PlaySelectionButton.Content = "▶  Слушать";
         var snapshot = rows.ToArray();
         ApplyOfflineStates(snapshot);
-        _tracks.Clear();
-        foreach (var row in snapshot) { row.IsPlaying = _player.HasSource && _current?.RequestId == row.RequestId; _tracks.Add(row); }
-        ApplyListSorting(false);
-        _view.Refresh(); UpdateCount();
+        foreach (var row in snapshot) row.IsPlaying = _player.HasSource && _current?.RequestId == row.RequestId;
+        _updatingTrackRows = true;
+        try
+        {
+            using (_view.DeferRefresh())
+            {
+                _tracks.ReplaceAll(snapshot);
+                ApplyListSorting(false);
+            }
+        }
+        finally { _updatingTrackRows = false; }
+        UpdateCount();
         Motion.Enter(TracksList);
     }
     private void ShowOffline()
@@ -109,19 +118,22 @@ public partial class MainWindow
     {
         if (_session is null) { SetStatus("Войдите в Яндекс, чтобы запустить персональную волну."); return; }
         var mode = _waveViewMode;
-        SetSection("wave", mode == WaveMode.Collection ? "Волна по коллекции" : "Моя волна");
-        if (!renew && _waveBatch?.Mode == mode && _waveTracks.Count > 0) { ShowRows(_waveTracks); UpdateWavePresentation(); return; }
+        var seed = _waveSeedTrack?.Id;
+        SetSection("wave", WaveViewTitle);
+        if (!renew && IsCurrentWaveView && _waveTracks.Count > 0) { ShowRows(_waveTracks); UpdateWavePresentation(); return; }
         _featureCts?.Cancel();
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, _accountCts.Token);
         _featureCts = cts;
+        var request = ++_waveRequestGeneration; var account = _accountGeneration;
         var playback = _playbackGeneration; var queueVersion = _playbackQueue.Version;
         _waveStarting = true; Busy(true); UpdateWavePresentation();
         try
         {
-            SetStatus("Подбираем треки Моей волны…");
+            SetStatus(mode == WaveMode.Track ? "Подбираем волну по треку…" : "Подбираем треки Моей волны…");
             var session = await EnsureSessionAsync(cts.Token);
-            var batch = await _api.StartWaveAsync(session, cts.Token, mode);
+            var batch = await _api.StartWaveAsync(session, cts.Token, mode, mode == WaveMode.Track ? seed : null);
             cts.Token.ThrowIfCancellationRequested();
+            if (_closed || account != _accountGeneration || request != _waveRequestGeneration || !ReferenceEquals(_featureCts, cts)) return;
             if (_playbackGeneration != playback || _playbackQueue.Version != queueVersion)
             { _api.ResetWaveState(); _waveBatch = null; _waveTracks.Clear(); _waveSources.Clear(); return; }
             _waveTracks.Clear();
@@ -133,13 +145,13 @@ public partial class MainWindow
             else SetStatus("Сервис не выдал доступных треков. Нажмите «Новая волна».", true);
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
-        catch (Exception ex) { ShowError(ex); }
-        finally { if (ReferenceEquals(_featureCts, cts)) { _featureCts = null; _waveStarting = false; } cts.Dispose(); Busy(false); UpdateWavePresentation(); }
+        catch (Exception ex) { if (!cts.IsCancellationRequested && account == _accountGeneration && request == _waveRequestGeneration) ShowError(ex); }
+        finally { if (ReferenceEquals(_featureCts, cts)) _featureCts = null; if (request == _waveRequestGeneration) _waveStarting = false; cts.Dispose(); Busy(false); UpdateWavePresentation(); }
     }
     private void AddWaveBatch(RadioBatch batch)
     {
         _waveBatch = batch;
-        foreach (var row in batch.Tracks) { _waveTracks.Add(row); _waveSources[row] = (batch.SessionId, batch.BatchId); }
+        foreach (var row in batch.Tracks) { _waveTracks.Add(row); _waveSources[row] = (batch.SessionId, batch.BatchId, batch.Mode, batch.TrackSeedId); }
         while (_waveTracks.Count > 300)
         {
             var old = _waveTracks[0]; _waveTracks.RemoveAt(0);
@@ -150,17 +162,22 @@ public partial class MainWindow
     private async Task ExtendWaveQueueAsync()
     {
         if (_waveBatch is null || _session is null) return;
+        if (_current is null || !ReferenceEquals(_playbackQueue.Current, _current) || !_waveSources.TryGetValue(_current, out var activeSource)
+            || activeSource.Mode != _waveBatch.Mode || activeSource.TrackSeedId != _waveBatch.TrackSeedId) return;
         if (_advancingWave) return;
         _advancingWave = true; UpdateControls();
         var generation = _playbackGeneration;
+        var request = _waveRequestGeneration; var account = _accountGeneration; var previousBatch = _waveBatch;
         var previousVersion = _playbackQueue.Version;
         var previousTrack = _current;
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, _accountCts.Token);
         try
         {
             var previousSession = _waveBatch.SessionId;
-            var session = await EnsureSessionAsync(_lifetime.Token);
-            var batch = await _api.MoreWaveAsync(session, previousSession, _lifetime.Token);
-            if (_session is null || _closed || generation != _playbackGeneration || _playbackQueue.Version != previousVersion || !ReferenceEquals(_current, previousTrack)) return;
+            var session = await EnsureSessionAsync(cts.Token);
+            var batch = await _api.MoreWaveAsync(session, previousSession, cts.Token);
+            if (_session is null || _closed || generation != _playbackGeneration || account != _accountGeneration || request != _waveRequestGeneration
+                || !ReferenceEquals(_waveBatch, previousBatch) || _playbackQueue.Version != previousVersion || !ReferenceEquals(_current, previousTrack)) return;
             AddWaveBatch(batch);
             if (batch.SessionId != previousSession) QueueWaveFeedback(batch.SessionId, batch.BatchId, "radioStarted", null, 0);
             // Keep only a small playback history; the server queue has its own bounded state.
@@ -170,7 +187,7 @@ public partial class MainWindow
             if (_section == "wave") ShowRows(_waveTracks);
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { ShowError(ex); }
+        catch (Exception ex) { if (!cts.IsCancellationRequested && account == _accountGeneration && request == _waveRequestGeneration) ShowError(ex); }
         finally { _advancingWave = false; UpdateControls(); }
     }
     private void BeginWaveListening(TrackRow track)
@@ -236,7 +253,7 @@ public partial class MainWindow
     }
     private void ResetFeatures()
     {
-        _accountGeneration++; _featureCts?.Cancel(); _downloadCts?.Cancel();
+        _accountGeneration++; _waveRequestGeneration++; _waveStarting = false; _waveSeedTrack = null; _waveViewMode = WaveMode.Personal; _featureCts?.Cancel(); _downloadCts?.Cancel();
         ResetBrowseState();
         CancelNextPreparation();
         _pendingAutoFavorites = null;

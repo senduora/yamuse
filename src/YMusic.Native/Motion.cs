@@ -93,6 +93,13 @@ public static class Motion
 
     private static void AnimateBrush(DependencyObject target, DependencyProperty property, Brush? value)
     {
+        // The shared accent already owns its five-second colour animation.
+        // A private clone would stop following it until the next hover trigger.
+        if (value is SolidColorBrush { IsFrozen: false, HasAnimatedProperties: true })
+        {
+            target.SetCurrentValue(property, value);
+            return;
+        }
         var previous = target.GetValue(property) as SolidColorBrush;
         if (!CanAnimate || previous is null || value is not SolidColorBrush next || previous.Color == next.Color)
         {

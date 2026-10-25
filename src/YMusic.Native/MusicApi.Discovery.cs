@@ -317,7 +317,7 @@ internal sealed partial class MusicApi
             var owner = row.TryGetProperty("owner", out var ownerRow) ? Text(ownerRow, "uid") : "";
             if (owner.Length > 0 && uid.Length > 0 && owner != uid) return null;
             if (owner.Length == 0) owner = uid;
-            return string.IsNullOrWhiteSpace(owner) ? null : new(id, kind, title, Text(row, "description"), owner, id, CoverUri: EntityArtwork(row, kind));
+            return string.IsNullOrWhiteSpace(owner) ? null : new(id, kind, title, Text(row, "description"), owner, id, CoverUri: EntityArtwork(row, kind), OwnerName: CatalogPlaylistOwnerName(row));
         }
         string? albumId = null;
         if (kind == "track" && row.TryGetProperty("albums", out var albums) && albums.ValueKind == JsonValueKind.Array && albums.GetArrayLength() > 0)

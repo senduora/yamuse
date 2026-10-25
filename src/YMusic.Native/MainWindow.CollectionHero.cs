@@ -57,7 +57,7 @@ public partial class MainWindow
             BrowseBackButton.HorizontalAlignment = HorizontalAlignment.Right;
             BrowseBackButton.VerticalAlignment = VerticalAlignment.Top;
             BrowseBackButton.Margin = new Thickness(0, 1, 0, 0);
-            BrowseBackButton.Padding = new Thickness(0, 2, 0, 4);
+            BrowseBackButton.Padding = new Thickness(12, 6, 12, 6);
             MoveHeroControl(TrackFilterPanel, heroSurface);
             Grid.SetColumn(TrackFilterPanel, 1);
             TrackFilterPanel.Width = 188;
@@ -190,7 +190,7 @@ public partial class MainWindow
         heading.Foreground = new SolidColorBrush(Color.FromRgb(243, 241, 240));
         heading.FontWeight = FontWeights.Bold; heading.Margin = new Thickness(0, 2, 94, 0);
         text.Children.Add(heading);
-        var creditsRow = new Grid { Name = "CollectionHeroCreatorRow", Margin = new Thickness(0, 2, 200, 0) };
+        var creditsRow = new Grid { Name = "CollectionHeroCreatorRow", Margin = new Thickness(0, string.IsNullOrWhiteSpace(creator) ? 0 : 2, 200, 0) };
         creditsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         creditsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         if (!string.IsNullOrWhiteSpace(creator))

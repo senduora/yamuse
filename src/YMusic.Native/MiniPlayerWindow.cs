@@ -8,11 +8,12 @@ using System.Windows.Media;
 
 namespace YMusic.Native;
 
-// A view of the main player's state. No clock, queue, media engine or network.
+// A view of the main player's state. WPF animates its display between native
+// observations; it owns no playback timer, queue, media engine or network.
 internal sealed class MiniPlayerWindow : Window
 {
     private static readonly Brush Muted = Brush("#989BA7");
-    private static readonly Brush Accent = Brush("#EA571C");
+    private static Brush Accent => (Brush)Application.Current.FindResource("AccentBrush");
     private readonly TextBlock _coverPlaceholder;
     private readonly Button _previous;
     private readonly Button _next;
@@ -21,6 +22,8 @@ internal sealed class MiniPlayerWindow : Window
     private double _position, _duration;
     private string _title = "", _artist = "";
     private string? _trackKey;
+    private bool _isPlaying;
+    private SliderGesture? _seekGesture, _volumeGesture;
 
     internal event Action<ShellAction>? Command;
     internal event Action<double>? SeekRequested;
@@ -62,7 +65,7 @@ internal sealed class MiniPlayerWindow : Window
         PinButton.Template = (ControlTemplate)XamlReader.Parse("""
             <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="ToggleButton">
               <Border x:Name="Surface" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" CornerRadius="6" Background="{TemplateBinding Background}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border>
-              <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Surface" Property="Background" Value="#30323B"/></Trigger><Trigger Property="IsChecked" Value="True"><Setter TargetName="Surface" Property="Background" Value="#352724"/></Trigger></ControlTemplate.Triggers>
+              <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Surface" Property="Background" Value="#30323B"/></Trigger><Trigger Property="IsChecked" Value="True"><Setter TargetName="Surface" Property="Background" Value="{DynamicResource AccentSoftBrush}"/></Trigger></ControlTemplate.Triggers>
             </ControlTemplate>
             """);
         AutomationProperties.SetName(PinButton, "Поверх других окон");
@@ -116,31 +119,18 @@ internal sealed class MiniPlayerWindow : Window
         _previous = IconButton("\uE892", "Предыдущий трек", () => Command?.Invoke(ShellAction.Previous), 37, 39, 17);
         PlayButton = IconButton("\uE768", "Играть", () => Command?.Invoke(ShellAction.PlayPause), 44, 44, 18);
         PlayButton.Template = ButtonTemplate(22);
-        PlayButton.Background = Accent; PlayButton.Foreground = Brush("#21191B"); PlayButton.Margin = new Thickness(7, 0, 7, 0);
+        PlayButton.Background = Accent; PlayButton.Foreground = (Brush)FindResource("AccentForegroundBrush"); PlayButton.Margin = new Thickness(7, 0, 7, 0);
         _next = IconButton("\uE893", "Следующий трек", () => Command?.Invoke(ShellAction.Next), 37, 39, 17);
         transport.Children.Add(_previous); transport.Children.Add(PlayButton); transport.Children.Add(_next); Grid.SetColumn(transport, 1); controls.Children.Add(transport);
         _volumeText = new TextBlock { Foreground = Muted, FontSize = 10, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center };
         Grid.SetColumn(_volumeText, 2); controls.Children.Add(_volumeText); Grid.SetRow(controls, 3); root.Children.Add(controls);
 
-        SeekSlider.AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler((_, args) =>
-        {
-            if (args.ChangedButton != MouseButton.Left || !_canSeek) return;
-            BeginSeek(false);
-            // A point click is handled by Slider before its instance handlers.
-            // Capture that gesture too, so release outside the rail finishes it.
-            if (Mouse.LeftButton == MouseButtonState.Pressed && !InsideThumb(args.OriginalSource as DependencyObject)) SeekSlider.CaptureMouse();
-        }), true);
-        SeekSlider.AddHandler(Mouse.PreviewMouseUpEvent, new MouseButtonEventHandler((_, args) =>
-        {
-            if (args.ChangedButton == MouseButton.Left) CompleteSeek(false);
-        }), true);
-        SeekSlider.LostMouseCapture += (_, _) => { if (_pointerSeeking && !SeekSlider.IsMouseCaptureWithin) CancelSeek(); };
-        SeekSlider.AddHandler(Thumb.DragStartedEvent, new DragStartedEventHandler((_, _) => BeginSeek(false)), true);
-        SeekSlider.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((_, args) => { if (args.Canceled) CancelSeek(); else CompleteSeek(false); }), true);
-        SeekSlider.PreviewKeyDown += (_, args) => { if (SeekKey(args.Key)) BeginSeek(true); else if (args.Key == Key.Escape) CancelSeek(); };
-        SeekSlider.PreviewKeyUp += (_, args) => { if (SeekKey(args.Key)) CompleteSeek(true); };
-        SeekSlider.LostKeyboardFocus += (_, _) => { if (_keySeeking) CompleteSeek(true); };
-        Deactivated += (_, _) => { if (_keySeeking) CompleteSeek(true); else CancelSeek(); };
+        _seekGesture = new SliderGesture(SeekSlider, () => BeginSeek(_seekGesture?.IsKeyboardActive == true),
+            commit => { if (commit) CompleteSeek(_keySeeking); else CancelSeek(); }, registerPointer: false);
+        SeekSlider.AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(_seekGesture.Start), true);
+        SeekSlider.AddHandler(Mouse.PreviewMouseUpEvent, new MouseButtonEventHandler(_seekGesture.End), true);
+        _volumeGesture = new SliderGesture(VolumeSlider, () => { }, _ => { });
+        Deactivated += (_, _) => { if (_keySeeking) _seekGesture.Complete(true); else _seekGesture.Cancel(); };
         SeekSlider.ValueChanged += (_, _) =>
         {
             if (_syncingSeek || !IsSeeking) return;
@@ -151,7 +141,7 @@ internal sealed class MiniPlayerWindow : Window
             _volumeText.Text = $"{Math.Round(VolumeSlider.Value):0}%";
             if (!_syncingVolume) VolumeRequested?.Invoke(VolumeSlider.Value);
         };
-        Closed += (_, _) => { CancelSeek(); Command = null; SeekRequested = null; VolumeRequested = null; ShowMainRequested = null; };
+        Closed += (_, _) => { _seekGesture.Cancel(); _volumeGesture.Cancel(); PlaybackTimeline.Stop(SeekSlider); Command = null; SeekRequested = null; VolumeRequested = null; ShowMainRequested = null; };
         Update("", "", false, false, false); UpdateDetails(null, 0, 0, false, false, false, 70);
     }
 
@@ -163,7 +153,8 @@ internal sealed class MiniPlayerWindow : Window
             CancelSeek(); _canSeek = false; SeekSlider.IsEnabled = false;
             CoverImage.Source = null; _coverPlaceholder.Visibility = Visibility.Visible;
         }
-        _title = title; _artist = artist; _hasTrack = !string.IsNullOrWhiteSpace(title);
+        _title = title; _artist = artist; _hasTrack = !string.IsNullOrWhiteSpace(title); _isPlaying = isPlaying;
+        if (!isPlaying) PlaybackTimeline.Stop(SeekSlider);
         TitleText.Text = _hasTrack ? title : "Музыка рядом"; TitleText.ToolTip = _hasTrack ? title : null;
         ArtistText.Text = _hasTrack && !string.IsNullOrWhiteSpace(artist) ? artist : "Выберите трек в основном окне";
         PlayButton.Content = Glyph(isPlaying ? "\uE769" : "\uE768", 18);
@@ -172,7 +163,7 @@ internal sealed class MiniPlayerWindow : Window
         if (!_hasTrack) UpdateDetails(null, 0, 0, false, false, false, VolumeSlider.Value);
     }
 
-    internal void UpdateDetails(ImageSource? cover, double positionSeconds, double durationSeconds, bool canSeek, bool isLiked, bool canLike, double volumePercent, string? trackKey = null)
+    internal void UpdateDetails(ImageSource? cover, double positionSeconds, double durationSeconds, bool canSeek, bool isLiked, bool canLike, double volumePercent, string? trackKey = null, double speedRatio = 1, bool advancePlayhead = false)
     {
         VerifyAccess();
         if (!string.Equals(_trackKey, trackKey, StringComparison.Ordinal)) { CancelSeek(); _trackKey = trackKey; }
@@ -184,8 +175,7 @@ internal sealed class MiniPlayerWindow : Window
         _syncingSeek = true;
         try
         {
-            SeekSlider.Maximum = Math.Max(1, duration);
-            if (!IsSeeking) { SeekSlider.Value = _position; PositionText.Text = Time(_position); }
+            if (!IsSeeking) { PlaybackTimeline.Update(SeekSlider, _position, duration, _isPlaying && allowSeek && advancePlayhead, speedRatio); PositionText.Text = Time(_position); }
         }
         finally { _syncingSeek = false; }
         DurationText.Text = Time(duration);
@@ -194,7 +184,7 @@ internal sealed class MiniPlayerWindow : Window
         LikeButton.Foreground = isLiked && _hasTrack ? Accent : Foreground;
         LikeButton.ToolTip = isLiked ? "Убрать из Мне нравится" : "Добавить в Мне нравится"; AutomationProperties.SetName(LikeButton, LikeButton.ToolTip.ToString());
         _syncingVolume = true;
-        try { VolumeSlider.Value = double.IsFinite(volumePercent) ? Math.Clamp(volumePercent, 0, 100) : 0; }
+        try { if (_volumeGesture?.IsActive != true) VolumeSlider.Value = double.IsFinite(volumePercent) ? Math.Clamp(volumePercent, 0, 100) : 0; }
         finally { _syncingVolume = false; }
     }
 
@@ -221,6 +211,8 @@ internal sealed class MiniPlayerWindow : Window
     {
         _pointerSeeking = _keySeeking = _seekDirty = false;
         if (SeekSlider is null || PositionText is null) return;
+        if (_seekGesture?.IsActive == true) _seekGesture.Cancel();
+        PlaybackTimeline.Stop(SeekSlider);
         if (ReferenceEquals(Mouse.Captured, SeekSlider)) SeekSlider.ReleaseMouseCapture();
         _syncingSeek = true;
         try { SeekSlider.Value = Math.Clamp(_position, 0, SeekSlider.Maximum); PositionText.Text = Time(_position); }
@@ -250,11 +242,11 @@ internal sealed class MiniPlayerWindow : Window
               <Grid x:Name="Surface" Background="Transparent">
                 <Border Height="4" Margin="5,0" CornerRadius="2" Background="#3A3C45" VerticalAlignment="Center"/>
                 <Track x:Name="PART_Track" Orientation="Horizontal" IsDirectionReversed="False">
-                  <Track.DecreaseRepeatButton><RepeatButton Command="Slider.DecreaseLarge" Background="#EA571C" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Height="4" Margin="5,0,0,0" CornerRadius="2" Background="{TemplateBinding Background}" VerticalAlignment="Center"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.DecreaseRepeatButton>
-                  <Track.Thumb><Thumb Width="10" Height="10"><Thumb.Template><ControlTemplate TargetType="Thumb"><Ellipse Fill="#EA571C"/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
+                  <Track.DecreaseRepeatButton><RepeatButton Command="Slider.DecreaseLarge" Background="{DynamicResource AccentBrush}" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Height="4" Margin="5,0,0,0" CornerRadius="2" Background="{TemplateBinding Background}" VerticalAlignment="Center"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.DecreaseRepeatButton>
+                  <Track.Thumb><Thumb Width="10" Height="10"><Thumb.Template><ControlTemplate TargetType="Thumb"><Ellipse Fill="{DynamicResource AccentBrush}"/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
                   <Track.IncreaseRepeatButton><RepeatButton Command="Slider.IncreaseLarge" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Background="Transparent"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.IncreaseRepeatButton>
                 </Track>
-                <Border x:Name="Focus" CornerRadius="6" BorderBrush="#EA571C" BorderThickness="1" Opacity="0" IsHitTestVisible="False"/>
+                <Border x:Name="Focus" CornerRadius="6" BorderBrush="{DynamicResource AccentBrush}" BorderThickness="1" Opacity="0" IsHitTestVisible="False"/>
               </Grid>
               <ControlTemplate.Triggers><Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="Focus" Property="Opacity" Value="0.7"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter TargetName="Surface" Property="Opacity" Value="0.35"/></Trigger></ControlTemplate.Triggers>
             </ControlTemplate>

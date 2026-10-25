@@ -16,6 +16,8 @@ internal sealed record PlayerPreferences
     public int ConcurrentDownloads { get; init; } = DefaultConcurrentDownloads;
     public double CrossfadeSeconds { get; init; } = 3;
     public bool NormalizeVolume { get; init; }
+    public bool AccentFromCover { get; init; } = true;
+    public string StaticAccentColor { get; init; } = "#EA571C";
 }
 
 // This file contains playback preferences only; authentication remains in SessionStore.
@@ -102,9 +104,13 @@ internal sealed class PreferencesStore
             Volume = double.IsFinite(preferences.Volume) ? Math.Clamp(preferences.Volume, 0, 1) : 0.5,
             PlaybackSpeed = double.IsFinite(preferences.PlaybackSpeed) ? Math.Clamp(preferences.PlaybackSpeed, 0.5, 2) : 1,
             ConcurrentDownloads = Math.Clamp(preferences.ConcurrentDownloads, 1, 10),
-            CrossfadeSeconds = double.IsFinite(preferences.CrossfadeSeconds) ? Math.Clamp(preferences.CrossfadeSeconds, 0, 10) : 3
+            CrossfadeSeconds = double.IsFinite(preferences.CrossfadeSeconds) ? Math.Clamp(preferences.CrossfadeSeconds, 0, 10) : 3,
+            StaticAccentColor = IsAccentColor(preferences.StaticAccentColor) ? preferences.StaticAccentColor.ToUpperInvariant() : "#EA571C"
         };
     }
+
+    internal static bool IsAccentColor(string? value) => value is { Length: 7 } && value[0] == '#'
+        && value.AsSpan(1).IndexOfAnyExcept("0123456789abcdefABCDEF") < 0;
 
     private static bool TryRead(string path, out PlayerPreferences? preferences)
     {

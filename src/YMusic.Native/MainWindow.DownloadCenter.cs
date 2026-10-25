@@ -38,7 +38,8 @@ public partial class MainWindow
         grid.RowDefinitions.Add(new() { Height = GridLength.Auto });
         grid.RowDefinitions.Add(new() { Height = new GridLength(1, GridUnitType.Star) });
         _downloadCenterSummary = new TextBlock { Name = "DownloadCenterSummary", TextWrapping = TextWrapping.Wrap, FontSize = 14, Margin = new(0, 0, 0, 12) };
-        grid.Children.Add(_downloadCenterSummary);
+        var overview = new StackPanel(); overview.Children.Add(_downloadCenterSummary);
+        overview.Children.Add(InitializeDownloadProgress()); grid.Children.Add(overview);
         var actions = new WrapPanel { Margin = new(0, 0, 0, 8) }; Grid.SetRow(actions, 1); grid.Children.Add(actions);
         _downloadPauseButton = AddButton("Пауза", "DownloadPauseButton", (_, _) => PauseDownloadQueue());
         _downloadResumeButton = AddButton("Продолжить", "DownloadResumeButton", async (_, _) => await ResumeDownloadQueue());
@@ -125,6 +126,8 @@ public partial class MainWindow
     private static DataTemplate ProgressTemplate()
     {
         var bar = new FrameworkElementFactory(typeof(ProgressBar));
+        bar.SetValue(Control.TemplateProperty, SoftProgressTemplate());
+        bar.SetResourceReference(Control.ForegroundProperty, "AccentBrush");
         bar.SetValue(FrameworkElement.WidthProperty, 92.0); bar.SetValue(FrameworkElement.HeightProperty, 5.0); bar.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
         bar.SetValue(System.Windows.Controls.Primitives.RangeBase.MaximumProperty, 100.0);
         bar.SetBinding(System.Windows.Controls.Primitives.RangeBase.ValueProperty, new Binding(nameof(DownloadEntry.Percent)) { Mode = BindingMode.OneWay });
@@ -142,6 +145,7 @@ public partial class MainWindow
     {
         if (_downloadCenterSummary is null) return;
         _downloadCenterSummary.Text = _downloadQueue.Summary;
+        RefreshTransferProgress();
         _downloadCenterNotice!.Text = _downloadQueue.Notice;
         RefreshDownloadUnlikeAction();
         RefreshDownloadSort(force: !_downloadQueue.Running);

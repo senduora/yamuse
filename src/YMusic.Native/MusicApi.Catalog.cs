@@ -355,7 +355,7 @@ internal sealed partial class MusicApi
         if (owner.Length == 0) owner = contextOwner ?? "";
         if (owner.Length == 0) throw new MusicException("В данных плейлиста отсутствует владелец.");
         if (contextOwner is not null && owner != contextOwner) throw new MusicException("Список содержит плейлист другого владельца.");
-        return new(id, kind, title, Text(row, "description"), owner, id, CoverUri: EntityArtwork(row, kind));
+        return new(id, kind, title, Text(row, "description"), owner, id, CoverUri: EntityArtwork(row, kind), OwnerName: CatalogPlaylistOwnerName(row));
     }
 
     private static JsonElement CatalogUnwrapEntity(JsonElement row, string property)

@@ -42,7 +42,7 @@ internal static partial class Program
         store.Save(imported);var json=File.ReadAllText(store.FilePath);
         using var document = JsonDocument.Parse(json);
         var fields = document.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n).ToArray();
-        Assert(fields.SequenceEqual(new[] { "autoDownloadFavorites", "concurrentDownloads", "crossfadeSeconds", "minimizeToTray", "normalizeVolume", "playbackSpeed", "quality", "volume" }), "saved schema differs");
+        Assert(fields.SequenceEqual(new[] { "accentFromCover", "autoDownloadFavorites", "concurrentDownloads", "crossfadeSeconds", "minimizeToTray", "normalizeVolume", "playbackSpeed", "quality", "staticAccentColor", "volume" }), "saved schema differs");
         using var player=new NativePlayer(); Assert(player.CrossfadeSeconds==3,"native default differs");
         player.SetCrossfade(10);
         Assert(!player.TryPlayPrepared(new Uri(Path.Combine(directory,"not-open.wav")),TimeSpan.FromSeconds(10)),"missing next source promoted");
@@ -63,12 +63,12 @@ internal static partial class Program
             Assert(fixture.Window.OwnedWindows.Count == 0 && Control<Grid>(fixture.Window, "SettingsPanel").IsVisible, "Settings created a separate window");
             slider.Value=10;dialog.UpdateLayout();await Task.Delay(120);
             ClCaptureElement(dialog,Path.Combine(_directory,"crossfade-settings.png"));
-            SaClick(SaVisuals<Button>(dialog).Single(b=>(string?)b.Content=="Сохранить"));
+            SaClick(SaVisuals<Button>(dialog).Single(b=>b.Name=="SettingsApplyButton"));
         });
         Assert(fixture.Player.CrossfadeSeconds==10 && store.Load().CrossfadeSeconds==10,"setting not applied and saved");
         await CrossfadePage(fixture.Window,dialog=>{
             var slider=SaVisuals<Slider>(dialog).Single(s=>s.Name=="CrossfadeSetting");Assert(slider.Value==10,"reopen lost value");
-            slider.Value=0;SaClick(SaVisuals<Button>(dialog).Single(b=>(string?)b.Content=="Сохранить"));return Task.CompletedTask;
+            slider.Value=0;SaClick(SaVisuals<Button>(dialog).Single(b=>b.Name=="SettingsApplyButton"));return Task.CompletedTask;
         });
         Assert(fixture.Player.CrossfadeSeconds==0 && store.Load().CrossfadeSeconds==0,"off value not retained");
         fixture.Window.Width=1050;fixture.Window.Height=680;fixture.Window.UpdateLayout();

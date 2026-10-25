@@ -10,6 +10,6 @@ public partial class MainWindow
         _shell.UpdateDetails(PlayerCover.Source, DisplayPosition(_player.Position).TotalSeconds,
             _player.Duration.TotalSeconds, SeekSlider.IsEnabled,
             _current is { } row && _favoriteTrackIds.Contains(row.Id), PlayerLikeButton.IsEnabled,
-            VolumeSlider.Value, $"{_playbackGeneration}:{_current?.RequestId}");
+            VolumeSlider.Value, $"{_playbackGeneration}:{_current?.RequestId}", _player.SpeedRatio, _pendingSeek is null);
     }
 }

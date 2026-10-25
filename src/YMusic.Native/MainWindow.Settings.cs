@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Media;
 
 namespace YMusic.Native;
 
@@ -10,6 +11,8 @@ public partial class MainWindow
     private bool _minimizeToTray;
     private bool _autoFavoritesEnabled;
     private int _concurrentDownloads = PlayerPreferences.DefaultConcurrentDownloads;
+    private bool _accentFromCover = true;
+    private string _staticAccentColor = "#EA571C";
     private DesktopShell? _shell;
     private void LoadPreferences()
     {
@@ -25,6 +28,9 @@ public partial class MainWindow
             _minimizeToTray = preferences.MinimizeToTray;
             _autoFavoritesEnabled = preferences.AutoDownloadFavorites;
             _concurrentDownloads = preferences.ConcurrentDownloads;
+            _accentFromCover = preferences.AccentFromCover;
+            _staticAccentColor = preferences.StaticAccentColor;
+            _coverAccent?.Configure(_accentFromCover, _staticAccentColor);
             AutoFavoritesCheckBox.IsChecked = _autoFavoritesEnabled;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { _diagnostics.LastErrorType = "PreferencesLoad:" + ex.GetType().Name; }
@@ -33,7 +39,7 @@ public partial class MainWindow
     private void SavePreferences()
     {
         if (!_preferencesReady || _preferenceStore is null) return;
-        try { _preferenceStore.Save(new() { Quality = SelectedQuality, Volume = VolumeSlider.Value / 100, PlaybackSpeed = _player.SpeedRatio, MinimizeToTray = _minimizeToTray, AutoDownloadFavorites = _autoFavoritesEnabled, ConcurrentDownloads = _concurrentDownloads, CrossfadeSeconds = _player.CrossfadeSeconds, NormalizeVolume = _player.NormalizeVolume }); }
+        try { _preferenceStore.Save(new() { Quality = SelectedQuality, Volume = VolumeSlider.Value / 100, PlaybackSpeed = _player.SpeedRatio, MinimizeToTray = _minimizeToTray, AutoDownloadFavorites = _autoFavoritesEnabled, ConcurrentDownloads = _concurrentDownloads, CrossfadeSeconds = _player.CrossfadeSeconds, NormalizeVolume = _player.NormalizeVolume, AccentFromCover = _accentFromCover, StaticAccentColor = _staticAccentColor }); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { _diagnostics.LastErrorType = "PreferencesSave:" + ex.GetType().Name; SetStatus("Не удалось сохранить настройки на диске.", true); }
     }
     private void InitializeShell()
@@ -79,6 +85,10 @@ public partial class MainWindow
         CrossfadeSetting.Value = _player.CrossfadeSeconds;
         ShowSettingsCrossfade();
         SettingsNormalizeVolume.IsChecked = _player.NormalizeVolume;
+        SettingsAccentFromCover.IsChecked = _accentFromCover;
+        InitializeAccentSwatches();
+        SettingsAccentHex.Text = _staticAccentColor;
+        UpdateAccentDraft();
         SettingsTray.IsChecked = _minimizeToTray;
         SettingsAutoFavorites.IsChecked = _autoFavoritesEnabled;
         SettingsDownloads.ItemsSource ??= Enumerable.Range(1, 10).ToArray();
@@ -127,6 +137,11 @@ public partial class MainWindow
     private void SettingsApply_Click(object sender, RoutedEventArgs e)
     {
         if (!_settingsOpen) return;
+        if (!PreferencesStore.IsAccentColor(SettingsAccentHex.Text))
+        { SettingsAccentError.Text = "Укажите цвет в формате #RRGGBB, например #EA571C."; SettingsAccentHex.Focus(); return; }
+        _accentFromCover = SettingsAccentFromCover.IsChecked == true;
+        _staticAccentColor = SettingsAccentHex.Text.ToUpperInvariant();
+        _coverAccent?.Configure(_accentFromCover, _staticAccentColor);
         _player.SetSpeed(SettingsSpeed.SelectedItem is double ratio ? ratio : 1);
         _player.SetCrossfade(CrossfadeSetting.Value);
         _player.SetNormalization(SettingsNormalizeVolume.IsChecked == true);
@@ -139,5 +154,31 @@ public partial class MainWindow
         if (!autoChanged) SavePreferences();
         SetSettingsVisible(false);
         SettingsButton.Focus();
+    }
+
+    private void InitializeAccentSwatches()
+    {
+        if (SettingsAccentSwatches.Children.Count != 0) return;
+        foreach (var (hex, name) in new[] { ("#EA571C", "Оранжевый"), ("#E55B76", "Розовый"), ("#A88AF1", "Лиловый"),
+            ("#6EADFA", "Голубой"), ("#51BDAD", "Бирюзовый"), ("#9DBF63", "Зелёный"), ("#E7BB59", "Золотистый"), ("#ADB0BA", "Серый") })
+        {
+            var button = new Button { Tag = hex, ToolTip = name + " · " + hex, Width = 38, Height = 38, Padding = new Thickness(5), Margin = new Thickness(0, 0, 8, 8),
+                BorderThickness = new Thickness(2), Background = System.Windows.Media.Brushes.Transparent,
+                Content = new System.Windows.Shapes.Ellipse { Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString(hex)), Width = 22, Height = 22 } };
+            System.Windows.Automation.AutomationProperties.SetName(button, "Статичный акцент: " + name);
+            button.Click += (_, _) => SettingsAccentHex.Text = hex;
+            SettingsAccentSwatches.Children.Add(button);
+        }
+    }
+
+    private void SettingsAccentHex_Changed(object sender, TextChangedEventArgs e) => UpdateAccentDraft();
+    private void UpdateAccentDraft()
+    {
+        if (SettingsAccentPreview is null || SettingsAccentError is null || SettingsAccentHex is null) return;
+        var valid = PreferencesStore.IsAccentColor(SettingsAccentHex.Text);
+        SettingsAccentError.Text = valid ? "" : "Цвет: # и шесть шестнадцатеричных цифр.";
+        if (valid) SettingsAccentPreview.Background = new SolidColorBrush(CoverPalette.Readable((Color)ColorConverter.ConvertFromString(SettingsAccentHex.Text)));
+        foreach (var button in SettingsAccentSwatches.Children.OfType<Button>())
+            button.BorderBrush = valid && string.Equals((string)button.Tag, SettingsAccentHex.Text, StringComparison.OrdinalIgnoreCase) ? System.Windows.Media.Brushes.White : System.Windows.Media.Brushes.Transparent;
     }
 }

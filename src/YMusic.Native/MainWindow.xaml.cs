@@ -24,7 +24,7 @@ public partial class MainWindow : Window
     private readonly string _diagnosticsDirectory;
     private readonly Diagnostics _diagnostics = new();
     private readonly NativePlayer _player;
-    private readonly ObservableCollection<TrackRow> _tracks = new();
+    private readonly TrackRows _tracks = new();
     private readonly CancellationTokenSource _lifetime = new();
     private CancellationTokenSource _accountCts;
     private readonly SemaphoreSlim _refreshLock = new(1);
@@ -87,7 +87,7 @@ public partial class MainWindow : Window
         };
         _player.Ended += async (_, _) => await AdvanceAsync(1, true);
         _player.TransitionFinished += OnTransitionFinished;
-        _player.Failed += (_, _) => { _progressTimer.Stop(); ReportWaveEnd(false); _diagnostics.Stage = "playback_error"; SetStatus("Windows прервала воспроизведение. Попробуйте снова или выберите другой трек.", true); UpdateControls(); };
+        _player.Failed += (_, _) => { _progressTimer.Stop(); ReportWaveEnd(false); _diagnostics.Stage = "playback_error"; SetStatus("Windows прервала воспроизведение. Попробуйте снова или выберите другой трек.", true); UpdateControls(); UpdateProgress(); };
         ContentRendered += OnReady;
         Closed += OnClosed;
         SourceInitialized += (_, _) => { InitializeWindows(); InitializeShell(); };
@@ -371,6 +371,8 @@ public partial class MainWindow : Window
         var promoted = PromotePrepared(track, prepared, automatic);
         if (!promoted) { CancelNextPreparation(); ReportWaveEnd(automatic); }
         _playbackGeneration++;
+        _seekGesture?.Cancel(); _expandedSeekGesture?.Cancel();
+        PlaybackTimeline.Stop(SeekSlider);
         _pendingSeek = null; _seekDragging = false;
         _playCts?.Cancel();
         var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
@@ -427,7 +429,7 @@ public partial class MainWindow : Window
             track.IsPlaying = true;
             HighlightTrack(track);
             QualityText.Text = (playingOffline ? "Офлайн · " : "") + (promoted ? prepared!.QualityLabel : localQuality ?? audio?.QualityLabel ?? "Локальное аудио");
-            SetStatus(playingOffline ? "" : _waveSources.ContainsKey(track) ? _waveBatch?.Mode == WaveMode.Collection ? "Волна по коллекции · персональные рекомендации" : "Моя волна · персональные рекомендации" : "Воспроизведение · очередь треков");
+            SetStatus(playingOffline ? "" : _waveSources.ContainsKey(track) ? WaveSourceLabel(track) : "Воспроизведение · очередь треков");
             BeginWaveListening(track);
             _progressTimer.Start();
             SavePlaybackState();
@@ -501,7 +503,7 @@ public partial class MainWindow : Window
 
     private void UpdateControls()
     {
-        if (PlaySelectionButton is null) return;
+        if (PlaySelectionButton is null || _updatingTrackRows) return;
         PlaySelectionButton.IsEnabled = _catalogShowing ? CatalogList.SelectedItem is CatalogItem : _view.Cast<TrackRow>().Any(row => row.CanPlay);
         if (DownloadButton is not null)
         {
@@ -514,6 +516,7 @@ public partial class MainWindow : Window
         PreviousButton.IsEnabled = _current is not null && _queue.Count > 0;
         NextButton.IsEnabled = !_advancingWave && (_playbackQueue.CanNext || _current is not null && _waveSources.ContainsKey(_current));
         SeekSlider.IsEnabled = !_loadingStream && _player.HasSource && _player.Duration.TotalSeconds > 0;
+        RefreshPlaybackDisplay();
         UpdatePlayerLikeState();
         UpdateLyricsTimer();
         PlayerLyricsButton.IsEnabled = _current is not null;
@@ -535,10 +538,7 @@ public partial class MainWindow : Window
     private void UpdateProgress()
     {
         var duration = RestoredPlaybackDuration ?? _player.Duration;
-        var position = DisplayPosition(_player.Position);
-        if (!_seekDragging) { SeekSlider.Maximum = Math.Max(1, duration.TotalSeconds); SeekSlider.Value = position.TotalSeconds; }
-        PositionText.Text = FormatTime(_seekDragging ? TimeSpan.FromSeconds(SeekSlider.Value) : position);
-        DurationText.Text = FormatTime(duration);
+        var position = RefreshPlaybackDisplay();
         SeekSlider.IsEnabled = !_loadingStream && _player.HasSource && duration.TotalSeconds > 0;
         UpdateLyrics(position.TotalSeconds);
         RefreshExpandedPlayer();
@@ -546,10 +546,23 @@ public partial class MainWindow : Window
         TryAutomaticTransition();
     }
     private static string FormatTime(TimeSpan time) => time.TotalHours >= 1 ? time.ToString(@"h\:mm\:ss") : time.ToString(@"m\:ss");
-    private void Seek_Start(object sender, MouseButtonEventArgs e) { if (SeekSlider.IsEnabled) { _seekDragging = true; PositionText.Text = FormatTime(TimeSpan.FromSeconds(SeekSlider.Value)); } }
-    private void Seek_End(object sender, MouseButtonEventArgs e) => FinishSeek(true);
-    private void Seek_KeyUp(object sender, KeyEventArgs e) { if (SeekSlider.IsEnabled && e.Key is Key.Left or Key.Right or Key.Home or Key.End or Key.PageDown or Key.PageUp) CommitSeek(SeekSlider.Value); }
-    private void Volume_Changed(object sender, RoutedPropertyChangedEventArgs<double> e) { _player.SetVolume(e.NewValue / 100); SavePreferences(); UpdateShellState(); }
+    private void Seek_Start(object sender, MouseButtonEventArgs e) { _seekGesture?.Start(sender, e); if (_seekDragging) PositionText.Text = FormatTime(TimeSpan.FromSeconds(SeekSlider.Value)); }
+    private void Seek_End(object sender, MouseButtonEventArgs e) => _seekGesture?.End(sender, e);
+    private void Seek_KeyUp(object sender, KeyEventArgs e)
+    {
+        if (!SeekSlider.IsEnabled || !SliderGesture.SeekKey(e.Key)) return;
+        if (_seekIgnoreKeyUp) { _seekIgnoreKeyUp = false; return; }
+        if (_seekGesture?.IsActive == true) _seekGesture.Complete(true);
+        else { PlaybackTimeline.Stop(SeekSlider, useBaseValue: true); CommitSeek(SeekSlider.Value); }
+    }
+    private void Volume_Changed(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        _player.SetVolume(e.NewValue / 100);
+        if (SliderGesture.HasActiveGesture || Mouse.LeftButton == MouseButtonState.Pressed)
+        { _volumeSaveTimer.Stop(); _volumeSaveTimer.Start(); }
+        else { _volumeSaveTimer.Stop(); SavePreferences(); }
+        UpdateShellState();
+    }
     private void Filter_TextChanged(object sender, TextChangedEventArgs e)
     {
         if (FilterHint is null) return;
@@ -567,6 +580,7 @@ public partial class MainWindow : Window
         UpdateCatalogCount();
         // A selection or transport change does not change thousands of offline files.
         // Refresh this status when the list changes; downloads/removals also refresh it explicitly.
+        InvalidatePlaylistStatus();
         UpdatePlaylistDownloadedStatus();
         UpdateControls();
     }
@@ -661,7 +675,9 @@ public partial class MainWindow : Window
         _lifetime.Cancel(); _authCts?.Cancel(); _libraryCts?.Cancel(); _playCts?.Cancel();
         CancelNextPreparation();
         _accountCts.Cancel();
-        _metricsTimer.Stop(); _progressTimer.Stop(); _filterTimer.Stop();
+        _metricsTimer.Stop(); _progressTimer.Stop(); _filterTimer.Stop(); _volumeSaveTimer.Stop();
+        _seekGesture?.Cancel(); _expandedSeekGesture?.Cancel(); _volumeGesture?.Cancel(); _expandedVolumeGesture?.Cancel();
+        PlaybackTimeline.Stop(SeekSlider); if (_expandedPlayerSeek is not null) PlaybackTimeline.Stop(_expandedPlayerSeek);
         _player.Dispose();
         SavePreferences(); _shell?.Dispose();
         _windows?.Dispose();

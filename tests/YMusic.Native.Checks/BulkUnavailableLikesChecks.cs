@@ -90,10 +90,10 @@ internal static partial class Program
             using var f = new UlFixture("polish-footer"); await f.Start(); SaInvoke(f.Window, "UpdateMetrics");
             var footer = Control<StackPanel>(f.Window, "MetricsRow");
             Assert(footer.Children.OfType<TextBlock>().Select(t => t.Name).SequenceEqual(["VersionText", "MemoryText", "CpuText"])
-                && Control<TextBlock>(f.Window, "VersionText").Text == "v0.3.14"
+                && Control<TextBlock>(f.Window, "VersionText").Text == AppBranding.VersionLabel
                 && !SaVisuals<Button>(Control<Border>(f.Window, "MetricsBar")).Any(), "footer retains extra labels/actions");
             SaInvoke(f.Window, "Settings_Click", null!, null!); f.Window.UpdateLayout();
-            Assert(SaVisuals<TextBlock>(Control<ContentControl>(f.Window, "SettingsUpdates")).Any(t => t.Text.Contains("Версия 0.3.14"))
+            Assert(SaVisuals<TextBlock>(Control<ContentControl>(f.Window, "SettingsUpdates")).Any(t => t.Text.Contains("Версия " + AppBranding.VersionLabel[1..]))
                 && SaVisuals<Button>(Control<Grid>(f.Window, "SettingsPanel")).Any(b => b.Name == "SaveMetricsButton"), "version or diagnostics action missing from Settings");
             Assert(((SolidColorBrush)f.Window.FindResource("AccentBrush")).Color == Color.FromRgb(234, 87, 28), "accent does not match the supplied swatch");
             var scroll = SaVisuals<ScrollViewer>(Control<Grid>(f.Window, "SettingsPanel")).First(); scroll.ScrollToEnd();
