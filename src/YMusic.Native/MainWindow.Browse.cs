@@ -14,7 +14,7 @@ public partial class MainWindow
     private sealed record BrowseSnapshot(string Section, string Title, TrackRow[] Tracks, CatalogItem[] Catalog,
         bool IsCatalog, string Filter, PlaylistDetails? Playlist, CatalogItem? Opened, int ArtistPage,
         ArtistDetails? Artist, bool? ArtistLiked, bool SearchVisible, double Offset, int SelectedIndex,
-        object? Selection, AlbumDetails? Album, string SearchText, string SearchType, int SearchPage, bool CollectionsSearch, string Query, WaveMode WaveMode);
+        object? Selection, AlbumDetails? Album, string SearchText, string SearchType, int SearchPage, bool CollectionsSearch, string Query, WaveMode WaveMode, TrackRow? WaveSeedTrack);
 
     private void RememberBrowseView()
     {
@@ -31,7 +31,7 @@ public partial class MainWindow
             _catalogShowing, FilterBox.Text, _activePlaylist, _openedCatalogItem, _artistPage, _artistDetails, _artistLiked,
             CatalogSearchPanel.Visibility == Visibility.Visible, FindViewer(_section is "home" or "artist-detail" ? CurrentContent() : list)?.VerticalOffset ?? 0,
             _catalogShowing ? CatalogList.SelectedIndex : TracksList.SelectedIndex, _catalogShowing ? CatalogList.SelectedItem : TracksList.SelectedItem,
-            _activeAlbumDetails, _searchText, _searchType, _searchPage, _collectionsSearch, CatalogQuery.Text, _waveViewMode);
+            _activeAlbumDetails, _searchText, _searchType, _searchPage, _collectionsSearch, CatalogQuery.Text, _waveViewMode, _waveSeedTrack);
     }
     private static void PushBrowse(Stack<BrowseSnapshot> stack, BrowseSnapshot snapshot)
     {
@@ -58,6 +58,7 @@ public partial class MainWindow
         _restoringBrowse = true;
         try
         {
+        _waveViewMode = previous.WaveMode; _waveSeedTrack = previous.WaveSeedTrack;
         NavigateSection(previous.Section, previous.Title, remember: false);
         _openedCatalogItem = previous.Opened; _artistPage = previous.ArtistPage;
         _searchText = previous.SearchText; _searchType = previous.SearchType; _searchPage = previous.SearchPage;
@@ -80,6 +81,7 @@ public partial class MainWindow
                 FindViewer(previous.Section is "home" or "artist-detail" ? CurrentContent() : list)?.ScrollToVerticalOffset(previous.Offset);
         }));
         UpdateBrowseButtons();
+        UpdateWavePresentation();
         SetStatus("Вернулись к " + previous.Title);
         }
         finally { _restoringBrowse = false; }

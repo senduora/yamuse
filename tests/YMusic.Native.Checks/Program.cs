@@ -460,6 +460,20 @@ internal static partial class Program
         await CheckExpandedPlayer();
         await CheckControlChrome();
         await CheckNavigation014();
+        await CheckUiPolish015();
+        await CheckCleanupPerformance015();
+        await CheckLargeCollection015();
+        await CheckTransferMaintenance015();
+        await CheckTrackWave015();
+        await CheckCoverAccent015();
+        await CheckAmbientBackdrop015();
+        await CheckCoverPalette016();
+        await CheckCoverAccent016();
+        await CheckSidebarPlayer016();
+        await CheckCompactTransfer016();
+        await CheckSmoothScroll016();
+        await CheckPlaybackControls016();
+        await CheckStartupUpdates016();
         await Run("Diagnostics contain resources and timings, without credentials or account data", () =>
         {
             var path = Path.Combine(_directory, "sanitized-diagnostics.json");

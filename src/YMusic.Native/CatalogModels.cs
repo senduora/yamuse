@@ -2,7 +2,11 @@ namespace YMusic.Native;
 
 // Id is the entity ID. Track album IDs are carried separately, never inferred from a name.
 internal sealed record CatalogItem(string Id, string Kind, string Title, string Subtitle,
-    string? Owner = null, string? PlaylistKind = null, string? AlbumId = null, string? CoverUri = null, TrackRow? Track = null);
+    string? Owner = null, string? PlaylistKind = null, string? AlbumId = null, string? CoverUri = null, TrackRow? Track = null,
+    string? OwnerName = null)
+{
+    public string DisplaySubtitle => Kind is "playlist" or "offline-playlist" && !string.IsNullOrWhiteSpace(OwnerName) ? OwnerName : Subtitle;
+}
 
 internal sealed record CatalogPage(IReadOnlyList<CatalogItem> Items, int Page, bool HasMore);
 

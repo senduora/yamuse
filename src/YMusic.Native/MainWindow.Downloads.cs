@@ -7,16 +7,11 @@ public partial class MainWindow
 {
     private void ApplyOfflineStates(IEnumerable<TrackRow> tracks)
     {
+        var snapshot = tracks as TrackRow[] ?? tracks.ToArray();
+        if (snapshot.Length > BackgroundOfflineThreshold) { QueueOfflineMarks(snapshot); return; }
         try
         {
-            foreach (var track in tracks)
-            {
-                var saved = _offline.Find(track);
-                var wasDownloaded = track.IsDownloaded;
-                track.DownloadedPath = saved is null ? null : _offline.ResolvePath(saved.FileName);
-                track.DownloadedQuality = saved is null ? null : OfflineQuality(saved);
-                if (wasDownloaded != track.IsDownloaded) QueueDownloadedSortRefresh();
-            }
+            ApplyOfflineMarks(ReadOfflineMarks(snapshot, _lifetime.Token));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or MusicException)
         { _diagnostics.LastErrorType = "OfflineIndex:" + ex.GetType().Name; SetStatus("Не удалось прочитать отметки скачанного. Аудиофайлы сохранены.", true); }
@@ -24,6 +19,7 @@ public partial class MainWindow
     private static string OfflineQuality(OfflineItem item) => item.Codec.StartsWith("flac", StringComparison.Ordinal) ? "Lossless · FLAC" : item.Codec.ToUpperInvariant().Replace("-MP4", "") + (item.Bitrate > 0 ? $" · {item.Bitrate} кбит/с" : "");
     private void RefreshDownloadedMarks()
     {
+        InvalidateOfflineViewState();
         ApplyOfflineStates(_tracks.Concat(_favoritesCache).Concat(_waveTracks).Concat(_queue).Concat(_catalogItems.Select(i => i.Track).OfType<TrackRow>()).Distinct());
         if (_current is not null) ApplyOfflineStates([_current]);
         UpdatePlaylistDownloadedStatus();
@@ -44,6 +40,7 @@ public partial class MainWindow
     private PlaylistDetails? CurrentDownloadPlaylist() => _section == "favorites" ? FavoritesDownloadSnapshot() : _activePlaylist;
     private void UpdatePlaylistDownloadedStatus()
     {
+        RefreshTransferProgress();
         if (DownloadPlaylistButton is null) return;
         var isFavorites = _section == "favorites";
         FavoritesWaveButton.Visibility = isFavorites ? Visibility.Visible : Visibility.Collapsed;
@@ -56,8 +53,15 @@ public partial class MainWindow
         DownloadPlaylistButton.IsEnabled = !_offlineMaintenance && _downloadCts is null && _session is not null && (!favorites || _favoritesSnapshotReady);
         try
         {
-            var state = _offline.GetPlaylistStatus(playlist.Owner, playlist.Kind, playlist.Tracks);
             var title = favorites ? "Мне нравится" : "плейлист";
+            var state = playlist.Tracks.Count > BackgroundOfflineThreshold
+                ? LargePlaylistStatus(playlist) : _offline.GetPlaylistStatus(playlist.Owner, playlist.Kind, playlist.Tracks);
+            if (state is null)
+            {
+                DownloadPlaylistButton.Content = $"↓ Скачать {title} целиком";
+                PlaylistDownloadText.Text = "Проверяем скачанную музыку…";
+                return;
+            }
             DownloadPlaylistButton.Content = state.Complete ? $"✓ Скачан · {state.Total}" : state.Downloaded > 0 ? $"↓ Докачать · {state.Downloaded}/{state.Total}" : $"↓ Скачать {title} целиком";
             PlaylistDownloadText.Text = favorites && !_favoritesSnapshotReady ? "Дождитесь полной загрузки избранного" : state.Complete ? "Все треки доступны офлайн" : state.HasSnapshot ? $"Скачано {state.Downloaded} из {state.Total}" + (state.ChangedSinceSnapshot ? " · список изменился" : "") : "";
         }
@@ -110,7 +114,7 @@ public partial class MainWindow
                 await Task.WhenAll(Enumerable.Range(0, Math.Min(concurrentDownloads, selected.Length)).Select(_ => WorkerAsync()));
                 _downloadsAutoSuspended = _downloadQueue.HasPaused;
                 if (_downloadQueue.Entries.Any(entry => entry.State == DownloadEntryState.Failed)) _pendingAutoFavorites = null;
-                SetStatus(_downloadQueue.Summary, _downloadQueue.Entries.Any(entry => entry.State is DownloadEntryState.Failed or DownloadEntryState.Unavailable));
+                ReportDownloadOutcome();
             }
             catch (OperationCanceledException) when (cts.IsCancellationRequested)
             {
@@ -169,6 +173,17 @@ public partial class MainWindow
                 }
             }
         }
+    }
+    private void ReportDownloadOutcome()
+    {
+        var progress = PlaylistTransferProgress.Read(_downloadQueue.Entries);
+        if (progress.Failed > 0 || progress.Unavailable > 0)
+            SetStatus($"Скачано {progress.Completed:N0} из {progress.Total:N0}. " +
+                (progress.Failed > 0 ? $"Не удалось скачать: {progress.Failed}. " : "") +
+                (progress.Unavailable > 0 ? $"Недоступно: {progress.Unavailable}. " : "") +
+                "Подробности в «Загрузках».", true);
+        else if (!_downloadQueueAutomatic && progress.Total > 0 && progress.Completed == progress.Total)
+            SetStatus("Музыка скачана и доступна офлайн.");
     }
     private void BeginFavoritesRefresh()
     {
@@ -241,22 +256,26 @@ public partial class MainWindow
     }
     private async Task ClearOfflineAfterConfirmationAsync()
     {
-        if (_offlineMaintenance) return;
+        if (_offlineMaintenance || _cacheMaintenance) return;
         _offlineMaintenance = true; _pendingAutoFavorites = null;
+        var maintenanceGeneration = ++_maintenanceGeneration;
+        InvalidateOfflineViewState(); RefreshMaintenanceActions(); ShowMaintenance("Подготавливаем очистку музыки…", 0);
         try
         {
             _autoFavoritesEnabled = false; AutoFavoritesCheckBox.IsChecked = false; SavePreferences();
             SuspendDownloadQueueForAccountChange();
             if (_downloadTask is { } task) await task;
             ReleaseOfflinePlayback(null);
-            var result = await _offline.ClearAsync(_lifetime.Token);
+            var result = await _offline.ClearAsync(_lifetime.Token, new Progress<OfflineCleanupProgress>(progress =>
+            { if (maintenanceGeneration == _maintenanceGeneration) ReportOfflineCleanup(progress); }));
             _downloadQueue.Removed(null); RefreshDownloadCenter(); RefreshDownloadStorage();
             RefreshOfflineView(); RefreshDownloadedMarks();
             SetStatus(RemovalStatus(result) + " · автоскачивание выключено", result.Preserved + result.Failed > 0);
+            ShowMaintenance(RemovalStatus(result), 100);
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
-        catch (Exception ex) { ShowError(ex); }
-        finally { _offlineMaintenance = false; UpdateControls(); UpdatePlaylistDownloadedStatus(); }
+        catch (Exception ex) { ShowError(ex); ShowMaintenance("Очистка не завершена. Сохранённые файлы можно проверить и повторить действие.", null); }
+        finally { _offlineMaintenance = false; RefreshMaintenanceActions(); UpdateControls(); UpdatePlaylistDownloadedStatus(); }
     }
     private void ReleaseOfflinePlayback(string? trackId)
     {

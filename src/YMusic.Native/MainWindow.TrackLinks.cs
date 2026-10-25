@@ -40,11 +40,23 @@ public partial class MainWindow
             var item = new MenuItem { Header = artist.Name };
             item.Click += async (_, _) =>
             {
-                if (generation == _accountGeneration && !_closed) await OpenArtistAsync(artist.Id, artist.Name);
+                if (generation != _accountGeneration || _closed) return;
+                if (IsExpandedPlayerOpen && _expandedPlayerArtistLinks is not null
+                    && (ReferenceEquals(anchor, _expandedPlayerArtistLinks) || anchor.IsDescendantOf(_expandedPlayerArtistLinks))) CloseExpandedPlayer();
+                await OpenArtistAsync(artist.Id, artist.Name);
             };
             menu.Items.Add(item);
         }
         return menu;
+    }
+
+    private void TrackArtists_ContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        if (_session is null || sender is not FrameworkElement { DataContext: TrackRow { Artists.Count: > 0 } track } anchor) return;
+        e.Handled = true;
+        var menu = CreateTrackArtistsMenu(anchor, track.Artists);
+        anchor.ContextMenu = menu;
+        menu.IsOpen = true;
     }
 
     private async void TrackAlbum_Click(object sender, RoutedEventArgs e)

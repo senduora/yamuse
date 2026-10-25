@@ -5,7 +5,7 @@
     <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>0.3.14</Version>
+    <Version>0.3.16</Version>
     <Product>Yamuse</Product>
     <Title>Yamuse</Title>
     <AssemblyTitle>Yamuse</AssemblyTitle>

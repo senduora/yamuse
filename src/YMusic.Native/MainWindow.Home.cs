@@ -14,7 +14,7 @@ public partial class MainWindow
 
     private void ShowHomeSections(IReadOnlyList<HomeSection> sections)
     {
-        _homeSections = sections.ToArray();
+        _homeSections = sections.Select(section => section with { Items = section.Items.Select(PresentCatalogAuthor).ToArray() }).ToArray();
         var shelves = _homeSections.Where(section => section.Items.Count > 0)
             .Select(section => new HomeShelf(section, section.Items.Take(6).ToArray())).ToArray();
         HomeShelves.ItemsSource = shelves;

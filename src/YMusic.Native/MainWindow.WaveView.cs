@@ -8,7 +8,8 @@ public partial class MainWindow
 
     private async Task OpenWaveAsync(WaveMode mode)
     {
-        _waveViewMode = mode;
+        if (_session is null) { SetStatus("Войдите в Яндекс, чтобы запустить персональную волну."); return; }
+        SelectWaveView(mode, null);
         await StartWaveViewAsync(false);
     }
 
@@ -17,9 +18,9 @@ public partial class MainWindow
     private async void WavePlay_Click(object sender, RoutedEventArgs e)
     {
         if (_waveStarting) return;
-        if (_current is not null && _waveSources.ContainsKey(_current) && _waveBatch?.Mode == _waveViewMode && _queue.Any(row => ReferenceEquals(row, _current)))
+        if (_current is not null && IsWaveTrackInView(_current) && IsCurrentWaveView && _queue.Any(row => ReferenceEquals(row, _current)))
         { await TogglePlaybackAsync(); return; }
-        if (_waveBatch?.Mode != _waveViewMode || _waveTracks.Count == 0) { await StartWaveViewAsync(true); return; }
+        if (!IsCurrentWaveView || _waveTracks.Count == 0) { await StartWaveViewAsync(true); return; }
         _playbackQueue.SetItems(_waveTracks);
         if (_playbackQueue.Current is { } first) await PlayTrackAsync(first);
     }
@@ -51,12 +52,14 @@ public partial class MainWindow
     {
         if (WavePanel is null) return;
         var collection = _waveViewMode == WaveMode.Collection;
-        WaveHeading.Text = collection ? "Волна по коллекции" : "Моя волна";
-        WaveModeCaption.Text = collection ? "Ваша коллекция задаёт настроение" : "Музыка, которая подходит именно вам";
-        var ownWave = _waveBatch?.Mode == _waveViewMode;
-        var track = ownWave && _current is not null && _waveSources.ContainsKey(_current) ? _current : ownWave ? _waveTracks.FirstOrDefault() : null;
+        var byTrack = _waveViewMode == WaveMode.Track;
+        WaveHeading.Text = WaveViewTitle;
+        WaveModeCaption.Text = byTrack ? "По треку «" + _waveSeedTrack?.Title + "»" : collection ? "Ваша коллекция задаёт настроение" : "Музыка, которая подходит именно вам";
+        WaveModeCaption.ToolTip = WaveModeCaption.Text;
+        var ownWave = IsCurrentWaveView;
+        var track = ownWave && _current is not null && IsWaveTrackInView(_current) ? _current : ownWave ? _waveTracks.FirstOrDefault() : null;
         WaveTrackTitle.Text = track?.Title ?? (_waveStarting ? "Подбираем музыку…" : "Откройте свою музыку заново");
-        WaveTrackArtist.Text = track?.Artist ?? (collection ? "Любимые треки и близкая вам музыка" : "Персональные рекомендации Яндекса");
+        WaveTrackArtist.Text = track?.Artist ?? (byTrack ? _waveSeedTrack?.Artist : collection ? "Любимые треки и близкая вам музыка" : "Персональные рекомендации Яндекса");
         if (!ReferenceEquals(track, _waveHeroTrack))
         {
             _waveHeroTrack = track;

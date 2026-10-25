@@ -15,6 +15,7 @@ public partial class MainWindow
     private Image? _expandedPlayerCover;
     private Button? _expandedPlayerCoverButton, _expandedPlayerTitleButton, _expandedPlayerLyricsButton, _expandedPlayerCloseButton;
     private TextBlock? _expandedPlayerTitle, _expandedPlayerArtist, _expandedPlayerPosition, _expandedPlayerDuration;
+    private ContentControl? _expandedPlayerArtistLinks;
     private Slider? _expandedPlayerSeek;
     private Grid? _expandedLyricsPanel;
     private ListBox? _expandedLyricsList;
@@ -61,12 +62,14 @@ public partial class MainWindow
         else
         {
             SetExpandedLyricsVisible(false, animate: false);
+            _expandedSeekGesture?.Cancel();
             _expandedSeekDragging = false;
             ExpandedPlayerHost.Visibility = Visibility.Collapsed;
             if (_expandedPlayerCover is not null) Artwork.SetSourceUri(_expandedPlayerCover, null);
             if (_expandedPlayerSeek is not null) _expandedPlayerSeek.IsEnabled = false;
             if (_expandedPlayerCoverButton is not null) _expandedPlayerCoverButton.Tag = null;
             if (_expandedPlayerTitleButton is not null) _expandedPlayerTitleButton.Tag = null;
+            if (_expandedPlayerArtistLinks is not null) { _expandedPlayerArtistLinks.Content = null; _expandedPlayerArtistLinks.ContextMenu = null; }
             _expandedCoverUri = null;
             _expandedPlayerTrack = null;
             if (_expandedWindowPlacement is { } previous)
@@ -122,15 +125,19 @@ public partial class MainWindow
         var details = new StackPanel { MaxWidth = 560, HorizontalAlignment = HorizontalAlignment.Stretch };
         Grid.SetRow(details, 1); player.Children.Add(details);
         _expandedPlayerTitle = new TextBlock { FontSize = 27, FontWeight = FontWeights.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis, TextAlignment = TextAlignment.Center, MaxHeight = 70, TextWrapping = TextWrapping.Wrap };
-        _expandedPlayerTitleButton = new Button { Name = "ExpandedPlayerTitle", Content = _expandedPlayerTitle, Style = (Style)FindResource("TrackTitleLink"), Padding = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Stretch, ToolTip = "Открыть альбом" };
+        _expandedPlayerTitleButton = new Button { Name = "ExpandedPlayerTitle", Content = _expandedPlayerTitle, Style = (Style)FindResource("TrackTitleLink"), Padding = new Thickness(0), HorizontalAlignment = HorizontalAlignment.Center, ToolTip = "Открыть альбом" };
         _expandedPlayerTitleButton.Click += ExpandedAlbum_Click; details.Children.Add(_expandedPlayerTitleButton);
         _expandedPlayerArtist = new TextBlock { FontSize = 16, Foreground = ExpandedBrush("MutedBrush"), TextTrimming = TextTrimming.CharacterEllipsis, TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 5, 0, 12) };
         details.Children.Add(_expandedPlayerArtist);
+        _expandedPlayerArtistLinks = new ContentControl { Name = "ExpandedPlayerArtists", ContentTemplate = (DataTemplate)FindResource("TrackArtistLinks"),
+            HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 5, 0, 12), Visibility = Visibility.Collapsed };
+        _expandedPlayerArtistLinks.AddHandler(Button.ClickEvent, new RoutedEventHandler((_, _) => CloseExpandedPlayer()), true);
+        details.Children.Add(_expandedPlayerArtistLinks);
         var transport = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
         details.Children.Add(transport);
         transport.Children.Add(ExpandedForwardButton("ExpandedPlayerPrevious", PreviousButton, "\uE892", "Предыдущий трек", 46));
         var play = ExpandedForwardButton("ExpandedPlayerPlayPause", PlayPauseButton, "\uE768", "Воспроизвести / пауза", 64);
-        play.Background = ExpandedBrush("AccentBrush"); play.Foreground = new SolidColorBrush(Color.FromRgb(28, 19, 16));
+        play.SetResourceReference(Control.BackgroundProperty, "AccentBrush"); play.SetResourceReference(Control.ForegroundProperty, "AccentForegroundBrush");
         play.FontSize = 27; play.Margin = new Thickness(14, 0, 14, 0); transport.Children.Add(play);
         transport.Children.Add(ExpandedForwardButton("ExpandedPlayerNext", NextButton, "\uE893", "Следующий трек", 46));
         var like = ExpandedForwardButton("ExpandedPlayerLike", PlayerLikeButton, "\uEB51", "Мне нравится", 46);
@@ -139,20 +146,25 @@ public partial class MainWindow
         _expandedPlayerLyricsButton.FontFamily = new FontFamily("Segoe UI"); _expandedPlayerLyricsButton.FontSize = 20;
         _expandedPlayerLyricsButton.Margin = new Thickness(5, 0, 0, 0); transport.Children.Add(_expandedPlayerLyricsButton);
 
-        _expandedPlayerSeek = new Slider { Name = "ExpandedPlayerSeek", Minimum = 0, Maximum = 1, Margin = new Thickness(0, 10, 0, 0), SmallChange = 5, LargeChange = 15 };
+        _expandedPlayerSeek = new Slider { Name = "ExpandedPlayerSeek", Minimum = 0, Maximum = 1, Margin = new Thickness(0, 10, 0, 0), SmallChange = 5, LargeChange = 15, IsMoveToPointEnabled = true };
         AutomationProperties.SetName(_expandedPlayerSeek, "Позиция воспроизведения"); details.Children.Add(_expandedPlayerSeek);
         _expandedPlayerSeek.ValueChanged += (_, args) => { if (_expandedSeekDragging && _expandedPlayerPosition is not null) _expandedPlayerPosition.Text = FormatTime(TimeSpan.FromSeconds(args.NewValue)); };
-        _expandedPlayerSeek.AddHandler(PreviewMouseLeftButtonDownEvent, new MouseButtonEventHandler((_, _) => { if (_expandedPlayerSeek.IsEnabled) _expandedSeekDragging = true; }), true);
-        _expandedPlayerSeek.AddHandler(PreviewMouseLeftButtonUpEvent, new MouseButtonEventHandler((_, _) => FinishExpandedSeek(true)), true);
+        _expandedSeekGesture = new SliderGesture(_expandedPlayerSeek, () =>
+        { _expandedSeekDragging = true; _expandedSeekIgnoreKeyUp = false; _expandedSeekKeyboardGesture = _expandedSeekGesture?.IsKeyboardActive == true; }, FinishExpandedSeek);
         _expandedPlayerSeek.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((_, args) => FinishExpandedSeek(!args.Canceled)), true);
-        _expandedPlayerSeek.AddHandler(Mouse.LostMouseCaptureEvent, new MouseEventHandler((_, _) => { if (!_expandedPlayerSeek.IsMouseCaptureWithin) FinishExpandedSeek(false); }), true);
-        _expandedPlayerSeek.PreviewKeyUp += (_, args) => { if (IsExpandedPlayerOpen && _expandedAccountGeneration == _accountGeneration && _expandedPlayerSeek.IsEnabled && args.Key is Key.Left or Key.Right or Key.Home or Key.End or Key.PageUp or Key.PageDown) { CommitSeek(_expandedPlayerSeek.Value); RefreshExpandedPlayer(); args.Handled = true; } };
+        _expandedPlayerSeek.PreviewKeyUp += (_, args) =>
+        {
+            if (!IsExpandedPlayerOpen || _expandedAccountGeneration != _accountGeneration || !_expandedPlayerSeek.IsEnabled || !SliderGesture.SeekKey(args.Key)) return;
+            if (_expandedSeekIgnoreKeyUp) { _expandedSeekIgnoreKeyUp = false; return; }
+            PlaybackTimeline.Stop(_expandedPlayerSeek, useBaseValue: true); CommitSeek(_expandedPlayerSeek.Value); RefreshExpandedPlayer(); args.Handled = true;
+        };
         var time = new DockPanel(); details.Children.Add(time);
         _expandedPlayerDuration = new TextBlock { Foreground = ExpandedBrush("MutedBrush"), FontSize = 12 }; DockPanel.SetDock(_expandedPlayerDuration, Dock.Right); time.Children.Add(_expandedPlayerDuration);
         _expandedPlayerPosition = new TextBlock { Foreground = ExpandedBrush("MutedBrush"), FontSize = 12 }; time.Children.Add(_expandedPlayerPosition);
         var volume = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 9, 0, 0) };
         volume.Children.Add(new TextBlock { Text = "\uE767", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 16, VerticalAlignment = VerticalAlignment.Center, Foreground = ExpandedBrush("MutedBrush") });
         var volumeSlider = new Slider { Name = "ExpandedPlayerVolume", Width = 150, Minimum = 0, Maximum = 100, SmallChange = 5, Margin = new Thickness(9, 0, 9, 0) };
+        _expandedVolumeGesture = new SliderGesture(volumeSlider, () => { }, _ => FlushVolumePreferences());
         volumeSlider.SetBinding(RangeBase.ValueProperty, new Binding(nameof(Slider.Value)) { Source = VolumeSlider, Mode = BindingMode.TwoWay });
         AutomationProperties.SetName(volumeSlider, "Громкость"); volume.Children.Add(volumeSlider);
         var volumeText = new TextBlock { Width = 37, FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Foreground = ExpandedBrush("MutedBrush") };
@@ -188,7 +200,10 @@ public partial class MainWindow
     private void FinishExpandedSeek(bool commit)
     {
         if (!_expandedSeekDragging) return;
+        if (!commit && _expandedSeekKeyboardGesture) _expandedSeekIgnoreKeyUp = true;
+        _expandedSeekKeyboardGesture = false;
         _expandedSeekDragging = false;
+        _expandedSeekGesture?.Cancel();
         if (commit && IsExpandedPlayerOpen && _expandedAccountGeneration == _accountGeneration && _expandedPlayerSeek is { IsEnabled: true } seek) CommitSeek(seek.Value);
         RefreshExpandedPlayer();
     }
@@ -199,19 +214,29 @@ public partial class MainWindow
         if (_expandedPlayerCover is null || _expandedPlayerSeek is null) return;
         var track = _current;
         if (!ReferenceEquals(_expandedPlayerTrack, track))
-        { _expandedPlayerTrack = track; _expandedSeekDragging = false; _expandedLyricsFollowIndex = -1; _expandedLyricsFollowUntil = default; }
+        { _expandedPlayerTrack = track; _expandedSeekGesture?.Cancel(); _expandedSeekDragging = false; PlaybackTimeline.Stop(_expandedPlayerSeek); _expandedLyricsFollowIndex = -1; _expandedLyricsFollowUntil = default; }
         if (_expandedCoverUri != track.CoverUri)
         { _expandedCoverUri = track.CoverUri; Artwork.SetSourceUri(_expandedPlayerCover, track.CoverUri); }
         _expandedPlayerTitle!.Text = track.Title; _expandedPlayerTitle.ToolTip = track.Title;
         _expandedPlayerArtist!.Text = track.Artist; _expandedPlayerArtist.ToolTip = track.Artist;
+        if (!ReferenceEquals(_expandedPlayerArtistLinks!.Content, track))
+        {
+            _expandedPlayerArtistLinks.Content = track;
+            _expandedPlayerArtistLinks.ContextMenu = track.Artists.Count > 0 ? CreateTrackArtistsMenu(_expandedPlayerArtistLinks, track.Artists) : null;
+        }
+        var hasArtistLinks = track.Artists.Count > 0 || !string.IsNullOrWhiteSpace(track.Artist);
+        _expandedPlayerArtistLinks.Visibility = hasArtistLinks ? Visibility.Visible : Visibility.Collapsed;
+        _expandedPlayerArtistLinks.IsEnabled = _session is not null;
+        _expandedPlayerArtist.Visibility = hasArtistLinks ? Visibility.Collapsed : Visibility.Visible;
         _expandedPlayerCoverButton!.Tag = _expandedPlayerTitleButton!.Tag = track;
         _expandedPlayerCoverButton.IsEnabled = _expandedPlayerTitleButton.IsEnabled = _session is not null;
         _expandedPlayerSeek.IsEnabled = SeekSlider.IsEnabled;
         if (!_expandedPlayerSeek.IsEnabled) _expandedSeekDragging = false;
+        if (_expandedSeekDragging) PlaybackTimeline.Stop(_expandedPlayerSeek, useBaseValue: true);
         if (!_expandedSeekDragging)
         {
-            _expandedPlayerSeek.Maximum = SeekSlider.Maximum;
-            _expandedPlayerSeek.Value = SeekSlider.Value;
+            PlaybackTimeline.Update(_expandedPlayerSeek, _pendingSeek ?? SeekSlider.Value, SeekSlider.Maximum,
+                _player.IsPlaying && _pendingSeek is null && !_loadingStream && !_closed, _player.SpeedRatio);
             _expandedPlayerPosition!.Text = PositionText.Text;
         }
         _expandedPlayerDuration!.Text = DurationText.Text;
@@ -228,10 +253,10 @@ public partial class MainWindow
         var note = new TextBlock { FontSize = 12, Foreground = ExpandedBrush("MutedBrush"), TextWrapping = TextWrapping.Wrap };
         note.SetBinding(TextBlock.TextProperty, new Binding(nameof(TextBlock.Text)) { Source = LyricsNote }); info.Children.Add(note);
         var actions = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
-        var source = new Button { Style = (Style)FindResource("QuietButton"), Padding = new Thickness(0, 5, 12, 5), FontSize = 12 };
+        var source = new Button { Style = (Style)FindResource("QuietButton"), Padding = new Thickness(12, 5, 12, 5), FontSize = 12 };
         source.SetBinding(ContentControl.ContentProperty, new Binding(nameof(Button.Content)) { Source = LyricsSourceButton });
         source.SetBinding(VisibilityProperty, new Binding(nameof(Visibility)) { Source = LyricsSourceButton }); source.Click += LyricsSource_Click; actions.Children.Add(source);
-        var retry = new Button { Content = "Обновить текст", Style = (Style)FindResource("QuietButton"), Padding = new Thickness(0, 5, 0, 5), FontSize = 12 }; retry.Click += LyricsRetry_Click; actions.Children.Add(retry); info.Children.Add(actions);
+        var retry = new Button { Content = "Обновить текст", Style = (Style)FindResource("QuietButton"), Padding = new Thickness(12, 5, 12, 5), FontSize = 12 }; retry.Click += LyricsRetry_Click; actions.Children.Add(retry); info.Children.Add(actions);
         _expandedLyricsPanel.Children.Add(info);
         _expandedLyricsList = new ListBox { Name = "ExpandedLyricsList", Background = Brushes.Transparent, BorderThickness = new Thickness(0), Foreground = ExpandedBrush("MutedBrush"), FontSize = 25, HorizontalContentAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(20, 0, 0, 0), ItemTemplate = LyricsList.ItemTemplate, ItemContainerStyle = LyricsList.ItemContainerStyle };
         _expandedLyricsList.SetBinding(ItemsControl.ItemsSourceProperty, new Binding(nameof(ItemsControl.ItemsSource)) { Source = LyricsList });

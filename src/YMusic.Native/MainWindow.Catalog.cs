@@ -44,7 +44,7 @@ public partial class MainWindow
         TracksList.Visibility = Visibility.Collapsed; CatalogList.Visibility = Visibility.Visible;
         CatalogList.ItemsSource = _catalogItems;
         if (!append) _catalogItems.Clear();
-        var snapshot = items.ToArray();
+        var snapshot = items.Select(PresentCatalogAuthor).ToArray();
         ApplyOfflineStates(snapshot.Select(item => item.Track).OfType<TrackRow>());
         foreach (var item in snapshot) _catalogItems.Add(item);
         GroupCatalogResults();
@@ -155,6 +155,7 @@ public partial class MainWindow
     }
     private void ShowPlaylist(PlaylistDetails details)
     {
+        details = PresentPlaylistAuthor(details);
         // A response fills the underlying view while an open Settings draft stays intact.
         ApplySection("playlist-detail", details.Title, closeSettings: false);
         CatalogSearchPanel.Visibility = Visibility.Collapsed;

@@ -51,17 +51,17 @@ internal static partial class Program
             var fixture = ChromeFixture(); ChromeLayout(fixture.Root);
             foreach (var (control, part, radius, margin, property) in new (Control, string, double, double, DependencyProperty)[]
             {
-                (fixture.Button, "ButtonKeyboardFocus", 7, 2, UIElement.IsKeyboardFocusedProperty),
-                (fixture.Quiet, "ButtonKeyboardFocus", 7, 2, UIElement.IsKeyboardFocusedProperty),
-                (fixture.Link, "LinkKeyboardFocus", 4, 1, UIElement.IsKeyboardFocusedProperty),
-                (fixture.Combo, "ComboKeyboardFocus", 7, 2, UIElement.IsKeyboardFocusWithinProperty),
-                (fixture.SelectedItem, "ItemKeyboardFocus", 5, 2, UIElement.IsKeyboardFocusWithinProperty)
+                (fixture.Button, "ButtonKeyboardFocus", 7, 2, YMusic.Native.InputFeedback.KeyboardFocusVisibleProperty),
+                (fixture.Quiet, "ButtonKeyboardFocus", 7, 2, YMusic.Native.InputFeedback.KeyboardFocusVisibleProperty),
+                (fixture.Link, "LinkKeyboardFocus", 4, 1, YMusic.Native.InputFeedback.KeyboardFocusVisibleProperty),
+                (fixture.Combo, "ComboKeyboardFocus", 7, 2, YMusic.Native.InputFeedback.KeyboardFocusVisibleProperty),
+                (fixture.SelectedItem, "ItemKeyboardFocus", 5, 2, YMusic.Native.InputFeedback.KeyboardFocusVisibleProperty)
             })
             {
                 var ring = ChromePart<Border>(control, part);
                 Assert(control.FocusVisualStyle is null && ring.Margin == new Thickness(margin)
                     && ring.CornerRadius == new CornerRadius(radius) && ring.BorderThickness == new Thickness(1)
-                    && ring.Opacity == 0 && !ring.IsHitTestVisible && ChromeColor(ring.BorderBrush) == "#FFEA571C",
+                    && ring.Opacity == 0 && !ring.IsHitTestVisible && ReferenceEquals(ring.BorderBrush, Application.Current.Resources["AccentBrush"]),
                     "control has native/outer/interactive focus chrome instead of a bounded accent ring");
                 Assert(ChromeTrigger(control, property, part, UIElement.OpacityProperty, 1d), "keyboard focus trigger does not reveal the internal ring");
             }
@@ -87,16 +87,16 @@ internal static partial class Program
         {
             var fixture = ChromeFixture(); ChromeLayout(fixture.Root);
             var selected = ChromePart<Border>(fixture.SelectedItem, "Item");
-            Assert(fixture.SelectedItem.IsSelected && ChromeColor(selected.Background) == "#FF3D2A21"
-                && ChromeColor(selected.BorderBrush) == "#FF6D3F2B" && ChromeColor(fixture.SelectedItem.Foreground) == "#FFFFB18F",
-                "actual selected-item state lost the warm selection surface");
+            Assert(fixture.SelectedItem.IsSelected && ReferenceEquals(selected.Background, Application.Current.Resources["AccentSelectionBrush"])
+                && ReferenceEquals(selected.BorderBrush, Application.Current.Resources["AccentHoverBrush"]) && ReferenceEquals(fixture.SelectedItem.Foreground, Application.Current.Resources["AccentHoverBrush"]),
+                "actual selected-item state lost the dynamic accent selection surface");
             Assert(ChromePart<Grid>(fixture.Disabled, "ButtonSurface").Opacity <= .351
                 && !fixture.Disabled.IsEnabled, "actual disabled state is not visible");
-            Assert(ChromeColor((Brush)Application.Current.Resources["AccentBrush"]) == "#FFEA571C", "brand accent changed");
-            Assert(ChromeTrigger(fixture.Link, UIElement.IsMouseOverProperty, null, System.Windows.Controls.Control.ForegroundProperty, "#FFF37843"),
-                "text link hover does not use the requested branded hover color");
+            Assert(YMusic.Native.CoverPalette.Contrast(((SolidColorBrush)Application.Current.Resources["AccentBrush"]).Color, YMusic.Native.CoverPalette.Ink) >= 4.5, "active accent lost readable ink contrast");
+            Assert(ChromeResourceTrigger(fixture.Link, UIElement.IsMouseOverProperty, null, System.Windows.Controls.Control.ForegroundProperty, "AccentHoverBrush"),
+                "text link hover does not resolve the dynamic accent hover resource");
             Assert(ChromeTrigger(fixture.Button, UIElement.IsMouseOverProperty, "ButtonHover", YMusic.Native.Motion.OpacityProperty, .065d)
-                && ChromeTrigger(fixture.Combo, ComboBox.IsDropDownOpenProperty, "ComboChrome", Border.BorderBrushProperty, "#FFF37843"),
+                && ChromeResourceTrigger(fixture.Combo, ComboBox.IsDropDownOpenProperty, "ComboChrome", Border.BorderBrushProperty, "AccentHoverBrush"),
                 "button or opened-combo state lost the bounded highlight");
             Assert(fixture.SelectedItem.FocusVisualStyle is null && fixture.NormalItem.FocusVisualStyle is null,
                 "combo items inherit native dotted keyboard focus");
@@ -112,7 +112,7 @@ internal static partial class Program
                 userCursorMoved = false,
                 keyboardOrMouseInputSent = false,
                 accountOrNetworkAccess = false,
-                accent = "#EA571C", hover = "#F37843"
+                accent = ChromeColor((Brush)Application.Current.Resources["AccentBrush"]), hover = "AccentHoverBrush", dynamicResourceKeysInspected = true
             }, new JsonSerializerOptions { WriteIndented = true }));
             return Task.CompletedTask;
         });
@@ -188,6 +188,11 @@ internal static partial class Program
         control.Template.Triggers.OfType<Trigger>().Where(trigger => trigger.Property == condition && Equals(trigger.Value, true))
             .SelectMany(trigger => trigger.Setters.OfType<Setter>()).Any(setter => setter.TargetName == target && setter.Property == property
                 && (value is string color ? setter.Value is Brush brush && ChromeColor(brush) == color : Equals(setter.Value, value)));
+
+    private static bool ChromeResourceTrigger(Control control, DependencyProperty condition, string? target, DependencyProperty property, string key) =>
+        control.Template.Triggers.OfType<Trigger>().Where(trigger => trigger.Property == condition && Equals(trigger.Value, true))
+            .SelectMany(trigger => trigger.Setters.OfType<Setter>()).Any(setter => setter.TargetName == target && setter.Property == property
+                && setter.Value is DynamicResourceExtension resource && Equals(resource.ResourceKey, key));
 
     private static void ChromeCapture(FrameworkElement root, string file)
     {

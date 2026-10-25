@@ -100,7 +100,11 @@ public static class SmoothScroll
             if (current is not ScrollViewer viewer || viewer.ScrollableHeight <= Epsilon) continue;
             var offset = States.TryGetValue(viewer, out var state) && state.HasPendingOffset
                 ? state.TargetOffset : viewer.VerticalOffset;
-            if (delta > 0 ? offset > Epsilon : offset < viewer.ScrollableHeight - Epsilon) return viewer;
+            // A clamped target can reach an edge before the visible viewport.
+            // Keep owning wheel input until that last part of the motion arrives;
+            // otherwise native scrolling consumes the next packet and snaps it.
+            if (delta > 0 ? Math.Max(offset, viewer.VerticalOffset) > Epsilon
+                : Math.Min(offset, viewer.VerticalOffset) < viewer.ScrollableHeight - Epsilon) return viewer;
         }
         return null;
     }
@@ -185,7 +189,29 @@ public static class SmoothScroll
             var basis = IsAnimating && Math.Sign(distance) == Math.Sign(TargetOffset - current)
                 ? TargetOffset : current;
             var target = Math.Clamp(basis + distance, 0, _viewer.ScrollableHeight);
-            if (Math.Abs(target - current) <= Epsilon) return;
+            if (Math.Abs(target - current) <= Epsilon)
+            {
+                if (HasPendingOffset)
+                {
+                    // Reversal can return to the visible edge before the first
+                    // frame has moved. Cancel the old inward target as well.
+                    if (Math.Abs(target - TargetOffset) > Epsilon)
+                    {
+                        Cancel();
+                        _viewer.ScrollToVerticalOffset(target);
+                    }
+                    args.Handled = true;
+                }
+                return;
+            }
+            // Extra packets towards an already clamped animated endpoint add no
+            // distance. Consume them without restarting or speeding up the tail.
+            if (IsAnimating && Math.Abs(target - TargetOffset) <= Epsilon &&
+                Math.Sign(distance) == Math.Sign(TargetOffset - current))
+            {
+                args.Handled = true;
+                return;
+            }
             // High-resolution wheel packets already describe fine movement at
             // the device's cadence. Queue their exact pixel distance once instead
             // of turning each small packet into another 280 ms animation tail.
@@ -275,6 +301,11 @@ public static class SmoothScroll
                 var scale = VisualTreeHelper.GetDpi(_viewer).DpiScaleY;
                 _requestedOffset = Math.Clamp(Math.Round(_requestedOffset * scale) / scale, 0, _viewer.ScrollableHeight);
             }
+            // The visible start or final partial row need not lie on a physical
+            // pixel. Rounding must not move a first frame backwards, overshoot a
+            // fractional target, or undo an already acknowledged queued frame.
+            _requestedOffset = Math.Clamp(_requestedOffset,
+                Math.Min(_viewer.VerticalOffset, TargetOffset), Math.Max(_viewer.VerticalOffset, TargetOffset));
             // An unchanged pixel produces no ScrollChanged acknowledgement.
             if (Math.Abs(_requestedOffset - _viewer.VerticalOffset) <= Epsilon)
             {

@@ -33,9 +33,10 @@ internal sealed class DesktopShell : IDisposable
     private bool _canNext;
     private bool _canPrevious;
     private ImageSource? _cover;
-    private double _positionSeconds, _durationSeconds, _volumePercent = 70;
+    private double _positionSeconds, _durationSeconds, _volumePercent = 70, _speedRatio = 1;
     private bool _canSeek, _isLiked, _canLike;
     private string? _trackKey;
+    private bool _advancePlayhead = true;
 
     public event Action<ShellAction>? Command;
     public event Action<double>? SeekRequested;
@@ -132,7 +133,7 @@ internal sealed class DesktopShell : IDisposable
     }
 
     public void UpdateDetails(ImageSource? cover, double positionSeconds, double durationSeconds,
-        bool canSeek, bool isLiked, bool canLike, double volumePercent, string? trackKey = null)
+        bool canSeek, bool isLiked, bool canLike, double volumePercent, string? trackKey = null, double speedRatio = 1, bool advancePlayhead = true)
     {
         OnWindowThread(() =>
         {
@@ -144,6 +145,8 @@ internal sealed class DesktopShell : IDisposable
             _canLike = canLike;
             _volumePercent = double.IsFinite(volumePercent) ? Math.Clamp(volumePercent, 0, 100) : 0;
             _trackKey = trackKey;
+            _speedRatio = double.IsFinite(speedRatio) ? Math.Clamp(speedRatio, .5, 2) : 1;
+            _advancePlayhead = advancePlayhead;
             UpdateMiniPlayerDetails();
         });
     }
@@ -193,7 +196,7 @@ internal sealed class DesktopShell : IDisposable
 
     private void UpdateMiniPlayer() => _mini?.Update(_title, _artist, _isPlaying, _canNext, _canPrevious);
     private void UpdateMiniPlayerDetails() => _mini?.UpdateDetails(_cover, _positionSeconds, _durationSeconds,
-        _canSeek, _isLiked, _canLike, _volumePercent, _trackKey);
+        _canSeek, _isLiked, _canLike, _volumePercent, _trackKey, _speedRatio, _advancePlayhead);
 
     private bool TryAddTray()
     {

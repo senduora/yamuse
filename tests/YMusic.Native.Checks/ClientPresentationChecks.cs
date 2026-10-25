@@ -171,6 +171,7 @@ internal static partial class Program
         SaField<List<TrackRow>>(fixture.Window, "_favoritesCache").AddRange(rows);
         await fixture.Library.RememberPlaylistAsync(new PlaylistDetails("local:favorites", "liked", "Мне нравится", "", 0, rows), AudioQuality.Excellent, default);
         SaInvoke(fixture.Window, "ShowRows", (object)rows);
+        await (SaField<Task?>(fixture.Window, "_playlistStatusTask") ?? Task.CompletedTask).WaitAsync(TimeSpan.FromSeconds(5));
         var status = Control<TextBlock>(fixture.Window, "PlaylistDownloadText"); var before = status.Text;
         var index = Path.Combine(fixture.Library.DirectoryPath, "playlists.index.json");
         File.WriteAllText(index, "deliberately changed metadata for the explicit-refresh check");
@@ -183,6 +184,7 @@ internal static partial class Program
         clock.Stop();
         Assert(status.Text == before, "ordinary selection re-read playlist metadata");
         SaInvoke(fixture.Window, "UpdateCount");
+        await (SaField<Task?>(fixture.Window, "_playlistStatusTask") ?? Task.CompletedTask).WaitAsync(TimeSpan.FromSeconds(5));
         Assert(status.Text == "Не удалось прочитать статус скачивания", "an explicit library refresh failed to observe changed metadata");
         File.WriteAllText(Path.Combine(_directory, "presentation-selection.json"), JsonSerializer.Serialize(new
         { tracks = rows.Length, selections = 40, selectionMs = clock.Elapsed.TotalMilliseconds, selectionReadsPlaylistIndex = false, explicitRefreshReadsChangedIndex = true }));
