@@ -83,8 +83,8 @@ internal static partial class Program
                 SaInvoke(f.Window,"Settings_Click",null!,null!);Control<Slider>(f.Window,"CrossfadeSetting").Value=9.5;
                 f.WriteRelease.TrySetResult();await unlike;f.ReadRelease.TrySetResult();await refresh;
                 Assert(!SaField<List<TrackRow>>(f.Window,"_favoritesCache").Any(t=>t.Id=="ul-dead")&&!SaField<HashSet<string>>(f.Window,"_favoriteTrackIds").Contains("ul-dead"),"late refresh revived removed ID");
-                Assert(SaField<bool>(f.Window,"_settingsOpen")&&Control<Slider>(f.Window,"CrossfadeSetting").Value==9.5&&f.Player.CrossfadeSeconds==3,"unlike/refresh closed Settings or reset/committed the draft");
-                SaClick(Control<Button>(f.Window,"SettingsCancelButton"));SaInvoke(f.Window,"Favorites_Click",null!,null!);
+                Assert(SaField<bool>(f.Window,"_settingsOpen")&&Control<Slider>(f.Window,"CrossfadeSetting").Value==9.5&&f.Player.CrossfadeSeconds==9.5,"unlike/refresh closed Settings or reset live controls/runtime");
+                SaClick(Control<Button>(f.Window,"SettingsBackButton"));SaInvoke(f.Window,"Favorites_Click",null!,null!);
                 Assert(!Control<ListView>(f.Window,"TracksList").Items.Cast<TrackRow>().Any(t=>t.Id=="ul-dead"),"removed track returned to the visible collection");
             }
         });

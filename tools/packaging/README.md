@@ -2,17 +2,19 @@
 
 Приложение использует **Velopack 1.2.161**, стабильный NuGet/vpk от 29.09.2026, лицензия MIT. Прямая зависимость закреплена точным диапазоном `[1.2.161]`, `src/YMusic.Native/packages.lock.json` содержит contentHash. `dotnet-tools.json` фиксирует ту же версию CLI. Для self-contained сборки закреплены .NET Core и Windows Desktop **8.0.32** от 13.10.2026; локально проверено с SDK **8.0.301**.
 
-Публичный источник настроен на [senduora/yamuse](https://github.com/senduora/yamuse). `update-feed.json` копируется в выход сборки и publish через csproj; PAT, секретов, фонового процесса и собственного механизма замены exe нет. Первую проверку/загрузку реального обновления можно подтвердить только после появления корректных Release assets. Приватный feed не подключён и авторизация для него не реализована.
+Публичный источник настроен на [senduora/yamuse](https://github.com/senduora/yamuse). `update-feed.json` копируется в выход сборки и publish через csproj; PAT, секретов, фонового процесса и собственного механизма замены exe нет. Проверка публичного выпуска и загрузка его пакета сверяются с опубликованными Release assets и SHA-256.
 
 ## Сборка
+
+Новые версии следуют [политике `X.Y.Z`](../../docs/VERSIONING.md): `X` — крупное обновление, `Y` — новые небольшие возможности, `Z` — исправления. Текущий стабильный выпуск — `0.4.0`. Полная `InformationalVersion` обязательна при проверке пакета: числовая `AssemblyVersion` равна `0.4.0.0` и не отличает preview от стабильной версии. Скрипт принимает только стабильную `X.Y.Z`; до создания рабочих папок и получения инструментов он отклоняет preview-исходники либо несовпадение полной версии готовой DLL. Упаковка preview пока не поддерживается.
 
 Нужны Windows x64, PowerShell и .NET SDK 8. Для окончательного пакета используйте уже проверенный self-contained publish и хеш DLL, прошедшего общие проверки. Указывайте новые пустые папки:
 
 ```powershell
 & .\tools\packaging\Pack-Installer.ps1 `
-  -Version 0.3.14 `
-  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.3.14') `
-  -WorkFolder (Join-Path $PWD 'work\package-0.3.14') `
+  -Version 0.4.0 `
+  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.4.0') `
+  -WorkFolder (Join-Path $PWD 'work\package-0.4.0') `
   -PackageCache (Join-Path $PWD 'work\verified-packages') `
   -PublishedFolder $checkedSelfContainedPublish `
   -ExpectedProductSha256 $checkedProductHash
@@ -48,7 +50,7 @@ Bootstrap расположен в `Program.Main`, выбран через Startu
 - `DownloadAsync(IProgress<int>? = null, CancellationToken = default)` скачивает выбранное обновление. Повторный вызов после готовности не скачивает его заново. Операции сериализуются.
 - `ApplyAndRestart()` разрешён только после `Downloaded`; вызывается отдельной кнопкой после сохранения состояния и остановки плеера. Только этот метод вызывает официальный SDK apply/restart.
 
-Сам service не ставит таймер и не делает автоматических сетевых вызовов. Отсутствующий файл либо `update-feed.template.json` с null дают немедленный `NotConfigured` без создания update backend. Настроенная переносимая версия даёт `Portable` и также не создаёт сетевой backend. Конфиг допускает только канонический HTTPS URL публичного `github.com/owner/repo`; credentials/query/token/неизвестные поля отклоняются. В состояние/сообщения не попадают raw URL и exception text.
+Сам service не ставит таймер и не делает автоматических сетевых вызовов. Отсутствующий файл либо `update-feed.template.json` с null дают немедленный `NotConfigured` без создания update backend. Переносимая версия проверяет публичные метаданные через `CheckPortableReleaseAsync` и предлагает официальный установщик или архив; backend установки Velopack для неё не создаётся. Конфиг допускает только канонический HTTPS URL публичного `github.com/owner/repo`; credentials/query/token/неизвестные поля отклоняются. В состояние/сообщения не попадают raw URL и exception text.
 
 CheckForUpdatesAsync в закреплённом SDK не принимает CancellationToken: начатый запрос не бросается в фоне при отмене, операция остаётся сериализованной до завершения. Download поддерживает отмену SDK. Нет проверки private Releases, серверной авторизации или встроенного PAT.
 

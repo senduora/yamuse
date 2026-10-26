@@ -32,20 +32,20 @@ internal static partial class Program
             Assert(SaField<string>(w, "_section") == section && NavHistoryCount(w, "_browseHistory") == 0 && NavHistoryCount(w, "_browseForward") == 0,
                 "history exposed the previous account after signout");
         });
-        await Run("Navigation014: mouse handling leaves ordinary buttons alone and Back closes Settings without applying its draft", async () =>
+        await Run("Navigation014: mouse handling leaves ordinary buttons alone and Back retains live Settings changes", async () =>
         {
             using var f = new SaFixture("mouse-overlay"); await f.Activate(); var w = f.Window;
             var left = new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left) { RoutedEvent = Mouse.PreviewMouseDownEvent };
             w.RaiseEvent(left); Assert(!left.Handled, "history swallowed an ordinary mouse button");
             var crossfade = f.Player.CrossfadeSeconds; SaInvoke(w, "Settings_Click", null!, null!); Control<Slider>(w, "CrossfadeSetting").Value = 9.5;
             NavMouse(w, MouseButton.XButton1);
-            Assert(!SaField<bool>(w, "_settingsOpen") && f.Player.CrossfadeSeconds == crossfade, "mouse Back applied an unsaved Settings draft");
+            Assert(!SaField<bool>(w, "_settingsOpen") && f.Player.CrossfadeSeconds == 9.5, "mouse Back rolled back live Settings");
             for (var i = 0; i < 30; i++) SaInvoke(w, "SetSection", i % 2 == 0 ? "favorites" : "offline", "Раздел " + i);
             Assert(NavHistoryCount(w, "_browseHistory") == 24, "navigation history is unbounded or clears all entries at the limit");
         });
-        await Run("Navigation014: track title and cover links in lists and player open the exact album without playing audio", async () =>
+        await Run("Navigation014: list title and album links plus player links open the exact album without playing audio", async () =>
         {
-            foreach (var origin in new[] { "list-title", "list-cover", "player-title", "player-cover" })
+            foreach (var origin in new[] { "list-title", "list-album", "player-title", "player-cover" })
             {
                 using var f = new SaFixture("album-affordance-" + origin); await f.Activate(); var w = f.Window;
                 var track = new TrackRow { Id = "nav-track", RequestId = "nav-track:same-title-b", Title = "Точное название", Album = "Точный альбом", AlbumId = "same-title-b", Available = true };
@@ -59,7 +59,7 @@ internal static partial class Program
                     var list = Control<ListView>(w, "TracksList"); list.ScrollIntoView(track); w.UpdateLayout();
                     var row = (ListViewItem)list.ItemContainerGenerator.ContainerFromItem(track)!;
                     button = SaVisuals<Button>(row).Single(b => ReferenceEquals(b.Tag, track) && (origin.EndsWith("title", StringComparison.Ordinal)
-                        ? SaVisuals<TextBlock>(b).Any(t => t.Text == track.Title) : SaVisuals<Image>(b).Any()));
+                        ? SaVisuals<TextBlock>(b).Any(t => t.Text == track.Title) : SaVisuals<TextBlock>(b).Any(t => t.Text == track.Album)));
                 }
                 SaClick(button); await Until(() => SaField<string>(w, "_section") == "album-detail" && SaField<CancellationTokenSource?>(w, "_featureCts") is null);
                 Assert(f.Handler.Seen.Any(c => c.Uri.AbsolutePath == "/albums/same-title-b/with-tracks") && !f.Handler.Seen.Any(c => c.Uri.AbsolutePath == "/search"), "album link guessed a title instead of using the exact ID");

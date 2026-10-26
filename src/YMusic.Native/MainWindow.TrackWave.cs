@@ -54,9 +54,18 @@ public partial class MainWindow
 
     private void AttachTrackWaveMenu(FrameworkElement anchor, Func<TrackRow?> selectedTrack)
     {
+        // Downloads also owns batch selection and confirmed-unlike commands.
+        if (ReferenceEquals(anchor, _downloadEntriesList)) AttachDownloadTrackWaveMenu(anchor, selectedTrack);
+        else AttachTrackActionsMenu(anchor, selectedTrack);
+    }
+
+    private void AttachDownloadTrackWaveMenu(FrameworkElement anchor, Func<TrackRow?> selectedTrack)
+    {
         var menu = anchor.ContextMenu ??= new ContextMenu();
         if (menu.Items.OfType<MenuItem>().Any(item => item.Header as string == TrackWaveActionText)) return;
-        var action = new MenuItem { Header = TrackWaveActionText, IsEnabled = false };
+        var action = new MenuItem { Header = TrackWaveActionText, IsEnabled = false,
+            Icon = new System.Windows.Shapes.Path { Data = (System.Windows.Media.Geometry)FindResource("MenuWaveGeometry"), Style = (Style)FindResource("MenuGlyph") } };
+        BindTrackActionGlyph(action);
         menu.Items.Add(action);
         TrackRow? target = null, pointerTarget = null; var account = -1; var hasPointerTarget = false;
         menu.Opened += (_, _) =>
@@ -71,6 +80,7 @@ public partial class MainWindow
             if (IsExpandedPlayerOpen) CloseExpandedPlayer();
             await OpenTrackWaveAsync(target);
         };
+        menu.Closed += (_, _) => { target = pointerTarget = null; hasPointerTarget = false; };
         if (anchor is ListBox list)
         {
             list.AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler((_, e) =>

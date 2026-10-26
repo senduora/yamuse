@@ -6,12 +6,22 @@ namespace YMusic.Native;
 public partial class MainWindow
 {
     private void Queue_Click(object sender, RoutedEventArgs e) => ShowQueue();
-    private void ShowQueue()
+    private void ShowQueue() => ShowQueueCore(revealCurrent: true);
+    private void ShowQueueCore(bool revealCurrent)
     {
         SetSection("queue", "Очередь воспроизведения"); QueueActions.Visibility = Visibility.Visible;
         ShowRows(_playbackQueue.Items);
         SelectVisibleQueueOccurrence(_playbackQueue.CurrentIndex);
         SetStatus("Порядок очереди можно менять кнопками выше. Двойной щелчок запускает выбранный трек.");
+        if (revealCurrent)
+        {
+            var view = _viewGeneration; var items = _playbackQueue.Items;
+            RequestCurrentTrackReveal(TracksList, () =>
+            {
+                SelectVisibleQueueOccurrence(_playbackQueue.CurrentIndex);
+                return TracksList.SelectedIndex;
+            }, () => _section == "queue" && view == _viewGeneration && ReferenceEquals(items, _playbackQueue.Items));
+        }
     }
     private void History_Click(object sender, RoutedEventArgs e)
     {
@@ -28,7 +38,7 @@ public partial class MainWindow
     {
         if (TracksList.SelectedItem is not TrackRow { CanPlay: true } row) return;
         _playbackQueue.Enqueue(row, next);
-        if (_section == "queue") ShowQueue();
+        if (_section == "queue") ShowQueueCore(revealCurrent: false);
         SetStatus(next ? "Трек будет играть следующим" : "Трек добавлен в конец очереди"); UpdateControls();
     }
     private int SelectedQueueIndex()
@@ -44,7 +54,7 @@ public partial class MainWindow
         var index = SelectedQueueIndex(); if (index < 0) return;
         var removingCurrent = index == _playbackQueue.CurrentIndex;
         var next = _playbackQueue.RemoveAt(index);
-        ShowQueue();
+        ShowQueueCore(revealCurrent: false);
         if (removingCurrent)
         {
             if (next is not null) await PlayTrackAsync(next);
@@ -64,18 +74,18 @@ public partial class MainWindow
         if (_section != "queue") return;
         var index = SelectedQueueIndex(); var to = index + direction;
         if (index < 0 || to < 0 || to >= _queue.Count) return;
-        _playbackQueue.Move(index, to); ShowQueue(); SelectVisibleQueueOccurrence(to); UpdateControls();
+        _playbackQueue.Move(index, to); ShowQueueCore(revealCurrent: false); SelectVisibleQueueOccurrence(to); UpdateControls();
     }
     private void UpdateQueueControls()
     {
         if (ShuffleButton is null) return;
         // Keep the compact transport controls icon-only; state belongs in colour,
         // the indicator and the accessible name, rather than clipped text.
-        ShuffleButton.Foreground = (System.Windows.Media.Brush)FindResource(_playbackQueue.Shuffle ? "AccentBrush" : "MutedBrush");
+        ShuffleButton.Foreground = (System.Windows.Media.Brush)FindResource(_playbackQueue.Shuffle ? "AccentTextBrush" : "MutedBrush");
         ShuffleIndicator.Visibility = _playbackQueue.Shuffle ? Visibility.Visible : Visibility.Collapsed;
         ShuffleButton.ToolTip = _playbackQueue.Shuffle ? "Перемешивание включено" : "Включить перемешивание";
         System.Windows.Automation.AutomationProperties.SetName(ShuffleButton, (string)ShuffleButton.ToolTip);
-        RepeatButton.Foreground = (System.Windows.Media.Brush)FindResource(_playbackQueue.Repeat == RepeatMode.Off ? "MutedBrush" : "AccentBrush");
+        RepeatButton.Foreground = (System.Windows.Media.Brush)FindResource(_playbackQueue.Repeat == RepeatMode.Off ? "MutedBrush" : "AccentTextBrush");
         RepeatIndicator.Visibility = _playbackQueue.Repeat == RepeatMode.Off ? Visibility.Collapsed : Visibility.Visible;
         RepeatOneLabel.Visibility = _playbackQueue.Repeat == RepeatMode.One ? Visibility.Visible : Visibility.Collapsed;
         RepeatButton.ToolTip = _playbackQueue.Repeat switch { RepeatMode.All => "Повтор всей очереди", RepeatMode.One => "Повтор трека", _ => "Повтор выключен" };

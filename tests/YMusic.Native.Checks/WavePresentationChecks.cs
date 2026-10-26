@@ -173,7 +173,7 @@ internal static partial class Program
             Assert(shuffleContent is Grid && repeatContent is Grid && WaveVisuals<System.Windows.Shapes.Path>((Grid)shuffleContent).Any() && WaveVisuals<System.Windows.Shapes.Path>((Grid)repeatContent).Any(), "transport controls are not icon grids");
             Assert(Control<Ellipse>(window, "ShuffleIndicator").Visibility == Visibility.Collapsed && Control<Ellipse>(window, "RepeatIndicator").Visibility == Visibility.Collapsed, "default transport indicators are incorrect");
             WaveClick(shuffle);
-            Assert(Control<Ellipse>(window, "ShuffleIndicator").Visibility == Visibility.Visible && ReferenceEquals(shuffle.Foreground, window.FindResource("AccentBrush")), "shuffle state lacks accent/dot");
+            Assert(Control<Ellipse>(window, "ShuffleIndicator").Visibility == Visibility.Visible && ReferenceEquals(shuffle.Foreground, window.FindResource("AccentTextBrush")), "shuffle state lacks accent/dot");
             Assert(shuffle.ToolTip.ToString() == "Перемешивание включено" && AutomationProperties.GetName(shuffle) == shuffle.ToolTip.ToString(), "shuffle accessible state is missing");
             WaveClick(shuffle);
             Assert(Control<Ellipse>(window, "ShuffleIndicator").Visibility == Visibility.Collapsed && shuffle.ToolTip.ToString() == "Включить перемешивание", "shuffle off state did not return");
@@ -182,14 +182,14 @@ internal static partial class Program
                 WaveClick(repeat);
                 Assert(repeat.ToolTip.ToString() == tooltip && AutomationProperties.GetName(repeat) == tooltip, "repeat accessible cycle is incorrect");
                 Assert((Control<Ellipse>(window, "RepeatIndicator").Visibility == Visibility.Visible) == dot && (Control<System.Windows.Shapes.Path>(window, "RepeatOneLabel").Visibility == Visibility.Visible) == one, "repeat icon state is incorrect");
-                Assert(ReferenceEquals(repeat.Foreground, window.FindResource(dot ? "AccentBrush" : "MutedBrush")), "repeat state foreground is incorrect");
+                Assert(ReferenceEquals(repeat.Foreground, window.FindResource(dot ? "AccentTextBrush" : "MutedBrush")), "repeat state foreground is incorrect");
             }
             Assert(ReferenceEquals(shuffle.Content, shuffleContent) && ReferenceEquals(repeat.Content, repeatContent)
                 && !WaveVisuals<TextBlock>((Grid)shuffleContent).Any() && !WaveVisuals<TextBlock>((Grid)repeatContent).Any(), "toggle injected raster/text labels into vector compact controls");
             WaveInvoke(window, "UpdateMetrics");
             Assert(Control<TextBlock>(window, "MemoryText").Text.StartsWith("RAM всего ", StringComparison.Ordinal) && Control<TextBlock>(window, "CpuText").Text.StartsWith("CPU ", StringComparison.Ordinal)
-                && Control<StackPanel>(window, "MetricsRow").Children.Count == 3
-                && Control<StackPanel>(window, "MetricsRow").Children[0] is TextBlock { Name: "VersionText" }, "resource footer must show version, RAM and CPU in order");
+                && Control<StackPanel>(window, "MetricsRow").Children.OfType<TextBlock>().Select(text => text.Name)
+                    .SequenceEqual(new[] { "VersionText", "MemoryText", "CpuText" }), "resource footer must show version, RAM and CPU in order");
             foreach (var name in new[] { "TracksList", "CatalogList", "LyricsList" })
             {
                 var list = Control<ItemsControl>(window, name);
@@ -214,7 +214,7 @@ internal static partial class Program
         Assert(Control<Button>(window, "WavePlayButton").Content.ToString()!.Contains("Пауза", StringComparison.Ordinal) && player.IsPlaying, "hero transport state does not match native playback");
         var selected = Control<Button>(window, mode == WaveMode.Collection ? "CollectionWaveNav" : "WaveNav");
         var other = Control<Button>(window, mode == WaveMode.Collection ? "WaveNav" : "CollectionWaveNav");
-        Assert(ReferenceEquals(selected.Foreground, window.FindResource("AccentBrush")) && !ReferenceEquals(other.Foreground, window.FindResource("AccentBrush")), "both Wave modes appear selected or the wrong one is selected");
+        Assert(ReferenceEquals(selected.Foreground, window.FindResource("AccentTextBrush")) && !ReferenceEquals(other.Foreground, window.FindResource("AccentTextBrush")), "both Wave modes appear selected or the wrong one is selected");
     }
     private static async Task WaveCapture(MainWindow window, string mode)
     {

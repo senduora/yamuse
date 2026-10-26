@@ -178,6 +178,9 @@ internal static partial class Program
             await Until(() => MediaVisuals<Image>(list).Any(image => image.DataContext is TrackRow track && track.Id == row.Id && image.Source is BitmapSource { IsFrozen: true }));
             var rowImage = MediaVisuals<Image>(list).First(image => image.DataContext is TrackRow track && track.Id == row.Id && image.Source is BitmapSource { IsFrozen: true });
             Assert(Artwork.GetSourceUri(rowImage) == row.CoverUri && Artwork.GetPixelSize(rowImage) == 64, "row XAML cover binding is incorrect");
+            // This cover/restart fixture saved Optimal MP3 192 above. Select that
+            // tier explicitly; Excellent now intentionally probes for an upgrade.
+            Control<ComboBox>(window, "QualityCombo").SelectedIndex = 1;
             await window.PlayTrackAsync(row);
             var cover = Control<Image>(window, "PlayerCover");
             await Until(() => cover.Source is BitmapSource { IsFrozen: true });

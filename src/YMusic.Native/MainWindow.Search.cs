@@ -17,7 +17,11 @@ public partial class MainWindow
             CatalogType.SelectedItem = CatalogType.Items.OfType<ComboBoxItem>().First(item => (string)item.Tag == type);
         UpdateSearchCategories();
         if (CatalogQuery.Text.Trim().Length > 0) await SearchCatalogViewAsync(false);
-        else { ShowCatalogItems([]); SetStatus("Введите название или имя исполнителя и нажмите Enter."); }
+        else
+        {
+            _featureCts?.Cancel(); ResetSearchResults();
+            ShowCatalogItems([]); SetStatus("Введите название или имя исполнителя и нажмите Enter.");
+        }
     }
 
     private void UpdateSearchCategories()
@@ -27,8 +31,8 @@ public partial class MainWindow
         foreach (var button in SearchCategories.Children.OfType<Button>())
         {
             var active = (string)button.Tag == selected;
-            button.Background = active ? new SolidColorBrush(Color.FromRgb(51, 37, 34)) : Brushes.Transparent;
-            button.Foreground = (Brush)FindResource(active ? "AccentBrush" : "MutedBrush");
+            button.Background = active ? (Brush)FindResource("AccentSoftBrush") : Brushes.Transparent;
+            button.Foreground = (Brush)FindResource(active ? "AccentTextBrush" : "MutedBrush");
             System.Windows.Automation.AutomationProperties.SetHelpText(button, active ? "Выбрано" : "");
         }
     }

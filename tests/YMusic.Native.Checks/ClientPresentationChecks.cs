@@ -13,7 +13,7 @@ internal static partial class Program
     private static async Task CheckClientPresentation()
     {
         await Run("Presentation: Home cards stay inside their shelves through repeated hover and scrolling", PresentationCards);
-        await Run("Presentation: inline Settings save cancel navigate and scroll while the same player continues", PresentationSettings);
+        await Run("Presentation: inline live Settings retain changes navigate and scroll while the same player continues", PresentationSettings);
         await Run("Presentation: selection avoids playlist disk reads while explicit refresh observes changed data", PresentationSelection);
     }
 
@@ -113,13 +113,13 @@ internal static partial class Program
         await Task.Delay(200);
         Assert(fixture.Player.IsPlaying && fixture.Player.Position > position && fixture.Queue.Version == version && window.OwnedWindows.Count == 0,
             "opening Settings interrupted playback or created another window");
-        SaClick(Control<Button>(window, "SettingsCancelButton")); window.UpdateLayout(); await Task.Delay(80);
-        Assert(fixture.Player.CrossfadeSeconds == 3 && fixture.Player.SpeedRatio == 1 && initialPreferences.SequenceEqual(File.ReadAllBytes(store.FilePath)), "Cancel applied draft settings");
+        SaClick(Control<Button>(window, "SettingsBackButton")); window.UpdateLayout(); await Task.Delay(80);
+        Assert(fixture.Player.CrossfadeSeconds == 8.5 && fixture.Player.SpeedRatio == 1.25 && store.Load().CrossfadeSeconds == 8.5 && store.Load().PlaybackSpeed == 1.25, "Back lost live settings or persistence");
         Assert(Control<TextBox>(window, "FilterBox").Text == "Трек" && list.SelectedIndex == 12 && Math.Abs(listScroll.VerticalOffset - offset) <= 1,
             "returning from Settings lost the list position or filter");
 
         SaClick(Control<Button>(window, "SettingsButton"));
-        Assert(Control<Slider>(window, "CrossfadeSetting").Value == 3, "reopen retained canceled draft");
+        Assert(Control<Slider>(window, "CrossfadeSetting").Value == 8.5, "reopen lost live settings");
         Control<Slider>(window, "CrossfadeSetting").Value = 8.5;
         Control<ComboBox>(window, "SettingsSpeed").SelectedItem = 1.25;
         Control<ComboBox>(window, "SettingsDownloads").SelectedItem = 7;
@@ -128,9 +128,10 @@ internal static partial class Program
         {
             await ClResize(window, width, height);
             var panel = Control<Grid>(window, "SettingsPanel"); var scroll = Control<ScrollViewer>(window, "SettingsScroll");
-            var apply = Control<Button>(window, "SettingsApplyButton"); var cancel = Control<Button>(window, "SettingsCancelButton");
-            ClWithin(apply, panel, "Settings save"); ClWithin(cancel, panel, "Settings cancel");
-            Assert(scroll.ViewportHeight > 100 && scroll.ScrollableHeight > 0 && !ClIntersects(ClRect(apply, window), ClRect(Control<Border>(window, "PlayerBar"), window)), "Settings cannot scroll or covers the player");
+            var back = Control<Button>(window, "SettingsBackButton");
+            ClWithin(back, panel, "Settings Back");
+            Assert(panel.RowDefinitions.Count == 2 && window.FindName("SettingsApplyButton") is null && window.FindName("SettingsCancelButton") is null
+                && scroll.ViewportHeight > 100 && scroll.ScrollableHeight > 0 && !ClIntersects(ClRect(back, window), ClRect(Control<Border>(window, "PlayerBar"), window)), "Settings retains the save footer, cannot scroll or covers the player");
             scroll.ScrollToTop(); await Task.Delay(100);
             App.Capture(window, Path.Combine(_directory, $"presentation-settings-top-{width}.png"));
             Control<Button>(window, "SettingsClearOffline").BringIntoView(); await Task.Delay(100);
@@ -138,7 +139,7 @@ internal static partial class Program
             scroll.ScrollToEnd(); await Task.Delay(100);
             App.Capture(window, Path.Combine(_directory, $"presentation-settings-bottom-{width}.png"));
         }
-        SaClick(Control<Button>(window, "SettingsApplyButton"));
+        SaClick(Control<Button>(window, "SettingsBackButton"));
         var saved = store.Load();
         Assert(saved.CrossfadeSeconds == 8.5 && saved.PlaybackSpeed == 1.25 && saved.ConcurrentDownloads == 7 && saved.Quality == AudioQuality.Optimal,
             "inline settings did not persist their supported choices");

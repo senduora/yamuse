@@ -86,6 +86,11 @@ internal static class UninstallCleanup
                 if (!UninstallPathGuard.EntryExists(music)) return;
                 using (var directory = UninstallPathGuard.HoldDirectory(music))
                 {
+                    // Execute is already called on the uninstall worker. An
+                    // authentic interrupted cleanup must repair its index before
+                    // ownership-based removal; a bad journal blocks this tree.
+                    using (var library = new OfflineLibrary(music, new AudioBuffer(Path.Combine(music, ".uninstall-unused-buffer"))))
+                        library.RecoverPendingAsync().GetAwaiter().GetResult();
                     var index = Path.Combine(music, "library.index.json");
                     var rows = ReadIndex(index);
                     var failed = false;
@@ -205,8 +210,10 @@ internal static class UninstallCleanup
     }
 
     private static bool Expected(Exception error) => error is IOException or UnauthorizedAccessException or Win32Exception
-        or JsonException or KeyNotFoundException or InvalidOperationException;
-    private static string Explain(Exception error) => error is JsonException or KeyNotFoundException or InvalidOperationException
+        or JsonException or KeyNotFoundException or InvalidOperationException or CryptographicException or MusicException;
+    private static string Explain(Exception error) => error is CryptographicException
+        ? "Журнал восстановления очистки повреждён или не принадлежит этой папке. Музыкальные файлы сохранены."
+        : error is JsonException or KeyNotFoundException or InvalidOperationException
         ? "Индекс музыки повреждён. Файлы сохранены."
         : error is UnauthorizedAccessException ? "Нет доступа к файлу или папке."
         : error is IOException io && io.Message.Contains("ссыл", StringComparison.OrdinalIgnoreCase) ? io.Message

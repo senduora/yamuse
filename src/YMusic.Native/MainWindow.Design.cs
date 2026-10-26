@@ -59,8 +59,8 @@ public partial class MainWindow
     private void FitTrackColumns()
     {
         if (TracksList.View is not GridView view || view.Columns.Count != 6 || TracksList.ActualWidth < 360) return;
-        var flexible = Math.Max(160, TracksList.ActualWidth - 22 - 40 - 38 - 64);
-        double[] widths = [40, 38, Math.Floor(flexible * .47), Math.Floor(flexible * .29), Math.Floor(flexible * .24), 64];
+        var flexible = Math.Max(160, TracksList.ActualWidth - 22 - 40 - 66 - 64);
+        double[] widths = [40, 66, Math.Floor(flexible * .47), Math.Floor(flexible * .29), Math.Floor(flexible * .24), 64];
         for (var i = 0; i < widths.Length; i++)
             if (double.IsNaN(view.Columns[i].Width) || Math.Abs(view.Columns[i].Width - widths[i]) > .5)
                 view.Columns[i].Width = widths[i];

@@ -145,7 +145,12 @@ internal static partial class Program
         EpClick(EpElement<Button>(w, "ExpandedPlayerPlayPause")); await Until(() => !f.Player.IsPlaying);
         EpInvoke(w, "UpdateLyrics", 7.9d); await Dispatcher.Yield(DispatcherPriority.DataBind);
         Assert(list.SelectedIndex == 7 && Control<ListBox>(w, "LyricsList").SelectedIndex == 7, "expanded active line differs from the original timed source");
-        list.ScrollIntoView(list.Items[15]); w.UpdateLayout();
+        // Manual navigation suspends lyric follow. Bring the exact virtualized
+        // index through WPF rather than relying on the item-based request.
+        EpInvoke(w, "PauseExpandedLyricsFollow");
+        typeof(VirtualizingStackPanel).GetMethod("BringIndexIntoView", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(EpVisuals<VirtualizingStackPanel>(list).First(), [15]);
+        await Until(() => { w.UpdateLayout(); return list.ItemContainerGenerator.ContainerFromIndex(15) is ListBoxItem; });
         var line = (ListBoxItem)list.ItemContainerGenerator.ContainerFromIndex(15)!;
         Assert(line is not null, "expanded lyric seek row did not realize");
         var click = new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left) { RoutedEvent = Mouse.PreviewMouseUpEvent };
@@ -240,8 +245,12 @@ internal static partial class Program
             w.WindowState = state; var style = w.WindowStyle; var resize = w.ResizeMode;
             Assert(!w.IsVisible && PresentationSource.FromVisual(w) is null, "placement fixture unexpectedly became visible");
             EpInvoke(w, "SetExpandedPlayerVisible", true, true);
-            Assert(w.WindowStyle == WindowStyle.None && w.ResizeMode == ResizeMode.NoResize && w.WindowState == WindowState.Maximized && !w.IsVisible && PresentationSource.FromVisual(w) is null,
-                "never-shown fullscreen properties are incorrect or created a desktop window");
+            var fullscreen = Fh040Window(w);
+            Assert(w.WindowStyle == style && w.ResizeMode == resize && w.WindowState == state
+                && fullscreen.WindowStyle == WindowStyle.None && fullscreen.ResizeMode == ResizeMode.NoResize
+                && fullscreen.WindowState == WindowState.Normal && fullscreen.AllowsTransparency
+                && !w.IsVisible && !fullscreen.IsVisible && PresentationSource.FromVisual(w) is null,
+                "fullscreen changed the main window or created native presentation in a never-shown fixture");
             EpInvoke(w, "CloseExpandedPlayer");
             Assert(w.WindowStyle == style && w.ResizeMode == resize && w.WindowState == state && w.Left == -17000 && w.Top == 20 && w.Width == 1180 && w.Height == 760 && !w.IsVisible,
                 "closing fullscreen did not restore prior normal/maximized placement");

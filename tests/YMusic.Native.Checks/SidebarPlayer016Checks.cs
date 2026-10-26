@@ -59,8 +59,10 @@ internal static partial class Program
                 nav.ScrollToEnd(); w.UpdateLayout(); await Dispatcher.Yield(DispatcherPriority.Background);
                 Sp016Within(Control<Button>(w, "QueueHistoryNav"), nav);
                 Assert(Sp016Rect(profile, root) == profileRect, "scrolling navigation displaced the fixed profile");
-                Assert(SaVisuals<TextBlock>(metrics).Select(t => t.Name).SequenceEqual(new[] { "VersionText", "MemoryText", "CpuText" })
-                    && !SaVisuals<Button>(metrics).Any(), "relocation changed the metrics footer contents");
+                Assert(Control<StackPanel>(w, "MetricsRow").Children.OfType<TextBlock>().Select(t => t.Name)
+                    .SequenceEqual(new[] { "VersionText", "MemoryText", "CpuText" })
+                    && SaVisuals<Button>(metrics).Select(button => button.Name).Order()
+                        .SequenceEqual(new[] { "ChangelogButton", "FooterUpdateButton", "GithubButton" }), "relocation changed the metrics footer contents");
                 readback.Add(new { width, height, signedIn, sidebar = sidebarRect, profile = profileRect, mini = Sp016Rect(mini, root),
                     settings = Sp016Rect(settings, root), player = playerRect, metrics = metricsRect, navigationViewport = nav.ViewportHeight,
                     navigationScrollableHeight = nav.ScrollableHeight, lastNavigationAction = Sp016Rect(Control<Button>(w, "QueueHistoryNav"), nav) });

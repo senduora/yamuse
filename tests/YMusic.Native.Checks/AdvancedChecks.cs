@@ -100,7 +100,7 @@ internal static partial class Program
             var optimal = await api.ResolveAudioAsync(FakeSession, "20", AudioQuality.Optimal, default);
             var excellent = await api.ResolveAudioAsync(FakeSession, "20", AudioQuality.Excellent, default);
             Assert(economical.Bitrate == 64 && economical.Extension == ".m4a" && optimal.Bitrate == 192 && optimal.Extension == ".m4a" && excellent.Codec == "flac-mp4" && excellent.Extension == ".m4a", "codec/container tier mismatch");
-            var window = new MainWindow(demo: true, restore: false, diagnosticsDirectory: _directory);
+            var window = new MainWindow(demo: true, restore: false, diagnosticsDirectory: _directory, offline: new OfflineLibrary(Path.Combine(_directory, "advanced-demo-offline")));
             try { window.Show(); var combo = Control<ComboBox>(window, "QualityCombo"); Assert(combo.Items.Count == 3 && ((ComboBoxItem)combo.Items[0]).Content.ToString() == "Превосходное" && ((ComboBoxItem)combo.Items[1]).Content.ToString() == "Оптимальное" && ((ComboBoxItem)combo.Items[2]).Content.ToString() == "Экономичное", "UI choices differ from official modes"); }
             finally { window.Close(); }
         });
@@ -151,7 +151,7 @@ internal static partial class Program
             var media = File.ReadAllBytes(WriteWave("wave-fixture.wav", 10));
             var mediaHandler = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(media) }));
             var native = new NativePlayer(new AudioBuffer(Path.Combine(_directory, "wave-buffer"), mediaHandler));
-            var window = new MainWindow(api: new MusicApi(fixture.Handler), store: new SessionStore(Path.Combine(_directory, "wave-store")), restore: false, diagnosticsDirectory: _directory, player: native);
+            var window = new MainWindow(api: new MusicApi(fixture.Handler), store: new SessionStore(Path.Combine(_directory, "wave-store")), restore: false, diagnosticsDirectory: _directory, player: native, offline: new OfflineLibrary(Path.Combine(_directory, "advanced-wave-offline")));
             try
             {
                 window.Show(); Control<Slider>(window, "VolumeSlider").Value = 0; await window.StartLoginAsync();

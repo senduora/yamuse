@@ -10,16 +10,27 @@ internal sealed partial class MusicApi
     public async Task<AudioDescriptor> ResolveAudioAsync(Session session, string trackId, AudioQuality quality, CancellationToken cancellationToken)
     {
         if (!Enum.IsDefined(quality)) throw new ArgumentOutOfRangeException(nameof(quality));
+        AudioDescriptor? preferred = null;
         try
         {
-            var result = await ResolveFileInfoAsync(session, trackId, quality, cancellationToken).ConfigureAwait(false);
-            if (quality != AudioQuality.Excellent || result.Codec.StartsWith("flac", StringComparison.Ordinal) || result.Codec.Contains("aac", StringComparison.Ordinal) && result.Bitrate >= 256 || result.Bitrate >= 320) return result;
-            var alternative = await ResolveStreamAsync(session, trackId, cancellationToken, 320).ConfigureAwait(false);
-            return alternative.Bitrate > result.Bitrate ? new(alternative.Uri, "mp3", alternative.Bitrate) : result;
+            preferred = await ResolveFileInfoAsync(session, trackId, quality, cancellationToken).ConfigureAwait(false);
+            if (quality != AudioQuality.Excellent || AudioQualityPolicy.IsSufficient(preferred.Codec, preferred.Bitrate, quality)) return preferred;
         }
         catch (MusicException error) when (!error.Authentication) { cancellationToken.ThrowIfCancellationRequested(); }
-        var mp3 = await ResolveStreamAsync(session, trackId, cancellationToken, quality == AudioQuality.Economical ? 64 : quality == AudioQuality.Optimal ? 192 : 320).ConfigureAwait(false);
-        return new(mp3.Uri, "mp3", mp3.Bitrate);
+        try
+        {
+            var mp3 = await ResolveStreamAsync(session, trackId, cancellationToken, quality == AudioQuality.Economical ? 64 : quality == AudioQuality.Optimal ? 192 : 320).ConfigureAwait(false);
+            return preferred is null || AudioQualityPolicy.IsBetter("mp3", mp3.Bitrate, preferred.Codec, preferred.Bitrate)
+                ? new(mp3.Uri, "mp3", mp3.Bitrate) : preferred;
+        }
+        // Failure of the optional legacy alternative must not discard a valid
+        // modern response or trigger the very same legacy request a second time.
+        catch (MusicException error) when (preferred is not null && !error.Authentication)
+        { cancellationToken.ThrowIfCancellationRequested(); return preferred; }
+        catch (HttpRequestException) when (preferred is not null)
+        { cancellationToken.ThrowIfCancellationRequested(); return preferred; }
+        catch (OperationCanceledException) when (preferred is not null && !cancellationToken.IsCancellationRequested)
+        { return preferred; }
     }
     private async Task<AudioDescriptor> ResolveFileInfoAsync(Session session, string trackId, AudioQuality quality, CancellationToken cancellationToken)
     {

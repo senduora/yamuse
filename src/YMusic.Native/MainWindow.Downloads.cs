@@ -8,6 +8,7 @@ public partial class MainWindow
     private void ApplyOfflineStates(IEnumerable<TrackRow> tracks)
     {
         var snapshot = tracks as TrackRow[] ?? tracks.ToArray();
+        ApplyTrackLikeStates(snapshot);
         if (snapshot.Length > BackgroundOfflineThreshold) { QueueOfflineMarks(snapshot); return; }
         try
         {
@@ -20,8 +21,7 @@ public partial class MainWindow
     private void RefreshDownloadedMarks()
     {
         InvalidateOfflineViewState();
-        ApplyOfflineStates(_tracks.Concat(_favoritesCache).Concat(_waveTracks).Concat(_queue).Concat(_catalogItems.Select(i => i.Track).OfType<TrackRow>()).Distinct());
-        if (_current is not null) ApplyOfflineStates([_current]);
+        ApplyOfflineStates(KnownTrackRows());
         UpdatePlaylistDownloadedStatus();
     }
     private Task? _downloadTask;
@@ -51,6 +51,7 @@ public partial class MainWindow
         var favorites = _section == "favorites";
         DownloadPlaylistButton.Visibility = Visibility.Visible;
         DownloadPlaylistButton.IsEnabled = !_offlineMaintenance && _downloadCts is null && _session is not null && (!favorites || _favoritesSnapshotReady);
+        if (RefreshCompactDownloadAction()) return;
         try
         {
             var title = favorites ? "Мне нравится" : "плейлист";
@@ -67,7 +68,13 @@ public partial class MainWindow
         }
         catch (Exception ex) when (ex is MusicException or IOException or UnauthorizedAccessException) { PlaylistDownloadText.Text = "Не удалось прочитать статус скачивания"; }
     }
-    private async void DownloadPlaylist_Click(object sender, RoutedEventArgs e) => await DownloadPlaylistAsync();
+    private async void DownloadPlaylist_Click(object sender, RoutedEventArgs e)
+    {
+        if (IsCurrentCompactDownload() && _compactDownloadOperation is { Total: > 0 } operation
+            && (_downloadQueue.Running || !operation.Complete))
+        { DownloadCenter_Click(sender, e); return; }
+        await DownloadPlaylistAsync();
+    }
     private Task DownloadPlaylistAsync()
     {
         if (CurrentDownloadPlaylist() is not { } playlist || _session is null || _downloadCts is not null || _offlineMaintenance
@@ -92,9 +99,20 @@ public partial class MainWindow
         if (selected.Length == 0) { RefreshDownloadCenter(); return Task.CompletedTask; }
         var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, _accountCts.Token);
         _downloadCts = cts; _downloadIsAutomatic = _downloadQueueAutomatic;
+        _compactDownloadOperation?.Dispose(); _compactDownloadOperation = null;
         var quality = _downloadQueueQuality;
+        var accountGeneration = _downloadQueueAccountGeneration;
         var concurrentDownloads = Math.Clamp(_concurrentDownloads, 1, 10);
         _offline.ConcurrentDownloads = concurrentDownloads;
+        CompactDownloadOperation? operation = null;
+        var dispatch = new DownloadProgressDispatch(
+            action => Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, action),
+            () =>
+            {
+                if (_closed || cts.IsCancellationRequested || accountGeneration != _accountGeneration
+                    || !ReferenceEquals(_downloadCts, cts) || !ReferenceEquals(_compactDownloadOperation, operation)) return;
+                FlushDownloadProgress();
+            });
         _downloadTask = RunBatchAsync();
         return _downloadTask;
 
@@ -103,11 +121,24 @@ public partial class MainWindow
             // Publish _downloadTask before any completion or auto-follow-up can run.
             await Task.Yield();
             UpdateControls(); UpdatePlaylistDownloadedStatus(); RefreshDownloadCenter();
-            _downloadProgressTimer?.Start();
             var next = 0;
             try
             {
                 cts.Token.ThrowIfCancellationRequested();
+                // A single background pass uses the existing index/path/length checks,
+                // never hashes audio or probes the whole library on a progress frame.
+                var work = await Task.Run(() => selected.Where(entry =>
+                {
+                    cts.Token.ThrowIfCancellationRequested();
+                    var existing = _offline.Find(entry.Track);
+                    return existing is null || !(_downloadQueueAutomatic && !retryFailed
+                        || AudioQualityPolicy.IsSufficient(existing.Codec, existing.Bitrate, quality));
+                }).ToArray(), cts.Token);
+                cts.Token.ThrowIfCancellationRequested();
+                if (accountGeneration != _accountGeneration) { SuspendDownloadQueueForAccountChange(); cts.Token.ThrowIfCancellationRequested(); }
+                operation = new CompactDownloadOperation(work, _downloadQueuePlaylist, accountGeneration, () => RefreshCompactDownloadAction());
+                _compactDownloadOperation = operation;
+                RefreshDownloadActivity();
                 if (_downloadQueuePlaylist is { } playlist) await _offline.RememberPlaylistAsync(playlist, quality, cts.Token);
                 // The fixed worker pool follows this batch's settings snapshot. Metadata stays
                 // in the snapshot; audio is streamed to disk with bounded buffers.
@@ -131,12 +162,17 @@ public partial class MainWindow
             }
             finally
             {
-                _downloadProgressTimer?.Stop(); _downloadProgress.Clear();
+                dispatch.Dispose(); _downloadProgress.Clear();
                 if (_downloadQueueAccountGeneration != _accountGeneration) _downloadQueue.Suspend();
                 _downloadQueue.EndRun(cts.IsCancellationRequested);
+                operation?.Dispose();
                 if (ReferenceEquals(_downloadCts, cts)) { _downloadCts = null; _downloadTask = null; _downloadIsAutomatic = false; }
-                cts.Dispose(); UpdateControls(); RefreshDownloadedMarks(); RefreshDownloadCenter(); RefreshDownloadStorage();
-                TryStartPendingAutoFavorites();
+                cts.Dispose();
+                if (!_closed)
+                {
+                    UpdateControls(); RefreshDownloadedMarks(); RefreshDownloadCenter(); RefreshDownloadStorage();
+                    TryStartPendingAutoFavorites();
+                }
             }
 
             async Task WorkerAsync()
@@ -145,31 +181,58 @@ public partial class MainWindow
                 {
                     cts.Token.ThrowIfCancellationRequested();
                     var entry = selected[next++]; var track = entry.Track;
-                    if (entry.SkipFavoritesDownload) continue;
+                    if (entry.SkipFavoritesDownload) { operation!.Exclude(entry); continue; }
                     if (_downloadQueueAutomatic && _deletedUntilFavoritesRefresh.Contains(track.Id))
-                    { entry.SetState(DownloadEntryState.Removed); continue; }
+                    { entry.SetState(DownloadEntryState.Removed); operation!.Exclude(entry); continue; }
                     try
                     {
-                        entry.Begin(); RefreshDownloadCenter();
-                        if (_offline.Find(track) is { } existing) { entry.Complete(existing.Bytes); continue; }
+                        entry.Begin();
+                        var existing = _offline.Find(track);
+                        // Automatic favorites synchronization only fills missing
+                        // tracks; existing quality upgrades require a manual run.
+                        if (existing is not null && (_downloadQueueAutomatic && !retryFailed
+                            || AudioQualityPolicy.IsSufficient(existing.Codec, existing.Bitrate, quality)))
+                        { operation!.Exclude(entry); entry.Complete(existing.Bytes); continue; }
+                        // Recheck the presentation cohort if an indexed file changed
+                        // after preflight. The downloader's admission rules stay below.
+                        operation!.Include(entry);
                         if (!track.Available)
-                        { entry.SetState(DownloadEntryState.Unavailable, "Трек недоступен в каталоге. Обновите список и проверьте доступность в сервисе."); continue; }
+                        {
+                            if (existing is not null) { operation.Exclude(entry); entry.Complete(existing.Bytes); }
+                            else entry.SetState(DownloadEntryState.Unavailable, "Трек недоступен в каталоге. Обновите список и проверьте доступность в сервисе.");
+                            continue;
+                        }
                         var session = await EnsureSessionAsync(cts.Token);
                         cts.Token.ThrowIfCancellationRequested();
                         if (_downloadQueueAccountGeneration != _accountGeneration) { SuspendDownloadQueueForAccountChange(); cts.Token.ThrowIfCancellationRequested(); }
                         var audio = await _api.ResolveAudioAsync(session, track.RequestId, quality, cts.Token);
                         cts.Token.ThrowIfCancellationRequested();
+                        // Metadata resolution yields: another library operation may
+                        // have removed or upgraded the earlier cached candidate.
+                        existing = _offline.Find(track);
+                        if (existing is not null && !AudioQualityPolicy.IsBetter(audio.Codec, audio.Bitrate, existing.Codec, existing.Bitrate))
+                        { operation.Exclude(entry); entry.Complete(existing.Bytes); continue; }
                         entry.SetState(DownloadEntryState.Downloading);
-                        var progress = new DownloadProgressSink(); _downloadProgress[entry] = progress;
+                        var transferred = false;
+                        var progress = new DownloadProgressSink(() => { Volatile.Write(ref transferred, true); dispatch.Request(); });
+                        _downloadProgress[entry] = progress;
                         var saved = await _offline.SaveAsync(track, audio, cts.Token, progress);
+                        // A concurrent same-key Save may supply an already committed
+                        // file without any media transfer by this run.
+                        if (!Volatile.Read(ref transferred)) operation.Exclude(entry);
                         entry.Complete(saved.Bytes);
-                        ApplyOfflineStates(_tracks.Concat(_favoritesCache).Concat(_waveTracks).Concat(_queue).Concat(_catalogItems.Select(i => i.Track).OfType<TrackRow>()).Where(t => t.Id == track.Id).Distinct());
-                        if (_current?.Id == track.Id) ApplyOfflineStates([_current]);
+                        ApplyOfflineStates(KnownTrackRows().Where(row => row.Id == track.Id));
                     }
                     catch (OperationCanceledException) when (cts.IsCancellationRequested) { throw; }
                     catch (Exception ex)
                     { entry.SetState(DownloadEntryState.Failed, DownloadFailure.Describe(ex)); _diagnostics.LastErrorType = "Download:" + ex.GetType().Name; }
-                    finally { _downloadProgress.Remove(entry); RefreshDownloadCenter(); }
+                    finally
+                    {
+                        _downloadProgress.Remove(entry);
+                        // Cached rows can number in thousands: their existing row
+                        // notifications suffice, followed by the single final refresh.
+                        if (operation!.Contains(entry)) RefreshDownloadActivity();
+                    }
                 }
             }
         }
@@ -225,8 +288,13 @@ public partial class MainWindow
     }
     private async void DeleteOfflineTrack_Click(object sender, RoutedEventArgs e)
     {
-        if (TracksList.SelectedItem is not TrackRow track || _offlineMaintenance) return;
+        if (TracksList.SelectedItem is TrackRow track) await DeleteOfflineTrackAsync(track);
+    }
+    private async Task DeleteOfflineTrackAsync(TrackRow track)
+    {
+        if (_closed || _offlineMaintenance) return;
         _offlineMaintenance = true;
+        if (!_closed) RefreshMaintenanceActions();
         _deletedUntilFavoritesRefresh.Add(track.Id);
         try
         {
@@ -240,7 +308,7 @@ public partial class MainWindow
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
         catch (Exception ex) { ShowError(ex); }
-        finally { _offlineMaintenance = false; UpdateControls(); UpdatePlaylistDownloadedStatus(); TryStartPendingAutoFavorites(); }
+        finally { _offlineMaintenance = false; if (!_closed) RefreshMaintenanceActions(); UpdateControls(); UpdatePlaylistDownloadedStatus(); TryStartPendingAutoFavorites(); }
     }
     private async void ClearOffline_Click(object sender, RoutedEventArgs e) => await ClearOfflineAsync();
     private async Task ClearOfflineAsync()

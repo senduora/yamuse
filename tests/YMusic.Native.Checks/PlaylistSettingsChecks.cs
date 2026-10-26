@@ -10,12 +10,12 @@ internal static partial class Program
 {
     private static async Task CheckPlaylistSettings()
     {
-        await Run("Playlist settings: delayed opening preserves the draft and Save applies it", () => PlaylistSettingsResponse(refresh: false, save: true));
-        await Run("Playlist settings: delayed refresh preserves the draft and Cancel discards it", () => PlaylistSettingsResponse(refresh: true, save: false));
+        await Run("Playlist settings: delayed opening preserves live settings and persistence", () => PlaylistSettingsResponse(refresh: false));
+        await Run("Playlist settings: delayed refresh preserves live settings and Back retains them", () => PlaylistSettingsResponse(refresh: true));
         await Run("Playlist settings: explicit navigation cancels a pending response without restoring the old page", PlaylistSettingsNavigateAway);
     }
 
-    private static async Task PlaylistSettingsResponse(bool refresh, bool save)
+    private static async Task PlaylistSettingsResponse(bool refresh)
     {
         using var fixture = new PlaylistSettingsFixture(refresh ? "refresh" : "open");
         var window = fixture.Window;
@@ -46,25 +46,22 @@ internal static partial class Program
         Assert(draft == 7.5 && (double)Control<ComboBox>(window, "SettingsSpeed").SelectedItem == 1.25
             && Control<ComboBox>(window, "SettingsQuality").SelectedIndex == 1 && (int)Control<ComboBox>(window, "SettingsDownloads").SelectedItem == 7,
             "a delayed response reset the Settings draft");
-        Assert(fixture.Player.CrossfadeSeconds == 3 && fixture.Player.SpeedRatio == 1
-            && baseline.SequenceEqual(File.ReadAllBytes(fixture.Preferences.FilePath)), "the response applied unsaved settings");
+        Assert(fixture.Player.CrossfadeSeconds == 7.5 && fixture.Player.SpeedRatio == 1.25
+            && baseline.SequenceEqual(File.ReadAllBytes(fixture.Preferences.FilePath)), "the response reset live settings or rewrote their persisted state");
         Assert(SaField<PlaylistDetails?>(window, "_activePlaylist") is { Kind: "17", Revision: 2, Title: "Плейлист после ответа" }
             && fixture.Requests == 1 && SaField<PlaybackQueue>(window, "_playbackQueue").Version == version,
             "the underlying playlist did not update once or changed playback");
-        SaClick(Control<Button>(window, save ? "SettingsApplyButton" : "SettingsCancelButton"));
+        SaClick(Control<Button>(window, "SettingsBackButton"));
         window.UpdateLayout();
         var preferences = fixture.Preferences.Load();
         Assert(!Control<Grid>(window, "SettingsPanel").IsVisible && Control<Grid>(window, "ContentGrid").IsVisible
             && Control<TextBlock>(window, "CollectionTitle").Text == "Плейлист после ответа", "return did not reveal the loaded playlist");
-        if (save)
-            Assert(preferences.CrossfadeSeconds == 7.5 && preferences.PlaybackSpeed == 1.25
-                && preferences.Quality == AudioQuality.Optimal && preferences.ConcurrentDownloads == 7, "Save lost retained draft values");
-        else
-            Assert(baseline.SequenceEqual(File.ReadAllBytes(fixture.Preferences.FilePath))
-                && fixture.Player.CrossfadeSeconds == 3 && fixture.Player.SpeedRatio == 1, "Cancel saved or applied the draft");
+        Assert(preferences.CrossfadeSeconds == 7.5 && preferences.PlaybackSpeed == 1.25
+            && preferences.Quality == AudioQuality.Optimal && preferences.ConcurrentDownloads == 7
+            && baseline.SequenceEqual(File.ReadAllBytes(fixture.Preferences.FilePath)), "Back lost retained live values or changed the persisted package");
         SaClick(Control<Button>(window, "SettingsButton"));
-        Assert(Control<Slider>(window, "CrossfadeSetting").Value == (save ? 7.5 : 3), "reopen did not reflect Save/Cancel");
-        SaClick(Control<Button>(window, "SettingsCancelButton"));
+        Assert(Control<Slider>(window, "CrossfadeSetting").Value == 7.5, "reopen lost the live value");
+        SaClick(Control<Button>(window, "SettingsBackButton"));
     }
 
     private static async Task PlaylistSettingsNavigateAway()
@@ -75,7 +72,7 @@ internal static partial class Program
         await fixture.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
         SaClick(Control<Button>(window, "SettingsButton"));
         Control<Slider>(window, "CrossfadeSetting").Value = 7.5;
-        var baseline = File.ReadAllBytes(fixture.Preferences.FilePath);
+        var expected = fixture.Preferences.Load() with { CrossfadeSeconds = 7.5 };
         SaClick(Control<Button>(window, "FavoritesNav"));
         Assert(!Control<Grid>(window, "SettingsPanel").IsVisible && fixture.CancellationObserved, "explicit navigation did not close Settings and cancel the request");
         fixture.Release.TrySetResult();
@@ -83,10 +80,10 @@ internal static partial class Program
         window.UpdateLayout();
         Assert(SaField<string>(window, "_section") == "favorites" && Control<TextBlock>(window, "CollectionTitle").Text == "Мне нравится"
             && SaField<PlaylistDetails?>(window, "_activePlaylist") is null, "a canceled late reply restored the playlist page");
-        Assert(baseline.SequenceEqual(File.ReadAllBytes(fixture.Preferences.FilePath)), "navigation saved the canceled draft");
+        Assert(fixture.Preferences.Load() == expected && fixture.Player.CrossfadeSeconds == 7.5, "navigation lost the live setting or changed unrelated preferences");
         SaClick(Control<Button>(window, "SettingsButton"));
-        Assert(Control<Slider>(window, "CrossfadeSetting").Value == 3, "navigation retained a discarded draft");
-        SaClick(Control<Button>(window, "SettingsCancelButton"));
+        Assert(Control<Slider>(window, "CrossfadeSetting").Value == 7.5, "navigation rolled back the live setting");
+        SaClick(Control<Button>(window, "SettingsBackButton"));
     }
 
     private sealed class PlaylistSettingsFixture : IDisposable

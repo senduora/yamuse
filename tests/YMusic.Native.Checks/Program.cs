@@ -25,10 +25,15 @@ internal static partial class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--security-offline-child") return SecurityOffline0317Child(args[1..]);
         _directory = Path.GetFullPath(args.FirstOrDefault(a => !a.StartsWith("--")) ?? "check-results");
         _only = args.FirstOrDefault(a => a.StartsWith("--only="))?[7..].Split(',') ?? [];
         _realAccount = args.Contains("--account");
         Directory.CreateDirectory(_directory);
+        // A UI fixture that forgets its own artwork cache must still stay
+        // inside the test directory and never reach the real CDN or cache.
+        Artwork.Cache = new ArtworkCache(Path.Combine(_directory, "shared-artwork"),
+            new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound))));
         var application = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         // All UI checks render their own windows. Keep them off the user's
         // desktop and never activate them while the real preview is in use.
@@ -49,6 +54,8 @@ internal static partial class Program
             source.Element(ns + "Application.Resources")!.Elements().Select(e => new XElement(e)));
         application.Resources = (ResourceDictionary)XamlReader.Parse(dictionary.ToString(SaveOptions.DisableFormatting)
             .Replace("clr-namespace:YMusic.Native", "clr-namespace:YMusic.Native;assembly=YMusic.Native", StringComparison.Ordinal));
+        ThemeManager.SystemLightDetector = () => false;
+        ThemeManager.Initialize(application);
         Dispatcher.CurrentDispatcher.BeginInvoke(new Action(async () =>
         {
             try { await CheckAll(args.Contains("--online")); }
@@ -85,6 +92,26 @@ internal static partial class Program
 
     private static async Task CheckAll(bool online)
     {
+        await CheckSelectorLabels040();
+        await CheckFullscreenRapid040();
+        await CheckLyricsScrollRecovery040();
+        await CheckPersistenceRecovery040();
+        await CheckSeekOwnershipRecovery040();
+        await CheckSearchStateRecovery040();
+        await CheckLyricsManual040();
+        await CheckPlayerAudioLayout040();
+        await CheckFullscreenCollapse040();
+        await CheckCurrentTrackReveal040();
+        await CheckPlaybackKeys040();
+        await CheckRapidSkip0317();
+        await CheckSecurityNetwork0317();
+        await CheckSecurityOffline0317();
+        await CheckSecurityStability0317();
+        await CheckSecurityPerformance0317();
+        await CheckLibraryPlayer017();
+        await CheckIdlePerformance017();
+        await CheckQualityOffline017();
+        await CheckQuality017();
         await Run("DPAPI current-user roundtrip, encrypted file, tamper rejection and logout deletion", () =>
         {
             var directory = Path.Combine(_directory, "dpapi");
@@ -353,7 +380,7 @@ internal static partial class Program
         });
         await Run("UI: 5000 rows virtualized, scrolling and filter; demo visibly marked", async () =>
         {
-            var window = new MainWindow(true, restore: false, diagnosticsDirectory: Path.Combine(_directory, "ui-data"));
+            var window = new MainWindow(true, restore: false, diagnosticsDirectory: Path.Combine(_directory, "ui-data"), offline: new OfflineLibrary(Path.Combine(_directory, "demo-offline")));
             try
             {
                 window.Show(); await Task.Delay(200);
@@ -468,11 +495,30 @@ internal static partial class Program
         await CheckCoverAccent015();
         await CheckAmbientBackdrop015();
         await CheckCoverPalette016();
+        await CheckColorfulAccent0317();
         await CheckCoverAccent016();
         await CheckSidebarPlayer016();
         await CheckCompactTransfer016();
         await CheckSmoothScroll016();
         await CheckPlaybackControls016();
+        await CheckPlaybackContext0317();
+        await CheckExpandedQueue0317();
+        await CheckFullscreenReveal0317();
+        await CheckFullscreenPower0317();
+        await CheckFullscreenHost040();
+        await CheckToastPlacement040();
+        await CheckVersioning040();
+        await CheckBranding040();
+        await CheckTheme040();
+        await CheckThemeSettings040();
+        await CheckThemeIntegration040();
+        await CheckTrackActions0317();
+        await CheckPopupGlyph0317();
+        await CheckInterfacePolish0317();
+        await CheckTrackPosition0317();
+        await CheckUpdateSchedule0317();
+        await CheckUpdateApplyPreferences0317();
+        await CheckCompactDownload0317();
         await CheckStartupUpdates016();
         await Run("Diagnostics contain resources and timings, without credentials or account data", () =>
         {
@@ -529,10 +575,15 @@ internal static partial class Program
                 AudioDescriptor? audio = null;
                 foreach (var track in candidates)
                 {
-                    try { audio = await api.ResolveAudioAsync(session, track.RequestId, AudioQuality.Excellent, default); break; }
+                    try
+                    {
+                        var candidate = await api.ResolveAudioAsync(session, track.RequestId, AudioQuality.Excellent, default);
+                        if (candidate.IsLossless) { audio = candidate; break; }
+                        Console.WriteLine("INFO server returned lossy codec=" + candidate.Codec + ", bitrate=" + candidate.Bitrate);
+                    }
                     catch (MusicException error) { Console.WriteLine("INFO lossless probe: " + error.Message); }
                 }
-                Assert(audio is not null, "No lossless rendition among first five available favorites");
+                Assert(audio is { IsLossless: true }, "Server returned no actual FLAC rendition among first five available favorites; lossy playback does not prove lossless");
                 using var player = new NativePlayer(new AudioBuffer(Path.Combine(_directory, "real-flac-buffer")));
                 player.SetVolume(0); await player.OpenAsync(audio!, default); await Task.Delay(300);
                 Assert(player.IsPlaying && player.Duration.TotalSeconds > 35 && player.Position.TotalMilliseconds > 50, "real lossless playback failed");
@@ -567,7 +618,7 @@ internal static partial class Program
         }
     }
 
-    private static MainWindow Window(FakeHandler handler) => new(api: new MusicApi(handler), store: new SessionStore(Path.Combine(_directory, "ui-store")), restore: false, diagnosticsDirectory: Path.Combine(_directory, "ui-data"));
+    private static MainWindow Window(FakeHandler handler) => new(api: new MusicApi(handler), store: new SessionStore(Path.Combine(_directory, "ui-store")), restore: false, diagnosticsDirectory: Path.Combine(_directory, "ui-data"), offline: new OfflineLibrary(Path.Combine(_directory, "ui-offline")));
     private static T Control<T>(MainWindow window, string name) where T : FrameworkElement => (T)window.FindName(name);
     private static int CountVisual<T>(DependencyObject element) where T : DependencyObject
     {

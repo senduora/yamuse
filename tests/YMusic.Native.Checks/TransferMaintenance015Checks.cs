@@ -14,7 +14,7 @@ internal static partial class Program
     private static async Task CheckTransferMaintenance015()
     {
         await Run("Transfer015: overall work separates saved errors unavailable partial and unknown bytes", Transfer015Model);
-        await Run("Transfer015: playlist and download center share real progress through pause resume and completion", Transfer015Playlist);
+        await Run("Transfer015: playlist button and download center retain real progress through pause resume and completion", Transfer015Playlist);
         await Run("Transfer015: failed and unavailable entries finish work without claiming every track saved", Transfer015Errors);
         await Run("Maintenance015: cache button clears private caches while preserving music and Settings draft", Maintenance015Cache);
         await Run("Maintenance015: confirmed offline clear displays progress and preserves foreign files and draft", Maintenance015Offline);
@@ -47,16 +47,17 @@ internal static partial class Program
         SaInvoke(w, "ShowPlaylist", playlist); var task = Call(w, "DownloadPlaylistAsync");
         await Until(() => f.Queue.Entries.Count == 3 && f.Queue.Entries.Any(e => e.State == DownloadEntryState.Completed) && f.Active > 0);
         SaInvoke(w, "FlushDownloadProgress"); w.UpdateLayout();
-        var bar = Control<ProgressBar>(w, "PlaylistTransferBar");
-        Assert(Control<Border>(w, "PlaylistTransferPanel").Visibility == Visibility.Visible && bar.Value is > 0 and < 100
-            && Control<TextBlock>(w, "PlaylistTransferDetails").Text.Contains("из 3"), "playlist has no real aggregate progress");
+        var bar = SaField<CircularDownloadProgress>(w, "_compactDownloadRing");
+        Assert(Control<Border>(w, "PlaylistTransferPanel").Visibility == Visibility.Collapsed && bar.Value is > 0 and < 100
+            && SaField<TextBlock>(w, "_compactDownloadCaption").Text.Contains("1/3"), "playlist has no real current-run progress");
         var overall = SaVisuals<ProgressBar>(w.DownloadCenterView).Single(p => p.Name == "DownloadOverallProgress");
+        SaInvoke(w, "RefreshDownloadCenter");
         Assert(Math.Abs(overall.Value - bar.Value) < .01, "playlist and download center disagree");
-        var indicator = (FrameworkElement)bar.Template.FindName("PART_Indicator", bar);
-        Assert(indicator.ActualWidth > 0 && indicator.ActualWidth < bar.ActualWidth, "progress fill is not visibly proportional");
+        Assert(bar.Width == 18 && bar.Height == 18 && bar.ActualWidth is >= 16 and <= 20 && bar.ActualHeight is >= 16 and <= 20
+            && !bar.IsIndeterminate, "progress ring is not compact and finite");
         App.Capture(w, Path.Combine(_directory, "transfer015-playlist-running-1280.png"));
         SaInvoke(w, "PauseDownloadQueue"); await task;
-        Assert(Control<TextBlock>(w, "PlaylistTransferTitle").Text.Contains("паузе") && f.Library.Read().Count == 1, "pause lost saved tracks or progress");
+        Assert(SaField<TextBlock>(w, "_compactDownloadCaption").Text.Contains("паузе") && f.Library.Read().Count == 1, "pause lost saved tracks or progress");
         await Call(w, "ResumeDownloadQueue");
         Assert(bar.Value == 100 && f.Library.Read().Count == 3 && Control<TextBlock>(w, "PlaylistTransferTitle").Text == "Плейлист скачан", "resume did not reach a confirmed saved state");
         SaInvoke(w, "DownloadCenter_Click", w, new RoutedEventArgs()); App.Capture(w, Path.Combine(_directory, "transfer015-downloads-complete-1280.png"));
@@ -70,7 +71,9 @@ internal static partial class Program
         SaInvoke(w, "ShowPlaylist", playlist); await Call(w, "DownloadPlaylistAsync");
         var p = PlaylistTransferProgress.Read(f.Queue.Entries);
         Assert(p.Percent == 100 && p.Completed == 1 && p.Failed == 1 && p.Unavailable == 1, "error completion lost actual outcomes");
-        Assert(Control<TextBlock>(w, "PlaylistTransferTitle").Text.Contains("часть треков") && Control<TextBlock>(w, "PlaylistTransferDetails").Text.Contains("Скачано 1 из 3"), "UI falsely reports a full offline playlist");
+        Assert(SaField<CircularDownloadProgress>(w, "_compactDownloadRing").Value < 100
+            && SaField<TextBlock>(w, "_compactDownloadCaption").Text == "Не скачано · 1/3"
+            && Control<Button>(w, "DownloadPlaylistButton").ToolTip.ToString()!.Contains("ошибок 1 · недоступно 1"), "UI falsely reports a full offline playlist");
         App.Capture(w, Path.Combine(_directory, "transfer015-partial-result-1280.png"));
     }
     private static async Task Maintenance015Cache()

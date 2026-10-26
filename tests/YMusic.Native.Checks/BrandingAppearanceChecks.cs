@@ -29,6 +29,7 @@ internal static partial class Program
         Assert(owner.Icon is {IsFrozen:true}, "main Window.Icon is missing or mutable");
         var logo=SaVisuals<Image>(owner).Single(image=>AutomationProperties.GetName(image)=="Логотип Yamuse");
         Assert(logo.Source is BitmapSource {PixelWidth:>0,PixelHeight:>0}&&logo.IsVisible, "sidebar Yamuse bitmap resource did not render");
+        BrandingSuppliedLogo040((BitmapSource)logo.Source);
         var mainNative=BrandingNativeFacts(owner,"main");
         SaInvoke(owner, "Settings_Click", Control<Button>(owner, "SettingsButton"), new RoutedEventArgs(Button.ClickEvent));
         await Task.Delay(180); owner.UpdateLayout();
@@ -37,13 +38,21 @@ internal static partial class Program
         Assert(ReferenceEquals(PresentationSource.FromVisual(Control<Grid>(owner, "SettingsPanel")), PresentationSource.FromVisual(owner)),
             "Settings created another presentation source");
         App.Capture(owner, Path.Combine(_directory, "settings-inline.png"));
-        SaClick(Control<Button>(owner, "SettingsCancelButton"));
+        SaClick(Control<Button>(owner, "SettingsBackButton"));
         Assert(!Control<Grid>(owner, "SettingsPanel").IsVisible, "Settings did not close");
         File.WriteAllText(Path.Combine(_directory, "branding038-native-appearance.json"), JsonSerializer.Serialize(new
         {
             main = mainNative, settingsInsideMain = true, ownedWindows = owner.OwnedWindows.Count,
             syntheticAccountOnly = true, systemThemeChanged = false, externalWindowsCaptured = false
         }, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static byte[] BrandingPixels038(BitmapSource bitmap)
+    {
+        var converted=new FormatConvertedBitmap(bitmap,PixelFormats.Bgra32,null,0);
+        var pixels=new byte[bitmap.PixelWidth*bitmap.PixelHeight*4];
+        converted.CopyPixels(pixels,bitmap.PixelWidth*4,0);
+        return pixels;
     }
 
     private static object BrandingNativeFacts(Window window,string fixtureKind)
@@ -72,17 +81,18 @@ internal static partial class Program
         if(OperatingSystem.IsWindowsVersionAtLeast(10,0,22000))
         {
             Assert(application!.DarkResult==0&&application.CaptionResult==0&&application.TextResult==0, "actual WindowAppearance.Apply native DWM setters failed");
-            Assert(darkResult==0&&dark==(highContrast?0u:1u), "actual native immersive dark readback failed or differs from high-contrast-aware expectation");
+            Assert(darkResult==0&&dark==(highContrast||ThemeManager.IsLight?0u:1u), "actual native immersive flag differs from selected theme or high contrast");
             var background=window.Background is SolidColorBrush brush?brush.Color:Color.FromRgb(16,18,22);
             var expectedCaption=highContrast?uint.MaxValue:(uint)(background.R|(background.G<<8)|(background.B<<16));
-            var expectedText=highContrast?uint.MaxValue:0x00F7F5F4u;
+            var ink = window.Foreground is SolidColorBrush foreground ? foreground.Color : ThemeManager.IsLight ? Color.FromRgb(35,37,43) : Color.FromRgb(244,245,247);
+            var expectedText=highContrast?uint.MaxValue:(uint)(ink.R|(ink.G<<8)|(ink.B<<16));
             Assert(application.CaptionColor==expectedCaption&&application.TextColor==expectedText, "actual helper setter inputs differ from the requested dark surface or high-contrast default");
             Assert(captionResult==0||captionResult==unchecked((int)0x80070057), "native caption color getter failed with an unexpected HRESULT");
             Assert(textResult==0||textResult==unchecked((int)0x80070057), "native text color getter failed with an unexpected HRESULT");
             if(captionResult==0)Assert(caption==expectedCaption, "supported native caption color getter differs from the requested value");
             if(textResult==0)Assert(text==expectedText, "supported native text color getter differs from the requested value");
         }
-        if(darkResult==0)Assert(dark==(highContrast?0u:1u), "actual native immersive dark flag differs from high-contrast-aware expectation");
+        if(darkResult==0)Assert(dark==(highContrast||ThemeManager.IsLight?0u:1u), "actual native immersive flag differs from selected theme or high contrast");
         return facts;
     }
 

@@ -184,10 +184,10 @@ public partial class MainWindow
         var text = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 0, 1) };
         Grid.SetColumn(text, 1); hero.Children.Add(text);
         var label = HeroText("CollectionHeroKind", kind, 10);
-        label.FontWeight = FontWeights.SemiBold; label.SetResourceReference(TextBlock.ForegroundProperty, "AccentBrush");
+        label.FontWeight = FontWeights.SemiBold; label.SetResourceReference(TextBlock.ForegroundProperty, "AccentTextBrush");
         text.Children.Add(label);
         var heading = HeroText("CollectionHeroTitle", title, 32);
-        heading.Foreground = new SolidColorBrush(Color.FromRgb(243, 241, 240));
+        heading.Foreground = ThemeManager.Brush("#F3F1F0");
         heading.FontWeight = FontWeights.Bold; heading.Margin = new Thickness(0, 2, 94, 0);
         text.Children.Add(heading);
         var creditsRow = new Grid { Name = "CollectionHeroCreatorRow", Margin = new Thickness(0, string.IsNullOrWhiteSpace(creator) ? 0 : 2, 200, 0) };

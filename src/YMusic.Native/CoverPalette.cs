@@ -7,7 +7,7 @@ namespace YMusic.Native;
 internal static class CoverPalette
 {
     internal const int SampleEdge = 32;
-    internal static readonly Color Fallback = Color.FromRgb(234, 87, 28);
+    internal static readonly Color Fallback = Color.FromRgb(231, 187, 89);
     internal static readonly Color Ink = Color.FromRgb(23, 17, 20);
 
     internal static Color? Extract(BitmapSource source)
@@ -26,18 +26,21 @@ internal static class CoverPalette
 
     private static Color? Select(byte[] pixels)
     {
-        // Count visible area of colour families across their light and dark shades.
-        // A moving hue window avoids an arbitrary boundary splitting one family;
-        // its circular range also keeps both sides of red together. Neutral shades
-        // form one competing family, so a small vivid title cannot beat grey art.
+        // Neutrals are a fallback, not a competing colour family: a supported
+        // coloured title should survive a mostly black/white cover. Circular hue
+        // windows combine neighbouring shades without splitting red at zero.
         const int bins = 360, familyWidth = 60;
         var counts = new int[bins]; var red = new int[bins]; var green = new int[bins]; var blue = new int[bins];
+        var chromaArea = new int[bins];
+        var detailRed = new long[bins]; var detailGreen = new long[bins]; var detailBlue = new long[bins];
         var neutralCount = 0; var neutralRed = 0; var neutralGreen = 0; var neutralBlue = 0;
+        var totalCount = 0; var totalRed = 0; var totalGreen = 0; var totalBlue = 0;
         for (var i = 0; i + 3 < pixels.Length; i += 4)
         {
             var area = pixels[i + 3];
             if (area == 0) continue;
             var b = pixels[i]; var g = pixels[i + 1]; var r = pixels[i + 2];
+            totalCount += area; totalRed += r * area; totalGreen += g * area; totalBlue += b * area;
             var maximum = Math.Max(r, Math.Max(g, b));
             var chroma = maximum - Math.Min(r, Math.Min(g, b));
             // Relative saturation keeps coloured shadows (e.g. 15,37,37) in
@@ -50,25 +53,53 @@ internal static class CoverPalette
             var hue = 60 * (maximum == r ? (g - b) / (double)chroma : maximum == g ? 2 + (b - r) / (double)chroma : 4 + (r - g) / (double)chroma);
             var bin = (int)(hue < 0 ? hue + 360 : hue);
             counts[bin] += area; red[bin] += r * area; green[bin] += g * area; blue[bin] += b * area;
+            chromaArea[bin] += chroma * area;
+            detailRed[bin] += (long)r * chroma * area; detailGreen[bin] += (long)g * chroma * area; detailBlue[bin] += (long)b * chroma * area;
         }
-        var bestCount = neutralCount; var bestRed = neutralRed; var bestGreen = neutralGreen; var bestBlue = neutralBlue;
-        var count = 0; var sumRed = 0; var sumGreen = 0; var sumBlue = 0;
+        var bestCount = neutralCount; long bestRed = neutralRed, bestGreen = neutralGreen, bestBlue = neutralBlue;
+        if (bestCount == 0) { bestCount = totalCount; bestRed = totalRed; bestGreen = totalGreen; bestBlue = totalBlue; }
+        var count = 0; var sumRed = 0; var sumGreen = 0; var sumBlue = 0; var sumChroma = 0; var bestScore = 0L;
+        long sumDetailRed = 0, sumDetailGreen = 0, sumDetailBlue = 0;
         for (var bin = 0; bin < familyWidth; bin++)
-        { count += counts[bin]; sumRed += red[bin]; sumGreen += green[bin]; sumBlue += blue[bin]; }
+        {
+            count += counts[bin]; sumRed += red[bin]; sumGreen += green[bin]; sumBlue += blue[bin]; sumChroma += chromaArea[bin];
+            sumDetailRed += detailRed[bin]; sumDetailGreen += detailGreen[bin]; sumDetailBlue += detailBlue[bin];
+        }
         for (var start = 0; start < bins; start++)
         {
-            if (count > bestCount) { bestCount = count; bestRed = sumRed; bestGreen = sumGreen; bestBlue = sumBlue; }
+            // At least 3% of visible alpha area and four opaque sample pixels
+            // admit meaningful details while rejecting isolated vivid noise.
+            // Chroma can at most double area weight; it cannot make one bright
+            // pixel beat a well-supported family of darker coloured shades.
+            var score = count * 255L + sumChroma;
+            if (count >= 4 * 255 && count * 100L >= totalCount * 3L && score > bestScore)
+            {
+                bestScore = score; bestCount = count; bestRed = sumRed; bestGreen = sumGreen; bestBlue = sumBlue;
+                // On a neutral background, antialiased/shadow edge pixels can
+                // outnumber the coloured detail itself. A chroma-weighted mean
+                // retains that detail without selecting a single vivid pixel.
+                if (neutralCount * 2 > totalCount)
+                { bestCount = sumChroma; bestRed = sumDetailRed; bestGreen = sumDetailGreen; bestBlue = sumDetailBlue; }
+            }
             var next = (start + familyWidth) % bins;
             count += counts[next] - counts[start]; sumRed += red[next] - red[start]; sumGreen += green[next] - green[start]; sumBlue += blue[next] - blue[start];
+            sumChroma += chromaArea[next] - chromaArea[start];
+            sumDetailRed += detailRed[next] - detailRed[start]; sumDetailGreen += detailGreen[next] - detailGreen[start]; sumDetailBlue += detailBlue[next] - detailBlue[start];
         }
         if (bestCount == 0) return null;
-        return Readable(Color.FromRgb((byte)(bestRed / bestCount), (byte)(bestGreen / bestCount), (byte)(bestBlue / bestCount)));
+        var color = Color.FromRgb((byte)(bestRed / bestCount), (byte)(bestGreen / bestCount), (byte)(bestBlue / bestCount));
+        // A thin detail downsampled against black is dimmer than its own colour.
+        // Lift only a supported detail's mean, keeping its hue before Readable.
+        var maximumChannel = Math.Max(color.R, Math.Max(color.G, color.B));
+        if (bestScore > 0 && neutralCount * 2 > totalCount && maximumChannel > 0)
+            color = Color.FromRgb((byte)(color.R * 255 / maximumChannel), (byte)(color.G * 255 / maximumChannel), (byte)(color.B * 255 / maximumChannel));
+        return Readable(color);
     }
 
     internal static Color Readable(Color color)
     {
         if (color == Fallback) return color;
-        // A supporting plane of convex sRGB luminance at the orange fallback.
+        // A supporting plane of convex sRGB luminance at the gold fallback.
         // Keeping every target in this half-space also keeps ALL interpolated
         // and interrupted transitions at least as bright as the fallback.
         var r = Fallback.R / 255d; var g = Fallback.G / 255d; var b = Fallback.B / 255d;

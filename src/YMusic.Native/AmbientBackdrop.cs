@@ -28,6 +28,15 @@ public sealed class AmbientBackdrop : Grid
         set => SetValue(CornerRadiusProperty, value);
     }
 
+    public static readonly DependencyProperty IsMotionEnabledProperty = DependencyProperty.Register(
+        nameof(IsMotionEnabled), typeof(bool), typeof(AmbientBackdrop), new PropertyMetadata(true,
+            (target, _) => ((AmbientBackdrop)target).UpdateMotion()));
+    public bool IsMotionEnabled
+    {
+        get => (bool)GetValue(IsMotionEnabledProperty);
+        set => SetValue(IsMotionEnabledProperty, value);
+    }
+
     private readonly Storyboard _motion = new();
     private readonly RectangleGeometry _roundedClip = new();
     private Window? _owner;
@@ -40,7 +49,7 @@ public sealed class AmbientBackdrop : Grid
         Focusable = false;
         ClipToBounds = true;
         Clip = _roundedClip;
-        Background = new SolidColorBrush(Color.FromRgb(17, 21, 28));
+        Background = ThemeManager.Brush(Color.FromRgb(17, 21, 28));
         SetResourceReference(AccentBrushProperty, "AccentBrush");
 
         // A fixed logical canvas only scales with layout. The animated transforms
@@ -52,10 +61,13 @@ public sealed class AmbientBackdrop : Grid
         AddCloud(clouds, 2, 180, 300, 760, 640, -70, 95, 60, -65, 22);
         AddCloud(clouds, 3, -300, 330, 750, 600, 90, -55, -25, 85, 21);
         var veil = new LinearGradientBrush { StartPoint = new Point(.5, 0), EndPoint = new Point(.5, 1) };
-        veil.GradientStops.Add(new(Color.FromArgb(90, 10, 14, 22), 0));
-        veil.GradientStops.Add(new(Color.FromArgb(135, 10, 14, 22), .48));
-        veil.GradientStops.Add(new(Color.FromArgb(211, 10, 14, 22), 1));
-        veil.Freeze();
+        foreach (var (alpha, offset) in new[] { ((byte)90, 0d), ((byte)135, .48), ((byte)211, 1d) })
+        {
+            var stop = new GradientStop { Offset = offset };
+            BindingOperations.SetBinding(stop, GradientStop.ColorProperty, new Binding(nameof(SolidColorBrush.Color))
+            { Source = ThemeManager.Brush(Color.FromArgb(alpha, 10, 14, 22)) });
+            veil.GradientStops.Add(stop);
+        }
         Children.Add(new Border { Background = veil, IsHitTestVisible = false });
         Loaded += OnLoaded;
         Unloaded += OnUnloaded;
@@ -145,7 +157,7 @@ public sealed class AmbientBackdrop : Grid
     private void UpdateMotion()
     {
         if (_closed) return;
-        if (!IsLoaded || !IsVisible || _owner?.WindowState == WindowState.Minimized || !Motion.CanAnimate) { PauseMotion(); return; }
+        if (!IsMotionEnabled || !IsLoaded || !IsVisible || _owner?.WindowState == WindowState.Minimized || !Motion.CanAnimate) { PauseMotion(); return; }
         if (!_begun)
         {
             _motion.Begin(this, HandoffBehavior.SnapshotAndReplace, true); _begun = true;

@@ -143,7 +143,7 @@ internal static partial class Program
                 if (action == "queue") Assert(ReferenceEquals(queue.Current, manual) && !f.Player.HasSource, "late response replaced manual queue");
                 if (action == "switch") Assert(SaField<RadioBatch>(w, "_waveBatch").TrackSeedId == "5678" && f.Seeds.Last() == "track:5678", "canceled response replaced a newer station");
                 if (action == "logout") Assert(SaField<RadioBatch?>(w, "_waveBatch") is null && !f.Player.HasSource && SaField<Session?>(w, "_session") is null, "late response revived signed-out account");
-                if (action == "settings") Assert(SaField<bool>(w, "_settingsOpen") && Control<Slider>(w, "CrossfadeSetting").Value == 9.5 && f.Player.CrossfadeSeconds != 9.5, "late response closed/applied the Settings draft");
+                if (action == "settings") Assert(SaField<bool>(w, "_settingsOpen") && Control<Slider>(w, "CrossfadeSetting").Value == 9.5 && f.Player.CrossfadeSeconds == 9.5, "late response closed Settings or reset live controls/runtime");
             }
         });
         await Run("TrackWave015: explicit HTTP failure leaves original queue and permits retry", async () =>

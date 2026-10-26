@@ -161,6 +161,7 @@ internal sealed class ArtworkCache : IDisposable
     private const int DiskEntryLimit = 2048;
     private readonly HttpClient _http;
     private readonly string _directory;
+    private readonly TimeSpan _downloadTimeout;
     private readonly SemaphoreSlim _workers = new(4, 4);
     private readonly SemaphoreSlim _diskGate = new(1, 1);
     private readonly object _sync = new();
@@ -170,14 +171,17 @@ internal sealed class ArtworkCache : IDisposable
     private long _memoryBytes;
     private bool _clearing;
 
-    internal ArtworkCache(string directory, HttpMessageHandler? handler = null)
+    internal ArtworkCache(string directory, HttpMessageHandler? handler = null, TimeSpan? downloadTimeout = null)
     {
+        _downloadTimeout = downloadTimeout ?? TimeSpan.FromSeconds(20);
+        if (_downloadTimeout <= TimeSpan.Zero || _downloadTimeout.TotalMilliseconds > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(downloadTimeout));
         _directory = Path.GetFullPath(directory);
         _http = new HttpClient(handler ?? new SocketsHttpHandler
         {
             UseCookies = false, AllowAutoRedirect = false, AutomaticDecompression = DecompressionMethods.None,
             PooledConnectionLifetime = TimeSpan.FromMinutes(5), ConnectTimeout = TimeSpan.FromSeconds(8)
-        }) { Timeout = TimeSpan.FromSeconds(20), MaxResponseContentBufferSize = MaximumResponseBytes };
+        }) { Timeout = Timeout.InfiniteTimeSpan, MaxResponseContentBufferSize = MaximumResponseBytes };
         // Deliberately independent of MusicApi: no OAuth, cookies, referrer or signed audio URL.
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("Yamuse-Artwork/0.3");
         _http.DefaultRequestHeaders.Accept.ParseAdd("image/*");
@@ -271,6 +275,18 @@ internal sealed class ArtworkCache : IDisposable
     }
 
     private async Task<byte[]> DownloadAsync(Uri uri, CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(_downloadTimeout);
+        try
+        {
+            return await DownloadCoreAsync(uri, timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException error) when (!cancellationToken.IsCancellationRequested)
+        { throw new HttpRequestException("Artwork download timed out.", error); }
+    }
+
+    private async Task<byte[]> DownloadCoreAsync(Uri uri, CancellationToken cancellationToken)
     {
         for (var redirects = 0; ; redirects++)
         {

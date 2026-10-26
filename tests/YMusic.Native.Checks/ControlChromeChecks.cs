@@ -88,12 +88,12 @@ internal static partial class Program
             var fixture = ChromeFixture(); ChromeLayout(fixture.Root);
             var selected = ChromePart<Border>(fixture.SelectedItem, "Item");
             Assert(fixture.SelectedItem.IsSelected && ReferenceEquals(selected.Background, Application.Current.Resources["AccentSelectionBrush"])
-                && ReferenceEquals(selected.BorderBrush, Application.Current.Resources["AccentHoverBrush"]) && ReferenceEquals(fixture.SelectedItem.Foreground, Application.Current.Resources["AccentHoverBrush"]),
+                && ReferenceEquals(selected.BorderBrush, Application.Current.Resources["AccentHoverBrush"]) && ReferenceEquals(fixture.SelectedItem.Foreground, Application.Current.Resources["AccentTextBrush"]),
                 "actual selected-item state lost the dynamic accent selection surface");
             Assert(ChromePart<Grid>(fixture.Disabled, "ButtonSurface").Opacity <= .351
                 && !fixture.Disabled.IsEnabled, "actual disabled state is not visible");
             Assert(YMusic.Native.CoverPalette.Contrast(((SolidColorBrush)Application.Current.Resources["AccentBrush"]).Color, YMusic.Native.CoverPalette.Ink) >= 4.5, "active accent lost readable ink contrast");
-            Assert(ChromeResourceTrigger(fixture.Link, UIElement.IsMouseOverProperty, null, System.Windows.Controls.Control.ForegroundProperty, "AccentHoverBrush"),
+            Assert(ChromeResourceTrigger(fixture.Link, UIElement.IsMouseOverProperty, null, System.Windows.Controls.Control.ForegroundProperty, "AccentTextBrush"),
                 "text link hover does not resolve the dynamic accent hover resource");
             Assert(ChromeTrigger(fixture.Button, UIElement.IsMouseOverProperty, "ButtonHover", YMusic.Native.Motion.OpacityProperty, .065d)
                 && ChromeResourceTrigger(fixture.Combo, ComboBox.IsDropDownOpenProperty, "ComboChrome", Border.BorderBrushProperty, "AccentHoverBrush"),
@@ -112,7 +112,7 @@ internal static partial class Program
                 userCursorMoved = false,
                 keyboardOrMouseInputSent = false,
                 accountOrNetworkAccess = false,
-                accent = ChromeColor((Brush)Application.Current.Resources["AccentBrush"]), hover = "AccentHoverBrush", dynamicResourceKeysInspected = true
+                accent = ChromeColor((Brush)Application.Current.Resources["AccentBrush"]), textHover = "AccentTextBrush", surfaceHover = "AccentHoverBrush", dynamicResourceKeysInspected = true
             }, new JsonSerializerOptions { WriteIndented = true }));
             return Task.CompletedTask;
         });

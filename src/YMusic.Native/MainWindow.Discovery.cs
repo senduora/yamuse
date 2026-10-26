@@ -21,6 +21,7 @@ public partial class MainWindow
     private LrclibLyricsClient? _lrclibLyrics = new();
     private readonly DispatcherTimer _lyricsTimer = new() { Interval = TimeSpan.FromMilliseconds(100) };
     private DateTimeOffset _lyricsFollowUntil;
+    private bool _lyricsManualDragging;
     private Uri? _lyricsSource;
     private readonly Dictionary<string, CachedLyrics> _lyricsCache = new(StringComparer.Ordinal);
     private sealed record CachedLyrics(LyricsResult Result, Uri? Source, DateTimeOffset Loaded);
@@ -53,7 +54,8 @@ public partial class MainWindow
         _lyricsTimer.Tick += (_, _) => UpdateLyrics(_player.Position.TotalSeconds);
         LyricsList.PreviewMouseWheel += (_, _) => PauseLyricsFollow();
         LyricsList.PreviewTouchDown += (_, _) => PauseLyricsFollow();
-        LyricsList.AddHandler(Thumb.DragStartedEvent, new DragStartedEventHandler((_, _) => PauseLyricsFollow()), true);
+        LyricsList.AddHandler(Thumb.DragStartedEvent, new DragStartedEventHandler((_, _) => { _lyricsManualDragging = true; PauseLyricsFollow(); }), true);
+        LyricsList.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((_, _) => { _lyricsManualDragging = false; PauseLyricsFollow(); }), true);
         LyricsList.PreviewKeyDown += (_, args) =>
         { if (args.Key is Key.Up or Key.Down or Key.PageUp or Key.PageDown or Key.Home or Key.End) PauseLyricsFollow(); };
     }
@@ -61,10 +63,11 @@ public partial class MainWindow
     {
         if (_lyricsOpen == visible) return;
         _lyricsOpen = visible;
+        _lyricsManualDragging = false;
         UpdateMainContentVisibility();
         UpdateLyricsTimer();
-        PlayerLyricsButton.Foreground = (Brush)FindResource(visible ? "AccentBrush" : "MutedBrush");
-        PlayerLyricsButton.Background = visible ? new SolidColorBrush(Color.FromRgb(51, 37, 34)) : Brushes.Transparent;
+        PlayerLyricsButton.Foreground = (Brush)FindResource(visible ? "AccentTextBrush" : "MutedBrush");
+        PlayerLyricsButton.Background = visible ? (Brush)FindResource("AccentSoftBrush") : Brushes.Transparent;
         PlayerLyricsButton.ToolTip = visible ? "Скрыть текст песни · Esc" : "Текст песни";
         System.Windows.Automation.AutomationProperties.SetName(PlayerLyricsButton, visible ? "Скрыть текст песни" : "Открыть текст песни");
         if (!_closed) Motion.Enter(CurrentContent());
@@ -106,7 +109,7 @@ public partial class MainWindow
     private void PauseLyricsFollow()
     {
         _lyricsFollowUntil = DateTimeOffset.UtcNow.AddMilliseconds(3500);
-        if (FindViewer(LyricsList) is { } viewer) SmoothScroll.CancelAnimation(viewer);
+        if (FindViewer(LyricsList) is { } viewer) SmoothScroll.CancelProgrammaticAnimation(viewer);
     }
     private async void RefreshLyrics()
     {
@@ -205,7 +208,7 @@ public partial class MainWindow
         var changed = _lyricsList.SelectedIndex != index;
         if (changed) _lyricsList.SelectedIndex = index;
         RefreshExpandedLyrics();
-        if (!_lyricsOpen || index < 0 || DateTimeOffset.UtcNow < _lyricsFollowUntil) return;
+        if (!_lyricsOpen || index < 0 || _lyricsManualDragging || DateTimeOffset.UtcNow < _lyricsFollowUntil) return;
         if (!changed && _lyricsFollowUntil == default) return;
         _lyricsFollowUntil = default;
         CenterLyricLine(index);
@@ -215,7 +218,11 @@ public partial class MainWindow
         if (FindViewer(LyricsList) is not { } viewer) return;
         if (LyricsList.ItemContainerGenerator.ContainerFromIndex(index) is not FrameworkElement row)
         {
-            LyricsList.ScrollIntoView(LyricsList.Items[index]);
+            var track = _current;
+            var account = _accountGeneration;
+            SmoothScroll.ScrollIntoView(viewer, LyricsList, index, () => _lyricsOpen && !_lyricsManualDragging &&
+                DateTimeOffset.UtcNow >= _lyricsFollowUntil && _accountGeneration == account &&
+                ReferenceEquals(_current, track) && LyricsList.SelectedIndex == index);
             return;
         }
         var point = row.TranslatePoint(new Point(0, 0), viewer);

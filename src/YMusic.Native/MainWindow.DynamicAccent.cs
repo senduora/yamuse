@@ -24,7 +24,7 @@ public partial class MainWindow
     }
 }
 
-/// <summary>One palette worker and six shared brushes; no frame timer or new artwork request.</summary>
+/// <summary>One palette worker and seven shared brushes; no frame timer or new artwork request.</summary>
 internal sealed class CoverAccentController : IDisposable
 {
     internal static readonly TimeSpan TransitionDuration = TimeSpan.FromSeconds(5);
@@ -79,6 +79,7 @@ internal sealed class CoverAccentController : IDisposable
         _sourceChanged.AddValueChanged(cover, OnCoverChanged);
         _uriChanged.AddValueChanged(cover, OnCoverChanged);
         _loadStatusChanged.AddValueChanged(cover, OnCoverChanged);
+        ThemeManager.Changed += OnThemeChanged;
         OnCoverChanged(cover, EventArgs.Empty);
     }
 
@@ -125,13 +126,48 @@ internal sealed class CoverAccentController : IDisposable
         color = CoverPalette.Readable(color);
         if (TargetColor == color) return;
         TargetColor = color;
+        ApplyPalette(color, animate: true);
+    }
+
+    private void OnThemeChanged(object? sender, EventArgs args)
+    {
+        if (_disposed) return;
+        _cover.VerifyAccess();
+        // Keep the original cover's clock and deadline. Only the three colours
+        // whose contrast depends on the page theme need new companion clocks.
+        var currentColor = _brushes["AccentBrush"].Color;
+        var remaining = TimeSpan.Zero;
+        if (_clocks.TryGetValue("AccentBrush", out var primary) && primary.CurrentState == ClockState.Active
+            && primary.CurrentTime is { } elapsed && elapsed < TransitionDuration)
+            remaining = TransitionDuration - elapsed;
+        var currentPalette = Palette(currentColor).ToDictionary(pair => pair.Key, pair => pair.Color);
+        foreach (var (key, target) in Palette(TargetColor))
+        {
+            if (key is not ("AccentTextBrush" or "AccentSoftBrush" or "AccentSelectionBrush")) continue;
+            var brush = _brushes[key];
+            var from = currentPalette[key];
+            brush.Color = target;
+            if (_clocks.Remove(key, out var previous)) previous.Controller?.Stop();
+            if (remaining <= TimeSpan.Zero || !SystemParameters.ClientAreaAnimation || from == target)
+            { HoldMutable(brush, target); continue; }
+            var animation = new ColorAnimation(from, target, new Duration(remaining)) { FillBehavior = FillBehavior.Stop };
+            var clock = (AnimationClock)animation.CreateClock(true);
+            _clocks[key] = clock;
+            brush.ApplyAnimationClock(SolidColorBrush.ColorProperty, clock, HandoffBehavior.SnapshotAndReplace);
+            clock.Controller!.Begin();
+            clock.Controller.SeekAlignedToLastTick(TimeSpan.Zero, TimeSeekOrigin.BeginTime);
+        }
+    }
+
+    private void ApplyPalette(Color color, bool animate)
+    {
         foreach (var (key, target) in Palette(color))
         {
             var brush = _brushes[key]; var current = brush.Color;
             brush.Color = target;
             // Explicit user-requested five-second colour fade is independent
             // of render tier; Windows' reduced-animation preference still wins.
-            if (!SystemParameters.ClientAreaAnimation || current == target)
+            if (!animate || !SystemParameters.ClientAreaAnimation || current == target)
             { HoldMutable(brush, target); _clocks.Remove(key); continue; }
             var animation = new ColorAnimation(current, target, new Duration(TransitionDuration))
             { FillBehavior = FillBehavior.Stop };
@@ -143,15 +179,23 @@ internal sealed class CoverAccentController : IDisposable
     private static IEnumerable<(string Key, Color Color)> Palette(Color color)
     {
         yield return ("AccentBrush", color);
+        yield return ("AccentTextBrush", ThemeManager.ReadableAccent(color));
         yield return ("AccentHoverBrush", CoverPalette.Mix(color, Colors.White, .20));
         yield return ("AccentFocusBrush", CoverPalette.Mix(color, Colors.White, .58));
-        yield return ("AccentSoftBrush", CoverPalette.Mix(Color.FromRgb(16, 17, 20), color, .12));
-        yield return ("AccentSelectionBrush", CoverPalette.Mix(Color.FromRgb(16, 17, 20), color, .20));
+        var background = ThemeManager.IsLight ? Color.FromRgb(245, 246, 248) : Color.FromRgb(16, 17, 20);
+        yield return ("AccentSoftBrush", CoverPalette.Mix(background, color, .12));
+        yield return ("AccentSelectionBrush", CoverPalette.Mix(background, color, .20));
         yield return ("AccentTextSelectionBrush", Color.FromArgb(110, color.R, color.G, color.B));
     }
 
-    private static void HoldMutable(SolidColorBrush brush, Color color) => brush.BeginAnimation(SolidColorBrush.ColorProperty,
-        new ColorAnimation(color, color, new Duration(TimeSpan.Zero)) { FillBehavior = FillBehavior.HoldEnd }, HandoffBehavior.SnapshotAndReplace);
+    private static void HoldMutable(SolidColorBrush brush, Color color)
+    {
+        var clock = (AnimationClock)new ColorAnimation(color, color, new Duration(TimeSpan.Zero))
+            { FillBehavior = FillBehavior.HoldEnd }.CreateClock(true);
+        brush.ApplyAnimationClock(SolidColorBrush.ColorProperty, clock, HandoffBehavior.SnapshotAndReplace);
+        clock.Controller!.Begin();
+        clock.Controller.SeekAlignedToLastTick(TimeSpan.Zero, TimeSeekOrigin.BeginTime);
+    }
 
     public void Dispose()
     {
@@ -159,6 +203,7 @@ internal sealed class CoverAccentController : IDisposable
         _disposed = true; _generation++; _pending?.Cancel(); _pending = null;
         _sourceChanged.RemoveValueChanged(_cover, OnCoverChanged); _uriChanged.RemoveValueChanged(_cover, OnCoverChanged);
         _loadStatusChanged.RemoveValueChanged(_cover, OnCoverChanged);
+        ThemeManager.Changed -= OnThemeChanged;
         foreach (var brush in _brushes.Values)
         { var current = brush.Color; brush.Color = current; brush.ApplyAnimationClock(SolidColorBrush.ColorProperty, null); }
         _clocks.Clear();

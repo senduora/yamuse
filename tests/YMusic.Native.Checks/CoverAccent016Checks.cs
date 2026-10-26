@@ -98,7 +98,7 @@ internal static partial class Program
         Assert(f.Controller.TargetColor == CoverPalette.Fallback, "a confirmed unavailable cover never used the configured fallback");
         if (SystemParameters.ClientAreaAnimation)
         {
-            Assert(f.Controller.Clocks.Count == 6 && f.Controller.Clocks.Values.All(c => c.Timeline.Duration.TimeSpan == TimeSpan.FromSeconds(5)), "missing cover bypassed the five-second fade");
+            Assert(f.Controller.Clocks.Count == 7 && f.Controller.Clocks.Values.All(c => c.Timeline.Duration.TimeSpan == TimeSpan.FromSeconds(5)), "missing cover bypassed the five-second fade");
             Accent015Seek(f.Controller, 0); Assert(f.Controller.Brushes["AccentBrush"].Color == before, "missing cover jumped to orange");
             Accent015Seek(f.Controller, 2.5); var midway = f.Controller.Brushes["AccentBrush"].Color;
             Assert(midway != before && midway != CoverPalette.Fallback, "fallback lacks intermediate colours");

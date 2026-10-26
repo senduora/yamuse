@@ -17,7 +17,10 @@ internal sealed record PlayerPreferences
     public double CrossfadeSeconds { get; init; } = 3;
     public bool NormalizeVolume { get; init; }
     public bool AccentFromCover { get; init; } = true;
-    public string StaticAccentColor { get; init; } = "#EA571C";
+    public string StaticAccentColor { get; init; } = "#E7BB59";
+    [JsonConverter(typeof(ThemeModeConverter))]
+    public string Theme { get; init; } = "System";
+    public UpdateCheckFrequency UpdateCheckFrequency { get; init; } = UpdateCheckFrequency.Startup;
 }
 
 // This file contains playback preferences only; authentication remains in SessionStore.
@@ -29,7 +32,7 @@ internal sealed class PreferencesStore
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true,
         WriteIndented = true,
-        Converters = { new JsonStringEnumConverter<AudioQuality>(allowIntegerValues: false) }
+        Converters = { new JsonStringEnumConverter<AudioQuality>(allowIntegerValues: false), new UpdateCheckFrequencyConverter() }
     };
     private static readonly ConcurrentDictionary<string, object> Gates = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _gate;
@@ -101,16 +104,21 @@ internal sealed class PreferencesStore
         return preferences with
         {
             Quality = Enum.IsDefined(preferences.Quality) ? preferences.Quality : AudioQuality.Excellent,
+            UpdateCheckFrequency = Enum.IsDefined(preferences.UpdateCheckFrequency) ? preferences.UpdateCheckFrequency : UpdateCheckFrequency.Startup,
             Volume = double.IsFinite(preferences.Volume) ? Math.Clamp(preferences.Volume, 0, 1) : 0.5,
             PlaybackSpeed = double.IsFinite(preferences.PlaybackSpeed) ? Math.Clamp(preferences.PlaybackSpeed, 0.5, 2) : 1,
             ConcurrentDownloads = Math.Clamp(preferences.ConcurrentDownloads, 1, 10),
             CrossfadeSeconds = double.IsFinite(preferences.CrossfadeSeconds) ? Math.Clamp(preferences.CrossfadeSeconds, 0, 10) : 3,
-            StaticAccentColor = IsAccentColor(preferences.StaticAccentColor) ? preferences.StaticAccentColor.ToUpperInvariant() : "#EA571C"
+            StaticAccentColor = IsAccentColor(preferences.StaticAccentColor) ? preferences.StaticAccentColor.ToUpperInvariant() : "#E7BB59",
+            Theme = NormalizeTheme(preferences.Theme)
         };
     }
 
     internal static bool IsAccentColor(string? value) => value is { Length: 7 } && value[0] == '#'
         && value.AsSpan(1).IndexOfAnyExcept("0123456789abcdefABCDEF") < 0;
+
+    internal static string NormalizeTheme(string? value) => string.Equals(value, "Light", StringComparison.OrdinalIgnoreCase) ? "Light"
+        : string.Equals(value, "Dark", StringComparison.OrdinalIgnoreCase) ? "Dark" : "System";
 
     private static bool TryRead(string path, out PlayerPreferences? preferences)
     {
@@ -124,4 +132,17 @@ internal sealed class PreferencesStore
         }
         catch (JsonException) { return false; }
     }
+}
+
+internal sealed class ThemeModeConverter : JsonConverter<string>
+{
+    public override bool HandleNull => true;
+    public override string Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.String) return PreferencesStore.NormalizeTheme(reader.GetString());
+        reader.Skip();
+        return "System";
+    }
+    public override void Write(Utf8JsonWriter writer, string value, JsonSerializerOptions options)
+        => writer.WriteStringValue(PreferencesStore.NormalizeTheme(value));
 }
