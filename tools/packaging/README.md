@@ -6,15 +6,15 @@
 
 ## Сборка
 
-Новые версии следуют [политике `X.Y.Z`](../../docs/VERSIONING.md): `X` — крупное обновление, `Y` — новые небольшие возможности, `Z` — исправления. Текущий стабильный выпуск — `0.4.0`. Полная `InformationalVersion` обязательна при проверке пакета: числовая `AssemblyVersion` равна `0.4.0.0` и не отличает preview от стабильной версии. Скрипт принимает только стабильную `X.Y.Z`; до создания рабочих папок и получения инструментов он отклоняет preview-исходники либо несовпадение полной версии готовой DLL. Упаковка preview пока не поддерживается.
+Новые версии следуют [политике `X.Y.Z`](../../docs/VERSIONING.md): `X` — крупное обновление, `Y` — новые небольшие возможности, `Z` — исправления. Стабильная версия для сборки — `0.4.1`. Полная `InformationalVersion` обязательна при проверке пакета: числовая `AssemblyVersion` равна `0.4.1.0` и не отличает preview от стабильной версии. Скрипт принимает только стабильную `X.Y.Z`; до создания рабочих папок и получения инструментов он отклоняет preview-исходники либо несовпадение полной версии готовой DLL. Упаковка preview пока не поддерживается.
 
 Нужны Windows x64, PowerShell и .NET SDK 8. Для окончательного пакета используйте уже проверенный self-contained publish и хеш DLL, прошедшего общие проверки. Указывайте новые пустые папки:
 
 ```powershell
 & .\tools\packaging\Pack-Installer.ps1 `
-  -Version 0.4.0 `
-  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.4.0') `
-  -WorkFolder (Join-Path $PWD 'work\package-0.4.0') `
+  -Version 0.4.1 `
+  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.4.1') `
+  -WorkFolder (Join-Path $PWD 'work\package-0.4.1') `
   -PackageCache (Join-Path $PWD 'work\verified-packages') `
   -PublishedFolder $checkedSelfContainedPublish `
   -ExpectedProductSha256 $checkedProductHash

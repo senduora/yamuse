@@ -19,7 +19,7 @@ internal static partial class Program
         await Run("PlaybackKeys040: routed F11 toggles the separate fullscreen host and Escape closes it", Pk040Fullscreen);
         await Run("PlaybackKeys040: text password rich text editable combo and modifier keys retain input", Pk040Input);
         await Run("PlaybackKeys040: main and numpad volume clamp persist and mute restores the last nonzero level", Pk040Volume);
-        await Run("PlaybackKeys040: routed P Space and exact reversed brackets use shared asynchronous playback", Pk040Transport);
+        await Run("PlaybackKeys040: routed P Space brackets and media keys use shared asynchronous playback", Pk040Transport);
         await Run("PlaybackKeys040: L captures current track and reuses confirmed account mutation guards", Pk040Like);
         File.WriteAllText(Path.Combine(_directory, "playback-keys040-scope.json"), JsonSerializer.Serialize(new
         {
@@ -127,13 +127,23 @@ internal static partial class Program
         Assert(ReferenceEquals(Pk040Field<TrackRow?>(f.Window, "_current"), f.Rows[1]) && f.Player.Volume == 0, "P played a different current or audible fixture");
         f.Key(Key.Space); Assert(!f.Player.IsPlaying, "existing Space did not pause");
         f.Key(Key.F11); Assert(f.Key(Key.P, f.Fullscreen).Handled && f.Player.IsPlaying, "fullscreen P did not resume");
-        Assert(f.Key(Key.OemOpenBrackets, f.Fullscreen).Handled, "[ was not handled");
+        foreach (var target in new UIElement[] { f.Window, f.Fullscreen })
+        {
+            f.Player.Seek(TimeSpan.FromSeconds(8));
+            Assert(f.Key(Key.OemOpenBrackets, target).Handled, "[ was not handled");
+            await Until(() => !Pk040Field<bool>(f.Window, "_loadingStream") && ReferenceEquals(Pk040Field<TrackRow?>(f.Window, "_current"), f.Rows[0]));
+            Assert(Pk040Field<PlaybackQueue>(f.Window, "_playbackQueue").CurrentIndex == 0 && f.Player.Position.TotalSeconds < 3, "[ did not mean previous track");
+            Assert(f.Key(Key.OemCloseBrackets, target).Handled, "] was not handled");
+            await Until(() => !Pk040Field<bool>(f.Window, "_loadingStream") && ReferenceEquals(Pk040Field<TrackRow?>(f.Window, "_current"), f.Rows[1]));
+            Assert(Pk040Field<PlaybackQueue>(f.Window, "_playbackQueue").CurrentIndex == 1, "] did not mean next track");
+        }
+        Assert(f.Key(Key.MediaNextTrack, f.Fullscreen).Handled, "media next was not handled");
         await Until(() => !Pk040Field<bool>(f.Window, "_loadingStream") && ReferenceEquals(Pk040Field<TrackRow?>(f.Window, "_current"), f.Rows[2]));
-        Assert(Pk040Field<PlaybackQueue>(f.Window, "_playbackQueue").CurrentIndex == 2, "[ did not mean next track");
+        Assert(Pk040Field<PlaybackQueue>(f.Window, "_playbackQueue").CurrentIndex == 2, "media next changed direction");
         f.Player.Seek(TimeSpan.FromSeconds(8));
-        Assert(f.Key(Key.OemCloseBrackets).Handled, "] was not handled");
+        Assert(f.Key(Key.MediaPreviousTrack).Handled, "media previous was not handled");
         await Until(() => !Pk040Field<bool>(f.Window, "_loadingStream") && ReferenceEquals(Pk040Field<TrackRow?>(f.Window, "_current"), f.Rows[1]));
-        Assert(Pk040Field<PlaybackQueue>(f.Window, "_playbackQueue").CurrentIndex == 1 && f.Player.Position.TotalSeconds < 3, "] did not mean previous track");
+        Assert(Pk040Field<PlaybackQueue>(f.Window, "_playbackQueue").CurrentIndex == 1 && f.Player.Position.TotalSeconds < 3, "media previous changed direction");
         f.Key(Key.P); Assert(!f.Player.IsPlaying && f.Http.Requests == 0, "P pause performed network or failed");
     }
 
