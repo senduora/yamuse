@@ -36,13 +36,23 @@ public partial class MainWindow
         grid.RowDefinitions.Add(new() { Height = GridLength.Auto });
         grid.RowDefinitions.Add(new() { Height = new GridLength(1, GridUnitType.Star) });
         _downloadCenterSummary = new TextBlock { Name = "DownloadCenterSummary", TextWrapping = TextWrapping.Wrap, FontSize = 14, Margin = new(0, 0, 0, 12) };
-        var overview = new StackPanel(); overview.Children.Add(_downloadCenterSummary);
-        overview.Children.Add(InitializeDownloadProgress()); grid.Children.Add(overview);
+        var overview = new StackPanel();
+        var intro = new TextBlock { Name = "DownloadCenterIntro", Text = "Очередь, прогресс и ошибки скачивания. Готовая музыка — в разделе «Скачанное».",
+            TextWrapping = TextWrapping.Wrap, FontSize = 12, Margin = new(0, 0, 0, 12) };
+        intro.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush");
+        overview.Children.Add(intro); overview.Children.Add(_downloadCenterSummary);
+        overview.Children.Add(InitializeDownloadProgress());
+        var overviewCard = new Border { Child = overview, CornerRadius = new(12), Padding = new(16), Margin = new(0, 0, 0, 14), BorderThickness = new(1) };
+        overviewCard.SetResourceReference(Border.BackgroundProperty, "ControlBrush");
+        overviewCard.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+        grid.Children.Add(overviewCard);
         var actions = new WrapPanel { Margin = new(0, 0, 0, 8) }; Grid.SetRow(actions, 1); grid.Children.Add(actions);
         _downloadPauseButton = AddButton("Пауза", "DownloadPauseButton", (_, _) => PauseDownloadQueue());
         _downloadResumeButton = AddButton("Продолжить", "DownloadResumeButton", async (_, _) => await ResumeDownloadQueue());
         _downloadRetryButton = AddButton("Повторить", "DownloadRetryButton", async (_, _) => await RetryFailedDownloads());
         _downloadRetryButton.ToolTip = "Повторить только неудачные загрузки";
+        var libraryButton = AddButton("Открыть скачанное →", "DownloadLibraryButton", Offline_Click);
+        libraryButton.ToolTip = "Перейти к готовой офлайн-музыке";
         _downloadSelectUnavailableButton = AddButton("Недоступные", "DownloadSelectUnavailableButton", (_, _) => SelectUnavailableDownloads());
         _downloadSelectUnavailableButton.ToolTip = "Выделить недоступные треки из «Мне нравится». Для своего выбора используйте Ctrl или Shift.";
         _downloadUnlikeButton = AddButton("Убрать лайк", "DownloadUnlikeButton", async (_, _) => await UnlikeSelectedDownloadAsync());
@@ -194,7 +204,7 @@ public partial class MainWindow
         _downloadQueue.Suspend(); _downloadCts?.Cancel(); RefreshDownloadCenter();
     }
     private void DownloadCenter_Click(object sender, RoutedEventArgs e)
-    { SetSection("download-center", "Загрузки"); RefreshDownloadCenter(); RefreshDownloadStorage(); }
+    { SetSection("download-center", "Центр загрузок"); DownloadCenterNav.BringIntoView(); RefreshDownloadCenter(); RefreshDownloadStorage(); }
 
     private bool CanUnlikeDownload(DownloadEntry? entry) => entry is not null && !entry.Active && !_closed && !_demo && !_catalogWriting
         && _session is not null && _account is not null && _downloadQueueAccountUid == _account.Uid

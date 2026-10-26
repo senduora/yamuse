@@ -65,7 +65,7 @@ public sealed class AmbientBackdrop : Grid
         {
             var stop = new GradientStop { Offset = offset };
             BindingOperations.SetBinding(stop, GradientStop.ColorProperty, new Binding(nameof(SolidColorBrush.Color))
-            { Source = ThemeManager.Brush(Color.FromArgb(alpha, 10, 14, 22)) });
+            { Source = ThemeManager.Brush(Color.FromArgb(alpha, 10, 14, 22)), Converter = VeilColorConverter.Instance });
             veil.GradientStops.Add(stop);
         }
         Children.Add(new Border { Background = veil, IsHitTestVisible = false });
@@ -82,8 +82,12 @@ public sealed class AmbientBackdrop : Grid
         foreach (var (offset, opacity) in new[] { (0d, .90), (.30, .70), (.62, .22), (1d, 0d) })
         {
             var stop = new GradientStop { Offset = offset };
-            BindingOperations.SetBinding(stop, GradientStop.ColorProperty, new Binding(nameof(AccentBrush) + ".Color")
-            { Source = this, Converter = CloudColorConverter.Instance, ConverterParameter = new CloudTint(tint, opacity) });
+            var colors = new MultiBinding { Converter = CloudColorConverter.Instance, ConverterParameter = new CloudTint(tint, opacity) };
+            colors.Bindings.Add(new Binding(nameof(AccentBrush) + ".Color") { Source = this });
+            // The stable theme brush also invalidates the presentation when a
+            // theme changes in the middle of the existing cover colour fade.
+            colors.Bindings.Add(new Binding(nameof(Background) + ".Color") { Source = this });
+            BindingOperations.SetBinding(stop, GradientStop.ColorProperty, colors);
             brush.GradientStops.Add(stop);
         }
         var translation = new TranslateTransform(xFrom, yFrom);
@@ -174,12 +178,13 @@ public sealed class AmbientBackdrop : Grid
     }
 
     private sealed record CloudTint(int Index, double Opacity);
-    private sealed class CloudColorConverter : IValueConverter
+    private sealed class CloudColorConverter : IMultiValueConverter
     {
         internal static readonly CloudColorConverter Instance = new();
-        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
         {
-            if (value is not Color color || parameter is not CloudTint tint) return Colors.Transparent;
+            if (values.Length == 0 || values[0] is not Color color || parameter is not CloudTint tint) return Colors.Transparent;
+            if (ThemeManager.IsLight && !SystemParameters.HighContrast) color = LightCloudColor(color);
             // Nearby tones keep the atmosphere related to the cover even when
             // the selected accent is blue/green; there is no fixed orange layer.
             var mix = tint.Index switch { 1 => .28, 2 => .12, 3 => .20, _ => 0 };
@@ -188,6 +193,36 @@ public sealed class AmbientBackdrop : Grid
             var blue = color.B * (1 - mix) + color.R * mix;
             return Color.FromArgb((byte)Math.Round(255 * tint.Opacity), (byte)red, (byte)green, (byte)blue);
         }
+        public object[] ConvertBack(object value, Type[] targetTypes, object parameter, CultureInfo culture) => [Binding.DoNothing, Binding.DoNothing];
+
+        private static Color LightCloudColor(Color color)
+        {
+            var maximum = Math.Max(color.R, Math.Max(color.G, color.B));
+            var chroma = maximum - Math.Min(color.R, Math.Min(color.G, color.B));
+            if (chroma < 8)
+            {
+                // Lift neutral covers without magnifying tiny channel noise.
+                var lift = Math.Max(0, 235 - maximum);
+                return Color.FromRgb((byte)(color.R + lift), (byte)(color.G + lift), (byte)(color.B + lift));
+            }
+            // A light decorative tint retains the cover's channel proportions
+            // without changing the shared accent. Bounded pastel channels keep
+            // both primary and muted light-theme text readable over the clouds.
+            var amount = Math.Clamp((chroma - 8) / 8d, 0, 1);
+            var peak = Math.Max(235d, maximum);
+            peak += (252 - peak) * amount;
+            var scale = Math.Min(1 + amount, (peak - 225) / chroma);
+            return Color.FromRgb((byte)Math.Round(peak - (maximum - color.R) * scale),
+                (byte)Math.Round(peak - (maximum - color.G) * scale), (byte)Math.Round(peak - (maximum - color.B) * scale));
+        }
+    }
+
+    private sealed class VeilColorConverter : IValueConverter
+    {
+        internal static readonly VeilColorConverter Instance = new();
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+            => value is Color color && ThemeManager.IsLight && !SystemParameters.HighContrast
+                ? Color.FromArgb((byte)Math.Round(color.A * .30), color.R, color.G, color.B) : value;
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) => Binding.DoNothing;
     }
 }

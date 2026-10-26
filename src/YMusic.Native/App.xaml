@@ -156,6 +156,20 @@
     <Geometry x:Key="MenuDownloadGeometry">M8,2 V11 M4,7 L8,11 L12,7 M3,14 H13</Geometry>
     <Geometry x:Key="MenuDeleteGeometry">M3,4 H13 M6,4 V2 H10 V4 M5,6 V14 H11 V6 M7,7 V12 M9,7 V12</Geometry>
     <Geometry x:Key="MenuWaveGeometry">M2,8 C4,2 6,2 8,8 C10,14 12,14 14,8</Geometry>
+    <GeometryGroup x:Key="CollectionWaveGeometry">
+      <GeometryGroup Transform="1,0,0,1,0,4"><GeometryGroup.Children><GeometryCollection><StaticResource ResourceKey="MenuWaveGeometry"/></GeometryCollection></GeometryGroup.Children></GeometryGroup>
+      <GeometryGroup Transform="0.6,0,0,0.6,8,0"><GeometryGroup.Children><GeometryCollection><StaticResource ResourceKey="MenuLikeGeometry"/></GeometryCollection></GeometryGroup.Children></GeometryGroup>
+    </GeometryGroup>
+    <Geometry x:Key="DownloadCenterGeometry">M2,2 H5 V5 H2 Z M8,3.5 H15 M2,10 H5 V13 H2 Z M8,11.5 H15</Geometry>
+    <Style x:Key="ButtonGlyph" TargetType="Path">
+      <Setter Property="Width" Value="16"/><Setter Property="Height" Value="16"/><Setter Property="Stretch" Value="Uniform"/>
+      <Setter Property="Stroke" Value="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/><Setter Property="StrokeThickness" Value="1.4"/>
+      <Setter Property="StrokeStartLineCap" Value="Round"/><Setter Property="StrokeEndLineCap" Value="Round"/><Setter Property="StrokeLineJoin" Value="Round"/>
+      <Setter Property="VerticalAlignment" Value="Center"/><Setter Property="IsHitTestVisible" Value="False"/>
+    </Style>
+    <Style x:Key="NavPathGlyph" TargetType="Path" BasedOn="{StaticResource ButtonGlyph}">
+      <Setter Property="Width" Value="18"/><Setter Property="Height" Value="18"/><Setter Property="Margin" Value="0,0,10,0"/>
+    </Style>
     <Style x:Key="MenuGlyph" TargetType="Path">
       <Setter Property="Width" Value="16"/><Setter Property="Height" Value="16"/><Setter Property="Stretch" Value="Uniform"/>
       <Setter Property="Stroke" Value="{Binding Foreground, RelativeSource={RelativeSource AncestorType=MenuItem}}"/><Setter Property="StrokeThickness" Value="1.4"/>

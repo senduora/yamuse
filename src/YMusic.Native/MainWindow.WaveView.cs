@@ -1,4 +1,5 @@
 using System.Windows;
+using System.Windows.Media;
 
 namespace YMusic.Native;
 
@@ -53,6 +54,7 @@ public partial class MainWindow
         if (WavePanel is null) return;
         var collection = _waveViewMode == WaveMode.Collection;
         var byTrack = _waveViewMode == WaveMode.Track;
+        if (WaveFallbackGlyph is not null) WaveFallbackGlyph.Data = (Geometry)FindResource(collection ? "CollectionWaveGeometry" : "MenuWaveGeometry");
         WaveHeading.Text = WaveViewTitle;
         WaveModeCaption.Text = byTrack ? "По треку «" + _waveSeedTrack?.Title + "»" : collection ? "Ваша коллекция задаёт настроение" : "Музыка, которая подходит именно вам";
         WaveModeCaption.ToolTip = WaveModeCaption.Text;
