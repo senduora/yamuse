@@ -131,10 +131,11 @@ internal sealed class DownloadQueueState
     { if (Environment.CurrentManagedThreadId != _ownerThread) throw new InvalidOperationException("Download queue mutations require their owning dispatcher thread."); }
 }
 
-internal sealed class DownloadProgressSink : IProgress<AudioProgress>
+internal sealed class DownloadProgressSink(Action? changed = null) : IProgress<AudioProgress>
 {
     private AudioProgress? _latest;
-    public void Report(AudioProgress value) => Interlocked.Exchange(ref _latest, value);
+    public void Report(AudioProgress value)
+    { Interlocked.Exchange(ref _latest, value); changed?.Invoke(); }
     internal AudioProgress? Take() => Interlocked.Exchange(ref _latest, null);
 }
 

@@ -11,6 +11,7 @@ public partial class MainWindow
     private void UpdatePlayerArtistLinks()
     {
         if (PlayerArtistPanel is null) return;
+        if (PlayerMoreButton is { } more) more.IsEnabled = _current is not null && !_closed;
         PlayerCoverButton.Tag = PlayerTitleButton.Tag = _current;
         PlayerCoverButton.IsEnabled = PlayerTitleButton.IsEnabled = _current is not null && _session is not null;
         var visible = _current is { } track && (track.Artists.Count > 0 || !string.IsNullOrWhiteSpace(track.Artist));

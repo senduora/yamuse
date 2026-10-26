@@ -17,7 +17,7 @@ internal static partial class Program
         await Run("Crossfade: actual overlap remains active beyond eight seconds and completes once at ten", CrossfadeNaturalCompletion);
         await Run("Crossfade: playback uses native Windows media and only the declared application dependency", () =>
         {
-            var allowed = new[] { "PresentationCore", "PresentationFramework", "WindowsBase", "Velopack", "WinRT.Runtime", "Microsoft.Windows.SDK.NET", "Microsoft.CSharp", "Microsoft.Win32.Primitives", "Microsoft.Win32.Registry" };
+            var allowed = new[] { "PresentationCore", "PresentationFramework", "WindowsBase", "Velopack", "WinRT.Runtime", "Microsoft.Windows.SDK.NET", "Microsoft.CSharp", "Microsoft.Win32.Primitives", "Microsoft.Win32.Registry", "Microsoft.Win32.SystemEvents" };
             var references = typeof(NativePlayer).Assembly.GetReferencedAssemblies();
             var undeclared = references.Where(a => !a.Name!.StartsWith("System.", StringComparison.Ordinal) && !allowed.Contains(a.Name)).ToArray();
             Assert(undeclared.Length == 0, "undeclared assembly reference: " + string.Join(", ", undeclared.Select(a => a.Name)));
@@ -42,7 +42,7 @@ internal static partial class Program
         store.Save(imported);var json=File.ReadAllText(store.FilePath);
         using var document = JsonDocument.Parse(json);
         var fields = document.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n).ToArray();
-        Assert(fields.SequenceEqual(new[] { "accentFromCover", "autoDownloadFavorites", "concurrentDownloads", "crossfadeSeconds", "minimizeToTray", "normalizeVolume", "playbackSpeed", "quality", "staticAccentColor", "volume" }), "saved schema differs");
+        Assert(fields.SequenceEqual(new[] { "accentFromCover", "autoDownloadFavorites", "concurrentDownloads", "crossfadeSeconds", "minimizeToTray", "normalizeVolume", "playbackSpeed", "quality", "staticAccentColor", "theme", "updateCheckFrequency", "volume" }), "saved schema differs");
         using var player=new NativePlayer(); Assert(player.CrossfadeSeconds==3,"native default differs");
         player.SetCrossfade(10);
         Assert(!player.TryPlayPrepared(new Uri(Path.Combine(directory,"not-open.wav")),TimeSpan.FromSeconds(10)),"missing next source promoted");
@@ -63,12 +63,12 @@ internal static partial class Program
             Assert(fixture.Window.OwnedWindows.Count == 0 && Control<Grid>(fixture.Window, "SettingsPanel").IsVisible, "Settings created a separate window");
             slider.Value=10;dialog.UpdateLayout();await Task.Delay(120);
             ClCaptureElement(dialog,Path.Combine(_directory,"crossfade-settings.png"));
-            SaClick(SaVisuals<Button>(dialog).Single(b=>b.Name=="SettingsApplyButton"));
+            SaClick(SaVisuals<Button>(dialog).Single(b=>b.Name=="SettingsBackButton"));
         });
         Assert(fixture.Player.CrossfadeSeconds==10 && store.Load().CrossfadeSeconds==10,"setting not applied and saved");
         await CrossfadePage(fixture.Window,dialog=>{
             var slider=SaVisuals<Slider>(dialog).Single(s=>s.Name=="CrossfadeSetting");Assert(slider.Value==10,"reopen lost value");
-            slider.Value=0;SaClick(SaVisuals<Button>(dialog).Single(b=>b.Name=="SettingsApplyButton"));return Task.CompletedTask;
+            slider.Value=0;SaClick(SaVisuals<Button>(dialog).Single(b=>b.Name=="SettingsBackButton"));return Task.CompletedTask;
         });
         Assert(fixture.Player.CrossfadeSeconds==0 && store.Load().CrossfadeSeconds==0,"off value not retained");
         fixture.Window.Width=1050;fixture.Window.Height=680;fixture.Window.UpdateLayout();
@@ -140,7 +140,7 @@ internal static partial class Program
         }
         finally
         {
-            if (panel.IsVisible) SaClick(Control<Button>(owner, "SettingsCancelButton"));
+            if (panel.IsVisible) SaClick(Control<Button>(owner, "SettingsBackButton"));
         }
     }
 }

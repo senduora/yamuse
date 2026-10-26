@@ -77,7 +77,7 @@ internal static partial class Program
             SaInvoke(f.Window, "UpdatePlaylistDownloadedStatus");
             Assert(warmHold.IsHeld && !warmHold.TimedOut && ReferenceEquals(firstStatusTask, SaField<Task?>(f.Window, "_playlistStatusTask")), "cached playlist status repeated IO for an unchanged view");
         }
-        SaClick(Control<Button>(f.Window, "SettingsCancelButton"));
+        SaClick(Control<Button>(f.Window, "SettingsBackButton"));
         notifications.Clear(); SaInvoke(f.Window, "Favorites_Click", f.Window, new RoutedEventArgs());
         Assert(notifications.Count == 0, "opening identical cached rows caused a redundant source Reset");
         await Large015Complete(Large015Pending(f.Window));

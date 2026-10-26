@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -75,7 +75,7 @@ public partial class MainWindow
             var selected = section == name || section == "home-shelf" && name == "home" || section == "playlist-detail" && name == "playlists" || section == "album-detail" && name == "albums" || section is "artist-detail" or "artist-tracks" && name == "artists" || section == "offline-playlist-detail" && name == "offline-playlists";
             if (name is "wave" or "collection-wave") selected = section == "wave" && (_waveViewMode == WaveMode.Collection ? name == "collection-wave" : _waveViewMode == WaveMode.Personal && name == "wave");
             button.Background = selected ? active : Brushes.Transparent;
-            button.Foreground = selected ? (Brush)FindResource("AccentBrush") : new SolidColorBrush(Color.FromRgb(184, 186, 195));
+            button.Foreground = selected ? (Brush)FindResource("AccentTextBrush") : ThemeManager.Brush("#B8BAC3");
         }
         UpdatePlaylistDownloadedStatus();
         UpdateBrowseButtons();
@@ -103,6 +103,7 @@ public partial class MainWindow
         finally { _updatingTrackRows = false; }
         UpdateCount();
         Motion.Enter(TracksList);
+        PlaybackContextViewShown();
     }
     private void ShowOffline()
     {

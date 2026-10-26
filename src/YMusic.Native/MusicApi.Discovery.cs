@@ -16,6 +16,7 @@ internal sealed partial class MusicApi
 {
     private const int DiscoveryJsonLimit = 4 * 1024 * 1024;
     private const int DiscoveryLyricsLimit = 1024 * 1024;
+    internal const int MaximumExpandedLyricsCharacters = 128 * 1024;
     private const int DiscoverySectionLimit = 32;
     private const int DiscoveryItemLimit = 200;
     private static readonly Regex DiscoveryTime = new(
@@ -330,6 +331,7 @@ internal sealed partial class MusicApi
         var raw = NormalizeDiscoveryLines(source).TrimStart('\uFEFF').Split('\n');
         if (raw.Length > 20000) throw new DiscoveryUnavailable("Слишком много строк LRC.", false);
         var timed = new List<LyricLine>();
+        long expandedTextCharacters = 0;
         long? offset = null;
         foreach (var rawLine in raw)
         {
@@ -372,6 +374,12 @@ internal sealed partial class MusicApi
             }
             if (text.Contains('<') && text.Contains(':')) throw new DiscoveryUnavailable("Словная разметка LRC пока не поддерживается.", false);
             if (timed.Count + times.Count > 20000) throw new DiscoveryUnavailable("Слишком много временных меток LRC.", false);
+            // Repeated timestamps share their text until string.Join materializes
+            // every copy. Bound the expanded text and its separators first.
+            var nextTextCharacters = expandedTextCharacters + (long)text.Length * times.Count;
+            if (nextTextCharacters + timed.Count + times.Count - 1 > MaximumExpandedLyricsCharacters)
+                throw new DiscoveryUnavailable("Слишком большой развёрнутый текст LRC.", false);
+            expandedTextCharacters = nextTextCharacters;
             foreach (var time in times) timed.Add(new(time, text));
         }
         if (timed.Count == 0 || timed.All(line => line.Text.Length == 0)) throw new DiscoveryUnavailable("LRC не содержит синхронизированных строк.", false);

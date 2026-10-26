@@ -21,9 +21,16 @@ public partial class MainWindow
     {
         SetSection("search", "Поиск");
         CatalogSearchPanel.Visibility = Visibility.Visible;
+        ResetSearchResults();
         ShowCatalogItems([]);
         UpdateSearchCategories();
         CatalogQuery.Focus(); SetStatus("Введите запрос и нажмите Enter или «Найти».");
+    }
+    private void ResetSearchResults()
+    {
+        _searchText = ""; _searchPage = 0;
+        _searchType = _collectionsSearch ? "collections" : (CatalogType.SelectedItem as ComboBoxItem)?.Tag as string ?? "all";
+        MoreCatalogButton.IsEnabled = false;
     }
     private async void PlaylistsNav_Click(object sender, RoutedEventArgs e) => await LoadCollectionAsync("playlists");
     private async void AlbumsNav_Click(object sender, RoutedEventArgs e) => await LoadCollectionAsync("albums");
@@ -221,9 +228,10 @@ public partial class MainWindow
     private void UpdatePlayerLikeState()
     {
         if (PlayerLikeButton is null) return;
+        ApplyTrackLikeStates(KnownTrackRows());
         var liked = _current is { } row && _favoriteTrackIds.Contains(row.Id);
         PlayerLikeButton.Content = liked ? "\uEB52" : "\uEB51";
-        PlayerLikeButton.Foreground = liked ? (System.Windows.Media.Brush)FindResource("AccentBrush") : (System.Windows.Media.Brush)FindResource("MutedBrush");
+        PlayerLikeButton.Foreground = liked ? (System.Windows.Media.Brush)FindResource("AccentTextBrush") : (System.Windows.Media.Brush)FindResource("MutedBrush");
         PlayerLikeButton.IsEnabled = _current is not null && _session is not null && _favoriteIdsKnown && !_catalogWriting;
         var label = liked ? "Убрать из Мне нравится" : "Добавить в Мне нравится";
         PlayerLikeButton.ToolTip = _session is not null && !_favoriteIdsKnown ? "Загружаем отметки Мне нравится…" : label;
@@ -289,23 +297,32 @@ public partial class MainWindow
     }
     private async void AddToPlaylist_Click(object sender, RoutedEventArgs e)
     {
-        if (TracksList.SelectedItem is not TrackRow row || _account is null || _catalogWriting || row.LocalPath is not null) return;
+        if (TracksList.SelectedItem is TrackRow row) await AddTrackToPlaylistAsync(row);
+    }
+    private async Task AddTrackToPlaylistAsync(TrackRow row)
+    {
+        if (_closed || _account is not { } account || _catalogWriting || row.LocalPath is not null) return;
         var reference = TrackReference(row);
         if (reference.AlbumId is null) { SetStatus("У трека не указан albumId, добавление в плейлист недоступно.", true); return; }
         var generation = _accountGeneration;
         try
         {
-            var session = await EnsureSessionAsync(_lifetime.Token);
-            var playlists = await _api.GetPlaylistsAsync(session, _account.Uid, _lifetime.Token);
+            var token = _accountCts.Token;
+            var session = await EnsureSessionAsync(token);
+            token.ThrowIfCancellationRequested();
+            if (generation != _accountGeneration || _closed || _account?.Uid != account.Uid) return;
+            var playlists = await _api.GetPlaylistsAsync(session, account.Uid, token);
             if (generation != _accountGeneration || _closed) return;
             var dialog = new PlaylistDialog(this, playlists);
             if (dialog.ShowDialog() != true || dialog.Selected is not { } selected) return;
-            var details = await _api.GetPlaylistAsync(session, selected.Owner!, selected.PlaylistKind!, _lifetime.Token);
+            if (generation != _accountGeneration || _closed) return;
+            var details = await _api.GetPlaylistAsync(session, selected.Owner!, selected.PlaylistKind!, token);
             if (generation != _accountGeneration || _closed) return;
             await CatalogMutationAsync((validSession, token) => _api.InsertPlaylistTracksAsync(validSession, details, [reference], details.Tracks.Count, token),
                 _ => SetStatus("Трек добавлен в выбранный плейлист"));
         }
-        catch (Exception ex) { ShowError(ex); }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (generation == _accountGeneration && !_closed) ShowError(ex); }
     }
     private async Task CatalogMutationAsync<T>(Func<Session, CancellationToken, Task<T>> operation, Action<T> success, bool requireSameView = true)
     {

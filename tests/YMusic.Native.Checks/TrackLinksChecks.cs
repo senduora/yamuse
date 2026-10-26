@@ -114,7 +114,7 @@ internal static partial class Program
         await Call(window,"CheckForAppUpdatesAsync");
         Assert(UpdateSupport.Current.State==state,"portable startup attempted an update operation");
         var panel=(FrameworkElement)typeof(MainWindow).GetMethod("CreateUpdateSettingsPanel",BindingFlags.NonPublic|BindingFlags.Instance)!.Invoke(window,null)!;
-        Assert(!SaVisuals<Button>(panel).Single(button=>button.Name=="AppUpdateButton").IsEnabled,"portable update button is enabled");
+        Assert(SaVisuals<Button>(panel).Single(button=>button.Name=="AppUpdateButton").IsEnabled==state.FeedConfigured,"portable manual check does not follow its configured feed");
     }
 
     private static async Task TlUpdateControls()

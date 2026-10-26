@@ -240,11 +240,11 @@ internal static partial class Program
             Assert(!player.NormalizeVolume, "normalization changed the default playback path");
             SaInvoke(fixture.Window, "Settings_Click", null!, null!);
             Control<CheckBox>(fixture.Window, "SettingsNormalizeVolume").IsChecked = true;
-            SaClick(Control<Button>(fixture.Window, "SettingsCancelButton"));
-            Assert(!player.NormalizeVolume, "canceled settings enabled normalization");
+            SaClick(Control<Button>(fixture.Window, "SettingsBackButton"));
+            Assert(player.NormalizeVolume && preferences.Load().NormalizeVolume, "Back rolled back immediate normalization");
             SaInvoke(fixture.Window, "Settings_Click", null!, null!);
             Control<CheckBox>(fixture.Window, "SettingsNormalizeVolume").IsChecked = true;
-            SaClick(Control<Button>(fixture.Window, "SettingsApplyButton"));
+            SaClick(Control<Button>(fixture.Window, "SettingsBackButton"));
             Assert(player.NormalizeVolume && preferences.Load().NormalizeVolume, "normalization choice was not applied and saved");
             var path = WriteWave("normalization-player.wav", 3); var before = SHA256.HashData(File.ReadAllBytes(path));
             var master = .7; player.Volume = 0;

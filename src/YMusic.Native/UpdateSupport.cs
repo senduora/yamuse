@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Net.Http;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Velopack;
@@ -15,8 +16,8 @@ internal enum AppUpdateStatus
 internal sealed record AppUpdateState(AppUpdateStatus Status, bool FeedConfigured, bool IsInstalled,
     string CurrentVersion, string? AvailableVersion, int? ProgressPercent, string Message);
 
-// The window checks once on startup and owns all user interactions. This service
-// has no timer, automatic download/application, or account storage access.
+// The window owns scheduling and all user interactions. This service has no
+// timer, automatic download/application, or account storage access.
 internal sealed class UpdateSupport
 {
     private static readonly Lazy<UpdateSupport> Instance = new(() => new(
@@ -26,31 +27,36 @@ internal sealed class UpdateSupport
     private readonly SemaphoreSlim _operation = new(1, 1);
     private readonly Func<Uri, IAppUpdateBackend> _backendFactory;
     private readonly Uri? _repository;
+    private readonly Func<CancellationToken, Task<string?>> _portableCheck;
     private IAppUpdateBackend? _backend;
     private volatile AppUpdateState _state;
     internal AppUpdateState State => _state;
+    internal bool HasPortableCheckOverride { get; }
 
     // Injection is limited to deterministic fixtures; production only uses a
     // canonical, public github.com repository and Velopack's built-in source.
     internal UpdateSupport(string configurationPath, bool? installed = null,
-        Func<Uri, IAppUpdateBackend>? backendFactory = null)
+        Func<Uri, IAppUpdateBackend>? backendFactory = null,
+        Func<CancellationToken, Task<string?>>? portableCheck = null)
     {
         _backendFactory = backendFactory ?? (uri => new VelopackUpdateBackend(uri));
         var isInstalled = installed ?? DetectInstalled();
-        var currentVersion = typeof(UpdateSupport).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+        var currentVersion = AppBranding.CurrentVersion;
         var (repository, invalid) = ReadRepository(configurationPath);
         _repository = repository;
+        _portableCheck = portableCheck ?? (token => CheckPortableReleaseAsync(currentVersion, token));
+        HasPortableCheckOverride = portableCheck is not null;
         _state = new(invalid ? AppUpdateStatus.Error : repository is null ? AppUpdateStatus.NotConfigured
             : isInstalled ? AppUpdateStatus.Ready : AppUpdateStatus.Portable,
             repository is not null, isInstalled, currentVersion, null, null,
             invalid ? "Файл настройки обновлений некорректен."
             : repository is null ? "Источник обновлений пока не настроен."
-            : !isInstalled ? "Обновления доступны после установки приложения. Сейчас запущена переносимая версия."
+            : !isInstalled ? "Переносимая версия: можно проверить обновления и открыть официальный выпуск."
             : "Обновления проверяются при запуске. Можно проверить их вручную.");
     }
 
     internal Task<AppUpdateState> CheckAsync(CancellationToken cancellationToken = default)
-        => CanUseUpdates ? CheckCoreAsync(cancellationToken) : Task.FromResult(State);
+        => _repository is not null ? CheckCoreAsync(cancellationToken) : Task.FromResult(State);
 
     internal Task<AppUpdateState> DownloadAsync(IProgress<int>? progress = null,
         CancellationToken cancellationToken = default)
@@ -65,6 +71,18 @@ internal sealed class UpdateSupport
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (!State.IsInstalled)
+            {
+                // Portable previews never create the installer backend. The
+                // only metadata authority is this project's public endpoint.
+                if (!string.Equals(_repository!.AbsoluteUri.TrimEnd('/'), "https://github.com/senduora/yamuse", StringComparison.Ordinal))
+                    return Set(AppUpdateStatus.Error, "Проверка переносимой версии доступна только для официального проекта Yamuse.");
+                Set(AppUpdateStatus.Checking, "Проверяем обновления…");
+                var release = await _portableCheck(cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                return release is null ? Set(AppUpdateStatus.NoUpdate, "Используется последняя доступная версия.")
+                    : Set(AppUpdateStatus.Available, "Доступна новая версия. Откройте официальный выпуск для скачивания.", release);
+            }
             if (State.Status == AppUpdateStatus.Downloaded) return State;
             _backend ??= _backendFactory(_repository!);
             if (_backend.PendingVersion is { } pending)
@@ -164,7 +182,7 @@ internal sealed class UpdateSupport
         catch (InvalidOperationException)
         {
             // A host/test which bypasses Program has no locator. Fail closed:
-            // such a process must never create a network update source.
+            // such a process must never create an installer backend.
             return false;
         }
     }
@@ -199,6 +217,43 @@ internal sealed class UpdateSupport
     }
 
     private sealed record UpdateFeedConfiguration(string? GithubRepository);
+
+    // This metadata-only path has no credentials, assets, arbitrary URLs or
+    // redirects. Keep the response bounded even without Content-Length.
+    internal static async Task<string?> CheckPortableReleaseAsync(string currentVersion, CancellationToken token,
+        HttpMessageHandler? handler = null)
+    {
+        using var client = new HttpClient(handler ?? new HttpClientHandler { AllowAutoRedirect = false })
+        { Timeout = TimeSpan.FromSeconds(10) };
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/repos/senduora/yamuse/releases/latest");
+        request.Headers.UserAgent.ParseAdd("Yamuse-Update-Check/1.0");
+        request.Headers.Accept.ParseAdd("application/vnd.github+json");
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength is > 65536) throw new InvalidDataException("Release metadata exceeds its bound.");
+        using var stream = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
+        using var buffer = new MemoryStream();
+        var bytes = new byte[4096];
+        int count;
+        while ((count = await stream.ReadAsync(bytes, timeout.Token).ConfigureAwait(false)) > 0)
+        {
+            if (buffer.Length + count > 65536) throw new InvalidDataException("Release metadata exceeds its bound.");
+            buffer.Write(bytes, 0, count);
+        }
+        using var document = JsonDocument.Parse(buffer.ToArray(), new JsonDocumentOptions { MaxDepth = 16 });
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("tag_name", out var tag) || tag.ValueKind != JsonValueKind.String
+            || !root.TryGetProperty("draft", out var draft) || draft.ValueKind != JsonValueKind.False
+            || !root.TryGetProperty("prerelease", out var prerelease) || prerelease.ValueKind != JsonValueKind.False)
+            throw new InvalidDataException("Release metadata is invalid.");
+        var text = tag.GetString();
+        if (text is null || text.Length is 0 or > 64 || !SemanticVersion.TryParse(text.TrimStart('v', 'V'), out var version)
+            || version.IsPrerelease || !SemanticVersion.TryParse(currentVersion, out var current))
+            throw new InvalidDataException("Release version is invalid.");
+        return version > current ? version.ToString() : null;
+    }
 }
 
 internal interface IAppUpdateBackend

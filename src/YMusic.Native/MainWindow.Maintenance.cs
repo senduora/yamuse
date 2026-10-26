@@ -17,6 +17,7 @@ public partial class MainWindow
     {
         SettingsClearOffline.IsEnabled = SettingsClearCache.IsEnabled = !_offlineMaintenance && !_cacheMaintenance;
         SettingsUninstall.IsEnabled = _uninstallListener is not null && !_offlineMaintenance && !_cacheMaintenance;
+        RefreshAppUpdateUi();
     }
     private void ReportOfflineCleanup(OfflineCleanupProgress progress)
     {

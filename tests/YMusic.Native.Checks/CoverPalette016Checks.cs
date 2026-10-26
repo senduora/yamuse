@@ -10,7 +10,7 @@ internal static partial class Program
     {
         await Run("CoverPalette016: shaded teal and blue majority beats flat vivid and neutral minorities", Cover016ShadedArea);
         await Run("CoverPalette016: neighbouring hue boundaries and circular red remain one family", Cover016HueBoundaries);
-        await Run("CoverPalette016: varied neutral majority remains neutral against vivid artwork", Cover016NeutralArea);
+        await Run("CoverPalette016: meaningful coloured artwork wins over varied neutral backgrounds", Cover016NeutralArea);
         await Run("CoverPalette016: visible alpha area defeats almost transparent RGB and requires frozen artwork", Cover016AlphaArea);
     }
 
@@ -50,9 +50,9 @@ internal static partial class Program
     private static Task Cover016NeutralArea()
     {
         var evidence = new[] {
-            Cover016Expect(Accent015Bitmap(32, 32, (x, y) => x < 24 ? Color.FromRgb((byte)(10 + 7 * y), (byte)(10 + 7 * y), (byte)(10 + 7 * y)) : Colors.Red), Color.FromRgb(118, 118, 118), "32 grey shades versus vivid red"),
-            Cover016Expect(Accent015Bitmap(32, 32, (x, _) => x < 12 ? Colors.Black : x < 24 ? Colors.White : Colors.Cyan), Color.FromRgb(127, 127, 127), "black and white versus vivid cyan") };
-        foreach (var item in evidence) Assert(item.Color.R == item.Color.G && item.Color.G == item.Color.B, "neutral majority acquired a colour");
+            Cover016Expect(Accent015Bitmap(32, 32, (x, y) => x < 24 ? Color.FromRgb((byte)(10 + 7 * y), (byte)(10 + 7 * y), (byte)(10 + 7 * y)) : Colors.Red), Colors.Red, "32 grey shades versus meaningful red"),
+            Cover016Expect(Accent015Bitmap(32, 32, (x, _) => x < 12 ? Colors.Black : x < 24 ? Colors.White : Colors.Cyan), Colors.Cyan, "black and white versus meaningful cyan") };
+        Assert(evidence[0].Color.R > evidence[0].Color.G && evidence[1].Color.G > evidence[1].Color.R, "a neutral background suppressed a supported colour");
         File.WriteAllText(Path.Combine(_directory, "cover-palette016-neutrals.json"), JsonSerializer.Serialize(evidence));
         return Task.CompletedTask;
     }

@@ -1,5 +1,7 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
@@ -17,7 +19,7 @@ internal sealed class DesktopShell : IDisposable
     private const uint NifMessage = 0x1, NifIcon = 0x2, NifTip = 0x4, NifGuid = 0x20;
     private readonly Window _owner;
     private readonly HwndSource _source;
-    private readonly Guid _iconGuid = Guid.NewGuid();
+    private readonly Guid _iconGuid = TrayIdentity(Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "Yamuse.exe"));
     private readonly uint _taskbarCreated;
     private readonly AppBranding.OwnedIcon _icon;
     private bool _minimizeToTray;
@@ -45,6 +47,18 @@ internal sealed class DesktopShell : IDisposable
     public string? FailureReason { get; private set; }
     internal nint WindowHandle { get; }
     internal Guid IconGuid => _iconGuid;
+    internal bool IsSeeking => _mini?.IsSeeking == true;
+
+    // Explorer retains preferences for a GUID at its executable location.
+    // Version/content changes at that location keep the same identity; an
+    // unsigned portable copy at another path needs its own registration.
+    internal static Guid TrayIdentity(string executablePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(executablePath);
+        var path = Path.GetFullPath(executablePath).Replace('/', '\\').ToUpperInvariant();
+        var digest = SHA256.HashData(Encoding.UTF8.GetBytes("Yamuse.NotificationArea.v1\0" + path));
+        return new Guid(digest.AsSpan(0, 16));
+    }
 
     public bool MinimizeToTray
     {

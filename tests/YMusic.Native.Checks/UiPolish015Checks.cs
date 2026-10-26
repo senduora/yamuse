@@ -104,9 +104,9 @@ internal static partial class Program
             link.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left) { RoutedEvent = Mouse.PreviewMouseDownEvent });
             link.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); host.UpdateLayout();
             Assert(link.IsKeyboardFocused && !InputFeedback.GetKeyboardFocusVisible(link) && ChromePart<Border>(link, "LinkKeyboardFocus").Opacity == 0
-                && ChromeColor(link.Foreground) == "#FFADB0BA" && clicks == 1, "mouse click retained accent/focus or lost the logical clickable owner");
+                && ChromeColor(link.Foreground) == ChromeColor((Brush)Application.Current.Resources["MutedBrush"]) && clicks == 1, "mouse click retained accent/focus or lost the logical clickable owner");
             link.RaiseEvent(new MouseEventArgs(Mouse.PrimaryDevice, Environment.TickCount) { RoutedEvent = Mouse.MouseLeaveEvent });
-            Assert(!InputFeedback.GetKeyboardFocusVisible(link) && ChromeColor(link.Foreground) == "#FFADB0BA", "leaving mouse link retained highlight");
+            Assert(!InputFeedback.GetKeyboardFocusVisible(link) && ChromeColor(link.Foreground) == ChromeColor((Brush)Application.Current.Resources["MutedBrush"]), "leaving mouse link retained highlight");
             Ui015Key(link, Key.Enter); host.UpdateLayout();
             Assert(InputFeedback.GetKeyboardFocusVisible(link) && ChromePart<Border>(link, "LinkKeyboardFocus").Opacity == 1, "keyboard use after mouse did not restore focus");
             first.Focus(); Assert(!InputFeedback.GetKeyboardFocusVisible(link), "lost focus retained link focus ring");
@@ -114,7 +114,7 @@ internal static partial class Program
             Assert(!InputFeedback.GetKeyboardFocusVisible(first) && ChromePart<Border>(first, "ButtonKeyboardFocus").Opacity == 0, "ordinary button retains orange mouse outline");
             link.IsEnabled = false; Assert(!link.Focus() && ChromePart<Grid>(link, "LinkSurface").Opacity == .4, "disabled link accepts focus or loses its disabled state");
             File.WriteAllText(Path.Combine(_directory, "ui015-focus-readback.json"), JsonSerializer.Serialize(new { actualWpfKeyboardFocus = true, actualMoveFocusTabTraversal = true,
-                localRoutedPointerAndKeyEvents = true, readOnlyInputPropertiesModified = false, nativeGlobalInputSent = false, userCursorMoved = false, activatedWindow = false, clickCount = clicks }));
+                localRoutedPointerAndKeyEvents = true, readOnlyInputPropertiesModified = false, nativeGlobalInputSent = false, userCursorMoved = false, activatedWindow = host.IsActive, privateFixtureOnly = true, clickCount = clicks }));
         }
         finally { host.Close(); }
         return Task.CompletedTask;

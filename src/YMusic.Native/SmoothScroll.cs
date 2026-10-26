@@ -6,6 +6,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Media3D;
+using System.Windows.Threading;
 
 namespace YMusic.Native;
 
@@ -39,6 +40,18 @@ public static class SmoothScroll
     internal static void CancelAnimation(ScrollViewer viewer)
     {
         if (States.TryGetValue(viewer, out var state)) state.Stop();
+    }
+
+    internal static void CancelProgrammaticAnimation(ScrollViewer viewer)
+    {
+        if (States.TryGetValue(viewer, out var state)) state.StopProgrammatic();
+    }
+
+    internal static void ScrollIntoView(ScrollViewer viewer, ListBox list, int index, Func<bool> isCurrent)
+    {
+        if (index < 0 || index >= list.Items.Count || !isCurrent()) return;
+        if (States.TryGetValue(viewer, out var state)) state.DeferBringIntoView(list, index, isCurrent);
+        else { list.ScrollIntoView(list.Items[index]); list.UpdateLayout(); }
     }
 
     // Hermite interpolation preserves the visible velocity when another wheel
@@ -149,6 +162,14 @@ public static class SmoothScroll
         private TimeSpan? _lastRenderingTime;
         private double _initialVelocity;
         private double _velocity;
+        private bool _programmatic;
+        private DispatcherOperation? _bringIntoView;
+        private int _bringGeneration;
+        private readonly List<(FrameworkElement Container, int Index, double Y)> _requestAnchors = [];
+        private ItemsControl? _requestOwner;
+        private object? _requestItems;
+        private int _requestItemCount;
+        private double _requestOrigin;
         internal bool IsAnimating { get; private set; }
         internal bool HasPendingOffset => IsAnimating || _precisionPending;
         internal double TargetOffset { get; private set; }
@@ -182,6 +203,7 @@ public static class SmoothScroll
             if (!Motion.CanAnimate && Math.Abs(args.Delta) >= 120) return;
             var lines = SystemParameters.WheelScrollLines;
             if (lines == 0) return;
+            StopProgrammatic();
             var distance = -args.Delta / 120d * (lines < 0 ? _viewer.ViewportHeight : lines * 16d);
             var current = _precisionPending ? TargetOffset : _viewer.VerticalOffset + _precisionRemainder;
             // Reverse immediately from the visible position instead of first paying
@@ -222,14 +244,17 @@ public static class SmoothScroll
                 _precisionOrigin = origin;
                 TargetOffset = Math.Clamp(current + distance, 0, _viewer.ScrollableHeight);
                 _precisionPending = true;
-                _viewer.ScrollToVerticalOffset(TargetOffset);
+                RequestOffset(TargetOffset);
                 args.Handled = true;
                 return;
             }
             if (_precisionPending)
             {
                 _requestedOffset = current;
-                _scrollPending = true;
+                // A subpixel command can round to the unchanged viewport and
+                // produce no ScrollChanged. Its fraction still belongs to the
+                // new trajectory, but it must not hold that trajectory hostage.
+                _scrollPending = Math.Abs(current - _viewer.VerticalOffset) > OffsetTolerance;
                 _precisionPending = false;
             }
             var continuing = IsAnimating && Math.Sign(distance) == Math.Sign(TargetOffset - current);
@@ -249,12 +274,19 @@ public static class SmoothScroll
 
         internal void AnimateTo(double target)
         {
+            if (_bringIntoView is not null)
+            {
+                _bringGeneration++;
+                _bringIntoView.Abort();
+                _bringIntoView = null;
+            }
             var current = _precisionPending ? TargetOffset : _viewer.VerticalOffset;
             if (Math.Abs(target - current) <= Epsilon) return;
+            _programmatic = true;
             if (_precisionPending)
             {
                 _requestedOffset = current;
-                _scrollPending = true;
+                _scrollPending = Math.Abs(current - _viewer.VerticalOffset) > OffsetTolerance;
                 _precisionPending = false;
             }
             _startOffset = current;
@@ -268,6 +300,78 @@ public static class SmoothScroll
         }
 
         internal void Stop() => Cancel();
+
+        internal void DeferBringIntoView(ListBox list, int index, Func<bool> isCurrent)
+        {
+            Cancel();
+            _programmatic = true;
+            var generation = _bringGeneration;
+            var source = list.ItemsSource;
+            var item = list.Items[index];
+            _bringIntoView = _viewer.Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, new Action(() =>
+            {
+                _bringIntoView = null;
+                if (generation != _bringGeneration || !_programmatic || !_viewer.IsLoaded || !_viewer.IsVisible ||
+                    !_viewer.IsEnabled || !list.IsLoaded || !list.IsVisible || !isCurrent() ||
+                    !ReferenceEquals(list.ItemsSource, source) || index >= list.Items.Count ||
+                    !ReferenceEquals(list.Items[index], item))
+                { if (generation == _bringGeneration) Cancel(); return; }
+                // No native BringIntoView has been queued until this cancellable
+                // callback owns the dispatcher. Finish its layout synchronously
+                // before a later manual event can acquire the viewport.
+                list.ScrollIntoView(item);
+                list.UpdateLayout();
+                _viewer.UpdateLayout();
+                if (generation == _bringGeneration) _programmatic = false;
+            }));
+        }
+
+        private void RequestOffset(double offset)
+        {
+            _requestedOffset = offset;
+            _requestOrigin = _viewer.VerticalOffset;
+            _requestAnchors.Clear();
+            _requestOwner = null;
+            if (ScrollInfo(_viewer.Content as DependencyObject) is VirtualizingStackPanel panel &&
+                ItemsControl.GetItemsOwner(panel) is { } owner)
+            {
+                _requestOwner = owner;
+                _requestItems = owner.ItemsSource ?? (object)owner.Items;
+                _requestItemCount = owner.Items.Count;
+                for (var i = 0; i < VisualTreeHelper.GetChildrenCount(panel); i++)
+                {
+                    if (VisualTreeHelper.GetChild(panel, i) is not FrameworkElement container) continue;
+                    var index = owner.ItemContainerGenerator.IndexFromContainer(container);
+                    if (index >= 0) _requestAnchors.Add((container, index, container.TranslatePoint(new Point(), _viewer).Y));
+                }
+            }
+            _viewer.ScrollToVerticalOffset(offset);
+        }
+
+        private bool MatchesVirtualRequest()
+        {
+            if (_requestOwner is not { } owner || owner.Items.Count != _requestItemCount ||
+                !ReferenceEquals(owner.ItemsSource ?? (object)owner.Items, _requestItems)) return false;
+            if (Math.Abs(_viewer.VerticalOffset - _requestedOffset) <= OffsetTolerance) return true;
+            var requestedMovement = _requestedOffset - _requestOrigin;
+            foreach (var anchor in _requestAnchors)
+            {
+                if (owner.ItemContainerGenerator.IndexFromContainer(anchor.Container) != anchor.Index) continue;
+                var movement = anchor.Y - anchor.Container.TranslatePoint(new Point(), _viewer).Y;
+                if (Math.Abs(movement - requestedMovement) <= OffsetTolerance) return true;
+            }
+            return false;
+        }
+
+        internal void StopProgrammatic()
+        {
+            if (!_programmatic) return;
+            var visible = _viewer.VerticalOffset;
+            Cancel();
+            // Replace any queued automatic offset as well. Otherwise its delayed
+            // acknowledgement can cancel the manual animation that just began.
+            _viewer.ScrollToVerticalOffset(visible);
+        }
 
         private void OnRendering(object? sender, EventArgs args)
         {
@@ -317,7 +421,7 @@ public static class SmoothScroll
                 return;
             }
             _scrollPending = true;
-            _viewer.ScrollToVerticalOffset(_requestedOffset);
+            RequestOffset(_requestedOffset);
         }
 
         private void OnScrollChanged(object sender, ScrollChangedEventArgs args)
@@ -325,12 +429,45 @@ public static class SmoothScroll
             if (!ReferenceEquals(args.OriginalSource, _viewer)) return;
             if (!HasPendingOffset)
             {
+                if (_bringIntoView is not null && args.VerticalChange != 0) Cancel();
                 if (args.VerticalChange != 0) _precisionRemainder = 0;
                 return;
             }
-            if (args.ExtentHeightChange != 0 || args.ViewportHeightChange != 0)
+            if (args.ViewportHeightChange != 0 ||
+                (args.ExtentHeightChange != 0 && ScrollInfo(_viewer.Content as DependencyObject) is not VirtualizingStackPanel))
             {
                 Cancel();
+                return;
+            }
+            // A pixel virtualizing panel estimates the height of unrealized rows.
+            // Wrapping lyrics refine that estimate while scrolling; this is the
+            // acknowledgement of our own move, not native input taking control.
+            // Keep its accumulated wheel distance, bounded by the revised edge.
+            if (args.ExtentHeightChange != 0)
+            {
+                // Extent refinement alone does not identify the owner. Match
+                // the visible row movement against our queued command before
+                // accepting a rebased offset; an external ScrollTo can refine
+                // the very same virtual extent while taking native control.
+                // VSP can publish a second, coordinate-only refinement after
+                // acknowledging the offset. The last request's visible anchors
+                // still identify that layout phase even without a pending ack.
+                if (!MatchesVirtualRequest())
+                { Cancel(); return; }
+                // Measuring a new row can also rebase the panel's pixel offset.
+                // Carry the remaining distance into that coordinate system.
+                var correction = _precisionPending ? _viewer.VerticalOffset - TargetOffset
+                    : _scrollPending ? _viewer.VerticalOffset - _requestedOffset : args.VerticalChange;
+                _startOffset += correction;
+                _precisionOrigin += correction;
+                // Anchors describe the pre-request viewport. Rebase its raw
+                // origin too, so another layout refinement compares the same
+                // requested visible distance rather than the prior correction.
+                _requestOrigin += correction;
+                TargetOffset = Math.Clamp(TargetOffset + correction, 0, _viewer.ScrollableHeight);
+                _requestedOffset = _viewer.VerticalOffset;
+                _scrollPending = false;
+                _precisionPending = false;
                 return;
             }
             if (args.VerticalChange == 0) return;
@@ -365,6 +502,13 @@ public static class SmoothScroll
 
         private void Cancel()
         {
+            _bringGeneration++;
+            _bringIntoView?.Abort();
+            _bringIntoView = null;
+            _requestAnchors.Clear();
+            _requestOwner = null;
+            _requestItems = null;
+            _programmatic = false;
             _precisionPending = false;
             _precisionRemainder = 0;
             if (!IsAnimating) { _scrollPending = false; return; }

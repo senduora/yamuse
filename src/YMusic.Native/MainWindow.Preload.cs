@@ -49,16 +49,22 @@ public partial class MainWindow
             try
             {
                 AudioDescriptor? audio = null;
-                if (identity.LocalPath is null)
+                var localPath = identity.LocalPath;
+                if (localPath is null)
                 {
                     var session = await EnsureSessionAsync(cts.Token);
                     audio = await _api.ResolveAudioAsync(session, next.RequestId, identity.Quality, cts.Token);
                 }
+                else
+                {
+                    audio = await TryResolveOfflineUpgradeAsync(next, localPath, identity.Quality, cts.Token);
+                    if (audio is not null) localPath = null;
+                }
                 cts.Token.ThrowIfCancellationRequested();
                 if (_preloadIdentity != identity || NextPreloadIdentity(next) != identity) return;
-                var source = identity.LocalPath is { } path ? new Uri(path) : audio!.Uri;
+                var source = localPath is { } path ? new Uri(path) : audio!.Uri;
                 var prepared = new PreparedPlayback(identity, next, source,
-                    next.LocalQuality ?? next.DownloadedQuality ?? audio?.QualityLabel ?? "Локальное аудио", identity.LocalPath is not null);
+                    localPath is not null ? next.LocalQuality ?? next.DownloadedQuality ?? "Локальное аудио" : audio!.QualityLabel, localPath is not null);
                 _preparedPlayback = prepared;
                 if (audio is null) await _player.PrepareNextAsync(source, cts.Token);
                 else await _player.PrepareNextAsync(audio, cts.Token);
@@ -123,7 +129,8 @@ public partial class MainWindow
 
     private void TryAutomaticTransition()
     {
-        if (_closed || _loadingStream || _advancingPlayback || !_player.IsPlaying || _seekDragging || _pendingSeek is not null) return;
+        if (_closed || _loadingStream || _advancingPlayback || !_player.IsPlaying
+            || _seekDragging || _expandedSeekDragging || _shell?.IsSeeking == true || _pendingSeek is not null) return;
         var duration = _player.Duration.TotalSeconds;
         var remaining = (duration - _player.Position.TotalSeconds) / _player.SpeedRatio;
         var overlap = Math.Min(CrossfadeSeconds, duration / _player.SpeedRatio / 3);

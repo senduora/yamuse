@@ -33,6 +33,12 @@ internal static partial class Program
         await Run("Mini player: volume synchronization has no feedback and buttons retain exact commands", MiniCommandChecks);
         await Run("Mini player: shell forwards state once, reuses, reopens and disposes its own windows", MiniLifecycleChecks);
         await Run("Mini player: Yamuse frozen icon and owned DPI-sized HICON cleanup", MiniIconChecks);
+        await Run("Mini player 017: native edge/corner resize and minimum window constraints", Mini017NativeResizeChecks);
+        await Run("Mini player 017: minimum, normal, wide and tall layouts with visible/hidden artwork", Mini017ResponsiveChecks);
+        await Run("Mini player 017: artwork toggle preserves synchronized state and active seek without callbacks", Mini017ArtworkChecks);
+        await Run("Mini player 017: accent resources remain live across pin, liked and playback controls", Mini017AccentChecks);
+        await Run("Mini player 017: artwork toggle shrinks native footprint and restores size without undoing user resize", Mini017CompactFootprintChecks);
+        await Run("Mini player 017: timeline stretches while artwork and wrapped artists reflow without playback callbacks", Mini017ReflowChecks);
     }
 
     private static async Task MiniStateChecks()
@@ -218,7 +224,7 @@ internal static partial class Program
             icon.Dispose(); Assert(icon.IsClosed && !MiniGetIconInfo(native, out _), "owned HICON remained valid after disposal");
             File.WriteAllText(Path.Combine(_directory, "mini-scope.json"), JsonSerializer.Serialize(new
             {
-                title = AppBranding.Name, miniWidth = 440, miniHeight = 258, trayIconPixels = width,
+                title = AppBranding.Name, miniWidth = 484, miniHeight = 300, miniMinimumWidth = 360, miniMinimumHeight = 264, trayIconPixels = width,
                 ownedHiconDestroyed = true, frozenPackagedWindowIcon = true, externalNetworkRequests = 0,
                 playerOrAudioEngineConstructed = false, userAccountLoaded = false, globalInputUsed = false,
                 actualTrayRegistrationTested = false, offscreenWpfWindows = true

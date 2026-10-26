@@ -4,7 +4,6 @@ using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Media;
-using System.Windows.Threading;
 
 namespace YMusic.Native;
 
@@ -12,7 +11,6 @@ public partial class MainWindow
 {
     private readonly DownloadQueueState _downloadQueue = new();
     private readonly Dictionary<DownloadEntry, DownloadProgressSink> _downloadProgress = [];
-    private DispatcherTimer? _downloadProgressTimer;
     private Grid? _downloadCenterView;
     private TextBlock? _downloadCenterSummary, _downloadCenterNotice;
     private Button? _downloadPauseButton, _downloadResumeButton, _downloadRetryButton, _downloadStorageButton;
@@ -20,7 +18,7 @@ public partial class MainWindow
     private TextBlock? _downloadSelectionText;
     private int _downloadUnlikeTotal, _downloadUnlikeCompleted;
     private MenuItem? _downloadUnlikeMenu;
-    private ListView? _downloadEntriesList;
+    private BatchSelectionListView? _downloadEntriesList;
     private string? _downloadQueueAccountUid;
     private int _downloadQueueAccountGeneration;
     private bool _downloadsAutoSuspended;
@@ -54,8 +52,9 @@ public partial class MainWindow
         actions.Children.Add(_downloadSelectionText);
         _downloadCenterNotice = new TextBlock { Name = "DownloadCenterNotice", TextWrapping = TextWrapping.Wrap, FontSize = 12, Foreground = (Brush)FindResource("MutedBrush"), Margin = new(0, 0, 0, 14) };
         Grid.SetRow(_downloadCenterNotice, 2); grid.Children.Add(_downloadCenterNotice);
-        var list = new ListView { Name = "DownloadEntriesList", ItemsSource = _downloadQueue.Entries, HorizontalContentAlignment = HorizontalAlignment.Stretch,
+        var list = new BatchSelectionListView { Name = "DownloadEntriesList", ItemsSource = _downloadQueue.Entries, HorizontalContentAlignment = HorizontalAlignment.Stretch,
             Background = Brushes.Transparent, Foreground = Foreground, BorderThickness = new(0), ItemContainerStyle = DownloadRowStyle() };
+        list.SetResourceReference(StyleProperty, typeof(ListView));
         _downloadEntriesList = list; list.SelectionMode = SelectionMode.Extended;
         list.SelectionChanged += (_, _) => RefreshDownloadUnlikeAction();
         list.PreviewMouseRightButtonDown += (_, e) => { SelectDownloadContextRow(e.OriginalSource as DependencyObject); e.Handled = true; };
@@ -73,8 +72,6 @@ public partial class MainWindow
         columns.Columns.Add(new() { Header = DownloadSortHeader("Получено / размер", ListSortField.Size), Width = 172, DisplayMemberBinding = new Binding(nameof(DownloadEntry.SizeText)) });
         columns.Columns.Add(new() { Header = DownloadSortHeader("Причина ошибки", ListSortField.Error), Width = 290, CellTemplate = TextTemplate(nameof(DownloadEntry.Error), wrap: true) });
         list.View = columns; Grid.SetRow(list, 3); grid.Children.Add(list);
-        _downloadProgressTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher) { Interval = TimeSpan.FromMilliseconds(200) };
-        _downloadProgressTimer.Tick += (_, _) => FlushDownloadProgress();
         RefreshDownloadCenter(); RefreshDownloadStorage();
 
         Button AddButton(string text, string name, RoutedEventHandler click)
@@ -105,8 +102,8 @@ public partial class MainWindow
         row.SetBinding(GridViewRowPresenter.ColumnsProperty, new Binding("View.Columns") { RelativeSource = new RelativeSource(RelativeSourceMode.FindAncestor, typeof(ListView), 1) });
         row.SetBinding(MarginProperty, new Binding("Padding") { RelativeSource = RelativeSource.TemplatedParent }); border.AppendChild(row);
         style.Setters.Add(new Setter(Control.TemplateProperty, new ControlTemplate(typeof(ListViewItem)) { VisualTree = border }));
-        var hover = new Trigger { Property = IsMouseOverProperty, Value = true }; hover.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Color.FromRgb(32, 34, 39)))); style.Triggers.Add(hover);
-        var selected = new Trigger { Property = ListViewItem.IsSelectedProperty, Value = true }; selected.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Color.FromRgb(43, 45, 52)))); style.Triggers.Add(selected);
+        var hover = new Trigger { Property = IsMouseOverProperty, Value = true }; hover.Setters.Add(new Setter(Control.BackgroundProperty, ThemeManager.Brush("#202227"))); style.Triggers.Add(hover);
+        var selected = new Trigger { Property = ListViewItem.IsSelectedProperty, Value = true }; selected.Setters.Add(new Setter(Control.BackgroundProperty, ThemeManager.Brush("#2B2D34"))); style.Triggers.Add(selected);
         return style;
     }
     private static DataTemplate TrackTemplate()
@@ -114,10 +111,10 @@ public partial class MainWindow
         var panel = new FrameworkElementFactory(typeof(StackPanel));
         var title = new FrameworkElementFactory(typeof(TextBlock)); title.SetBinding(TextBlock.TextProperty, new Binding(nameof(DownloadEntry.Title))); title.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis);
         title.SetBinding(ToolTipProperty, new Binding(nameof(DownloadEntry.Title))); panel.AppendChild(title);
-        var artist = new FrameworkElementFactory(typeof(TextBlock)); artist.SetBinding(TextBlock.TextProperty, new Binding(nameof(DownloadEntry.Artist))); artist.SetValue(TextBlock.FontSizeProperty, 11.0); artist.SetValue(TextBlock.ForegroundProperty, new SolidColorBrush(Color.FromRgb(173, 176, 186))); artist.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis); panel.AppendChild(artist);
+        var artist = new FrameworkElementFactory(typeof(TextBlock)); artist.SetBinding(TextBlock.TextProperty, new Binding(nameof(DownloadEntry.Artist))); artist.SetValue(TextBlock.FontSizeProperty, 11.0); artist.SetValue(TextBlock.ForegroundProperty, ThemeManager.Brush("#ADB0BA")); artist.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis); panel.AppendChild(artist);
         var collection = new FrameworkElementFactory(typeof(TextBlock)); collection.SetBinding(TextBlock.TextProperty, new Binding(nameof(DownloadEntry.CollectionText)));
         collection.SetValue(TextBlock.FontSizeProperty, 11.0); collection.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 4, 0, 0));
-        collection.SetValue(TextBlock.ForegroundProperty, new SolidColorBrush(Color.FromRgb(190, 181, 181)));
+        collection.SetValue(TextBlock.ForegroundProperty, ThemeManager.Brush("#BEB5B5"));
         var style = new Style(typeof(TextBlock)); var empty = new DataTrigger { Binding = new Binding(nameof(DownloadEntry.CollectionText)), Value = "" };
         empty.Setters.Add(new Setter(UIElement.VisibilityProperty, Visibility.Collapsed)); style.Triggers.Add(empty);
         collection.SetValue(FrameworkElement.StyleProperty, style); panel.AppendChild(collection);
@@ -127,7 +124,7 @@ public partial class MainWindow
     {
         var bar = new FrameworkElementFactory(typeof(ProgressBar));
         bar.SetValue(Control.TemplateProperty, SoftProgressTemplate());
-        bar.SetResourceReference(Control.ForegroundProperty, "AccentBrush");
+        bar.SetResourceReference(Control.ForegroundProperty, "DownloadBrush");
         bar.SetValue(FrameworkElement.WidthProperty, 92.0); bar.SetValue(FrameworkElement.HeightProperty, 5.0); bar.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
         bar.SetValue(System.Windows.Controls.Primitives.RangeBase.MaximumProperty, 100.0);
         bar.SetBinding(System.Windows.Controls.Primitives.RangeBase.ValueProperty, new Binding(nameof(DownloadEntry.Percent)) { Mode = BindingMode.OneWay });
@@ -143,9 +140,9 @@ public partial class MainWindow
     }
     private void RefreshDownloadCenter()
     {
+        RefreshTransferProgress();
         if (_downloadCenterSummary is null) return;
         _downloadCenterSummary.Text = _downloadQueue.Summary;
-        RefreshTransferProgress();
         _downloadCenterNotice!.Text = _downloadQueue.Notice;
         RefreshDownloadUnlikeAction();
         RefreshDownloadSort(force: !_downloadQueue.Running);
@@ -174,7 +171,7 @@ public partial class MainWindow
         if (_downloadCts is null || _downloadCts.IsCancellationRequested) return;
         foreach (var (entry, sink) in _downloadProgress)
             if (sink.Take() is { } value) entry.Progress(value);
-        RefreshDownloadCenter();
+        RefreshDownloadActivity();
     }
     private void PauseDownloadQueue()
     {
@@ -192,6 +189,7 @@ public partial class MainWindow
     }
     private void SuspendDownloadQueueForAccountChange()
     {
+        _compactDownloadOperation?.Dispose();
         _downloadsAutoSuspended = true; _pendingAutoFavorites = null;
         _downloadQueue.Suspend(); _downloadCts?.Cancel(); RefreshDownloadCenter();
     }
@@ -235,8 +233,7 @@ public partial class MainWindow
     {
         if (_downloadEntriesList is null || _catalogWriting) return;
         var entries = _downloadEntriesList.Items.OfType<DownloadEntry>().Where(entry => IsUnavailableDownload(entry) && CanUnlikeDownload(entry)).ToArray();
-        _downloadEntriesList.SelectedItems.Clear();
-        foreach (var entry in entries) _downloadEntriesList.SelectedItems.Add(entry);
+        _downloadEntriesList.ReplaceSelection(entries);
         RefreshDownloadUnlikeAction();
     }
     private async Task UnlikeSelectedDownloadAsync()

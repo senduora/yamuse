@@ -12,13 +12,13 @@ internal static partial class Program
 {
     private static async Task CheckCoverAccent015()
     {
-        await Run("CoverAccent015: dominant pixel area beats vivid minorities and retains neutral covers", Accent015Dominant);
+        await Run("CoverAccent015: dominant coloured area and meaningful details retain readable monochrome fallbacks", Accent015Dominant);
         await Run("CoverAccent015: transparent pixels are ignored and decoded sampling stays bounded", Accent015Sampling);
         await Run("CoverAccent015: palette and complete interrupted colour paths retain readable contrast", Accent015Contrast);
         await Run("CoverAccent015: actual WPF five-second clocks have start midpoint end and continuous retarget", Accent015Clocks);
         await Run("CoverAccent015: source identity generation missing cover mode cancellation and dispose reject late palettes", Accent015Stale);
         await Run("CoverAccent015: old valid invalid and unknown preference fields preserve the supported schema", Accent015Preferences);
-        await Run("CoverAccent015: Settings drafts cancel without mutation and apply mode static colour and persistence together", Accent015Settings);
+        await Run("CoverAccent015: Settings apply mode and static colour immediately while invalid input preserves the last valid color", Accent015Settings);
         await Run("CoverAccent015: real main mini expanded slider hover focus selection resources remain shared and mutable", Accent015Views);
     }
 
@@ -41,7 +41,8 @@ internal static partial class Program
         foreach (var majority in new[] { Colors.Gray, Colors.Black, Color.FromRgb(74, 102, 85), Colors.Blue })
         {
             var result = CoverPalette.Extract(Accent015Bitmap(32, 32, (x, _) => x < 24 ? majority : Colors.Red));
-            Assert(result == CoverPalette.Readable(majority), "vivid minority defeated 75 percent cover area: " + majority);
+            var expected = majority.R == majority.G && majority.G == majority.B ? Colors.Red : majority;
+            Assert(result == CoverPalette.Readable(expected), "colour-family area or neutral-background priority changed: " + majority);
         }
         return Task.CompletedTask;
     }
@@ -84,7 +85,7 @@ internal static partial class Program
         controller.Retarget(Colors.Blue);
         if (!SystemParameters.ClientAreaAnimation)
         { Assert(brush.Color == controller.TargetColor && controller.Clocks.Count == 0, "Windows reduced-animation preference ignored"); return; }
-        Assert(controller.Clocks.Count == 6 && controller.Clocks.Values.All(c => c.Timeline.Duration.TimeSpan == TimeSpan.FromSeconds(5)), "requested five-second duration changed");
+        Assert(controller.Clocks.Count == 7 && controller.Clocks.Values.All(c => c.Timeline.Duration.TimeSpan == TimeSpan.FromSeconds(5)), "requested five-second duration changed");
         Accent015Seek(controller, 0); Assert(brush.Color == from, "fade jumps at start");
         Accent015Seek(controller, 2.5); var middle = brush.Color;
         Assert(middle != from && middle != controller.TargetColor && CoverPalette.Contrast(middle, CoverPalette.Ink) >= 4.5, "midpoint jumps or loses contrast");
@@ -140,16 +141,19 @@ internal static partial class Program
     private static Task Accent015Preferences()
     {
         var directory = Path.Combine(_directory, "accent015-preferences"); Directory.CreateDirectory(directory); var store = new PreferencesStore(directory);
-        Assert(store.Load().AccentFromCover && store.Load().StaticAccentColor == "#EA571C", "new defaults changed");
+        Assert(store.Load().AccentFromCover && store.Load().StaticAccentColor == "#E7BB59" && store.Load().Theme == "System", "new defaults changed");
         File.WriteAllText(store.FilePath, "{\"volume\":0.31,\"concurrentDownloads\":7,\"unknownExperimentalTheme\":true}");
-        var old = store.Load(); Assert(old.AccentFromCover && old.StaticAccentColor == "#EA571C" && old.Volume == .31 && old.ConcurrentDownloads == 7, "old preferences lost defaults or unrelated choices");
+        var old = store.Load(); Assert(old.AccentFromCover && old.StaticAccentColor == "#E7BB59" && old.Theme == "System" && old.Volume == .31 && old.ConcurrentDownloads == 7, "old preferences lost defaults or unrelated choices");
         store.Save(old with { AccentFromCover = false, StaticAccentColor = "#6eadfa" }); var saved = store.Load();
         Assert(!saved.AccentFromCover && saved.StaticAccentColor == "#6EADFA" && saved.Volume == .31 && saved.ConcurrentDownloads == 7, "static preference roundtrip changed state");
+        store.Save(saved with { StaticAccentColor = "#ea571c" }); var savedOrange = store.Load();
+        Assert(savedOrange.StaticAccentColor == "#EA571C" && !savedOrange.AccentFromCover && savedOrange.Theme == "System"
+            && savedOrange.Volume == .31 && savedOrange.ConcurrentDownloads == 7, "existing explicit orange choice was replaced by the new default");
         Assert(!File.ReadAllText(store.FilePath).Contains("unknownExperimentalTheme"), "unknown experimental schema was persisted");
         foreach (var invalid in new[] { "red", "#123", "#GG0000", "#12345678", "#12345 ", "#000000\n", "" })
-        { store.Save(saved with { StaticAccentColor = invalid }); Assert(store.Load().StaticAccentColor == "#EA571C" && !store.Load().AccentFromCover, "invalid colour was accepted or changed mode: " + invalid); }
+        { store.Save(saved with { StaticAccentColor = invalid }); Assert(store.Load().StaticAccentColor == "#E7BB59" && !store.Load().AccentFromCover, "invalid colour was accepted or changed mode: " + invalid); }
         File.WriteAllText(store.FilePath, "{\"accentFromCover\":false,\"staticAccentColor\":null,\"volume\":0.31}");
-        Assert(store.Load().StaticAccentColor == "#EA571C" && !store.Load().AccentFromCover && store.Load().Volume == .31, "null colour corrupted unrelated settings");
+        Assert(store.Load().StaticAccentColor == "#E7BB59" && !store.Load().AccentFromCover && store.Load().Volume == .31, "null colour corrupted unrelated settings");
         return Task.CompletedTask;
     }
 
@@ -159,29 +163,32 @@ internal static partial class Program
         var store = new PreferencesStore(Path.Combine(_directory, "accent015-settings-store"));
         typeof(MainWindow).GetField("_preferenceStore", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(w, store);
         var controller = SaField<CoverAccentController>(w, "_coverAccent");
-        Assert(ReferenceEquals(Control<Button>(w, "FavoritesNav").Foreground, controller.Brushes["AccentBrush"])
-            && ReferenceEquals(Control<Button>(w, "LoginButton").Foreground, controller.Brushes["AccentBrush"]), "Main XAML retained cached application resources from before controller initialization");
+        Assert(ReferenceEquals(Control<Button>(w, "FavoritesNav").Foreground, controller.Brushes["AccentTextBrush"])
+            && ReferenceEquals(Control<Button>(w, "LoginButton").Foreground, controller.Brushes["AccentTextBrush"]), "Main XAML retained cached application resources from before controller initialization");
         SaClick(Control<Button>(w, "SettingsButton"));
-        Assert(Control<CheckBox>(w, "SettingsAccentFromCover").IsChecked == true && Control<TextBox>(w, "SettingsAccentHex").Text == "#EA571C", "Settings lost current values");
+        Assert(Control<CheckBox>(w, "SettingsAccentFromCover").IsChecked == true && Control<TextBox>(w, "SettingsAccentHex").Text == "#E7BB59", "Settings lost current values");
         Control<CheckBox>(w, "SettingsAccentFromCover").IsChecked = false; Control<TextBox>(w, "SettingsAccentHex").Text = "#6EADFA";
-        Assert(controller.TargetColor == CoverPalette.Fallback && !File.Exists(store.FilePath), "editing a draft applied theme or saved disk state");
-        SaClick(Control<Button>(w, "SettingsCancelButton")); SaClick(Control<Button>(w, "SettingsButton"));
-        Assert(Control<CheckBox>(w, "SettingsAccentFromCover").IsChecked == true && Control<TextBox>(w, "SettingsAccentHex").Text == "#EA571C", "Cancel did not discard draft");
+        Assert(controller.TargetColor == CoverPalette.Readable(Color.FromRgb(110, 173, 250)) && store.Load().StaticAccentColor == "#6EADFA", "live color did not apply or persist");
+        SaClick(Control<Button>(w, "SettingsBackButton")); SaClick(Control<Button>(w, "SettingsButton"));
+        Assert(Control<CheckBox>(w, "SettingsAccentFromCover").IsChecked == false && Control<TextBox>(w, "SettingsAccentHex").Text == "#6EADFA", "Back rolled back live color");
+        var validBefore = File.ReadAllBytes(store.FilePath);
         Control<CheckBox>(w, "SettingsAccentFromCover").IsChecked = false; Control<TextBox>(w, "SettingsAccentHex").Text = "#XXYYZZ";
-        SaClick(Control<Button>(w, "SettingsApplyButton"));
-        Assert(SaField<bool>(w, "_settingsOpen") && !File.Exists(store.FilePath) && controller.TargetColor == CoverPalette.Fallback, "invalid input changed theme or preferences");
-        Control<TextBox>(w, "SettingsAccentHex").Text = "#6eadfa"; SaClick(Control<Button>(w, "SettingsApplyButton"));
+        Assert(SaField<bool>(w, "_settingsOpen") && File.ReadAllBytes(store.FilePath).SequenceEqual(validBefore)
+            && controller.TargetColor == CoverPalette.Readable(Color.FromRgb(110, 173, 250)) && Control<TextBox>(w, "SettingsAccentHex").Text == "#XXYYZZ", "invalid input changed theme or preferences or lost typed text");
+        Control<TextBox>(w, "SettingsAccentHex").Text = "#6eadfa"; SaClick(Control<Button>(w, "SettingsBackButton"));
         Assert(!SaField<bool>(w, "_settingsOpen") && !store.Load().AccentFromCover && store.Load().StaticAccentColor == "#6EADFA" && controller.TargetColor == CoverPalette.Readable(Color.FromRgb(110, 173, 250)), "Save did not apply and persist static mode atomically");
         SaInvoke(w, "LoadPreferences");
         Assert(!SaField<bool>(w, "_accentFromCover") && SaField<string>(w, "_staticAccentColor") == "#6EADFA" && controller.TargetColor == CoverPalette.Readable(Color.FromRgb(110, 173, 250)), "loading saved preferences did not configure the live accent");
         var persisted = File.ReadAllBytes(store.FilePath);
         SaClick(Control<Button>(w, "SettingsButton"));
-        var swatches = Control<WrapPanel>(w, "SettingsAccentSwatches"); Assert(swatches.Children.Count == 8 && swatches.Children.OfType<Button>().Count(b => b.BorderBrush == Brushes.White) == 1, "palette lost selection");
+        var swatches = Control<WrapPanel>(w, "SettingsAccentSwatches"); Assert(swatches.Children.Count == 8
+            && swatches.Children.OfType<Button>().Count(b => ReferenceEquals(b.BorderBrush, w.FindResource("ForegroundBrush"))) == 1, "palette lost selection");
         Control<CheckBox>(w, "SettingsAccentFromCover").IsChecked = true; SaClick(swatches.Children.OfType<Button>().First());
-        Assert(Control<TextBox>(w, "SettingsAccentHex").Text == "#EA571C" && controller.TargetColor == CoverPalette.Readable(Color.FromRgb(110, 173, 250)) && File.ReadAllBytes(store.FilePath).SequenceEqual(persisted), "swatch draft changed live theme");
+        Assert(Control<TextBox>(w, "SettingsAccentHex").Text == "#E7BB59" && controller.TargetColor == CoverPalette.Fallback
+            && store.Load().AccentFromCover && store.Load().StaticAccentColor == "#E7BB59", "live swatch did not apply/persist its fallback");
         foreach (var (width, height) in new[] { (1050, 680), (1280, 860) })
         { w.Width = width; w.Height = height; w.UpdateLayout(); await Task.Delay(340); App.Capture(w, Path.Combine(_directory, $"accent015-settings-{width}x{height}.png")); }
-        SaClick(Control<Button>(w, "SettingsApplyButton")); Assert(store.Load().AccentFromCover && store.Load().StaticAccentColor == "#EA571C", "auto setting did not persist selected static fallback");
+        SaClick(Control<Button>(w, "SettingsBackButton")); Assert(store.Load().AccentFromCover && store.Load().StaticAccentColor == "#E7BB59", "auto setting did not persist selected static fallback");
         var beforeAnalysis = File.ReadAllBytes(store.FilePath);
         Control<Image>(w, "PlayerCover").Source = Accent015Bitmap(32, 32, (_, _) => Colors.Blue); await controller.PendingAnalysis;
         Assert(controller.TargetColor == CoverPalette.Readable(Colors.Blue) && File.ReadAllBytes(store.FilePath).SequenceEqual(beforeAnalysis), "cover analysis saved preferences or ignored enabled auto mode");
@@ -198,15 +205,16 @@ internal static partial class Program
         Control<Image>(w, "PlayerCover").Source = cover;
         var controller = SaField<CoverAccentController>(w, "_coverAccent"); await controller.PendingAnalysis; Accent015Seek(controller, 5.01); w.UpdateLayout();
         var accent = controller.Brushes["AccentBrush"];
+        var accentText = controller.Brushes["AccentTextBrush"];
         Assert(controller.TargetColor == CoverPalette.Readable(Colors.Blue) && ReferenceEquals(Control<Button>(w, "PlayPauseButton").Background, accent), "main play disc lost dynamic resource");
-        Assert(ReferenceEquals(Control<Button>(w, "FavoritesNav").Foreground, accent) && ReferenceEquals(Control<Button>(w, "LoginButton").Foreground, accent)
+        Assert(ReferenceEquals(Control<Button>(w, "FavoritesNav").Foreground, accentText) && ReferenceEquals(Control<Button>(w, "LoginButton").Foreground, accentText)
             && ReferenceEquals(((Border)Control<Button>(w, "PlayerCoverButton").Content).Background, controller.Brushes["AccentSoftBrush"]), "main XAML text retained a stale palette");
         foreach (var pair in controller.Brushes) Assert(ReferenceEquals(w.FindResource(pair.Key), pair.Value) && !pair.Value.IsFrozen, "live resource frozen or replaced: " + pair.Key);
         var mini = new MiniPlayerWindow { Left = -16000, Top = -16000, ShowActivated = false, ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.Manual };
         try
         {
             mini.Update(current.Title, current.Artist, false, true, true); mini.UpdateDetails(cover, 0, 180, true, true, true, 0, current.RequestId); mini.Show(); mini.UpdateLayout();
-            Assert(ReferenceEquals(mini.PlayButton.Background, accent) && ReferenceEquals(mini.LikeButton.Foreground, accent), "mini play or like kept old orange");
+            Assert(ReferenceEquals(mini.PlayButton.Background, accent) && ReferenceEquals(mini.LikeButton.Foreground, accentText), "mini play or like kept a stale accent");
             Assert(SaVisuals<System.Windows.Shapes.Ellipse>(mini.SeekSlider).Any(e => ReferenceEquals(e.Fill, accent)), "mini seek handle kept hardcoded orange");
             SaInvoke(w, "SetExpandedPlayerVisible", true, false); w.UpdateLayout();
             var expanded = Control<ContentControl>(w, "ExpandedPlayerHost");
@@ -220,7 +228,7 @@ internal static partial class Program
             try
             {
                 controls.Show(); controls.UpdateLayout(); Ui015Key(link, System.Windows.Input.Key.Tab); link.Focus();
-                Assert(ReferenceEquals(link.Foreground, accent) && ReferenceEquals(ChromePart<Border>(link, "LinkKeyboardFocus").BorderBrush, accent), "keyboard link focus kept an old accent");
+                Assert(ReferenceEquals(link.Foreground, accentText) && ReferenceEquals(ChromePart<Border>(link, "LinkKeyboardFocus").BorderBrush, accent), "keyboard link focus kept an old accent");
                 var item = (ListBoxItem)selection.ItemContainerGenerator.ContainerFromIndex(0);
                 Assert(ReferenceEquals(ChromePart<Border>(item, "ItemSurface").Background, controller.Brushes["AccentSelectionBrush"])
                     && ReferenceEquals(input.SelectionBrush, controller.Brushes["AccentTextSelectionBrush"]), "selection surfaces lost dynamic palette");

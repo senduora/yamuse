@@ -48,6 +48,8 @@ public partial class MainWindow : Window
     private bool _seekDragging;
     private bool _closed;
     private bool _loadingStream;
+    private double _volumeBeforeMute = 50;
+    private long _advanceOperation;
     private int _busy;
     private readonly HashSet<string> _favoriteTrackIds = new(StringComparer.Ordinal);
     private bool _favoriteIdsKnown;
@@ -63,6 +65,7 @@ public partial class MainWindow : Window
         _player = player ?? new NativePlayer();
         _preferenceStore = preferences;
         _accountCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        ThemeManager.Initialize(Application.Current);
         InitializeComponent();
         WindowAppearance.Apply(this);
         InitializeSortingSources();
@@ -182,6 +185,7 @@ public partial class MainWindow : Window
         var account = await _api.GetAccountAsync(session, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         if (_accountCts.IsCancellationRequested) { _accountCts.Dispose(); _accountCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token); }
+        if (_account?.Uid != account.Uid) ClearPlaybackContext(clearView: true);
         _session = session;
         _account = account;
         _deviceId = session.DeviceId;
@@ -280,6 +284,7 @@ public partial class MainWindow : Window
             _diagnostics.Stage = _player.IsPlaying ? "playing" : "library_ready";
             if (_section == "favorites") SetStatus($"Избранное загружено · {_favoritesCache.Count:N0} треков · {clock.Elapsed.TotalSeconds:F2} с");
             UpdateCount();
+            if (_section == "favorites") PlaybackContextViewShown();
             ScheduleAutoFavoritesDownloads();
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
@@ -299,6 +304,7 @@ public partial class MainWindow : Window
     private void Logout_Click(object sender, RoutedEventArgs e) => SignOut();
     internal void SignOut()
     {
+        ClearPlaybackContext(clearView: true);
         SuspendDownloadQueueForAccountChange();
         var playbackCleared = ClearPlaybackState();
         ResetFeatures();
@@ -349,7 +355,11 @@ public partial class MainWindow : Window
             var index = SelectedQueueIndex();
             if (index < 0 || !_playbackQueue.SelectAt(index)) return;
         }
-        else _playbackQueue.SetItems(_view.Cast<TrackRow>().ToArray(), selected);
+        else
+        {
+            _playbackQueue.SetItems(_view.Cast<TrackRow>().ToArray(), selected);
+            CapturePlaybackContext();
+        }
         await PlayTrackAsync(selected);
     }
 
@@ -368,6 +378,7 @@ public partial class MainWindow : Window
             if (_queue.Any(row => ReferenceEquals(row, track))) _playbackQueue.Select(track);
             else _playbackQueue.SetItems([track], track);
         }
+        ValidatePlaybackContext();
         var promoted = PromotePrepared(track, prepared, automatic);
         if (!promoted) { CancelNextPreparation(); ReportWaveEnd(automatic); }
         _playbackGeneration++;
@@ -388,7 +399,7 @@ public partial class MainWindow : Window
         TrackTitle.Text = track.Title; TrackArtist.Text = track.Artist;
         Artwork.SetSourceUri(PlayerCover, track.CoverUri);
         QualityText.Text = "";
-        SetStatus("Открываем аудиопоток…");
+        SetStatus(promoted ? "" : localPath is not null ? "Открываем локальный трек…" : "Получаем аудиопоток…");
         _diagnostics.Stage = "resolving_stream";
         UpdateControls(); UpdateProgress();
         var clock = Stopwatch.StartNew();
@@ -399,6 +410,11 @@ public partial class MainWindow : Window
             {
                 var session = await EnsureSessionAsync(cts.Token);
                 audio = await _api.ResolveAudioAsync(session, track.RequestId, SelectedQuality, cts.Token);
+            }
+            else if (!promoted)
+            {
+                audio = await TryResolveOfflineUpgradeAsync(track, localPath!, SelectedQuality, cts.Token);
+                if (audio is not null) { localPath = null; localQuality = null; SetStatus("Получаем аудиопоток…"); }
             }
             cts.Token.ThrowIfCancellationRequested();
             _diagnostics.Timing("stream_url_ms", clock.Elapsed.TotalMilliseconds);
@@ -429,7 +445,7 @@ public partial class MainWindow : Window
             track.IsPlaying = true;
             HighlightTrack(track);
             QualityText.Text = (playingOffline ? "Офлайн · " : "") + (promoted ? prepared!.QualityLabel : localQuality ?? audio?.QualityLabel ?? "Локальное аудио");
-            SetStatus(playingOffline ? "" : _waveSources.ContainsKey(track) ? WaveSourceLabel(track) : "Воспроизведение · очередь треков");
+            SetStatus(!playingOffline && _waveSources.ContainsKey(track) ? WaveSourceLabel(track) : "");
             BeginWaveListening(track);
             _progressTimer.Start();
             SavePlaybackState();
@@ -438,7 +454,7 @@ public partial class MainWindow : Window
         catch (Exception ex) { _diagnostics.Stage = "playback_error"; ShowError(ex); }
         finally
         {
-            if (ReferenceEquals(_playCts, cts)) { _playCts = null; _loadingStream = false; UpdateControls(); UpdateProgress(); }
+            if (ReferenceEquals(_playCts, cts)) { _playCts = null; _loadingStream = false; UpdateControls(); UpdateProgress(); SyncPlaybackContextSelection(); }
             cts.Dispose();
         }
     }
@@ -457,7 +473,6 @@ public partial class MainWindow : Window
         SavePlaybackState();
         SetWavePaused(!_player.IsPlaying);
         _diagnostics.Stage = _player.IsPlaying ? "playing" : "paused";
-        SetStatus(_player.IsPlaying ? "Воспроизведение · очередь из избранного" : "Пауза");
         if (_player.IsPlaying) _progressTimer.Start(); else _progressTimer.Stop();
         UpdateControls();
     }
@@ -470,7 +485,8 @@ public partial class MainWindow : Window
     private async void Next_Click(object sender, RoutedEventArgs e) => await AdvanceAsync(1, false);
     private async Task AdvanceAsync(int direction, bool automatic)
     {
-        if (_closed || _queue.Count == 0 || _advancingPlayback) return;
+        if (_closed || _queue.Count == 0 || _advancingPlayback && (automatic || _advancingWave)) return;
+        var operation = ++_advanceOperation;
         _advancingPlayback = true;
         try
         {
@@ -496,9 +512,15 @@ public partial class MainWindow : Window
             }
             return;
         }
+        // Navigation restarts even when the target is the restored TrackRow.
+        // Only the initial Play action may consume its saved resume position.
+        ForgetRestoredPositionFor(next, restart: true);
         await PlayTrackCoreAsync(next, prepared, automatic);
         }
-        finally { _advancingPlayback = false; RefreshNextPreparation(); }
+        finally
+        {
+            if (operation == _advanceOperation) { _advancingPlayback = false; RefreshNextPreparation(); }
+        }
     }
 
     private void UpdateControls()
@@ -516,6 +538,7 @@ public partial class MainWindow : Window
         PreviousButton.IsEnabled = _current is not null && _queue.Count > 0;
         NextButton.IsEnabled = !_advancingWave && (_playbackQueue.CanNext || _current is not null && _waveSources.ContainsKey(_current));
         SeekSlider.IsEnabled = !_loadingStream && _player.HasSource && _player.Duration.TotalSeconds > 0;
+        UpdateAmbientMotion();
         RefreshPlaybackDisplay();
         UpdatePlayerLikeState();
         UpdateLyricsTimer();
@@ -527,6 +550,7 @@ public partial class MainWindow : Window
         if (_current is null) Artwork.SetSourceUri(PlayerCover, null);
         UpdateWindowsMedia();
         UpdateQueueControls();
+        UpdatePlaybackContextButton();
         UpdateWavePresentation();
         RefreshNextPreparation();
         UpdateShellState();
@@ -557,6 +581,7 @@ public partial class MainWindow : Window
     }
     private void Volume_Changed(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
+        if (e.NewValue > 0) _volumeBeforeMute = e.NewValue;
         _player.SetVolume(e.NewValue / 100);
         if (SliderGesture.HasActiveGesture || Mouse.LeftButton == MouseButtonState.Pressed)
         { _volumeSaveTimer.Stop(); _volumeSaveTimer.Start(); }
@@ -587,17 +612,18 @@ public partial class MainWindow : Window
     private void Busy(bool start)
     {
         _busy = Math.Max(0, _busy + (start ? 1 : -1));
-        if (!_closed) BusyBar.Visibility = _busy > 0 ? Visibility.Visible : Visibility.Collapsed;
+        UpdateStatusNotificationLifetime();
     }
     private void SetStatus(string text, bool error = false)
     {
         if (_closed) return;
         StatusText.Text = text;
-        StatusText.Foreground = new SolidColorBrush(error ? Color.FromRgb(255, 154, 139) : Color.FromRgb(156, 165, 181));
+        ShowStatusNotification(error);
         WaveStatus.Text = text;
-        WaveStatus.Foreground = StatusText.Foreground;
+        var inlineStatusBrush = (Brush)FindResource(error ? "ErrorBrush" : "MutedBrush");
+        WaveStatus.Foreground = inlineStatusBrush;
         HomeStatus.Text = ArtistStatus.Text = text;
-        HomeStatus.Foreground = ArtistStatus.Foreground = StatusText.Foreground;
+        HomeStatus.Foreground = ArtistStatus.Foreground = inlineStatusBrush;
     }
     private void ShowError(Exception error, string prefix = "")
     {
@@ -641,17 +667,38 @@ public partial class MainWindow : Window
     }
     private async void Window_KeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Escape && IsExpandedPlayerOpen) { e.Handled = true; CloseExpandedPlayer(); return; }
+        // WPF's Modifiers property reports Alt/Control/Shift, but omits Win.
+        if (_closed || e.Handled || (e.KeyboardDevice.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Windows)) != 0
+            || e.KeyboardDevice.IsKeyDown(Key.LWin) || e.KeyboardDevice.IsKeyDown(Key.RWin)) return;
+        if (e.Key == Key.Escape && IsExpandedPlayerOpen) { e.Handled = true; RequestExpandedPlayerClose(); return; }
         if (e.Key == Key.Escape && _settingsOpen) { e.Handled = true; SettingsClose_Click(sender, e); return; }
-        if (_settingsOpen && e.Key is not (Key.MediaPlayPause or Key.MediaNextTrack or Key.MediaPreviousTrack)) return;
+        if (e.Key == Key.F11) { e.Handled = true; ExpandPlayer_Click(sender, e); return; }
+        if (_settingsOpen && e.Key is not (Key.MediaPlayPause or Key.MediaNextTrack or Key.MediaPreviousTrack
+            or Key.P or Key.M or Key.L or Key.OemOpenBrackets or Key.OemCloseBrackets
+            or Key.Add or Key.OemPlus or Key.Subtract or Key.OemMinus)) return;
         if (e.Key == Key.Escape && _lyricsOpen) { e.Handled = true; SetLyricsVisible(false); PlayerLyricsButton.Focus(); return; }
-        if (e.OriginalSource is TextBoxBase or Slider) return;
+        if (IsPlaybackTextInput(e.OriginalSource as DependencyObject)) return;
+        if (e.Key is Key.Add or Key.OemPlus) { e.Handled = true; VolumeSlider.Value = Math.Clamp(VolumeSlider.Value + 10, 0, 100); return; }
+        if (e.Key is Key.Subtract or Key.OemMinus) { e.Handled = true; VolumeSlider.Value = Math.Clamp(VolumeSlider.Value - 10, 0, 100); return; }
+        if (e.OriginalSource is Slider && e.Key is not (Key.P or Key.M or Key.L or Key.OemOpenBrackets or Key.OemCloseBrackets)) return;
         if (_windows?.IsAvailable == true && e.Key is Key.MediaPlayPause or Key.MediaNextTrack or Key.MediaPreviousTrack) return;
-        if (e.Key is Key.Space or Key.MediaPlayPause) { e.Handled = true; await TogglePlaybackAsync(); }
-        else if (e.Key == Key.MediaNextTrack) { e.Handled = true; await AdvanceAsync(1, false); }
-        else if (e.Key == Key.MediaPreviousTrack) { e.Handled = true; await AdvanceAsync(-1, false); }
+        if (e.Key is Key.Space or Key.P or Key.MediaPlayPause) { e.Handled = true; await TogglePlaybackAsync(); }
+        else if (e.Key is Key.OemOpenBrackets or Key.MediaNextTrack) { e.Handled = true; await AdvanceAsync(1, false); }
+        else if (e.Key is Key.OemCloseBrackets or Key.MediaPreviousTrack) { e.Handled = true; await AdvanceAsync(-1, false); }
+        else if (e.Key == Key.M) { e.Handled = true; VolumeSlider.Value = VolumeSlider.Value > 0 ? 0 : Math.Clamp(_volumeBeforeMute, 0, 100); }
+        else if (e.Key == Key.L) { e.Handled = true; await ToggleCurrentLikeAsync(); }
         else if (e.Key == Key.Enter && TracksList.IsKeyboardFocusWithin) { e.Handled = true; await PlaySelectedAsync(); }
         else if (e.Key == Key.Enter && CatalogList.IsKeyboardFocusWithin) { e.Handled = true; await OpenSelectedCatalogAsync(); }
+    }
+    private static bool IsPlaybackTextInput(DependencyObject? source)
+    {
+        while (source is not null)
+        {
+            if (source is TextBoxBase or PasswordBox or ComboBox or ComboBoxItem or MenuItem) return true;
+            source = source is Visual or System.Windows.Media.Media3D.Visual3D ? VisualTreeHelper.GetParent(source)
+                : source is FrameworkContentElement content ? content.Parent : LogicalTreeHelper.GetParent(source);
+        }
+        return false;
     }
     private void LoadDemo()
     {
@@ -671,6 +718,7 @@ public partial class MainWindow : Window
         SavePlaybackState();
         SuspendDownloadQueueForAccountChange();
         _closed = true;
+        ClearPlaybackContext(clearView: true);
         CloseSorting();
         _lifetime.Cancel(); _authCts?.Cancel(); _libraryCts?.Cancel(); _playCts?.Cancel();
         CancelNextPreparation();

@@ -82,11 +82,18 @@ public partial class MainWindow
         if (DateTimeOffset.UtcNow - _lastPlaybackStateSave < TimeSpan.FromSeconds(5) || _playbackStateWriteTask is { IsCompleted: false }
             || !PlaybackPersistenceEnabled || _playbackStateStore is null || _playbackStateInvalidated || _playbackStateWriteBlocked
             || _account is null || _playbackStateAccountUid != _account.Uid) return;
-        var seconds = RestoredPlaybackPosition?.TotalSeconds ?? DisplayPosition(_player.Position).TotalSeconds;
-        var snapshot = PlaybackStateStore.Capture(_account.Uid, _playbackQueue, seconds);
+        // Validation can fail synchronously before the background write starts.
+        // Throttle that failure too; keep the last good snapshot and live queue.
         _lastPlaybackStateSave = DateTimeOffset.UtcNow;
-        _playbackStateWriteTask = SaveAsync();
-        async Task SaveAsync()
+        try
+        {
+            var seconds = RestoredPlaybackPosition?.TotalSeconds ?? DisplayPosition(_player.Position).TotalSeconds;
+            var snapshot = PlaybackStateStore.Capture(_account.Uid, _playbackQueue, seconds);
+            _playbackStateWriteTask = SaveAsync(snapshot);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        { _diagnostics.LastErrorType = "PlaybackSave:" + ex.GetType().Name; }
+        async Task SaveAsync(PlaybackSnapshot snapshot)
         {
             try { await _playbackStateStore.SaveInBackgroundAsync(snapshot); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
@@ -129,10 +136,10 @@ public partial class MainWindow
         _restoredPlaybackTrack = null; _restoredPlaybackSeconds = null;
     }
 
-    private void ForgetRestoredPositionFor(TrackRow track)
+    private void ForgetRestoredPositionFor(TrackRow track, bool restart = false)
     {
         _playbackStateWriteBlocked = false; // An explicit new playback can replace an unrestorable queue.
-        if (ReferenceEquals(track, _restoredPlaybackTrack)) return;
+        if (!restart && ReferenceEquals(track, _restoredPlaybackTrack)) return;
         _restoredPlaybackTrack = null; _restoredPlaybackSeconds = null;
     }
 

@@ -91,11 +91,12 @@ internal static partial class Program
             var footer = Control<StackPanel>(f.Window, "MetricsRow");
             Assert(footer.Children.OfType<TextBlock>().Select(t => t.Name).SequenceEqual(["VersionText", "MemoryText", "CpuText"])
                 && Control<TextBlock>(f.Window, "VersionText").Text == AppBranding.VersionLabel
-                && !SaVisuals<Button>(Control<Border>(f.Window, "MetricsBar")).Any(), "footer retains extra labels/actions");
+                && SaVisuals<Button>(Control<Border>(f.Window, "MetricsBar")).Select(button => button.Name).Order()
+                    .SequenceEqual(new[] { "ChangelogButton", "FooterUpdateButton", "GithubButton" }), "footer retains extra labels/actions");
             SaInvoke(f.Window, "Settings_Click", null!, null!); f.Window.UpdateLayout();
             Assert(SaVisuals<TextBlock>(Control<ContentControl>(f.Window, "SettingsUpdates")).Any(t => t.Text.Contains("Версия " + AppBranding.VersionLabel[1..]))
                 && SaVisuals<Button>(Control<Grid>(f.Window, "SettingsPanel")).Any(b => b.Name == "SaveMetricsButton"), "version or diagnostics action missing from Settings");
-            Assert(((SolidColorBrush)f.Window.FindResource("AccentBrush")).Color == Color.FromRgb(234, 87, 28), "accent does not match the supplied swatch");
+            Assert(((SolidColorBrush)f.Window.FindResource("AccentBrush")).Color == Color.FromRgb(231, 187, 89), "accent does not match the supplied swatch");
             var scroll = SaVisuals<ScrollViewer>(Control<Grid>(f.Window, "SettingsPanel")).First(); scroll.ScrollToEnd();
             await Task.Delay(200); App.Capture(f.Window, Path.Combine(_directory, "polish014-settings.png"));
         });

@@ -99,6 +99,7 @@ public partial class MainWindow
         if (!_sortingReady || _syncSortUi || !ListSortStore.ValidContext(SortContext)) return;
         _listSorts[SortContext] = rule;
         ApplyListSorting(true);
+        if (IsPlaybackContextView()) _playbackContextSort = rule;
         try { _listSortStore?.Save(_listSorts); }
         catch (Exception e) when (e is System.IO.IOException or UnauthorizedAccessException)
         { _diagnostics.LastErrorType = "ListSortSave:" + e.GetType().Name; SetStatus("Сортировка применена, но её не удалось сохранить на диске.", true); return; }

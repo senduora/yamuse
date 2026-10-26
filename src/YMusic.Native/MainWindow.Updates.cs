@@ -15,20 +15,26 @@ public partial class MainWindow
     private TextBlock? _startupUpdateText;
     private Button? _startupUpdateButton, _startupUpdateLater;
     private string? _startupUpdateFailure;
+    private bool AppUpdateMaintenanceActive => _offlineMaintenance || _cacheMaintenance;
+    private const string AppUpdateMaintenanceMessage = "Дождитесь завершения очистки музыки или кэша и повторите обновление.";
 
     private async Task CheckForAppUpdatesAsync()
     {
         if (_closed || _startupUpdateCheckStarted) return;
         _startupUpdateCheckStarted = true;
+        InitializeUpdateSchedule();
+        RefreshAppUpdateUi();
         try
         {
             var updates = AppUpdates;
-            if (!updates.State.FeedConfigured || !updates.State.IsInstalled) return;
-            await updates.CheckAsync(_lifetime.Token);
+            if (!updates.State.FeedConfigured || !updates.State.IsInstalled && !_restore && !updates.HasPortableCheckOverride) return;
+            if (_updateCheckFrequency != UpdateCheckFrequency.Startup)
+            { await RunScheduledUpdateCheckAsync(); return; }
+            await CheckAppUpdateNowAsync(updates);
             if (_closed || _lifetime.IsCancellationRequested) return;
             // Offline startup stays quiet. Only a confirmed available package
             // creates the invitation; navigation and settings refresh cannot.
-            if (updates.State.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded)
+            if (updates.State.IsInstalled && updates.State.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded)
                 CreateStartupUpdatePrompt();
             RefreshAppUpdateUi();
         }
@@ -43,8 +49,33 @@ public partial class MainWindow
         var available = state.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded;
         SettingsButton.Content = available ? "Настройки · •" : "Настройки";
         SettingsButton.ToolTip = available ? "Доступно обновление " + state.AvailableVersion : "Настройки";
+        RefreshFooterUpdateUi(state);
         AppUpdateUiChanged?.Invoke();
         RefreshStartupUpdatePrompt();
+    }
+
+    private void RefreshFooterUpdateUi(AppUpdateState state)
+    {
+        if (FooterUpdateButton is null) return;
+        var available = state.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded;
+        FooterUpdateButton.Content = state.Status switch
+        {
+            AppUpdateStatus.Checking => "…", AppUpdateStatus.Downloading => "…",
+            AppUpdateStatus.Available or AppUpdateStatus.Downloaded => "↑",
+            AppUpdateStatus.NoUpdate => "✓", AppUpdateStatus.Error => "!", _ => "↻"
+        };
+        FooterUpdateButton.SetResourceReference(Control.ForegroundProperty, available ? "AccentTextBrush" : "MutedBrush");
+        FooterUpdateButton.ToolTip = state.Status switch
+        {
+            AppUpdateStatus.Available or AppUpdateStatus.Downloaded => "Доступно обновление " + state.AvailableVersion + (state.IsInstalled ? " — открыть настройки" : " — открыть официальный выпуск"),
+            AppUpdateStatus.Checking => "Проверяем обновления…", AppUpdateStatus.Downloading => "Скачиваем обновление…",
+            AppUpdateStatus.NoUpdate => "Последняя доступная версия. Нажмите, чтобы проверить снова.",
+            AppUpdateStatus.Error => "Не удалось проверить обновления. Нажмите, чтобы повторить.",
+            _ => "Проверить обновления"
+        };
+        AutomationProperties.SetName(FooterUpdateButton, FooterUpdateButton.ToolTip.ToString());
+        FooterUpdateButton.IsEnabled = state.FeedConfigured && !_appUpdateActionInProgress && !_updateCheckInProgress
+            && state.Status is not AppUpdateStatus.Checking and not AppUpdateStatus.Downloading;
     }
 
     private void CreateStartupUpdatePrompt()
@@ -83,7 +114,7 @@ public partial class MainWindow
     {
         if (_startupUpdatePrompt is null || _startupUpdateDismissed || _closed) return;
         var state = AppUpdates.State;
-        _startupUpdateText!.Text = _startupUpdateFailure ?? (state.Status switch
+        _startupUpdateText!.Text = AppUpdateMaintenanceActive ? AppUpdateMaintenanceMessage : _startupUpdateFailure ?? (state.Status switch
         {
             AppUpdateStatus.Downloading => $"Скачиваем обновление… {state.ProgressPercent ?? 0}%",
             AppUpdateStatus.Checking => "Проверяем обновление…",
@@ -92,7 +123,7 @@ public partial class MainWindow
             AppUpdateStatus.Downloaded => $"Версия {state.AvailableVersion} загружена и готова к установке.",
             _ => $"Версия {state.AvailableVersion}. Приложение сохранит состояние и перезапустится."
         });
-        _startupUpdateButton!.IsEnabled = !_appUpdateActionInProgress && !_startupUpdateRestartRequested
+        _startupUpdateButton!.IsEnabled = !AppUpdateMaintenanceActive && !_appUpdateActionInProgress && !_startupUpdateRestartRequested
             && state.Status is not AppUpdateStatus.Checking and not AppUpdateStatus.Downloading;
         _startupUpdateLater!.IsEnabled = !_appUpdateActionInProgress && !_startupUpdateRestartRequested;
     }
@@ -100,6 +131,7 @@ public partial class MainWindow
     private async Task InstallStartupUpdateAsync()
     {
         if (_closed || _startupUpdateDismissed || _appUpdateActionInProgress || _startupUpdateRestartRequested) return;
+        if (AppUpdateMaintenanceActive) { RefreshAppUpdateUi(); return; }
         var updates = AppUpdates;
         _appUpdateActionInProgress = true;
         _startupUpdateFailure = null;
@@ -142,22 +174,23 @@ public partial class MainWindow
     private async Task<bool> ApplyAppUpdateAsync(UpdateSupport updates)
     {
         if (_closed || _lifetime.IsCancellationRequested) return false;
-        SavePreferences(); SavePlaybackState(); SuspendDownloadQueueForAccountChange();
+        if (AppUpdateMaintenanceActive) { RefreshAppUpdateUi(); return false; }
+        SuspendDownloadQueueForAccountChange();
         // Preserve committed preferences, and finish an atomic offline write
         // before the SDK exits the process. Closing the window cancels this wait.
-        var autoBefore = _autoFavoritesEnabled;
-        try
-        {
-            _autoFavoritesEnabled = false;
-            var pending = _downloadTask;
-            _downloadCts?.Cancel();
-            if (pending is not null)
-                try { await pending.WaitAsync(_lifetime.Token); } catch (OperationCanceledException) { }
-            if (_closed || _lifetime.IsCancellationRequested) return false;
-            updates.ApplyAndRestart();
-            return true;
-        }
-        finally { _autoFavoritesEnabled = autoBefore; }
+        // Queue suspension already blocks automatic downloads. The preference
+        // remains the user's choice and can change while this wait yields.
+        var pending = _downloadTask;
+        _downloadCts?.Cancel();
+        if (pending is not null)
+            try { await pending.WaitAsync(_lifetime.Token); } catch (OperationCanceledException) { }
+        if (_closed || _lifetime.IsCancellationRequested) return false;
+        // Cleanup can start while the pending download yields. Recheck on
+        // the dispatcher immediately before saving state and exiting.
+        if (AppUpdateMaintenanceActive) { RefreshAppUpdateUi(); return false; }
+        SavePreferences(); SavePlaybackState();
+        updates.ApplyAndRestart();
+        return true;
     }
 
     private FrameworkElement CreateUpdateSettingsPanel()
@@ -169,27 +202,53 @@ public partial class MainWindow
         panel.Children.Add(new TextBlock { Text = "Обновления", FontSize = 17, FontWeight = FontWeights.SemiBold });
         var text = new TextBlock { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 10) };
         var button = new Button { HorizontalAlignment = HorizontalAlignment.Left, Name = "AppUpdateButton" };
-        panel.Children.Add(text); panel.Children.Add(button);
+        var frequencyLabel = new TextBlock { Text = "Проверять обновления", Margin = new Thickness(0, 2, 0, 5) };
+        var frequency = new ComboBox { Name = "UpdateCheckFrequencyCombo", Width = 250, HorizontalAlignment = HorizontalAlignment.Left,
+            Margin = new Thickness(0, 0, 0, 6), DisplayMemberPath = "Label", SelectedValuePath = "Value",
+            ItemsSource = new[]
+            {
+                new { Value = UpdateCheckFrequency.Startup, Label = "При запуске" },
+                new { Value = UpdateCheckFrequency.Hourly, Label = "Раз в час" },
+                new { Value = UpdateCheckFrequency.Daily, Label = "Раз в день" },
+                new { Value = UpdateCheckFrequency.Weekly, Label = "Раз в неделю" },
+                new { Value = UpdateCheckFrequency.Monthly, Label = "Раз в месяц" },
+                new { Value = UpdateCheckFrequency.Off, Label = "Не проверять автоматически" }
+            }, SelectedValue = _updateCheckFrequency };
+        _updateFrequencyCombo = frequency;
+        frequency.SelectionChanged += (_, _) =>
+        {
+            if (!CanApplySettingsControl || frequency.SelectedValue is not UpdateCheckFrequency selected || !Enum.IsDefined(selected)) return;
+            _updateCheckFrequency = selected;
+            PersistSettingsImmediately();
+            ArmUpdateSchedule();
+        };
+        AutomationProperties.SetName(frequency, "Частота проверки обновлений");
+        panel.Children.Add(frequencyLabel); panel.Children.Add(frequency);
+        panel.Children.Add(new TextBlock { Text = "Только пока Yamuse открыт. Изменения применяются сразу.", FontSize = 12,
+            TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10) });
+        panel.Children.Add(text);
+        panel.Children.Add(button);
         void Refresh()
         {
             var state = updates.State;
-            text.Text = "Версия " + state.CurrentVersion + "\n" + state.Message;
+            text.Text = "Версия " + state.CurrentVersion + "\n" + (AppUpdateMaintenanceActive ? AppUpdateMaintenanceMessage : state.Message);
             button.Content = state.Status switch
             {
-                AppUpdateStatus.Available => "Скачать обновление",
+                AppUpdateStatus.Available => state.IsInstalled ? "Скачать обновление" : "Открыть официальный выпуск",
                 AppUpdateStatus.Downloaded => "Обновить и перезапустить",
                 AppUpdateStatus.Checking => "Проверяем…",
                 AppUpdateStatus.Downloading => "Скачиваем…",
                 _ => "Проверить обновления"
             };
-            button.IsEnabled = state.FeedConfigured && state.IsInstalled
-                && !_appUpdateActionInProgress && state.Status is not AppUpdateStatus.Checking and not AppUpdateStatus.Downloading;
+            button.IsEnabled = state.FeedConfigured
+                && !AppUpdateMaintenanceActive && !_appUpdateActionInProgress && !_updateCheckInProgress && state.Status is not AppUpdateStatus.Checking and not AppUpdateStatus.Downloading;
         }
         panel.Loaded += (_, _) => { AppUpdateUiChanged += Refresh; Refresh(); };
         panel.Unloaded += (_, _) => AppUpdateUiChanged -= Refresh;
         button.Click += async (_, _) =>
         {
-            if (_closed || _appUpdateActionInProgress) return;
+            if (_closed || _appUpdateActionInProgress || _updateCheckInProgress) return;
+            if (AppUpdateMaintenanceActive) { Refresh(); return; }
             _appUpdateActionInProgress = true;
             button.IsEnabled = false;
             RefreshAppUpdateUi();
@@ -202,6 +261,7 @@ public partial class MainWindow
                 }
                 else if (updates.State.Status == AppUpdateStatus.Available)
                 {
+                    if (!updates.State.IsInstalled) { OpenUpdateLink(ReleasesUri); return; }
                     text.Text = "Скачиваем обновление…";
                     await updates.DownloadAsync(new Progress<int>(percent =>
                     { if (panel.IsLoaded) text.Text = $"Скачиваем обновление… {percent}%"; }), _lifetime.Token);
@@ -209,7 +269,7 @@ public partial class MainWindow
                 else
                 {
                     text.Text = "Проверяем обновления…";
-                    await updates.CheckAsync(_lifetime.Token);
+                    await CheckAppUpdateNowAsync(updates);
                 }
             }
             catch (OperationCanceledException) { }
@@ -218,7 +278,7 @@ public partial class MainWindow
             finally
             {
                 _appUpdateActionInProgress = false;
-                if (!_closed) RefreshAppUpdateUi();
+                if (!_closed) { RefreshAppUpdateUi(); ArmUpdateSchedule(); }
                 if (failure is not null && panel.IsLoaded) text.Text = failure;
             }
         };

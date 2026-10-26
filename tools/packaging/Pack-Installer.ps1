@@ -14,6 +14,22 @@ $packId = 'YMusic.Native' # Deliberately different from the existing user-data f
 $velopackVersion = '1.2.161'
 $runtimeVersion = '8.0.32'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+function Assert-PackageProductVersion([string]$ProductDllPath, [string]$ExpectedVersion) {
+    $fullVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($ProductDllPath).ProductVersion
+    if ([string]::IsNullOrWhiteSpace($fullVersion) -or $fullVersion.Split('+')[0] -cne $ExpectedVersion) {
+        throw 'Published product informational version does not match Version; preview DLLs cannot be packaged as stable.'
+    }
+}
+if (![string]::IsNullOrWhiteSpace($PublishedFolder)) {
+    # Reject preview/stable mismatches before creating folders or downloading tools.
+    Assert-PackageProductVersion (Join-Path ([IO.Path]::GetFullPath($PublishedFolder)) 'YMusic.Native.dll') $Version
+}
+else {
+    [xml]$sourceProject = Get-Content -LiteralPath (Join-Path $projectRoot 'src\YMusic.Native\YMusic.Native.csproj') -Raw
+    if ([string]$sourceProject.Project.PropertyGroup.Version -match '-') {
+        throw 'The source version is prerelease; this stable-only packaging script cannot relabel it as stable.'
+    }
+}
 $outputPath = [IO.Path]::GetFullPath($OutputFolder)
 $workingPath = [IO.Path]::GetFullPath($WorkFolder)
 if ($outputPath -eq $workingPath) { throw 'OutputFolder and WorkFolder must be different.' }
@@ -106,6 +122,7 @@ else {
 }
 $assembly = [Reflection.AssemblyName]::GetAssemblyName((Join-Path $stage 'YMusic.Native.dll'))
 if ($assembly.Version.ToString(3) -ne $Version) { throw 'Published assembly version does not match Version.' }
+Assert-PackageProductVersion (Join-Path $stage 'YMusic.Native.dll') $Version
 $productHash = (Get-FileHash -LiteralPath (Join-Path $stage 'YMusic.Native.dll') -Algorithm SHA256).Hash
 if ($ExpectedProductSha256 -and $productHash -ne $ExpectedProductSha256) { throw 'Published product DLL does not match the caller-approved SHA-256.' }
 if (!(Test-Path -LiteralPath (Join-Path $stage 'coreclr.dll')) -or !(Test-Path -LiteralPath (Join-Path $stage 'PresentationFramework.dll'))) {

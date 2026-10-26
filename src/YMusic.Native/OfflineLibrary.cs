@@ -15,9 +15,10 @@ internal sealed record OfflineItem([property: JsonRequired] string Id, [property
 
 internal sealed record OfflineRemovalResult(int Removed, int Preserved, int Failed, int Forgotten);
 
-internal sealed class OfflineLibrary : IDisposable
+internal sealed partial class OfflineLibrary : IDisposable
 {
     public string DirectoryPath { get; }
+    internal Action<string>? RemovalCheckpoint { get; set; }
     private readonly AudioBuffer _downloader;
     // Coordinate multiple library instances in this process, including playlist snapshots.
     private static readonly ConcurrentDictionary<string, DirectoryState> DirectoryLocks = new(StringComparer.OrdinalIgnoreCase);
@@ -47,6 +48,7 @@ internal sealed class OfflineLibrary : IDisposable
         _directoryState = DirectoryLocks.GetOrAdd(DirectoryPath, _ => new DirectoryState());
         _writeLock = _directoryState.Gate;
         _downloader = downloader ?? new AudioBuffer();
+        _ = ScheduleRecoveryIfNeeded();
     }
     public IReadOnlyList<OfflineItem> Read() => LoadLibrary().Items;
 
@@ -79,6 +81,7 @@ internal sealed class OfflineLibrary : IDisposable
         var snapshot = new OfflinePlaylist(playlist.Owner, playlist.Kind, playlist.Title, playlist.Revision,
             quality, DateTimeOffset.UtcNow, Array.AsReadOnly(tracks));
         ValidatePlaylist(snapshot);
+        await RecoverPendingAsync(cancellationToken).ConfigureAwait(false);
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -131,6 +134,7 @@ internal sealed class OfflineLibrary : IDisposable
     {
         ArgumentNullException.ThrowIfNull(track); ArgumentNullException.ThrowIfNull(audio);
         ValidateAlbumId(track.AlbumId);
+        await RecoverPendingAsync(cancellationToken).ConfigureAwait(false);
         // A key gate coalesces identical requests across instances without serializing
         // unrelated network downloads. Entries are removed when their last waiter leaves.
         var key = track.Id + "\0" + audio.Codec + "\0" + audio.Bitrate;
@@ -214,9 +218,13 @@ internal sealed class OfflineLibrary : IDisposable
 
     private async Task<OfflineRemovalResult> RemoveAsync(string? trackId, CancellationToken cancellationToken, IProgress<OfflineCleanupProgress>? progress)
     {
+        await RecoverPendingAsync(cancellationToken).ConfigureAwait(false);
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        SetRemovalActive(true);
         var staged = new ConcurrentBag<StagedRemoval>();
-        var removed = 0; var preserved = 0; var failed = 0; var committed = false;
+        var removed = 0; var preserved = 0; var failed = 0;
+        var completed = false;
+        RecoveryJournalLease? journal = null;
         var retained = new List<OfflineItem>();
         UninstallPathGuard.AncestorLease? ancestors = null;
         try
@@ -257,6 +265,7 @@ internal sealed class OfflineLibrary : IDisposable
                     if ((File.GetAttributes(path) & FileAttributes.ReadOnly) != 0)
                     { lock (resultGate) { failed++; retained.Add(item); } return; }
                     var quarantine = ResolvePath(".ym-delete-" + Guid.NewGuid().ToString("N") + ".pending");
+                    var recovery = ResolvePath(".ym-recovered-" + Guid.NewGuid().ToString("N") + Path.GetExtension(path));
                     // READ|DELETE, FILE_SHARE_READ, OPEN_REPARSE_POINT. The
                     // native guard validates the opened object itself. Keep
                     // this exact handle alive through commit and deletion so
@@ -268,9 +277,7 @@ internal sealed class OfflineLibrary : IDisposable
                         || !await RemovalHashMatchesAsync(file, item.Sha256, token).ConfigureAwait(false))
                     { lock (resultGate) preserved++; return; }
                     token.ThrowIfCancellationRequested();
-                    EnsureSafeDirectory();
-                    ManagedCacheCleanup.RenameByHandle(file.SafeFileHandle, quarantine);
-                    staged.Add(new(item, path, quarantine, file));
+                    staged.Add(new(item, path, quarantine, recovery, file));
                     file = null; // Ownership transfers to staged until final commit/rollback.
                     lock (resultGate) verifiedBytes += item.Bytes;
                 }
@@ -284,6 +291,16 @@ internal sealed class OfflineLibrary : IDisposable
             }).ConfigureAwait(false);
             remaining.AddRange(retained);
             cancellationToken.ThrowIfCancellationRequested();
+            // The complete immutable mapping is durable before the first rename.
+            // Verification retains the exact opened handles without moving files.
+            journal = CreateRecoveryJournal(staged.ToArray(), library, playlists, remaining, trackId is null);
+            foreach (var entry in staged)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                ManagedCacheCleanup.RenameByHandle(entry.File.SafeFileHandle, entry.Quarantine);
+                entry.Moved = true;
+                RemovalCheckpoint?.Invoke("after-stage");
+            }
             Report("commit");
             // Clear resets snapshots too; deleting one track retains snapshot metadata
             // and its completion is recomputed from actual remaining managed files.
@@ -293,9 +310,10 @@ internal sealed class OfflineLibrary : IDisposable
                 if (trackId is null)
                 {
                     snapshotWritten = await WriteIndexAsync(_playlistIndexPath, new OfflinePlaylistIndex(1, []), PlaylistJson, playlists.Stamp, cancellationToken).ConfigureAwait(false);
+                    RemovalCheckpoint?.Invoke("after-playlist-commit");
                 }
                 await WriteIndexAsync(_indexPath, remaining, LibraryJson, library.Stamp, cancellationToken).ConfigureAwait(false);
-                committed = true;
+                RemovalCheckpoint?.Invoke("after-library-commit");
             }
             catch
             {
@@ -314,6 +332,7 @@ internal sealed class OfflineLibrary : IDisposable
                     // Index commit is the cancellation boundary. After it, the
                     // small delete/restore phase completes with no audio reads.
                     UninstallPathGuard.DeleteByHandle(entry.File.SafeFileHandle);
+                    entry.Deleted = true;
                     entry.File.Dispose(); removed++;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
@@ -336,19 +355,42 @@ internal sealed class OfflineLibrary : IDisposable
                 if (repaired.Count != latest.Items.Count)
                     await WriteIndexAsync(_indexPath, repaired, LibraryJson, latest.Stamp, CancellationToken.None).ConfigureAwait(false);
             }
+            DeleteRecoveryJournal(journal);
+            completed = true;
             Report("complete");
             return new(removed, preserved, failed, selected.Length - retained.Count);
         }
         finally
         {
-            foreach (var entry in staged)
+            try
             {
-                if (!committed) RestoreStaged(entry);
-                entry.File.Dispose();
+                if (!completed)
+                {
+                    var restored = new List<RecoveredAudio>();
+                    foreach (var entry in staged)
+                        if (!entry.Deleted) restored.Add(new(entry.Item, RestoreStaged(entry)));
+                    // A collision may change the pathname even before commit.
+                    // Repair that exact mapping rather than indexing a foreign replacement.
+                    if (journal is not null)
+                    {
+                        await RestoreInterruptedPlaylistsAsync(journal.Data).ConfigureAwait(false);
+                        if (restored.Count > 0) await RepairRecoveredIndexAsync(restored).ConfigureAwait(false);
+                    }
+                    if (journal is not null) DeleteRecoveryJournal(journal);
+                }
             }
-            ancestors?.Dispose();
-            lock (_cacheLock) { _libraryCache = null; _playlistCache = null; }
-            _writeLock.Release();
+            finally
+            {
+                foreach (var entry in staged) entry.File.Dispose();
+                journal?.Dispose();
+                ancestors?.Dispose();
+                lock (_cacheLock) { _libraryCache = null; _playlistCache = null; }
+                SetRemovalActive(false);
+                _writeLock.Release();
+                // Only failures which could not repair their mapping leave a journal.
+                // Its fault is observed; ordinary reads fail promptly until recovery succeeds.
+                _ = ScheduleRecoveryIfNeeded();
+            }
         }
     }
 
@@ -380,16 +422,23 @@ internal sealed class OfflineLibrary : IDisposable
     }
     private string RestoreStaged(StagedRemoval entry)
     {
+        if (entry.RestoredPath is { } restored) return restored;
+        if (!entry.Moved) return entry.Original;
         try
         {
             EnsureSafeDirectory();
-            var recovered = File.Exists(entry.Original) ? ResolvePath(".ym-recovered-" + Guid.NewGuid().ToString("N") + Path.GetExtension(entry.Original)) : entry.Original;
-            ManagedCacheCleanup.RenameByHandle(entry.File.SafeFileHandle, recovered); return recovered;
+            var recovered = UninstallPathGuard.EntryExists(entry.Original) ? entry.Recovery : entry.Original;
+            ManagedCacheCleanup.RenameByHandle(entry.File.SafeFileHandle, recovered); return entry.RestoredPath = recovered;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or MusicException or Win32Exception)
         { return entry.Quarantine; /* Keep the uniquely named, verified file for recovery. */ }
     }
-    private sealed record StagedRemoval(OfflineItem Item, string Original, string Quarantine, FileStream File);
+    private sealed record StagedRemoval(OfflineItem Item, string Original, string Quarantine, string Recovery, FileStream File)
+    {
+        internal bool Moved { get; set; }
+        internal bool Deleted { get; set; }
+        internal string? RestoredPath { get; set; }
+    }
     private void SafeDeleteStaged(string? path)
     {
         if (path is null) return;
@@ -439,8 +488,9 @@ internal sealed class OfflineLibrary : IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
     }
 
-    private LibraryCache LoadLibrary(bool force = false)
+    private LibraryCache LoadLibrary(bool force = false, bool recovering = false)
     {
+        if (!recovering) EnsureRecoveryReadReady();
         lock (_cacheLock)
         {
             EnsureSafeDirectory();
@@ -472,8 +522,9 @@ internal sealed class OfflineLibrary : IDisposable
         }
     }
 
-    private PlaylistCache LoadPlaylists(bool force = false)
+    private PlaylistCache LoadPlaylists(bool force = false, bool recovering = false)
     {
+        if (!recovering) EnsureRecoveryReadReady();
         lock (_cacheLock)
         {
             EnsureSafeDirectory();
@@ -501,7 +552,12 @@ internal sealed class OfflineLibrary : IDisposable
         try
         {
             var serialized = JsonSerializer.Serialize(data, options);
-            await File.WriteAllTextAsync(temp, serialized, cancellationToken).ConfigureAwait(false);
+            await using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                var bytes = System.Text.Encoding.UTF8.GetBytes(serialized);
+                await output.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+                output.Flush(flushToDisk: true);
+            }
             if (await File.ReadAllTextAsync(temp, cancellationToken).ConfigureAwait(false) != serialized) throw new MusicException("Не прошла проверка сохранённого индекса офлайн-библиотеки.");
             cancellationToken.ThrowIfCancellationRequested();
             EnsureSafeDirectory();
@@ -570,6 +626,9 @@ internal sealed class OfflineLibrary : IDisposable
     private sealed class DirectoryState
     {
         public SemaphoreSlim Gate { get; } = new(1);
+        internal object RecoverySync { get; } = new();
+        internal Task? RecoveryTask;
+        internal bool RemovalActive;
         public long Generation;
         private readonly object _gate = new();
         private int _downloadLimit = 3, _activeDownloads;
