@@ -1,0 +1,74 @@
+{
+  "name": "Предложение",
+  "description": "Одна идея по улучшению Yamuse с описанием пользовательской задачи.",
+  "title": "[Предложение]: ",
+  "body": [
+    {
+      "type": "markdown",
+      "attributes": {
+        "value": "Проверьте существующие обращения. Предложение не означает обязательство реализовать его к определённой дате. Ошибки направляйте через форму ошибки; уязвимости — по [SECURITY.md](https://github.com/senduora/yamuse/blob/main/SECURITY.md)."
+      }
+    },
+    {
+      "type": "checkboxes",
+      "id": "preflight",
+      "attributes": {
+        "label": "Перед отправкой",
+        "options": [
+          {
+            "label": "Я проверил существующие обращения и README.",
+            "required": true
+          },
+          {
+            "label": "В сообщении нет секретов или чужих персональных данных.",
+            "required": true
+          }
+        ]
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "need",
+      "attributes": {
+        "label": "Какую задачу нужно решить?",
+        "description": "Опишите ситуацию и кому мешает текущее поведение."
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "proposal",
+      "attributes": {
+        "label": "Предлагаемое поведение",
+        "description": "Что должен увидеть или сделать пользователь?"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "alternatives",
+      "attributes": {
+        "label": "Возможные альтернативы",
+        "description": "Если есть: другой способ решить задачу или текущий обходной путь."
+      },
+      "validations": {
+        "required": false
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "context",
+      "attributes": {
+        "label": "Дополнительный контекст",
+        "description": "Сценарии, обезличенный макет или примеры. Не добавляйте материалы, которые не вправе публиковать."
+      },
+      "validations": {
+        "required": false
+      }
+    }
+  ]
+}

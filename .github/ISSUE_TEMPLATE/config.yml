@@ -1,0 +1,10 @@
+{
+  "blank_issues_enabled": false,
+  "contact_links": [
+    {
+      "name": "Сообщение об уязвимости",
+      "url": "https://github.com/senduora/yamuse/blob/main/SECURITY.md",
+      "about": "Порядок приватного сообщения; не раскрывайте уязвимости в публичных Issues."
+    }
+  ]
+}

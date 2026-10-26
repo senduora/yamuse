@@ -1,0 +1,121 @@
+{
+  "name": "Ошибка в Yamuse",
+  "description": "Воспроизводимая ошибка приложения, включая препятствия доступности.",
+  "title": "[Ошибка]: ",
+  "body": [
+    {
+      "type": "markdown",
+      "attributes": {
+        "value": "Опишите один случай. Не публикуйте токены, cookies, файлы входа, личные журналы или скачанную музыку. Для уязвимостей используйте [SECURITY.md](https://github.com/senduora/yamuse/blob/main/SECURITY.md)."
+      }
+    },
+    {
+      "type": "checkboxes",
+      "id": "preflight",
+      "attributes": {
+        "label": "Перед отправкой",
+        "options": [
+          {
+            "label": "Я проверил существующие обращения и README.",
+            "required": true
+          },
+          {
+            "label": "В сообщении нет секретов или чужих персональных данных.",
+            "required": true
+          }
+        ]
+      }
+    },
+    {
+      "type": "input",
+      "id": "version",
+      "attributes": {
+        "label": "Версия Yamuse",
+        "description": "Номер из приложения; для исходников — commit SHA."
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "input",
+      "id": "windows",
+      "attributes": {
+        "label": "Версия Windows",
+        "placeholder": "Например: Windows 11 24H2, сборка 26100"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "dropdown",
+      "id": "distribution",
+      "attributes": {
+        "label": "Способ запуска",
+        "options": [
+          "Установленная версия",
+          "Portable",
+          "Сборка из исходников"
+        ]
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "steps",
+      "attributes": {
+        "label": "Шаги воспроизведения",
+        "placeholder": "1. Открыть…\n2. Нажать…\n3. Наблюдать…"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "expected",
+      "attributes": {
+        "label": "Ожидаемое поведение"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "actual",
+      "attributes": {
+        "label": "Фактическое поведение",
+        "description": "Что произошло и повторяется ли это каждый раз?"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "accessibility",
+      "attributes": {
+        "label": "Условия интерфейса и доступности",
+        "description": "Если относится к случаю: масштаб дисплея, размер окна/текста, контрастность, клавиатура, название и версия экранного диктора."
+      },
+      "validations": {
+        "required": false
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "evidence",
+      "attributes": {
+        "label": "Обезличенные материалы",
+        "description": "Снимок или короткий фрагмент журнала, если он помогает. Удалите имена, пути профиля, адреса, токены и идентификаторы аккаунта."
+      },
+      "validations": {
+        "required": false
+      }
+    }
+  ]
+}
