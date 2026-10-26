@@ -1,0 +1,2 @@
+# Preserve the exact pinned license bytes, including each upstream's line endings.
+tools/packaging/licenses/*.txt -text
