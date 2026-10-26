@@ -683,8 +683,8 @@ public partial class MainWindow : Window
         if (e.OriginalSource is Slider && e.Key is not (Key.P or Key.M or Key.L or Key.OemOpenBrackets or Key.OemCloseBrackets)) return;
         if (_windows?.IsAvailable == true && e.Key is Key.MediaPlayPause or Key.MediaNextTrack or Key.MediaPreviousTrack) return;
         if (e.Key is Key.Space or Key.P or Key.MediaPlayPause) { e.Handled = true; await TogglePlaybackAsync(); }
-        else if (e.Key is Key.OemOpenBrackets or Key.MediaNextTrack) { e.Handled = true; await AdvanceAsync(1, false); }
-        else if (e.Key is Key.OemCloseBrackets or Key.MediaPreviousTrack) { e.Handled = true; await AdvanceAsync(-1, false); }
+        else if (e.Key is Key.OemCloseBrackets or Key.MediaNextTrack) { e.Handled = true; await AdvanceAsync(1, false); }
+        else if (e.Key is Key.OemOpenBrackets or Key.MediaPreviousTrack) { e.Handled = true; await AdvanceAsync(-1, false); }
         else if (e.Key == Key.M) { e.Handled = true; VolumeSlider.Value = VolumeSlider.Value > 0 ? 0 : Math.Clamp(_volumeBeforeMute, 0, 100); }
         else if (e.Key == Key.L) { e.Handled = true; await ToggleCurrentLikeAsync(); }
         else if (e.Key == Key.Enter && TracksList.IsKeyboardFocusWithin) { e.Handled = true; await PlaySelectedAsync(); }

@@ -66,7 +66,7 @@
 | **F11** | Открыть или закрыть полноэкранный проигрыватель. |
 | **Esc** | Вернуться из проигрывателя, настроек или текста песни. |
 | **Пробел** или **P** | Воспроизведение / пауза. |
-| **[** / **]** | Следующий / предыдущий трек. |
+| **[** / **]** | Предыдущий / следующий трек. |
 | **M** | Выключить звук или вернуть прежнюю громкость. |
 | **+** / **−** | Изменить громкость на 10 пунктов. |
 | **L** | Добавить текущий трек в «Мне нравится» или убрать его оттуда. |
@@ -142,7 +142,7 @@ dotnet run --project tests/YMusic.Native.Checks/YMusic.Native.Checks.csproj -c R
 Упаковка установщика и файлов обновления:
 
 ```powershell
-./tools/packaging/Pack-Installer.ps1 -Version 0.4.0 -OutputFolder ./artifacts/setup -WorkFolder ./work/package
+./tools/packaging/Pack-Installer.ps1 -Version 0.4.1 -OutputFolder ./artifacts/setup -WorkFolder ./work/package
 ```
 
 Подробности сборки и упаковки — в [руководстве](tools/packaging/README.md), правила нумерации — в [docs/VERSIONING.md](docs/VERSIONING.md).
