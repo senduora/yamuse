@@ -142,7 +142,7 @@ dotnet run --project tests/YMusic.Native.Checks/YMusic.Native.Checks.csproj -c R
 Упаковка установщика и файлов обновления:
 
 ```powershell
-./tools/packaging/Pack-Installer.ps1 -Version 0.4.1 -OutputFolder ./artifacts/setup -WorkFolder ./work/package
+./tools/packaging/Pack-Installer.ps1 -Version 0.4.2 -OutputFolder ./artifacts/setup -WorkFolder ./work/package
 ```
 
 Подробности сборки и упаковки — в [руководстве](tools/packaging/README.md), правила нумерации — в [docs/VERSIONING.md](docs/VERSIONING.md).

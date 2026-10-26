@@ -92,6 +92,9 @@ internal static partial class Program
 
     private static async Task CheckAll(bool online)
     {
+        await CheckHomeDiscovery041();
+        await CheckHomeWaveUi041();
+        await CheckAmbientLight041();
         await CheckSelectorLabels040();
         await CheckFullscreenRapid040();
         await CheckLyricsScrollRecovery040();

@@ -30,7 +30,7 @@ internal sealed partial class MusicApi
         try
         {
             using var json = await DiscoveryJsonAsync(session,
-                "/landing3?blocks=personal-playlists%2Cnew-releases%2Cnew-playlists%2Cchart", false, cancellationToken).ConfigureAwait(false);
+                "/landing3?blocks=personalplaylists%2Cnew-releases%2Cnew-playlists%2Cchart%2Cartists%2Calbums%2Cplaylists", false, cancellationToken).ConfigureAwait(false);
             var sections = ReadDiscoveryLanding(DiscoveryResult(json));
             if (sections.Any(section => section.Items.Count > 0)) return sections;
             if (sections.Count > 0) landingFailure = new("Объекты главной пока не поддерживаются.", false);
