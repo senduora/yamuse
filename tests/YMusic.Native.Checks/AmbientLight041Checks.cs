@@ -2,6 +2,7 @@ using System.IO;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
@@ -16,9 +17,10 @@ internal static partial class Program
         var previousMode = ThemeManager.Mode;
         try
         {
-            await Run("AmbientLight041: olive black-band and saturated covers produce measurable soft colour with readable light text", AmbientLight041Colour);
+            await Run("AmbientLight041: gold yellow olive red and blue covers produce a strong soft colour field with readable light text", AmbientLight041Colour);
             await Run("AmbientLight041: monochrome and near-neutral covers remain neutral in rendered light backgrounds", AmbientLight041Neutral);
             await Run("AmbientLight041: light presentation follows interrupted cover fades while dark pixels and idle motion stay unchanged", AmbientLight041Transition);
+            await Run("AmbientLight041: actual fullscreen surface keeps strong gold and yellow colour at both sizes with unchanged dark presentation", AmbientLight041Fullscreen);
         }
         finally { ThemeManager.SetMode(previousMode); }
     }
@@ -27,7 +29,8 @@ internal static partial class Program
     {
         ThemeManager.SetMode("Light");
         var results = new List<object>();
-        foreach (var (name, color) in new[] { ("olive-black-bands", Color.FromRgb(66, 75, 24)), ("saturated-teal", Color.FromRgb(20, 125, 175)), ("saturated-magenta", Color.FromRgb(170, 25, 150)) })
+        foreach (var (name, color) in new[] { ("olive-black-bands", Color.FromRgb(66, 75, 24)), ("saturated-teal", Color.FromRgb(20, 125, 175)), ("saturated-magenta", Color.FromRgb(170, 25, 150)),
+            ("gold", Color.FromRgb(231, 187, 89)), ("yellow", Color.FromRgb(235, 210, 66)), ("red", Color.FromRgb(185, 30, 30)), ("blue", Color.FromRgb(30, 65, 195)) })
         {
             var cover = AmbientLight041Cover(color);
             var palette = CoverPalette.Extract(cover)!.Value;
@@ -38,8 +41,11 @@ internal static partial class Program
                 var scene = AmbientLight041Scene(ambient, cover, accent, name);
                 await AmbientLight041Layout(scene);
                 var metrics = AmbientLight041Metrics(ambient);
-                Assert(metrics.PeakChroma >= 15 && metrics.MeanChroma >= 5,
+                Assert(metrics.PeakChroma >= 25 && metrics.MeanChroma >= 13 && metrics.ColourCoverage >= .45,
                     "Light atmosphere washed the cover into a neutral field: " + name + ", " + metrics);
+                if (name is "gold" or "yellow")
+                    Assert(metrics.PeakChroma >= 55 && metrics.MeanChroma >= 25,
+                        "Warm cover colour is still barely visible in Light: " + name + ", " + metrics);
                 Assert(metrics.MinimumTextContrast >= 4.5 && metrics.MinimumMutedContrast >= 4.5
                     && CoverPalette.Contrast(palette, CoverPalette.Ink) >= 4.5,
                     "Light cover atmosphere reduced text or play-control readability: " + name + ", " + metrics);
@@ -50,6 +56,53 @@ internal static partial class Program
             finally { ambient.Release(); }
         }
         File.WriteAllText(System.IO.Path.Combine(_directory, "ambient-light-041-colour.json"), JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static async Task AmbientLight041Fullscreen()
+    {
+        var results = new List<object>();
+        foreach (var (mode, name, color, width, height) in new[]
+        {
+            ("Light", "gold", Color.FromRgb(231, 187, 89), 1280, 860),
+            ("Light", "gold", Color.FromRgb(231, 187, 89), 1920, 1080),
+            ("Light", "yellow", Color.FromRgb(235, 210, 66), 1920, 1080),
+            ("Dark", "gold", Color.FromRgb(231, 187, 89), 1920, 1080)
+        })
+        {
+            using var fixture = new Fr0317Fixture("ambient-light-strength-" + mode + name + width);
+            // MainWindow loads its isolated preferences during construction.
+            // Select the tested theme after that normal initialization.
+            ThemeManager.SetMode(mode);
+            var main = fixture.Window;
+            var cover = AmbientLight041Cover(color);
+            ((Image)main.FindName("PlayerCover")).Source = cover;
+            var controller = EpField<CoverAccentController>(main, "_coverAccent");
+            await controller.PendingAnalysis;
+            await AmbientLight041Frame(controller, 5.01);
+            Fr0317Call(main, "SetExpandedPlayerVisible", true, true);
+            Fr0317Call(main, "CancelExpandedReveal");
+            EpField<Image>(main, "_expandedPlayerCover").Source = cover;
+            var host = Fh040Window(main);
+            var root = (Grid)host.Content;
+            var size = new Size(width, height);
+            root.Measure(size); root.Arrange(new Rect(size)); root.UpdateLayout();
+            await Dispatcher.Yield(DispatcherPriority.DataBind);
+            await Dispatcher.Yield(DispatcherPriority.Render);
+            var ambient = EpField<AmbientBackdrop>(main, "_expandedAmbient");
+            var metrics = AmbientLight041Metrics(ambient);
+            Assert(ambient.ActualWidth == width && ambient.ActualHeight == height && ReferenceEquals(ambient.AccentBrush, controller.Brushes["AccentBrush"]),
+                "Fullscreen no longer fills its surface with the live shared accent");
+            if (mode == "Light")
+                Assert(metrics.MeanChroma >= 25 && metrics.PeakChroma >= 55 && metrics.ColourCoverage >= .65
+                    && metrics.MinimumTextContrast >= 4.5 && metrics.MinimumMutedContrast >= 4.5,
+                    "Fullscreen still loses the warm cover or text contrast: " + name + ", " + metrics);
+            Assert(!main.IsVisible && !host.IsVisible && new WindowInteropHelper(main).Handle == IntPtr.Zero
+                && new WindowInteropHelper(host).Handle == IntPtr.Zero && !ambient.IsMotionEnabled,
+                "Backdrop fixture created a native window or started idle motion");
+            AmbientLight041Save(root, $"ambient-light-041-fullscreen-{mode.ToLowerInvariant()}-{name}-{width}x{height}.png");
+            results.Add(new { mode, name, width, height, metrics });
+        }
+        File.WriteAllText(System.IO.Path.Combine(_directory, "ambient-light-041-fullscreen.json"), JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
     }
 
     private static async Task AmbientLight041Neutral()
@@ -126,7 +179,7 @@ internal static partial class Program
             Assert(brushes.SequenceEqual(EpVisuals<Ellipse>(ambient).Select(cloud => cloud.Fill))
                 && stops.SequenceEqual(brushes.SelectMany(brush => brush.GradientStops)), "Theme change rebuilt the live gradient bindings");
             var metrics = AmbientLight041Metrics(ambient);
-            Assert(metrics.PeakChroma >= 15 && metrics.MinimumMutedContrast >= 4.5, "Mid-transition Light atmosphere lost colour or readability");
+            Assert(metrics.PeakChroma >= 15 && metrics.MinimumMutedContrast >= 4.5, "Mid-transition Light atmosphere lost colour or readability: " + metrics);
             AmbientLight041Save(scene, "ambient-light-041-transition.png");
             controller.Retarget(originalColor);
             if (SystemParameters.ClientAreaAnimation)
@@ -194,7 +247,7 @@ internal static partial class Program
         await Dispatcher.Yield(DispatcherPriority.Render);
     }
 
-    private sealed record AmbientLight041Measurement(double MeanChroma, int PeakChroma, double MinimumTextContrast, double MinimumMutedContrast);
+    private sealed record AmbientLight041Measurement(double MeanChroma, int PeakChroma, double ColourCoverage, string MostChromaticSample, double MinimumTextContrast, double MinimumMutedContrast);
     private static AmbientLight041Measurement AmbientLight041Metrics(AmbientBackdrop ambient)
     {
         var bitmap = Ambient015Bitmap(ambient);
@@ -206,6 +259,7 @@ internal static partial class Program
             for (var x = 32; x < bitmap.PixelWidth - 32; x += 32) samples.Add(Ambient015Pixel(bitmap, pixels, x, y));
         Assert(samples.Count > 100 && samples.All(color => color.A == 255), "Light fixture did not render a complete opaque backdrop");
         return new(samples.Average(color => AmbientLight041Chroma(color)), samples.Max(color => AmbientLight041Chroma(color)),
+            samples.Count(color => AmbientLight041Chroma(color) >= 12) / (double)samples.Count, samples.MaxBy(AmbientLight041Chroma).ToString(),
             samples.Min(color => CoverPalette.Contrast(color, foreground)), samples.Min(color => CoverPalette.Contrast(color, muted)));
     }
     private static int AmbientLight041Chroma(Color color) => Math.Max(color.R, Math.Max(color.G, color.B)) - Math.Min(color.R, Math.Min(color.G, color.B));

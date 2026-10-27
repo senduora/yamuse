@@ -184,14 +184,19 @@ public sealed class AmbientBackdrop : Grid
         public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
         {
             if (values.Length == 0 || values[0] is not Color color || parameter is not CloudTint tint) return Colors.Transparent;
-            if (ThemeManager.IsLight && !SystemParameters.HighContrast) color = LightCloudColor(color);
+            var light = ThemeManager.IsLight && !SystemParameters.HighContrast;
             // Nearby tones keep the atmosphere related to the cover even when
             // the selected accent is blue/green; there is no fixed orange layer.
             var mix = tint.Index switch { 1 => .28, 2 => .12, 3 => .20, _ => 0 };
             var red = color.R * (1 - mix) + (tint.Index == 1 ? color.B : color.G) * mix;
             var green = color.G * (1 - mix) + color.B * mix;
             var blue = color.B * (1 - mix) + color.R * mix;
-            return Color.FromArgb((byte)Math.Round(255 * tint.Opacity), (byte)red, (byte)green, (byte)blue);
+            var shown = Color.FromRgb((byte)red, (byte)green, (byte)blue);
+            if (light) shown = LightCloudColor(shown);
+            // A broader soft falloff gives Light a visible colour field rather
+            // than leaving almost the whole surface behind the white veil.
+            var opacity = light ? Math.Sqrt(tint.Opacity) : tint.Opacity;
+            return Color.FromArgb((byte)Math.Round(255 * opacity), shown.R, shown.G, shown.B);
         }
         public object[] ConvertBack(object value, Type[] targetTypes, object parameter, CultureInfo culture) => [Binding.DoNothing, Binding.DoNothing];
 
@@ -205,15 +210,28 @@ public sealed class AmbientBackdrop : Grid
                 var lift = Math.Max(0, 235 - maximum);
                 return Color.FromRgb((byte)(color.R + lift), (byte)(color.G + lift), (byte)(color.B + lift));
             }
-            // A light decorative tint retains the cover's channel proportions
-            // without changing the shared accent. Bounded pastel channels keep
-            // both primary and muted light-theme text readable over the clouds.
+            // Retain a much wider cover-colour range than a near-white pastel.
+            // Fit each nearby cloud tone to the actual muted text colour before
+            // compositing, so even overlapping clouds remain readable.
             var amount = Math.Clamp((chroma - 8) / 8d, 0, 1);
             var peak = Math.Max(235d, maximum);
             peak += (252 - peak) * amount;
-            var scale = Math.Min(1 + amount, (peak - 225) / chroma);
-            return Color.FromRgb((byte)Math.Round(peak - (maximum - color.R) * scale),
+            var scale = Math.Min(1 + 3 * amount, (peak - 156) / chroma);
+            var tint = Color.FromRgb((byte)Math.Round(peak - (maximum - color.R) * scale),
                 (byte)Math.Round(peak - (maximum - color.G) * scale), (byte)Math.Round(peak - (maximum - color.B) * scale));
+            // Shared resources update before converted neutral backgrounds.
+            // A converted Muted brush can still hold the previous theme while
+            // this converter handles the new background's binding notification.
+            var muted = ((SolidColorBrush)Application.Current.Resources["MutedBrush"]).Color;
+            if (CoverPalette.Contrast(tint, muted) >= 4.55) return tint;
+            var low = 0d; var high = 1d;
+            for (var step = 0; step < 8; step++)
+            {
+                var middle = (low + high) / 2;
+                if (CoverPalette.Contrast(CoverPalette.Mix(tint, Colors.White, middle), muted) >= 4.55) high = middle;
+                else low = middle;
+            }
+            return CoverPalette.Mix(tint, Colors.White, high);
         }
     }
 

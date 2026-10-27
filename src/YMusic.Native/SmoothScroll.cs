@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Collections.Specialized;
 using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -165,10 +166,13 @@ public static class SmoothScroll
         private bool _programmatic;
         private DispatcherOperation? _bringIntoView;
         private int _bringGeneration;
-        private readonly List<(FrameworkElement Container, int Index, double Y)> _requestAnchors = [];
+        private readonly List<(FrameworkElement Container, object Item, int Index, double Y)> _requestAnchors = [];
+        private readonly NotifyCollectionChangedEventHandler _requestItemsChanged;
+        private INotifyCollectionChanged? _requestNotifications;
         private ItemsControl? _requestOwner;
         private object? _requestItems;
         private int _requestItemCount;
+        private int _requestExpectedItemCount;
         private double _requestOrigin;
         internal bool IsAnimating { get; private set; }
         internal bool HasPendingOffset => IsAnimating || _precisionPending;
@@ -177,6 +181,7 @@ public static class SmoothScroll
         internal ScrollState(ScrollViewer viewer)
         {
             _viewer = viewer;
+            _requestItemsChanged = OnRequestItemsChanged;
             _wheelHandler = OnWheel;
             _mouseHandler = (_, _) => Cancel();
             _keyHandler = (_, _) => Cancel();
@@ -328,6 +333,7 @@ public static class SmoothScroll
 
         private void RequestOffset(double offset)
         {
+            StopObservingRequestItems();
             _requestedOffset = offset;
             _requestOrigin = _viewer.VerticalOffset;
             _requestAnchors.Clear();
@@ -338,11 +344,14 @@ public static class SmoothScroll
                 _requestOwner = owner;
                 _requestItems = owner.ItemsSource ?? (object)owner.Items;
                 _requestItemCount = owner.Items.Count;
+                _requestExpectedItemCount = _requestItemCount;
+                _requestNotifications = (INotifyCollectionChanged)owner.Items;
+                _requestNotifications.CollectionChanged += _requestItemsChanged;
                 for (var i = 0; i < VisualTreeHelper.GetChildrenCount(panel); i++)
                 {
                     if (VisualTreeHelper.GetChild(panel, i) is not FrameworkElement container) continue;
                     var index = owner.ItemContainerGenerator.IndexFromContainer(container);
-                    if (index >= 0) _requestAnchors.Add((container, index, container.TranslatePoint(new Point(), _viewer).Y));
+                    if (index >= 0) _requestAnchors.Add((container, owner.Items[index], index, container.TranslatePoint(new Point(), _viewer).Y));
                 }
             }
             _viewer.ScrollToVerticalOffset(offset);
@@ -350,17 +359,39 @@ public static class SmoothScroll
 
         private bool MatchesVirtualRequest()
         {
-            if (_requestOwner is not { } owner || owner.Items.Count != _requestItemCount ||
+            if (_requestOwner is not { } owner || owner.Items.Count != _requestExpectedItemCount ||
                 !ReferenceEquals(owner.ItemsSource ?? (object)owner.Items, _requestItems)) return false;
-            if (Math.Abs(_viewer.VerticalOffset - _requestedOffset) <= OffsetTolerance) return true;
+            var appended = _requestExpectedItemCount > _requestItemCount;
+            var offsetMatches = Math.Abs(_viewer.VerticalOffset - _requestedOffset) <= OffsetTolerance;
+            if (!appended && offsetMatches) return true;
             var requestedMovement = _requestedOffset - _requestOrigin;
             foreach (var anchor in _requestAnchors)
             {
-                if (owner.ItemContainerGenerator.IndexFromContainer(anchor.Container) != anchor.Index) continue;
+                if (owner.ItemContainerGenerator.IndexFromContainer(anchor.Container) != anchor.Index ||
+                    !ReferenceEquals(owner.Items[anchor.Index], anchor.Item) ||
+                    !ReferenceEquals(owner.ItemContainerGenerator.ItemFromContainer(anchor.Container), anchor.Item)) continue;
+                if (appended && offsetMatches) return true;
                 var movement = anchor.Y - anchor.Container.TranslatePoint(new Point(), _viewer).Y;
                 if (Math.Abs(movement - requestedMovement) <= OffsetTolerance) return true;
             }
             return false;
+        }
+
+        private void OnRequestItemsChanged(object? sender, NotifyCollectionChangedEventArgs args)
+        {
+            // Only a confirmed tail append can extend this request's collection.
+            // Sorted inserts, replacement, reordering and Reset transfer ownership.
+            if (args.Action == NotifyCollectionChangedAction.Add && args.NewItems is { Count: > 0 } added &&
+                args.NewStartingIndex == _requestExpectedItemCount && _requestOwner is { } owner &&
+                owner.Items.Count == _requestExpectedItemCount + added.Count)
+                _requestExpectedItemCount += added.Count;
+            else Cancel();
+        }
+
+        private void StopObservingRequestItems()
+        {
+            if (_requestNotifications is not null) _requestNotifications.CollectionChanged -= _requestItemsChanged;
+            _requestNotifications = null;
         }
 
         internal void StopProgrammatic()
@@ -480,6 +511,7 @@ public static class SmoothScroll
                     // distance on displays such as 125% scaling.
                     _precisionRemainder = TargetOffset - _viewer.VerticalOffset;
                     _precisionPending = false;
+                    StopObservingRequestItems();
                 }
                 else if (_viewer.VerticalOffset < Math.Min(_precisionOrigin, TargetOffset) - OffsetTolerance ||
                     _viewer.VerticalOffset > Math.Max(_precisionOrigin, TargetOffset) + OffsetTolerance) Cancel();
@@ -502,6 +534,7 @@ public static class SmoothScroll
 
         private void Cancel()
         {
+            StopObservingRequestItems();
             _bringGeneration++;
             _bringIntoView?.Abort();
             _bringIntoView = null;

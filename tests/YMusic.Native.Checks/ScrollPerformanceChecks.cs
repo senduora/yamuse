@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Reflection;
 using System.Text.Json;
@@ -19,6 +20,8 @@ internal static partial class Program
         await Run("Scroll0311: actual 3920-row covered collection frame layout allocation measurement", ScrollCollectionMeasurement);
         await Run("Scroll0311: retargeted wheel keeps velocity and monotonic exact endpoints", ScrollTrajectoryContinuity);
         await Run("Scroll0311: precision bursts native input nested boundaries and high-DPI endpoints", ScrollRoutingRegression);
+        await Run("Scroll0311: tail-appended pages keep the anchored wheel target and release request subscriptions", ScrollAppendAcknowledgements);
+        await Run("Scroll0311: replacement reorder sorted insertion source swap and external offsets retain ownership", ScrollAppendOwnership);
     }
 
     private static Task ScrollTrajectoryContinuity()
@@ -139,6 +142,138 @@ internal static partial class Program
         }
         finally { window.Close(); }
         Assert(!SmoothScroll.IsAnimating(outer), "unloaded viewer retained animation");
+    }
+
+    private static async Task ScrollAppendAcknowledgements()
+    {
+        using var f = await ScrollAppendFixture.Create();
+        f.List.SelectedItem = f.Rows[0]; f.Window.UpdateLayout();
+        var selected = f.List.SelectedItem;
+        var state = ScrollAppendRequest(f.Viewer);
+        var target = ScrollAppendTarget(state); var started = Smooth016Started(f.Viewer);
+        var origin = f.Viewer.VerticalOffset; var extent = f.Viewer.ExtentHeight; var extentChanges = 0;
+        ScrollChangedEventHandler changed = (_, args) =>
+        { if (ReferenceEquals(args.OriginalSource, f.Viewer) && args.ExtentHeightChange > 0) extentChanges++; };
+        f.Viewer.ScrollChanged += changed;
+        try
+        {
+            for (var i = 200; i < 300; i++) f.Rows.Add(ScrollAppendRow(i));
+            f.Window.UpdateLayout();
+            Assert(extentChanges > 0 && f.Viewer.ExtentHeight > extent, "append did not refine the actual virtualized viewport extent");
+            Assert(SmoothScroll.IsAnimating(f.Viewer) && Smooth016Started(f.Viewer) == started
+                && ScrollAppendTarget(state) == target && target > f.Viewer.VerticalOffset,
+                "tail append canceled or restarted the remaining wheel target");
+            Assert(f.Viewer.VerticalOffset == origin && ReferenceEquals(f.List.SelectedItem, selected),
+                "tail append moved the resting anchor or replaced the selected row");
+
+            // Replacing the request must detach its previous event handler.
+            ScrollAppendInvoke(state, "RequestOffset", f.Viewer.VerticalOffset);
+            ScrollAppendInvoke(state, "RequestOffset", f.Viewer.VerticalOffset);
+            f.Rows.Add(ScrollAppendRow(300)); f.Window.UpdateLayout();
+            Assert(SmoothScroll.IsAnimating(f.Viewer) && ScrollAppendField<int>(state, "_requestExpectedItemCount") == 301,
+                "a superseded request retained a duplicate collection subscription");
+            SmoothScroll.CancelAnimation(f.Viewer);
+            var detachedCount = ScrollAppendField<int>(state, "_requestExpectedItemCount");
+            f.Rows.Add(ScrollAppendRow(301)); f.Window.UpdateLayout();
+            Assert(ScrollAppendField<object?>(state, "_requestNotifications") is null
+                && ScrollAppendField<int>(state, "_requestExpectedItemCount") == detachedCount && !SmoothScroll.IsAnimating(f.Viewer),
+                "canceled request retained collection updates or restarted motion");
+            File.WriteAllText(Path.Combine(_directory, "scroll0311-tail-append.json"), JsonSerializer.Serialize(new
+            {
+                initialRows = 200, appendedRows = 100, extentChanges, origin, target, started,
+                remainingTarget = target - origin, selectedIdentityPreserved = true,
+                newRequestReplacedSubscription = true, canceledRequestDetached = true,
+                method = "Actual pixel-virtualized ListBox and ScrollState request/acknowledgement; the controller is seeded synchronously before a rendering tick, so assertions also run under reduced motion without mouse or display timing."
+            }));
+        }
+        finally { f.Viewer.ScrollChanged -= changed; SmoothScroll.CancelAnimation(f.Viewer); }
+    }
+
+    private static async Task ScrollAppendOwnership()
+    {
+        var facts = new List<object>();
+        foreach (var mode in new[] { "replacement", "reorder", "sorted-insert", "source-swap", "remove", "reset", "missing-anchor", "external-offset" })
+        {
+            using var f = await ScrollAppendFixture.Create();
+            var state = ScrollAppendRequest(f.Viewer); var target = ScrollAppendTarget(state);
+            var origin = f.Viewer.VerticalOffset;
+            switch (mode)
+            {
+                case "replacement": f.Rows[0] = ScrollAppendRow(0); break; // Same ID, different identity.
+                case "reorder": f.Rows.Move(0, 1); break;
+                case "sorted-insert": f.Rows.Insert(0, ScrollAppendRow(1000)); break;
+                case "source-swap": f.List.ItemsSource = new ObservableCollection<TrackRow>(f.Rows); break;
+                case "remove": f.Rows.RemoveAt(0); break;
+                case "reset": f.Rows.Clear(); break;
+                case "missing-anchor": ((System.Collections.IList)ScrollAppendField<object>(state, "_requestAnchors")).Clear(); break;
+                case "external-offset": f.Viewer.ScrollToVerticalOffset(200); break;
+            }
+            // Growth cannot turn a preceding mutation or external move into our acknowledgement.
+            for (var i = 200; i < 300; i++) f.Rows.Add(ScrollAppendRow(i));
+            f.Window.UpdateLayout();
+            Assert(!SmoothScroll.IsAnimating(f.Viewer), mode + " was accepted as an anchored tail-append acknowledgement");
+            if (mode == "external-offset")
+                Assert(f.Viewer.VerticalOffset > origin && Math.Abs(f.Viewer.VerticalOffset - 200) <= 1,
+                    "external-offset fixture did not apply its native destination");
+            Assert(ScrollAppendField<object?>(state, "_requestNotifications") is null,
+                mode + " retained a canceled request's collection subscription");
+            facts.Add(new { mode, origin, target, finalOffset = f.Viewer.VerticalOffset, canceled = true, detached = true });
+        }
+        File.WriteAllText(Path.Combine(_directory, "scroll0311-append-ownership.json"), JsonSerializer.Serialize(facts));
+    }
+
+    private static object ScrollAppendRequest(ScrollViewer viewer)
+    {
+        var state = Smooth016State(viewer);
+        // Exercise the same request/acknowledgement controller used by a wheel
+        // trajectory, independent of hardware animation and rendering cadence.
+        ScrollAppendInvoke(state, "AnimateTo", viewer.VerticalOffset + 180);
+        state.GetType().GetField("_programmatic", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(state, false);
+        ScrollAppendInvoke(state, "RequestOffset", viewer.VerticalOffset);
+        Assert(SmoothScroll.IsAnimating(viewer) && ScrollAppendField<object?>(state, "_requestNotifications") is not null,
+            "controller fixture did not establish an active anchored request");
+        return state;
+    }
+    private static T ScrollAppendField<T>(object state, string name)
+        => (T)state.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(state)!;
+    private static double ScrollAppendTarget(object state)
+        => (double)state.GetType().GetProperty("TargetOffset", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(state)!;
+    private static void ScrollAppendInvoke(object state, string name, double value)
+        => state.GetType().GetMethod(name, BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(state, [value]);
+    private static TrackRow ScrollAppendRow(int index) => new()
+    { Id = "append-" + index, RequestId = "append-" + index + ":1", Title = "Append " + index, Available = true };
+
+    private sealed class ScrollAppendFixture : IDisposable
+    {
+        internal ObservableCollection<TrackRow> Rows { get; } = new(Enumerable.Range(0, 200).Select(ScrollAppendRow));
+        internal ListBox List { get; }
+        internal Window Window { get; }
+        internal ScrollViewer Viewer { get; private set; } = null!;
+        private ScrollAppendFixture()
+        {
+            var style = new Style(typeof(ListBoxItem)); style.Setters.Add(new Setter(FrameworkElement.HeightProperty, 36d));
+            List = new ListBox { ItemsSource = Rows, DisplayMemberPath = nameof(TrackRow.Title), ItemContainerStyle = style };
+            ScrollViewer.SetCanContentScroll(List, true);
+            ScrollViewer.SetHorizontalScrollBarVisibility(List, ScrollBarVisibility.Disabled);
+            VirtualizingPanel.SetIsVirtualizing(List, true); VirtualizingPanel.SetScrollUnit(List, ScrollUnit.Pixel);
+            VirtualizingPanel.SetVirtualizationMode(List, VirtualizationMode.Recycling); SmoothScroll.SetEnabled(List, true);
+            Window = new Window { Content = List, Width = 500, Height = 400, Left = -16000, Top = 0,
+                ShowActivated = false, ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.Manual };
+        }
+        internal static async Task<ScrollAppendFixture> Create()
+        {
+            var fixture = new ScrollAppendFixture();
+            try
+            {
+                fixture.Window.Show(); await Task.Delay(60); fixture.Window.UpdateLayout();
+                fixture.Viewer = SaVisuals<ScrollViewer>(fixture.List).First();
+                Assert(fixture.Viewer.ScrollableHeight > 1000 && SaVisuals<ListBoxItem>(fixture.List).Any(),
+                    "append fixture did not realize its virtualized viewport");
+                return fixture;
+            }
+            catch { fixture.Dispose(); throw; }
+        }
+        public void Dispose() => Window.Close();
     }
 
     private static async Task ScrollCollectionMeasurement()
