@@ -192,6 +192,8 @@ public partial class MainWindow : Window
         {
             if (_account is not null) SuspendDownloadQueueForAccountChange();
             ClearPlaybackContext(clearView: true);
+            ResetFavoritesCacheAccount();
+            _favoritesAccountUid = account.Uid;
         }
         _session = session;
         _account = account;
@@ -245,74 +247,14 @@ public partial class MainWindow : Window
         if (_section == "home") await LoadHomeAsync();
         else if (_section == "wave") await StartWaveViewAsync(true);
         else if (_section == "offline") ShowOffline();
-        else if (!await RefreshCatalogViewAsync()) await RefreshLibraryAsync();
-    }
-
-    internal async Task RefreshLibraryAsync()
-    {
-        if (_account is null || _closed) return;
-        BeginFavoritesRefresh();
-        _libraryCts?.Cancel();
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-        _libraryCts = cts;
-        var removedDuringRefresh = _libraryRemovedLikes = new HashSet<string>(StringComparer.Ordinal);
-        var clock = Stopwatch.StartNew();
-        Busy(true);
-        RefreshButton.IsEnabled = false;
-        _diagnostics.Stage = _player.IsPlaying ? "playing_library_loading" : "library_loading";
-        try
-        {
-            var uid = _account.Uid;
-            var session = await EnsureSessionAsync(cts.Token);
-            SetStatus("Получаем список избранного…");
-            var ids = await _api.GetLikedIdsAsync(session, uid, cts.Token);
-            cts.Token.ThrowIfCancellationRequested();
-            _favoriteTrackIds.Clear();
-            _favoriteTrackIds.UnionWith(ids.Where(id => !removedDuringRefresh.Contains(id.Id)).Select(id => id.Id));
-            _favoriteIdsKnown = true;
-            UpdatePlayerLikeState();
-            _favoritesCache.Clear();
-            if (_section == "favorites") _tracks.Clear();
-            _diagnostics.TotalTracks = ids.Count(id => !removedDuringRefresh.Contains(id.Id));
-            _diagnostics.LoadedTracks = 0;
-            UpdateCount();
-            for (var offset = 0; offset < ids.Count; offset += 100)
-            {
-                var batch = ids.Skip(offset).Take(100).ToArray();
-                var rows = await _api.GetTracksAsync(session, batch, offset, cts.Token);
-                cts.Token.ThrowIfCancellationRequested();
-                ApplyOfflineStates(rows);
-                foreach (var row in rows.Where(row => !removedDuringRefresh.Contains(row.Id))) { row.IsPlaying = _player.HasSource && _current?.RequestId == row.RequestId; _favoritesCache.Add(row); if (_section == "favorites") _tracks.Add(row); }
-                _diagnostics.LoadedTracks = _favoritesCache.Count;
-                if (offset == 0) _diagnostics.Timing("favorites_first_batch_ms", clock.Elapsed.TotalMilliseconds);
-                if (_section == "favorites") SetStatus($"Загружено {_favoritesCache.Count:N0} из {ids.Count:N0} треков…");
-                UpdateCount();
-            }
-            _diagnostics.Timing("favorites_all_ms", clock.Elapsed.TotalMilliseconds);
-            _diagnostics.Stage = _player.IsPlaying ? "playing" : "library_ready";
-            if (_section == "favorites") SetStatus($"Избранное загружено · {_favoritesCache.Count:N0} треков · {clock.Elapsed.TotalSeconds:F2} с");
-            UpdateCount();
-            if (_section == "favorites") PlaybackContextViewShown();
-            ScheduleAutoFavoritesDownloads();
-        }
-        catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
-        catch (Exception ex)
-        {
-            _diagnostics.Stage = "library_partial_or_error";
-            ShowError(ex, $"Загружено {_favoritesCache.Count:N0} из {_diagnostics.TotalTracks:N0}. ");
-        }
-        finally
-        {
-            if (ReferenceEquals(_libraryCts, cts)) { _libraryCts = null; _libraryRemovedLikes = null; RefreshButton.IsEnabled = true; }
-            cts.Dispose();
-            Busy(false);
-        }
+        else if (!await RefreshCatalogViewAsync()) await RefreshLibraryAsync(refreshMetadata: true);
     }
 
     private void Logout_Click(object sender, RoutedEventArgs e) => SignOut();
     internal void SignOut()
     {
         ClearPlaybackContext(clearView: true);
+        ResetFavoritesCacheAccount();
         SuspendDownloadQueueForAccountChange();
         var playbackCleared = ClearPlaybackState();
         ResetFeatures();

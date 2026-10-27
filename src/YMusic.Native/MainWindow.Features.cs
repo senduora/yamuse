@@ -89,7 +89,9 @@ public partial class MainWindow
         FilterBox.IsEnabled = _session is not null || _section == "offline" || _demo;
         PlaySelectionButton.Content = "▶  Слушать";
         var snapshot = rows.ToArray();
-        ApplyOfflineStates(snapshot);
+        if (_section == "favorites" && _libraryCts is not null)
+        { ApplyTrackLikeStates(snapshot); if (snapshot.Length > 0) QueueOfflineMarks(snapshot); }
+        else ApplyOfflineStates(snapshot);
         foreach (var row in snapshot) row.IsPlaying = _player.HasSource && _current?.RequestId == row.RequestId;
         _updatingTrackRows = true;
         try

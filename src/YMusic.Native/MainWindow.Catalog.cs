@@ -248,6 +248,7 @@ public partial class MainWindow
     }
     private void ApplyConfirmedTrackLike(TrackRow row, bool liked, bool showStatus = true)
     {
+        _favoritesLikeRevision++;
         if (liked) _favoriteTrackIds.Add(row.Id);
         else
         {
@@ -265,6 +266,7 @@ public partial class MainWindow
         if (_account?.Uid == _downloadQueueAccountUid && _accountGeneration == _downloadQueueAccountGeneration)
         { _downloadQueue.SetCollectionLike(row.Id, liked); RefreshDownloadCenter(); }
         if (showStatus) SetStatus(liked ? "Трек добавлен в избранное" : "Трек убран из избранного");
+        PersistFavoritesCache();
         if (liked) _ = RefreshLibraryAsync();
     }
     private async void CreatePlaylist_Click(object sender, RoutedEventArgs e)

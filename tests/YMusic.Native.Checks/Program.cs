@@ -92,6 +92,8 @@ internal static partial class Program
 
     private static async Task CheckAll(bool online)
     {
+        await CheckFavoritesCacheStore();
+        await CheckFavoritesCache();
         await CheckQueueEditing();
         await CheckPlaybackOptions();
         await CheckDownloadRestore();

@@ -52,10 +52,16 @@ public partial class MainWindow
         DownloadPlaylistButton.Visibility = Visibility.Visible;
         DownloadPlaylistButton.IsEnabled = !_offlineMaintenance && _downloadCts is null && _session is not null && (!favorites || _favoritesSnapshotReady);
         if (RefreshCompactDownloadAction()) return;
+        if (favorites && _libraryCts is not null && !_favoritesSnapshotReady)
+        {
+            DownloadPlaylistButton.Content = "↓ Скачать Мне нравится целиком";
+            PlaylistDownloadText.Text = "Обновляем список избранного…";
+            return;
+        }
         try
         {
             var title = favorites ? "Мне нравится" : "плейлист";
-            var state = playlist.Tracks.Count > BackgroundOfflineThreshold
+            var state = playlist.Tracks.Count > BackgroundOfflineThreshold || favorites && _libraryCts is not null
                 ? LargePlaylistStatus(playlist) : _offline.GetPlaylistStatus(playlist.Owner, playlist.Kind, playlist.Tracks);
             if (state is null)
             {
