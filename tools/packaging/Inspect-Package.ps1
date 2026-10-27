@@ -47,6 +47,28 @@ function Get-ZipEntrySha256($Entry) {
     try { return [BitConverter]::ToString($algorithm.ComputeHash($entryStream)).Replace('-','') }
     finally { $algorithm.Dispose(); $entryStream.Dispose() }
 }
+function Get-UniqueZipEntry($Archive, [string]$RelativePath) {
+    $entries = @($Archive.Entries | Where-Object { $_.FullName -cmatch ('(^|/)' + [regex]::Escape($RelativePath) + '$') })
+    if ($entries.Count -ne 1) { throw "Expected exactly one packaged file: $RelativePath" }
+    return $entries[0]
+}
+$runtimeVersion = '10.0.14'
+$runtimeConfig = Get-Content -LiteralPath (Join-Path $referencePath 'YMusic.Native.runtimeconfig.json') -Raw | ConvertFrom-Json
+if ($runtimeConfig.runtimeOptions.tfm -cne 'net10.0') { throw 'Reference publish must target .NET 10.' }
+foreach ($framework in @('Microsoft.NETCore.App','Microsoft.WindowsDesktop.App')) {
+    $included = @($runtimeConfig.runtimeOptions.includedFrameworks | Where-Object { $_.name -ceq $framework })
+    if ($included.Count -ne 1 -or $included[0].version -cne $runtimeVersion) { throw "Expected exactly one pinned $framework $runtimeVersion runtime." }
+}
+# Exact binary hashes from the signed 10.0.14 runtime nupkg entries. A changed
+# runtimeconfig alone must never relabel older runtime binaries as .NET 10.
+$runtimeProofHashes = @{
+    'coreclr.dll'='1BC65B8D45474B19ADF3CA85CE881087AFF599FFC72B2C1A323E878227757B65'
+    'PresentationFramework.dll'='15EC7AC7EAECDEABF3BFB378711F2C45BCD8A59D77BCD8254B9E90B776385189'
+    'YMusic.Native.runtimeconfig.json'=(Get-FileHash -LiteralPath (Join-Path $referencePath 'YMusic.Native.runtimeconfig.json') -Algorithm SHA256).Hash
+}
+foreach ($file in $runtimeProofHashes.Keys) {
+    if ((Get-FileHash -LiteralPath (Join-Path $referencePath $file) -Algorithm SHA256).Hash -ne $runtimeProofHashes[$file]) { throw "Reference publish differs from the pinned runtime: $file" }
+}
 $archive = [IO.Compression.ZipFile]::OpenRead($package.FullName)
 try {
     $nuspec = $archive.Entries | Where-Object { $_.FullName -like '*.nuspec' } | Select-Object -First 1
@@ -72,7 +94,7 @@ try {
     $noticeHashes = @{
         'Velopack-LICENSE.txt'='91845DB83551C877EBBB1118E0FB92E4E527290D23B995C55DCD438B3293943F'
         'Microsoft.NETCore-LICENSE.txt'='D7A68596AB69B06F51CA278A6545148E4269A9381C26D597C13DF5D88E08CF5B'
-        'Microsoft.NETCore-THIRD-PARTY-NOTICES.txt'='B60B2912DA28EAA6518593C9E2EFB5334EE062D3C42E80D8FDFA806B3DC52977'
+        'Microsoft.NETCore-THIRD-PARTY-NOTICES.txt'='6D15E10A101C6BFFF2AB4429ED061BF76C456FC4B23AD6B03E0D0F8377148A21'
         'Microsoft.WindowsDesktop-LICENSE.txt'='A89886665765362EB77E0F8E26602C924520041D1711B2EEDC136434FE4D01AB'
         'Third-Party-Notices.txt'=$ExpectedProjectNoticesSha256
         'Yamuse-LICENSE.txt'=$ExpectedProjectLicenseSha256
@@ -82,11 +104,30 @@ try {
         if (!$noticeEntry) { throw "Required third-party notice missing: $notice" }
         if ((Get-ZipEntrySha256 $noticeEntry) -ne $noticeHashes[$notice]) { throw "Third-party notice differs from the verified source: $notice" }
     }
+    foreach ($file in $runtimeProofHashes.Keys) {
+        $runtimeEntry = Get-UniqueZipEntry $archive $file
+        if ((Get-ZipEntrySha256 $runtimeEntry) -ne $runtimeProofHashes[$file]) { throw "Packaged runtime differs from the pinned publish: $file" }
+    }
     $productHash = Get-ZipEntrySha256 $productEntry
     if ($ExpectedProductSha256 -and $productHash -ne $ExpectedProductSha256) { throw 'Packaged product DLL differs from the checked publish SHA-256.' }
+    if ($productHash -ne (Get-FileHash -LiteralPath (Join-Path $referencePath 'YMusic.Native.dll') -Algorithm SHA256).Hash) { throw 'Packaged product DLL differs from the reference publish.' }
     $nuspecText = $metadata.OuterXml
     $inventory = @($archive.Entries | ForEach-Object { [pscustomobject]@{name=$_.FullName;bytes=$_.Length} })
 } finally { $archive.Dispose() }
+$portableHashes = @{
+    'YMusic.Native.dll'=$productHash
+    'YMusic.Native.exe'=$mainExeHash
+    'Assets/Yamuse.ico'=$ExpectedIconSha256
+}
+foreach ($file in $runtimeProofHashes.Keys) { $portableHashes[$file] = $runtimeProofHashes[$file] }
+foreach ($notice in $noticeHashes.Keys) { $portableHashes[('Legal/' + $notice)] = $noticeHashes[$notice] }
+$portableArchive = [IO.Compression.ZipFile]::OpenRead((Join-Path $outputPath 'Yamuse-win-Portable.zip'))
+try {
+    foreach ($file in $portableHashes.Keys) {
+        $entry = Get-UniqueZipEntry $portableArchive $file
+        if ((Get-ZipEntrySha256 $entry) -ne $portableHashes[$file]) { throw "Portable file differs from the verified full package: $file" }
+    }
+} finally { $portableArchive.Dispose() }
 
 # LoadLibraryEx with DATAFILE reads PE resources only; it cannot execute Setup.
 if (!('PackagingManifestReader' -as [type])) {
@@ -209,6 +250,7 @@ $evidence = [pscustomobject]@{
     product='Yamuse'; authors='senduora'; projectLicenseSha256=$ExpectedProjectLicenseSha256; iconSha256=$ExpectedIconSha256;
     mainExecutableSha256=$mainExeHash; mainExecutableProduct=$mainExeInfo.ProductName; executableIconMatches=$executableIconMatches; setupIconMatches=$setupIconMatches; iconFrameSizes=[YamuseIconVerifier]::FrameSizes($sourceIcon);
     setupEmbedsVerifiedNupkg=$true; setupPackageOffset=$payloadOffset; setupEmbeddedNupkgSha256=$setupPayloadHash;
+    runtime=$runtimeVersion; runtimeFilesSha256=$runtimeProofHashes; portableMatchesVerifiedFiles=$true;
     setupFileVersion=$setup.VersionInfo.FileVersion; setupProduct=$setup.VersionInfo.ProductName;
     setupExecutionLevel='asInvoker'; setupExecuted=$false;
     setupSignature=(Get-AuthenticodeSignature -LiteralPath $setup.FullName).Status.ToString();

@@ -1,2 +1,4 @@
 # Preserve the exact pinned license bytes, including each upstream's line endings.
-tools/packaging/licenses/*.txt -text
+tools/packaging/licenses/*.txt -text -whitespace
+# NuGet lock files retain their existing Windows line endings.
+**/packages.lock.json whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

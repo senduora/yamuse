@@ -23,10 +23,12 @@ public partial class MainWindow
     private void CapturePlaybackContext()
     {
         ClearPlaybackContext();
-        if (_catalogShowing || _section is not ("playlist-detail" or "favorites" or "album-detail")) return;
+        if (_catalogShowing || _section is not ("playlist-detail" or "favorites" or "album-detail" or "smart-playlist-detail" or "quick-access-detail")) return;
         var snapshot = CaptureBrowseView();
         if (snapshot.Section == "playlist-detail" && snapshot.Playlist is null
             || snapshot.Section == "album-detail" && snapshot.Album is null && snapshot.Opened?.Kind != "album") return;
+        if (snapshot.Section == "smart-playlist-detail" && snapshot.Opened?.Kind != "smart"
+            || snapshot.Section == "quick-access-detail" && snapshot.Opened?.Kind != "quick") return;
         // Playlist/album containers can come from mutable service caches. Keep
         // this launch's full source list even when its queue is filtered/sorted.
         if (snapshot.Playlist is { } playlist)
@@ -76,6 +78,8 @@ public partial class MainWindow
                 && source.Owner == shown.Owner && source.Kind == shown.Kind,
             "album-detail" => (_playbackContext.Album?.Id ?? _playbackContext.Opened?.Id) is { } id
                 && id == (_activeAlbumDetails?.Id ?? (_openedCatalogItem?.Kind == "album" ? _openedCatalogItem.Id : null)),
+            "smart-playlist-detail" => _playbackContext.Opened is { Kind: "smart" } smart && _openedCatalogItem is { Kind: "smart" } shown && smart.Id == shown.Id,
+            "quick-access-detail" => _playbackContext.Opened is { Kind: "quick" } quick && _openedCatalogItem is { Kind: "quick" } shown && quick.Id == shown.Id,
             _ => false
         };
     }

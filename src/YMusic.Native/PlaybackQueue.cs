@@ -4,7 +4,7 @@ internal enum RepeatMode { Off, All, One }
 
 // An in-memory navigation model. Own it on the WPF dispatcher; it does not play audio,
 // change TrackRow.IsPlaying, persist data, or send listening/feedback requests.
-internal sealed class PlaybackQueue
+internal sealed partial class PlaybackQueue
 {
     private sealed record Entry(long Token, TrackRow Track);
     private readonly Random _random;
@@ -73,6 +73,7 @@ internal sealed class PlaybackQueue
         var selectedIndex = selected is null ? 0 : Array.FindIndex(rows, row => ReferenceEquals(row, selected));
         if (selected is not null && selectedIndex < 0)
             throw new ArgumentException("Выбранного экземпляра трека нет в новой очереди.", nameof(selected));
+        _removalUndo = null;
         _entries.Clear();
         _presentTokens.Clear();
         _past.Clear();
@@ -96,6 +97,7 @@ internal sealed class PlaybackQueue
         var rows = Materialize(tracks);
         if (currentIndex < -1 || currentIndex >= rows.Length) throw new ArgumentOutOfRangeException(nameof(currentIndex));
         if (!Enum.IsDefined(repeat)) throw new ArgumentOutOfRangeException(nameof(repeat));
+        _removalUndo = null;
         _entries.Clear(); _presentTokens.Clear(); _past.Clear(); _future.Clear();
         _shuffleBag.Clear(); _playNext.Clear(); _cycleVisited.Clear();
         foreach (var row in rows) _entries.Add(NewEntry(row));
@@ -163,6 +165,7 @@ internal sealed class PlaybackQueue
     public TrackRow? RemoveAt(int index)
     {
         ValidateIndex(index);
+        _removalUndo = null;
         var removed = _entries[index];
         var wasCurrent = ReferenceEquals(removed, _current);
         _entries.RemoveAt(index);

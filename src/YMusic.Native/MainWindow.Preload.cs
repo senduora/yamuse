@@ -21,7 +21,7 @@ public partial class MainWindow
 
     private void RefreshNextPreparation()
     {
-        if (_closed || _loadingStream || !_player.HasSource || _current is null || _offlineMaintenance)
+        if (_closed || _loadingStream || !_player.HasSource || _current is null || _offlineMaintenance || !CanAutoAdvancePlaybackOptions())
         { CancelNextPreparation(); return; }
         if (_advancingPlayback || _advancingWave) return;
         // Obtain another server batch while there is still music to play. This
@@ -129,7 +129,7 @@ public partial class MainWindow
 
     private void TryAutomaticTransition()
     {
-        if (_closed || _loadingStream || _advancingPlayback || !_player.IsPlaying
+        if (_closed || _loadingStream || _advancingPlayback || !_player.IsPlaying || !CanAutoAdvancePlaybackOptions()
             || _seekDragging || _expandedSeekDragging || _shell?.IsSeeking == true || _pendingSeek is not null) return;
         var duration = _player.Duration.TotalSeconds;
         var remaining = (duration - _player.Position.TotalSeconds) / _player.SpeedRatio;

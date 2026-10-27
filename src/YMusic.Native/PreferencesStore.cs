@@ -16,6 +16,7 @@ internal sealed record PlayerPreferences
     public int ConcurrentDownloads { get; init; } = DefaultConcurrentDownloads;
     public double CrossfadeSeconds { get; init; } = 3;
     public bool NormalizeVolume { get; init; }
+    public string OutputDeviceId { get; init; } = "";
     public bool AccentFromCover { get; init; } = true;
     public string StaticAccentColor { get; init; } = "#E7BB59";
     [JsonConverter(typeof(ThemeModeConverter))]
@@ -109,6 +110,7 @@ internal sealed class PreferencesStore
             PlaybackSpeed = double.IsFinite(preferences.PlaybackSpeed) ? Math.Clamp(preferences.PlaybackSpeed, 0.5, 2) : 1,
             ConcurrentDownloads = Math.Clamp(preferences.ConcurrentDownloads, 1, 10),
             CrossfadeSeconds = double.IsFinite(preferences.CrossfadeSeconds) ? Math.Clamp(preferences.CrossfadeSeconds, 0, 10) : 3,
+            OutputDeviceId = NormalizeOutputDeviceId(preferences.OutputDeviceId),
             StaticAccentColor = IsAccentColor(preferences.StaticAccentColor) ? preferences.StaticAccentColor.ToUpperInvariant() : "#E7BB59",
             Theme = NormalizeTheme(preferences.Theme)
         };
@@ -116,6 +118,9 @@ internal sealed class PreferencesStore
 
     internal static bool IsAccentColor(string? value) => value is { Length: 7 } && value[0] == '#'
         && value.AsSpan(1).IndexOfAnyExcept("0123456789abcdefABCDEF") < 0;
+
+    internal static string NormalizeOutputDeviceId(string? value) => value is { Length: > 0 and <= 2048 }
+        && !value.Any(char.IsControl) ? value : "";
 
     internal static string NormalizeTheme(string? value) => string.Equals(value, "Light", StringComparison.OrdinalIgnoreCase) ? "Light"
         : string.Equals(value, "Dark", StringComparison.OrdinalIgnoreCase) ? "Dark" : "System";

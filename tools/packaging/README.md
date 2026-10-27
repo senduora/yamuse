@@ -1,26 +1,26 @@
 # Локальная упаковка Windows x64
 
-Приложение использует **Velopack 1.2.161**, стабильный NuGet/vpk от 29.09.2026, лицензия MIT. Прямая зависимость закреплена точным диапазоном `[1.2.161]`, `src/YMusic.Native/packages.lock.json` содержит contentHash. `dotnet-tools.json` фиксирует ту же версию CLI. Для self-contained сборки закреплены .NET Core и Windows Desktop **8.0.32** от 13.10.2026; локально проверено с SDK **8.0.301**.
+Приложение использует **Velopack 1.2.161**, стабильный NuGet/vpk от 29.09.2026, лицензия MIT. Прямая зависимость закреплена точным диапазоном `[1.2.161]`, `src/YMusic.Native/packages.lock.json` содержит contentHash. `dotnet-tools.json` фиксирует ту же версию CLI. Для self-contained сборки закреплены .NET Core и Windows Desktop **10.0.14**; SDK **10.0.403** закреплён в global.json, Windows projection — **10.0.19041.57**.
 
 Публичный источник настроен на [senduora/yamuse](https://github.com/senduora/yamuse). `update-feed.json` копируется в выход сборки и publish через csproj; PAT, секретов, фонового процесса и собственного механизма замены exe нет. Проверка публичного выпуска и загрузка его пакета сверяются с опубликованными Release assets и SHA-256.
 
 ## Сборка
 
-Новые версии следуют [политике `X.Y.Z`](../../docs/VERSIONING.md): `X` — крупное обновление, `Y` — новые небольшие возможности, `Z` — исправления. Стабильная версия для сборки — `0.4.2`. Полная `InformationalVersion` обязательна при проверке пакета: числовая `AssemblyVersion` равна `0.4.2.0` и не отличает preview от стабильной версии. Скрипт принимает только стабильную `X.Y.Z`; до создания рабочих папок и получения инструментов он отклоняет preview-исходники либо несовпадение полной версии готовой DLL. Упаковка preview пока не поддерживается.
+Новые версии следуют [политике `X.Y.Z`](../../docs/VERSIONING.md): `X` — крупное обновление, `Y` — новые небольшие возможности, `Z` — исправления. Стабильная версия для сборки — `0.5.0`. Полная `InformationalVersion` обязательна при проверке пакета: числовая `AssemblyVersion` равна `0.5.0.0` и не отличает preview от стабильной версии. Скрипт принимает только стабильную `X.Y.Z`; до создания рабочих папок и получения инструментов он отклоняет preview-исходники либо несовпадение полной версии готовой DLL. Упаковка preview пока не поддерживается.
 
-Нужны Windows x64, PowerShell и .NET SDK 8. Для окончательного пакета используйте уже проверенный self-contained publish и хеш DLL, прошедшего общие проверки. Указывайте новые пустые папки:
+Нужны Windows x64, PowerShell и .NET SDK 10.0.403. Для локально распакованного SDK передайте `-DotnetPath <полный путь к dotnet.exe>`. Для окончательного пакета используйте уже проверенный self-contained publish и хеш DLL, прошедшего общие проверки. Указывайте новые пустые папки:
 
 ```powershell
 & .\tools\packaging\Pack-Installer.ps1 `
-  -Version 0.4.2 `
-  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.4.2') `
-  -WorkFolder (Join-Path $PWD 'work\package-0.4.2') `
+  -Version 0.5.0 `
+  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.5.0') `
+  -WorkFolder (Join-Path $PWD 'work\package-0.5.0') `
   -PackageCache (Join-Path $PWD 'work\verified-packages') `
   -PublishedFolder $checkedSelfContainedPublish `
   -ExpectedProductSha256 $checkedProductHash
 ```
 
-Без `PublishedFolder` скрипт копирует исходники в отдельный staging, не трогает активный `app`, публикует self-contained WPF `win-x64`, затем вызывает закреплённый `vpk pack`. В staging создаётся RID-specific lock; основная блокировка зависимостей не переписывается. `PinnedRuntime.targets` отделяет версию Windows SDK projection 10.0.19041.31 от .NET runtime 8.0.32 — глобальная настройка RuntimeFrameworkVersion в SDK 8.0.301 иначе ошибочно применяется к обоим. Transitive framework downloads не отключаются: это нужно WPF profile для получения parent runtime pack. ASP.NET 8.0.32 запрашивается SDK в build cache, но не входит в publish этого WPF-приложения; это отдельно проверено холодным restore.
+Без `PublishedFolder` скрипт копирует исходники и global.json в отдельный staging, не трогает активный `app`, публикует self-contained WPF `win-x64`, затем вызывает закреплённый `vpk pack`. В staging создаётся RID-specific lock; основная блокировка зависимостей не переписывается. `PinnedRuntime.targets` задаёт WindowsSdkPackageVersion отдельно: глобальная RuntimeFrameworkVersion несовместима с Windows profile references SDK 10. Transitive framework downloads не отключаются. Итоговые Core и WPF runtime 10.0.14 обязательно сверяются в runtimeconfig; ASP.NET может быть загружен SDK в build cache, но не поставляется WPF-приложением.
 
 `-PublishedFolder <проверенная папка>` упаковывает копию без пересборки. Проверяются assembly version, наличие WPF/CoreCLR и точная версия bundled runtime. `-ExpectedProductSha256` связывает пакет с проверенным DLL; тот же хеш затем сравнивается с DLL внутри full.nupkg. В обеих ветках кладутся согласованный публичный `update-feed.json` и `Legal` notices, без подмены DLL.
 
@@ -60,11 +60,11 @@ CheckForUpdatesAsync в закреплённом SDK не принимает Can
 
 `Inspect-Package.ps1` читает nupkg/nuspec, сравнивает package id/version, размер/SHA-256 Release assets и читает манифест Setup как PE DATAFILE. Дополнительно сверяются product DLL и все шесть license/notice по SHA-256 внутри nupkg, включая `Third-Party-Notices.txt` и собственную MIT-лицензию `Yamuse-LICENSE.txt`. Встроенный полный nupkg внутри unsigned Setup подтверждается его SHA-256. Новый обязательный аргумент `-ReferencePublishedFolder` указывает на тот же проверенный publish: apphost сравнивается побайтово, его ProductName/FileDescription и native icon resources, а также иконка Setup должны соответствовать Yamuse. `Pack-Installer.ps1` передаёт reference и ожидаемые SHA автоматически. Setup не выполняется. Результат — `package-evidence.json`, `package.nuspec.xml`, `setup.manifest.xml`.
 
-`Legal/Velopack-LICENSE.txt` — точный first-party [LICENSE](https://github.com/velopack/velopack/blob/92d6a1c91716729d449034df5c50307dcce39493/LICENSE) commit из nuspec Velopack 1.2.161, с copyright Caelan Sayler/Velopack Ltd. Также поставляются неизменённые NETCore LICENSE/THIRD-PARTY-NOTICES и WindowsDesktop LICENSE из подписанных runtime nupkg 8.0.32. Csproj копирует их в output/publish, packscript — в staging. Эти лицензии относятся к зависимостям; собственный код Yamuse распространяется по лицензии MIT (см. LICENSE).
+`Legal/Velopack-LICENSE.txt` — точный first-party [LICENSE](https://github.com/velopack/velopack/blob/92d6a1c91716729d449034df5c50307dcce39493/LICENSE) commit из nuspec Velopack 1.2.161, с copyright Caelan Sayler/Velopack Ltd. Также поставляются точные NETCore LICENSE/THIRD-PARTY-NOTICES и WindowsDesktop LICENSE из подписанных runtime nupkg 10.0.14. Csproj копирует их в output/publish, packscript — в staging. Эти лицензии относятся к зависимостям; собственный код Yamuse распространяется по лицензии MIT (см. LICENSE). Vendor notices сохраняются побайтно; Git не нормализует их line endings или upstream whitespace. Инспектор сверяет SHA-256.
 
 Установщик smoke не подписан Authenticode (`NotSigned`); NuGet repository signature исходных инструментов не является подписью нашего Setup. Signing certificate не предоставлен и не придумывается. Реальную установку/обновление/удаление и сохранение данных после них нужно проверять отдельно в разрешённом изолированном профиле/VM. Живой профиль и старый открытый клиент в этой работе не менялись.
 
-Официальные источники: [NuGet Velopack 1.2.161](https://www.nuget.org/packages/Velopack/1.2.161), [NuGet vpk 1.2.161](https://www.nuget.org/packages/vpk/1.2.161), [startup и отключение auto-apply](https://docs.velopack.io/integrating/overview), [per-user Setup](https://docs.velopack.io/packaging/installer), [сохранение внешних данных](https://docs.velopack.io/integrating/preserved-files), [ярлыки](https://docs.velopack.io/integrating/shortcuts), [self-contained без framework bootstrap](https://docs.velopack.io/packaging/bootstrapping), [.NET 8 release metadata](https://builds.dotnet.microsoft.com/dotnet/release-metadata/8.0/releases.json).
+Официальные источники: [NuGet Velopack 1.2.161](https://www.nuget.org/packages/Velopack/1.2.161), [NuGet vpk 1.2.161](https://www.nuget.org/packages/vpk/1.2.161), [startup и отключение auto-apply](https://docs.velopack.io/integrating/overview), [per-user Setup](https://docs.velopack.io/packaging/installer), [сохранение внешних данных](https://docs.velopack.io/integrating/preserved-files), [ярлыки](https://docs.velopack.io/integrating/shortcuts), [self-contained без framework bootstrap](https://docs.velopack.io/packaging/bootstrapping), [.NET 10 release metadata](https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json).
 
 ## Описания опубликованных выпусков
 

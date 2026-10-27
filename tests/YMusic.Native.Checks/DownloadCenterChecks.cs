@@ -75,7 +75,8 @@ internal static partial class Program
         Assert(fixture.Library.Read().Count == 4 && fixture.Queue.Entries.All(e => e.State == DownloadEntryState.Completed), "resume did not finish the queue");
         Assert(fixture.Queue.Notice.Contains("Все треки") && !fixture.Queue.Notice.Contains("на паузе"), "completed queue still claims it is paused");
         Assert(fixture.Requests["1"] == 1 && fixture.Requests["2"] == 2 && fixture.Requests["3"] == 2 && fixture.Requests["4"] == 1, "resume downloaded completed files or skipped pending files");
-        Assert(hash.SequenceEqual(System.Security.Cryptography.SHA256.HashData(await File.ReadAllBytesAsync(path))) && !wrongThread, "completed file changed or UI model mutated off dispatcher");
+        var resumedBytes = await File.ReadAllBytesAsync(path);
+        Assert(hash.SequenceEqual(System.Security.Cryptography.SHA256.HashData(resumedBytes)) && !wrongThread, "completed file changed or UI model mutated off dispatcher");
         await Task.Delay(200);
         App.Capture(fixture.Window, Path.Combine(fixture.DirectoryPath, "downloads-completed.png"));
         Assert(!Directory.EnumerateFiles(fixture.BufferPath, "*", SearchOption.AllDirectories).Any(), "pause or resume leaked a streaming buffer");

@@ -47,6 +47,12 @@ internal sealed class DownloadEntry(TrackRow track) : INotifyPropertyChanged
     }
     internal void Complete(long bytes)
     { VerifyAccess(); Bytes = Math.Max(0, bytes); TotalBytes = Bytes > 0 ? Bytes : null; SetState(DownloadEntryState.Completed); }
+    internal void Restore(DownloadEntryState state, long bytes, int attempts, string error, bool removedFromCollection, bool skipFavoritesDownload)
+    {
+        VerifyAccess(); Bytes = Math.Max(0, bytes); TotalBytes = state == DownloadEntryState.Completed && Bytes > 0 ? Bytes : null;
+        Attempts = attempts; RemovedFromCollection = removedFromCollection; SkipFavoritesDownload = skipFavoritesDownload;
+        SetState(state, DownloadFailure.RestorableReason(error));
+    }
     internal void SetCollectionLike(bool liked, bool favoritesBatch)
     { VerifyAccess(); RemovedFromCollection = !liked; SkipFavoritesDownload = !liked && favoritesBatch; Changed(); }
     internal static string FormatBytes(long bytes) => bytes >= 1073741824 ? $"{bytes / 1073741824.0:F2} ГБ" : bytes >= 1048576 ? $"{bytes / 1048576.0:F1} МБ" : bytes >= 1024 ? $"{bytes / 1024.0:F1} КБ" : $"{bytes} Б";
@@ -67,6 +73,7 @@ internal sealed class DownloadQueueState
     public bool Running { get; private set; }
     public bool Suspended { get; private set; }
     public bool FavoritesBatch { get; private set; }
+    internal event Action? StateChanged;
     public bool CanResume => !Running && !Suspended && Entries.Any(e => !e.SkipFavoritesDownload && (e.State is DownloadEntryState.Queued or DownloadEntryState.Paused));
     public bool CanRetry => !Running && !Suspended && Entries.Any(e => !e.SkipFavoritesDownload && e.State == DownloadEntryState.Failed);
     public bool HasPaused => Entries.Any(e => !e.SkipFavoritesDownload && (e.State is DownloadEntryState.Paused or DownloadEntryState.Suspended));
@@ -76,11 +83,32 @@ internal sealed class DownloadQueueState
         VerifyAccess();
         if (Running) throw new InvalidOperationException("A running download queue cannot be replaced.");
         var replaced = Entries.Count > 0;
-        Entries.Clear();
-        foreach (var track in tracks.DistinctBy(t => t.Id, StringComparer.Ordinal)) Entries.Add(new(track));
+        ClearEntries();
+        foreach (var track in tracks.DistinctBy(t => t.Id, StringComparer.Ordinal)) AddEntry(new(track));
         Label = label; Suspended = false; FavoritesBatch = favoritesBatch;
         Notice = replaced ? "Показана новая очередь вместо предыдущей. Сохранённые файлы остаются в скачанном." : "Пауза сохраняет готовые треки. Незавершённый трек при продолжении скачивается заново.";
+        StateChanged?.Invoke();
     }
+    internal void Restore(RestoredDownloadQueue restored)
+    {
+        VerifyAccess();
+        if (Running) throw new InvalidOperationException("A running download queue cannot be restored.");
+        ClearEntries();
+        foreach (var item in restored.Entries)
+        {
+            var entry = new DownloadEntry(item.Track);
+            entry.Restore(item.State, item.Bytes, item.Attempts, item.Error, item.RemovedFromCollection, item.SkipFavoritesDownload);
+            AddEntry(entry);
+        }
+        Label = restored.Label; FavoritesBatch = restored.FavoritesBatch; Suspended = false;
+        Notice = "Очередь восстановлена на паузе. Нажмите «Продолжить»; готовые файлы не скачиваются повторно. Ошибки можно повторить отдельно.";
+        StateChanged?.Invoke();
+    }
+    private void ClearEntries()
+    { foreach (var entry in Entries) entry.PropertyChanged -= EntryChanged; Entries.Clear(); }
+    private void AddEntry(DownloadEntry entry)
+    { Entries.Add(entry); entry.PropertyChanged += EntryChanged; }
+    private void EntryChanged(object? sender, PropertyChangedEventArgs args) => StateChanged?.Invoke();
     internal DownloadEntry[] BeginRun(bool retryFailed)
     {
         VerifyAccess();
@@ -90,6 +118,7 @@ internal sealed class DownloadQueueState
         else if (selected.Any(e => e.State == DownloadEntryState.Paused)) Notice = "Продолжаем очередь. Уже сохранённые треки не скачиваются повторно.";
         foreach (var entry in selected) entry.SetState(DownloadEntryState.Queued);
         Running = selected.Length > 0;
+        StateChanged?.Invoke();
         return selected;
     }
     internal void Pause()
@@ -97,18 +126,21 @@ internal sealed class DownloadQueueState
         VerifyAccess();
         foreach (var entry in Entries.Where(e => e.Active || e.State == DownloadEntryState.Queued)) entry.SetState(DownloadEntryState.Paused);
         Notice = "Очередь на паузе. Нажмите «Продолжить»: сохранённые треки не скачиваются повторно.";
+        StateChanged?.Invoke();
     }
     internal void Suspend()
     {
         VerifyAccess(); Suspended = true;
         foreach (var entry in Entries.Where(e => e.Active || e.State is DownloadEntryState.Queued or DownloadEntryState.Paused)) entry.SetState(DownloadEntryState.Suspended);
         Notice = "Очередь остановлена после выхода или изменения скачанного. Новую загрузку запустите из списка треков.";
+        StateChanged?.Invoke();
     }
     internal void EndRun(bool interrupted)
     {
         VerifyAccess();
         if (interrupted && !Suspended) Pause();
         Running = false;
+        StateChanged?.Invoke();
         if (Suspended) return;
         if (HasPaused) Notice = "Очередь на паузе. Нажмите «Продолжить»: сохранённые треки не скачиваются повторно.";
         else if (Entries.Any(e => e.State == DownloadEntryState.Failed && !e.SkipFavoritesDownload)) Notice = "Загрузка завершена с ошибками. Кнопка «Повторить неудачные» повторит только треки с ошибкой.";
@@ -141,6 +173,28 @@ internal sealed class DownloadProgressSink(Action? changed = null) : IProgress<A
 
 internal static class DownloadFailure
 {
+    private const string UnknownReason = "Не удалось загрузить трек. Повторите; если ошибка сохранится, откройте диагностику.";
+    // A snapshot can only carry reasons authored here, never arbitrary exception
+    // messages, signed audio URLs, credentials or paths from an earlier process.
+    internal static string RestorableReason(string reason) => reason switch
+    {
+        "" or "Вход больше не действует. Войдите заново и запустите загрузку."
+        or "Нет доступа к папке скачанного. Проверьте права и свободное место."
+        or "На диске закончилось свободное место. Освободите место и повторите."
+        or "Не удалось сохранить файл. Проверьте папку скачанного, свободное место и доступ к диску."
+        or "Сервер не ответил вовремя. Проверьте сеть и повторите загрузку."
+        or "Сервер отклонил доступ к аудио. Проверьте вход, подписку и доступность трека."
+        or "Ошибка соединения с сервером. Проверьте сеть и повторите загрузку."
+        or "Не удалось безопасно обновить скачанное. Проверьте папку и индекс библиотеки; файлы сохранены."
+        or "Трек превышает допустимый размер 256 МБ."
+        or "Аудиофайл получен не полностью или не прошёл проверку. Повторите загрузку."
+        or "Сервис не выдал полное аудио. Проверьте вход, подписку и доступность трека."
+        or "Аудиосервер временно отклонил запрос. Повторите загрузку позже."
+        or "Не удалось получить безопасный полный аудиофайл от сервиса. Повторите загрузку позже."
+        or "Трек недоступен в каталоге. Обновите список и проверьте доступность в сервисе."
+        or UnknownReason => reason,
+        _ => UnknownReason
+    };
     // Never show Exception.Message: HTTP errors and paths can contain signed URLs,
     // tokens or private directories. Only locally authored reasons reach the UI.
     internal static string Describe(Exception error) => error switch
@@ -153,7 +207,7 @@ internal static class DownloadFailure
         HttpRequestException { StatusCode: HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden } => "Сервер отклонил доступ к аудио. Проверьте вход, подписку и доступность трека.",
         HttpRequestException => "Ошибка соединения с сервером. Проверьте сеть и повторите загрузку.",
         MusicException music => MusicReason(music.Message),
-        _ => "Не удалось загрузить трек. Повторите; если ошибка сохранится, откройте диагностику."
+        _ => UnknownReason
     };
     private static string MusicReason(string message)
     {
