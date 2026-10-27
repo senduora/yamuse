@@ -74,7 +74,6 @@ public partial class MainWindow
         else if (previous.Playlist is { } playlist) ShowPlaylist(playlist);
         else if (previous.IsCatalog) ShowCatalogItems(previous.Catalog);
         else { ShowRows(previous.Tracks); if (previous.Album is { } album) ShowCollectionHero(album, previous.Title); }
-        RefreshSmartPlaylistView();
         CatalogSearchPanel.Visibility = previous.SearchVisible ? Visibility.Visible : Visibility.Collapsed;
         FilterBox.Text = previous.Filter;
         var list = previous.IsCatalog ? (ListBox)CatalogList : TracksList;

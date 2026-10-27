@@ -78,7 +78,6 @@ public partial class MainWindow : Window
         LoadPreferences();
         InitializePlaybackOptions(audioOutputDevices);
         InitializeQueueEditing();
-        InitializeQuickAccess();
         InitializeSorting();
         InitializePlaybackPersistence();
         InitializeDownloadPersistence();
@@ -192,7 +191,6 @@ public partial class MainWindow : Window
         if (_account?.Uid != account.Uid)
         {
             if (_account is not null) SuspendDownloadQueueForAccountChange();
-            ResetQuickAccessForAccount();
             ClearPlaybackContext(clearView: true);
         }
         _session = session;
@@ -244,7 +242,6 @@ public partial class MainWindow : Window
 
     private async void Refresh_Click(object sender, RoutedEventArgs e)
     {
-        if (RefreshSmartPlaylistView()) return;
         if (_section == "home") await LoadHomeAsync();
         else if (_section == "wave") await StartWaveViewAsync(true);
         else if (_section == "offline") ShowOffline();
@@ -309,14 +306,12 @@ public partial class MainWindow : Window
             if (ReferenceEquals(_libraryCts, cts)) { _libraryCts = null; _libraryRemovedLikes = null; RefreshButton.IsEnabled = true; }
             cts.Dispose();
             Busy(false);
-            RefreshQuickAccessCollection();
         }
     }
 
     private void Logout_Click(object sender, RoutedEventArgs e) => SignOut();
     internal void SignOut()
     {
-        ResetQuickAccessForAccount();
         ClearPlaybackContext(clearView: true);
         SuspendDownloadQueueForAccountChange();
         var playbackCleared = ClearPlaybackState();
@@ -686,7 +681,6 @@ public partial class MainWindow : Window
     }
     private async void Window_KeyDown(object sender, KeyEventArgs e)
     {
-        if (HandleQuickAccessKey(e)) return;
         if (!_closed && !e.Handled && _section == "queue" && e.Key == Key.Z && Keyboard.Modifiers == ModifierKeys.Control
             && !IsPlaybackTextInput(e.OriginalSource as DependencyObject))
         { e.Handled = true; UndoQueueRemoval_Click(sender, e); return; }
@@ -740,7 +734,6 @@ public partial class MainWindow : Window
     {
         SavePlaybackState();
         SaveDownloadQueueForClose();
-        DisposeQuickAccess();
         DisposePlaybackOptions();
         ClearQueueDropLine();
         SuspendDownloadQueueForAccountChange();

@@ -23,7 +23,6 @@ public partial class MainWindow
         InvalidateOfflineViewState();
         ApplyOfflineStates(KnownTrackRows());
         UpdatePlaylistDownloadedStatus();
-        RefreshQuickAccessCollection();
     }
     private Task? _downloadTask;
     private bool _downloadIsAutomatic;
@@ -229,7 +228,6 @@ public partial class MainWindow
                         if (!Volatile.Read(ref transferred)) operation.Exclude(entry);
                         entry.Complete(saved.Bytes);
                         ApplyOfflineStates(KnownTrackRows().Where(row => row.Id == track.Id));
-                        RefreshQuickAccessCollection();
                     }
                     catch (OperationCanceledException) when (cts.IsCancellationRequested) { throw; }
                     catch (Exception ex)

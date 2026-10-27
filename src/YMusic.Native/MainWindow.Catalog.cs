@@ -99,7 +99,7 @@ public partial class MainWindow
             var uid = _account?.Uid ?? throw new OperationCanceledException(token);
             var items = kind == "playlists" ? await _api.GetPlaylistsAsync(session, uid, token)
                 : kind == "albums" ? await _api.GetLikedAlbumsAsync(session, uid, token) : await _api.GetLikedArtistsAsync(session, uid, token);
-            token.ThrowIfCancellationRequested(); QuickAccessCollectionLoaded(kind, items); ShowCatalogItems(items);
+            token.ThrowIfCancellationRequested(); ShowCatalogItems(items);
             if (kind == "playlists") { PlaylistActions.Visibility = Visibility.Visible; CreatePlaylistButton.Visibility = Visibility.Visible; }
             SetStatus($"{title} · {items.Count:N0}");
         });
@@ -163,7 +163,6 @@ public partial class MainWindow
     private void ShowPlaylist(PlaylistDetails details)
     {
         details = PresentPlaylistAuthor(details);
-        QuickAccessPlaylistLoaded(details);
         // A response fills the underlying view while an open Settings draft stays intact.
         ApplySection("playlist-detail", details.Title, closeSettings: false);
         CatalogSearchPanel.Visibility = Visibility.Collapsed;
@@ -266,7 +265,6 @@ public partial class MainWindow
         if (_account?.Uid == _downloadQueueAccountUid && _accountGeneration == _downloadQueueAccountGeneration)
         { _downloadQueue.SetCollectionLike(row.Id, liked); RefreshDownloadCenter(); }
         if (showStatus) SetStatus(liked ? "Трек добавлен в избранное" : "Трек убран из избранного");
-        RefreshQuickAccessCollection();
         if (liked) _ = RefreshLibraryAsync();
     }
     private async void CreatePlaylist_Click(object sender, RoutedEventArgs e)

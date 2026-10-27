@@ -18,6 +18,7 @@ internal static partial class Program
     {
         await Run("PlaybackKeys040: routed F11 toggles the separate fullscreen host and Escape closes it", Pk040Fullscreen);
         await Run("PlaybackKeys040: text password rich text editable combo and modifier keys retain input", Pk040Input);
+        await Run("PlaybackKeys040: retired local search shortcut and smart navigation stay absent", Pk040RetiredLocalSearch);
         await Run("PlaybackKeys040: main and numpad volume clamp persist and mute restores the last nonzero level", Pk040Volume);
         await Run("PlaybackKeys040: routed P Space brackets and media keys use shared asynchronous playback", Pk040Transport);
         await Run("PlaybackKeys040: L captures current track and reuses confirmed account mutation guards", Pk040Like);
@@ -29,6 +30,24 @@ internal static partial class Program
             audio = "private generated WAV at zero volume for transport checks",
             fullscreenClose = "production request route; never-shown surface uses its immediate fallback"
         }, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static Task Pk040RetiredLocalSearch()
+    {
+        using var f = new Pk040Fixture("retired-local-search");
+        f.Account();
+        var navigation = (StackPanel)((ScrollViewer)f.Window.FindName("NavigationScroll")).Content;
+        Assert(navigation.Children.OfType<Button>().All(button => button.Name is not ("QuickAccessNav" or "SmartPlaylistsNav")),
+            "retired feature remained in navigation");
+        Assert(f.Window.FindName("SearchNav") is Button, "normal service search was removed with local search");
+        var windows = Application.Current.Windows.Count;
+        var requests = f.Http.Requests;
+        Assert(!f.Key(Key.K, modifiers: ModifierKeys.Control).Handled, "retired Ctrl K was still consumed");
+        var text = new TextBox { Text = "Поиск" };
+        Assert(!f.Key(Key.K, text, ModifierKeys.Control).Handled && text.Text == "Поиск", "Ctrl K intercepted text input");
+        Assert(Application.Current.Windows.Count == windows && f.Http.Requests == requests && !f.Player.HasSource,
+            "retired shortcut opened a dialog or started network/audio");
+        return Task.CompletedTask;
     }
 
     private static Task Pk040Fullscreen()
