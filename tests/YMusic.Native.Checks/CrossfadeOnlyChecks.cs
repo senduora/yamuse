@@ -42,7 +42,7 @@ internal static partial class Program
         store.Save(imported);var json=File.ReadAllText(store.FilePath);
         using var document = JsonDocument.Parse(json);
         var fields = document.RootElement.EnumerateObject().Select(p => p.Name).OrderBy(n => n).ToArray();
-        Assert(fields.SequenceEqual(new[] { "accentFromCover", "autoDownloadFavorites", "concurrentDownloads", "crossfadeSeconds", "minimizeToTray", "normalizeVolume", "playbackSpeed", "quality", "staticAccentColor", "theme", "updateCheckFrequency", "volume" }), "saved schema differs");
+        Assert(fields.SequenceEqual(new[] { "accentFromCover", "autoDownloadFavorites", "concurrentDownloads", "crossfadeSeconds", "minimizeToTray", "normalizeVolume", "outputDeviceId", "playbackSpeed", "quality", "staticAccentColor", "theme", "updateCheckFrequency", "volume" }), "saved schema differs");
         using var player=new NativePlayer(); Assert(player.CrossfadeSeconds==3,"native default differs");
         player.SetCrossfade(10);
         Assert(!player.TryPlayPrepared(new Uri(Path.Combine(directory,"not-open.wav")),TimeSpan.FromSeconds(10)),"missing next source promoted");

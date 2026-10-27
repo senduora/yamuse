@@ -28,13 +28,13 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Microsoft.Windows.SDK.NET.Ref 10.0.19041.31
+Microsoft.Windows.SDK.NET.Ref 10.0.19041.57
 Runtime projections: Microsoft.Windows.SDK.NET.dll and WinRT.Runtime.dll.
 Copyright Microsoft Corporation. All rights reserved.
 Windows SDK license: https://aka.ms/WinSDKLicenseURL
-Package: https://www.nuget.org/packages/Microsoft.Windows.SDK.NET.Ref/10.0.19041.31
+Package: https://www.nuget.org/packages/Microsoft.Windows.SDK.NET.Ref/10.0.19041.57
 The framework-dependent development build uses the installed .NET Desktop Runtime.
-The Windows x64 installer bundles Microsoft.NETCore.App and Microsoft.WindowsDesktop.App 8.0.32.
+The Windows x64 installer bundles Microsoft.NETCore.App and Microsoft.WindowsDesktop.App 10.0.14.
 The bundled runtime license and notices are included in Legal/.
 
 Velopack 1.2.161 (MIT), installer and update library:

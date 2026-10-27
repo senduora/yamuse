@@ -188,6 +188,7 @@ public partial class MainWindow
         if (_downloadCts is null) return;
         _downloadsAutoSuspended = true; _pendingAutoFavorites = null;
         _downloadQueue.Pause(); _downloadCts.Cancel(); RefreshDownloadCenter();
+        _ = PersistDownloadQueueAsync(force: true);
     }
     private Task ResumeDownloadQueue() => ContinueDownloadQueue(retryFailed: false);
     private Task RetryFailedDownloads() => ContinueDownloadQueue(retryFailed: true);
@@ -199,6 +200,7 @@ public partial class MainWindow
     }
     private void SuspendDownloadQueueForAccountChange()
     {
+        ClearPersistedDownloadQueue();
         _compactDownloadOperation?.Dispose();
         _downloadsAutoSuspended = true; _pendingAutoFavorites = null;
         _downloadQueue.Suspend(); _downloadCts?.Cancel(); RefreshDownloadCenter();

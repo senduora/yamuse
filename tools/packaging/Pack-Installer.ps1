@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory)][string]$WorkFolder,
     [string]$PublishedFolder,
     [string]$PackageCache,
+    [string]$DotnetPath,
     [ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedProductSha256
 )
 $ErrorActionPreference = 'Stop'
@@ -12,8 +13,18 @@ Set-StrictMode -Version Latest
 
 $packId = 'YMusic.Native' # Deliberately different from the existing user-data folder.
 $velopackVersion = '1.2.161'
-$runtimeVersion = '8.0.32'
+$runtimeVersion = '10.0.14'
+$sdkVersion = '10.0.403'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+if ([string]::IsNullOrWhiteSpace($DotnetPath)) {
+    $dotnetExecutable = (Get-Command dotnet -CommandType Application -ErrorAction Stop).Source
+}
+else {
+    $dotnetExecutable = [IO.Path]::GetFullPath($DotnetPath)
+    if (!(Test-Path -LiteralPath $dotnetExecutable -PathType Leaf)) { throw 'DotnetPath must identify an existing dotnet executable.' }
+}
+$actualSdk = (& $dotnetExecutable --version)
+if ($LASTEXITCODE -ne 0 -or $actualSdk.Trim() -cne $sdkVersion) { throw "Packaging requires the pinned .NET SDK $sdkVersion." }
 function Assert-PackageProductVersion([string]$ProductDllPath, [string]$ExpectedVersion) {
     $fullVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($ProductDllPath).ProductVersion
     if ([string]::IsNullOrWhiteSpace($fullVersion) -or $fullVersion.Split('+')[0] -cne $ExpectedVersion) {
@@ -54,7 +65,7 @@ $env:DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'
 $env:NUGET_PACKAGES = Join-Path $workingPath 'nuget'
 
 function Invoke-DotNet([string[]]$Arguments) {
-    & dotnet @Arguments
+    & $dotnetExecutable @Arguments
     if ($LASTEXITCODE -ne 0) { throw "dotnet failed with exit code $LASTEXITCODE." }
 }
 function Get-PinnedPackage([string]$Id, [string]$PackageVersion, [string]$Sha256) {
@@ -70,11 +81,11 @@ function Get-PinnedPackage([string]$Id, [string]$PackageVersion, [string]$Sha256
 $pinnedPackages = @(
     (Get-PinnedPackage 'velopack' $velopackVersion 'D57275692B299751A12EE3E18283B5F7FE3E55339F96B1623345DA095DC484ED'),
     (Get-PinnedPackage 'vpk' $velopackVersion 'AC9BE73846D9A7A76483F8684ABD1503CD50703B992727429DCDC045589C5E08'),
-    (Get-PinnedPackage 'microsoft.netcore.app.runtime.win-x64' $runtimeVersion '4B7AE1688A886CDCE2EAE81822FDE63D15D8E5E8A8B03957D80858E4CFD894C1'),
-    (Get-PinnedPackage 'microsoft.windowsdesktop.app.runtime.win-x64' $runtimeVersion '9DC00EC0A7FB950E794E118993DC322FF97869173185CCA356FE9D11E8D8D6C7'),
-    (Get-PinnedPackage 'microsoft.netcore.app.host.win-x64' $runtimeVersion '32D48BDBCE29EC3C57917CA2AAE2AA5FC71302702780C099B9F122842BCCD789'),
-    (Get-PinnedPackage 'microsoft.windows.sdk.net.ref' '10.0.19041.31' 'A061DAF752588596B99B231CFB49DDA93C0F11617EA63AA0E833DAE42A6C22A5'),
-    (Get-PinnedPackage 'microsoft.aspnetcore.app.runtime.win-x64' $runtimeVersion '45C80DB007781F6A825FC9FE0C288216117187CA92C5064ABEF016F7EF8291A2')
+    (Get-PinnedPackage 'microsoft.netcore.app.runtime.win-x64' $runtimeVersion 'A3EA61B4A2DA6D28E562DD1CDACF80EB4DD6B9727B0A2B47F9D6ABA90DBBCB1F'),
+    (Get-PinnedPackage 'microsoft.windowsdesktop.app.runtime.win-x64' $runtimeVersion 'A6DBA3CA8B8B5B7945399545D881E0AC294746A7571F2209981934D49ECFE8CC'),
+    (Get-PinnedPackage 'microsoft.netcore.app.host.win-x64' $runtimeVersion '2A4547B0E6CF0DD15E723531DAA5450D99D4E151105AEC0D31F2B0C7CFB286DB'),
+    (Get-PinnedPackage 'microsoft.windows.sdk.net.ref' '10.0.19041.57' '90B18F2CF7D7A23F5B0BFE2B86D8DDA45881481F677CE36ECCAF6E9AB50B6B4B'),
+    (Get-PinnedPackage 'microsoft.aspnetcore.app.runtime.win-x64' $runtimeVersion '91638AC8382C437E71C0739A0E3123290F9BF48BCD01E616352A86ADD5571089')
 )
 Invoke-DotNet (@('nuget','verify','--all') + $pinnedPackages + @('--configfile',(Join-Path $PSScriptRoot 'NuGet.Config')))
 $localConfig = Join-Path $workingPath 'LocalFeed.Config'
@@ -82,7 +93,8 @@ $escapedCachePath = [System.Security.SecurityElement]::Escape($cachePath)
 "<configuration><packageSources><clear/><add key=`"verified-local-packages`" value=`"$escapedCachePath`"/></packageSources></configuration>" | Set-Content -LiteralPath $localConfig -Encoding utf8
 $toolPath = Join-Path $workingPath 'vpk'
 Invoke-DotNet @('tool','install','vpk','--version',$velopackVersion,'--tool-path',$toolPath,'--configfile',$localConfig)
-$vpk = Join-Path $toolPath 'vpk.exe'
+$vpk = Join-Path $toolPath '.store/vpk/1.2.161/vpk/1.2.161/tools/net10.0/any/vpk.dll'
+if (!(Test-Path -LiteralPath $vpk -PathType Leaf)) { throw 'The pinned vpk .NET 10 entry point is missing.' }
 
 $stage = Join-Path $workingPath 'publish'
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
@@ -114,10 +126,11 @@ else {
     } | Copy-Item -Destination $sourceStage
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'PinnedRuntime.targets') -Destination (Join-Path $sourceStage 'Directory.Build.targets')
     $project = Join-Path $sourceStage 'YMusic.Native.csproj'
-    Invoke-DotNet @('restore',$project,'--source',$cachePath,'--runtime','win-x64',"-p:RuntimeFrameworkVersion=$runtimeVersion",'-p:SelfContained=true','--force-evaluate')
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'global.json') -Destination (Join-Path $workingPath 'source\global.json')
+    Invoke-DotNet @('restore',$project,'--source',$cachePath,'--runtime','win-x64','-p:SelfContained=true','--force-evaluate')
     # The RID-specific lock is generated only in staging. It is saved as build evidence.
     Invoke-DotNet @('publish',$project,'-c','Release','-r','win-x64','--self-contained','true','--no-restore','-o',$stage,
-        "-p:Version=$Version","-p:RuntimeFrameworkVersion=$runtimeVersion",'-p:PublishSingleFile=false','-p:PublishTrimmed=false','-p:DebugType=embedded')
+        "-p:Version=$Version",'-p:PublishSingleFile=false','-p:PublishTrimmed=false','-p:DebugType=embedded')
     Copy-Item -LiteralPath (Join-Path $sourceStage 'packages.lock.json') -Destination (Join-Path $workingPath 'publish.packages.lock.json')
 }
 $assembly = [Reflection.AssemblyName]::GetAssemblyName((Join-Path $stage 'YMusic.Native.dll'))
@@ -129,8 +142,10 @@ if (!(Test-Path -LiteralPath (Join-Path $stage 'coreclr.dll')) -or !(Test-Path -
     throw 'PublishedFolder must contain the complete self-contained Windows x64 WPF publish.'
 }
 $runtimeConfig = Get-Content -LiteralPath (Join-Path $stage 'YMusic.Native.runtimeconfig.json') -Raw | ConvertFrom-Json
-if (!($runtimeConfig.runtimeOptions.includedFrameworks | Where-Object { $_.name -eq 'Microsoft.NETCore.App' -and $_.version -eq $runtimeVersion })) {
-    throw "Expected the pinned .NET $runtimeVersion runtime."
+if ($runtimeConfig.runtimeOptions.tfm -cne 'net10.0') { throw 'Expected a .NET 10 publish.' }
+foreach ($framework in @('Microsoft.NETCore.App','Microsoft.WindowsDesktop.App')) {
+    $included = @($runtimeConfig.runtimeOptions.includedFrameworks | Where-Object { $_.name -ceq $framework })
+    if ($included.Count -ne 1 -or $included[0].version -cne $runtimeVersion) { throw "Expected exactly one pinned $framework $runtimeVersion runtime." }
 }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'update-feed.json') -Destination (Join-Path $stage 'update-feed.json')
 $legalStage = Join-Path $stage 'Legal'
@@ -151,16 +166,16 @@ $iconHash = (Get-FileHash -LiteralPath $sourceIcon -Algorithm SHA256).Hash
 $stageIcon = Join-Path $stage 'Assets\Yamuse.ico'
 if (!(Test-Path -LiteralPath $stageIcon) -or (Get-FileHash -LiteralPath $stageIcon -Algorithm SHA256).Hash -ne $iconHash) { throw 'Published Yamuse icon is missing or differs from the approved source.' }
 
-# No --framework: .NET 8 is bundled. No --msi: the standard Setup is per-user,
+# No --framework: .NET 10 is bundled. No --msi: the standard Setup is per-user,
 # uses LocalAppData, and requires no administrator elevation.
-& $vpk pack --packId $packId --packVersion $Version --packDir $stage --mainExe 'YMusic.Native.exe' --packTitle 'Yamuse' --packAuthors 'senduora' --icon $stageIcon --runtime win-x64 --channel win --shortcuts 'Desktop,StartMenuRoot' --outputDir $outputPath
+& $dotnetExecutable $vpk pack --packId $packId --packVersion $Version --packDir $stage --mainExe 'YMusic.Native.exe' --packTitle 'Yamuse' --packAuthors 'senduora' --icon $stageIcon --runtime win-x64 --channel win --shortcuts 'Desktop,StartMenuRoot' --outputDir $outputPath
 if ($LASTEXITCODE -ne 0) { throw "vpk pack failed with exit code $LASTEXITCODE." }
 & (Join-Path $PSScriptRoot 'Rename-ReleaseAssets.ps1') -OutputFolder $outputPath -Version $Version | Out-Null
 & (Join-Path $PSScriptRoot 'Inspect-Package.ps1') -OutputFolder $outputPath -ExpectedVersion $Version -ExpectedPackId $packId -ExpectedProductSha256 $productHash -ExpectedProjectNoticesSha256 $projectNoticesHash -ExpectedProjectLicenseSha256 $projectLicenseHash -ExpectedIconSha256 $iconHash -ReferencePublishedFolder $stage
 if (!$?) { throw 'Package inspection failed.' }
 [pscustomobject]@{
     version=$Version; packId=$packId; product='Yamuse'; authors='senduora'; velopack=$velopackVersion; runtime=$runtimeVersion; productDllSha256=$productHash; projectNoticesSha256=$projectNoticesHash; projectLicenseSha256=$projectLicenseHash; iconSha256=$iconHash;
-    sdk=(& dotnet --version); configuration='Self-contained Windows x64, public GitHub feed, explicit apply';
+    sdk=$actualSdk; dotnetPath=$dotnetExecutable; configuration='Self-contained Windows x64, public GitHub feed, explicit apply';
     workFolder=$workingPath; packageSource='https://api.nuget.org/v3/index.json';
     packages=@($pinnedPackages | ForEach-Object { [pscustomobject]@{file=[IO.Path]::GetFileName($_);sha256=(Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash} })
 } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outputPath 'build-provenance.json') -Encoding utf8

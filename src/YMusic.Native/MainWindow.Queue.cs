@@ -12,7 +12,9 @@ public partial class MainWindow
         SetSection("queue", "Очередь воспроизведения"); QueueActions.Visibility = Visibility.Visible;
         ShowRows(_playbackQueue.Items);
         SelectVisibleQueueOccurrence(_playbackQueue.CurrentIndex);
-        SetStatus("Порядок очереди можно менять кнопками выше. Двойной щелчок запускает выбранный трек.");
+        SetStatus(CanDragQueue ? "Перетащите треки для изменения порядка. Ctrl/Shift — несколько треков, Ctrl+Z — вернуть удалённые."
+            : "Перетаскивание доступно в исходном порядке без поиска. Кнопки выше меняют порядок воспроизведения.");
+        UpdateQueueEditingControls();
         if (revealCurrent)
         {
             var view = _viewGeneration; var items = _playbackQueue.Items;
@@ -48,13 +50,18 @@ public partial class MainWindow
         for (var i = 0; i < _queue.Count; i++) if (ReferenceEquals(_queue[i], selected) && --ordinal == 0) return i;
         return -1;
     }
-    private async void RemoveQueue_Click(object sender, RoutedEventArgs e)
+    private async void RemoveQueue_Click(object sender, RoutedEventArgs e) => await RemoveSelectedQueueAsync();
+    private async Task RemoveSelectedQueueAsync()
     {
         if (_section != "queue") return;
-        var index = SelectedQueueIndex(); if (index < 0) return;
-        var removingCurrent = index == _playbackQueue.CurrentIndex;
-        var next = _playbackQueue.RemoveAt(index);
-        ShowQueueCore(revealCurrent: false);
+        var indices = SelectedQueueIndices(); if (indices.Length == 0) return;
+        var removingCurrent = indices.Contains(_playbackQueue.CurrentIndex);
+        var next = WithQueueSelectionViewport(() =>
+        {
+            var replacement = _playbackQueue.RemoveMany(indices);
+            ShowQueueCore(revealCurrent: false);
+            return replacement;
+        });
         if (removingCurrent)
         {
             if (next is not null) await PlayTrackAsync(next);
@@ -66,15 +73,17 @@ public partial class MainWindow
             }
         }
         UpdateControls(); UpdateProgress();
+        SavePlaybackState();
     }
     private void MoveQueueUp_Click(object sender, RoutedEventArgs e) => MoveSelectedQueue(-1);
     private void MoveQueueDown_Click(object sender, RoutedEventArgs e) => MoveSelectedQueue(1);
     private void MoveSelectedQueue(int direction)
     {
         if (_section != "queue") return;
-        var index = SelectedQueueIndex(); var to = index + direction;
-        if (index < 0 || to < 0 || to >= _queue.Count) return;
-        _playbackQueue.Move(index, to); ShowQueueCore(revealCurrent: false); SelectVisibleQueueOccurrence(to); UpdateControls();
+        var indices = SelectedQueueIndices();
+        if (indices.Length == 0 || direction < 0 && indices[0] == 0 || direction > 0 && indices[^1] == _queue.Count - 1) return;
+        var gap = direction < 0 ? indices[0] - 1 : indices[^1] + 2;
+        MoveQueueSelection(indices, gap);
     }
     private void UpdateQueueControls()
     {

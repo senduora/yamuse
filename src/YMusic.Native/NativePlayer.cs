@@ -73,6 +73,7 @@ internal sealed partial class NativePlayer : IDisposable
             await slot.Opened.Task.WaitAsync(TimeSpan.FromSeconds(30), operation.Token);
             operation.Token.ThrowIfCancellationRequested();
             if (!ReferenceEquals(slot, _current)) throw new OperationCanceledException(operation.Token);
+            ApplyGains();
             if (play) { slot.Play(); IsPlaying = true; }
         }
         catch
@@ -151,7 +152,7 @@ internal sealed partial class NativePlayer : IDisposable
             _fading = previous; _fadeDuration = crossfade; _fadeElapsed = TimeSpan.Zero;
             _fadeClock.Restart(); _fadeTimer.Start(); next.Volume = 0;
         }
-        else { previous?.Close(); next.Volume = Volume * next.Gain; }
+        else { previous?.Close(); next.Volume = Volume * _sleepGain * next.Gain; }
         next.Speed = SpeedRatio;
         next.Play(); IsPlaying = true;
         StartGainTimer(); // A prepared slot may still be ramping when it becomes audible.
@@ -209,8 +210,8 @@ internal sealed partial class NativePlayer : IDisposable
     private void ApplyGains()
     {
         var fraction = FadeFraction;
-        if (_current is not null) _current.Volume = Volume * _current.Gain * fraction;
-        if (_fading is not null) _fading.Volume = Volume * _fading.Gain * (1 - fraction);
+        if (_current is not null) _current.Volume = Volume * _sleepGain * _current.Gain * fraction;
+        if (_fading is not null) _fading.Volume = Volume * _sleepGain * _fading.Gain * (1 - fraction);
         if (_prepared is not null) _prepared.Volume = 0;
     }
     private void UpdateFade()
@@ -223,7 +224,7 @@ internal sealed partial class NativePlayer : IDisposable
         _fadeTimer.Stop(); _fadeClock.Reset(); _fadeElapsed = TimeSpan.Zero;
         var fading = _fading; _fading = null;
         fading?.Close();
-        if (_current is not null) _current.Volume = Volume * _current.Gain;
+        if (_current is not null) _current.Volume = Volume * _sleepGain * _current.Gain;
         if (fading is not null) TransitionFinished?.Invoke(natural);
     }
 
@@ -260,7 +261,7 @@ internal sealed partial class NativePlayer : IDisposable
         _disposed = true;
         try { Stop(); } finally { _buffer.Dispose(); }
     }
-    private static string? LocalPath(Slot? slot) => slot?.Input?.Path ?? (slot?.Player.Source is { IsFile: true } source ? source.LocalPath : null);
+    private static string? LocalPath(Slot? slot) => slot?.Input?.Path ?? (slot?.OpenedSource is { IsFile: true } source ? source.LocalPath : null);
     private static void ValidateSource(Uri source)
     { ArgumentNullException.ThrowIfNull(source); if (!source.IsAbsoluteUri) throw new ArgumentException("Требуется абсолютный адрес аудио.", nameof(source)); }
 
@@ -271,6 +272,8 @@ internal sealed partial class NativePlayer : IDisposable
         private Windows.Media.Playback.MediaPlayer? _network;
         private Windows.Media.Core.MediaSource? _networkSource;
         private readonly Dispatcher _dispatcher = Dispatcher.CurrentDispatcher;
+        internal Uri? OpenedSource { get; private set; }
+        private int _routeRevision;
         internal bool HasSource => _networkSource is not null || Player.Source is not null;
         internal TimeSpan Position { get => _network?.PlaybackSession.Position ?? Player.Position; set { if (_network is not null) _network.PlaybackSession.Position = value; else Player.Position = value; } }
         internal TimeSpan Duration => _network?.PlaybackSession.NaturalDuration ?? (Player.NaturalDuration.HasTimeSpan ? Player.NaturalDuration.TimeSpan : TimeSpan.Zero);
@@ -280,15 +283,66 @@ internal sealed partial class NativePlayer : IDisposable
         internal void Pause() { if (_network is not null) _network.Pause(); else Player.Pause(); }
         internal void Open(Uri source)
         {
-            if (Input?.Progressive != true) { Player.Open(source); return; }
-            _network = new Windows.Media.Playback.MediaPlayer { AutoPlay = false, Volume = Player.Volume };
-            _network.CommandManager.IsEnabled = false;
-            _network.PlaybackSession.PlaybackRate = Player.SpeedRatio;
-            _network.MediaOpened += (_, _) => Post(() => MediaOpened(this, EventArgs.Empty));
-            _network.MediaEnded += (_, _) => Post(() => _owner.OnMediaEnded(this));
-            _network.MediaFailed += (_, args) => Post(() => _owner.OnMediaFailed(this, args.ExtendedErrorCode ?? new MusicException("Windows не удалось открыть поток.")));
+            OpenedSource = source;
+            if (Input?.Progressive != true && _owner._outputRoute.Id.Length == 0) { Player.Open(source); return; }
+            _network = CreateNetworkPlayer(_owner._outputRoute);
             _networkSource = Windows.Media.Core.MediaSource.CreateFromUri(source);
             _network.Source = _networkSource;
+        }
+        private Windows.Media.Playback.MediaPlayer CreateNetworkPlayer(IAudioOutputRoute route, TaskCompletionSource? routingOpened = null)
+        {
+            var player = new Windows.Media.Playback.MediaPlayer { AutoPlay = false, Volume = 0 };
+            try
+            {
+                player.CommandManager.IsEnabled = false;
+                player.PlaybackSession.PlaybackRate = _owner.SpeedRatio;
+                route.Apply(player);
+                player.MediaOpened += (_, _) => Post(() =>
+                {
+                    routingOpened?.TrySetResult();
+                    if (ReferenceEquals(player, _network)) { MediaOpened(this, EventArgs.Empty); _owner.ApplyGains(); }
+                });
+                player.MediaEnded += (_, _) => Post(() => { if (ReferenceEquals(player, _network)) _owner.OnMediaEnded(this); });
+                player.MediaFailed += (_, args) => Post(() =>
+                {
+                    var error = args.ExtendedErrorCode ?? new MusicException("Windows не удалось открыть поток.");
+                    routingOpened?.TrySetException(error);
+                    if (ReferenceEquals(player, _network)) _owner.OnMediaFailed(this, error);
+                });
+                return player;
+            }
+            catch { player.Dispose(); throw; }
+        }
+        internal async Task RouteAsync(IAudioOutputRoute route)
+        {
+            var revision = ++_routeRevision;
+            if (_closed) return;
+            if (_network is not null) { route.Apply(_network); return; }
+            // Keep the existing WPF decoder alive until the replacement has opened.
+            // Its source still belongs to this slot, including a buffered temp file.
+            try { await Opened.Task.WaitAsync(TimeSpan.FromSeconds(30), NormalizationCancellation.Token); }
+            catch (OperationCanceledException) when (_closed) { return; }
+            if (_closed || revision != _routeRevision) return;
+            var opened = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Windows.Media.Playback.MediaPlayer? replacement = CreateNetworkPlayer(route, opened);
+            Windows.Media.Core.MediaSource? source = null;
+            try
+            {
+                source = Windows.Media.Core.MediaSource.CreateFromUri(OpenedSource!);
+                replacement.Source = source;
+                await opened.Task.WaitAsync(TimeSpan.FromSeconds(30), NormalizationCancellation.Token);
+                if (_closed || revision != _routeRevision) return;
+                var position = Player.Position;
+                Player.Pause();
+                replacement.PlaybackSession.Position = position;
+                _network = replacement; _networkSource = source;
+                replacement = null; source = null;
+                Player.Close();
+                _owner.ApplyGains();
+                if (_owner.IsPlaying && (ReferenceEquals(_owner._current, this) || ReferenceEquals(_owner._fading, this))) _network.Play();
+            }
+            catch (OperationCanceledException) when (_closed) { }
+            finally { replacement?.Dispose(); source?.Dispose(); }
         }
         private void Post(Action action)
         {
@@ -322,6 +376,7 @@ internal sealed partial class NativePlayer : IDisposable
         {
             if (_closed) return;
             _closed = true;
+            ++_routeRevision; OpenedSource = null;
             NormalizationCancellation.Cancel();
             if (NormalizationTask is { } task)
                 _ = task.ContinueWith(_ => NormalizationCancellation.Dispose(), TaskScheduler.Default);

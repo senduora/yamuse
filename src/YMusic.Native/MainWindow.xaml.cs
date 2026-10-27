@@ -54,7 +54,7 @@ public partial class MainWindow : Window
     private readonly HashSet<string> _favoriteTrackIds = new(StringComparer.Ordinal);
     private bool _favoriteIdsKnown;
 
-    internal MainWindow(bool demo = false, MusicApi? api = null, SessionStore? store = null, bool restore = true, string? diagnosticsDirectory = null, OfflineLibrary? offline = null, NativePlayer? player = null, PreferencesStore? preferences = null)
+    internal MainWindow(bool demo = false, MusicApi? api = null, SessionStore? store = null, bool restore = true, string? diagnosticsDirectory = null, OfflineLibrary? offline = null, NativePlayer? player = null, PreferencesStore? preferences = null, IAudioOutputDevices? audioOutputDevices = null)
     {
         _demo = demo;
         _restore = restore;
@@ -76,8 +76,11 @@ public partial class MainWindow : Window
         InitializeDesign();
         InitializeLyrics();
         LoadPreferences();
+        InitializePlaybackOptions(audioOutputDevices);
+        InitializeQueueEditing();
         InitializeSorting();
         InitializePlaybackPersistence();
+        InitializeDownloadPersistence();
         DownloadCenterPanel.Content = DownloadCenterView;
         _metricsTimer.Tick += (_, _) => UpdateMetrics();
         _progressTimer.Tick += (_, _) => { UpdateProgress(); PersistPlaybackStateIfDue(); };
@@ -88,7 +91,7 @@ public partial class MainWindow : Window
             _view.Refresh();
             UpdateCount();
         };
-        _player.Ended += async (_, _) => await AdvanceAsync(1, true);
+        _player.Ended += async (_, _) => { if (!HandlePlaybackOptionsTrackEnded()) await AdvanceAsync(1, true); };
         _player.TransitionFinished += OnTransitionFinished;
         _player.Failed += (_, _) => { _progressTimer.Stop(); ReportWaveEnd(false); _diagnostics.Stage = "playback_error"; SetStatus("Windows прервала воспроизведение. Попробуйте снова или выберите другой трек.", true); UpdateControls(); UpdateProgress(); };
         ContentRendered += OnReady;
@@ -185,7 +188,11 @@ public partial class MainWindow : Window
         var account = await _api.GetAccountAsync(session, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         if (_accountCts.IsCancellationRequested) { _accountCts.Dispose(); _accountCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token); }
-        if (_account?.Uid != account.Uid) ClearPlaybackContext(clearView: true);
+        if (_account?.Uid != account.Uid)
+        {
+            if (_account is not null) SuspendDownloadQueueForAccountChange();
+            ClearPlaybackContext(clearView: true);
+        }
         _session = session;
         _account = account;
         _deviceId = session.DeviceId;
@@ -198,6 +205,7 @@ public partial class MainWindow : Window
         FilterBox.IsEnabled = true;
         TrySaveSession(session);
         RestorePlaybackState(account.Uid);
+        await RestoreDownloadQueueAsync(account.Uid);
         await RefreshLibraryAsync();
     }
 
@@ -313,6 +321,7 @@ public partial class MainWindow : Window
         _session = null; _account = null;
         _favoriteTrackIds.Clear(); _favoriteIdsKnown = false;
         _player.Stop(); _progressTimer.Stop();
+        SetSleepTimer(SleepTimerMode.Off);
         if (_current is not null) _current.IsPlaying = false;
         HighlightTrack(null);
         _current = null; _playbackQueue.SetItems([]); _loadingStream = false;
@@ -405,6 +414,8 @@ public partial class MainWindow : Window
         var clock = Stopwatch.StartNew();
         try
         {
+            await EnsureAudioOutputReadyAsync();
+            cts.Token.ThrowIfCancellationRequested();
             AudioDescriptor? audio = null;
             if (!promoted && localPath is null)
             {
@@ -447,6 +458,7 @@ public partial class MainWindow : Window
             QualityText.Text = (playingOffline ? "Офлайн · " : "") + (promoted ? prepared!.QualityLabel : localQuality ?? audio?.QualityLabel ?? "Локальное аудио");
             SetStatus(!playingOffline && _waveSources.ContainsKey(track) ? WaveSourceLabel(track) : "");
             BeginWaveListening(track);
+            PlaybackOptionsTrackChanged();
             _progressTimer.Start();
             SavePlaybackState();
         }
@@ -526,6 +538,8 @@ public partial class MainWindow : Window
     private void UpdateControls()
     {
         if (PlaySelectionButton is null || _updatingTrackRows) return;
+        PlaybackOptionsPlaybackChanged();
+        UpdateQueueEditingControls();
         PlaySelectionButton.IsEnabled = _catalogShowing ? CatalogList.SelectedItem is CatalogItem : _view.Cast<TrackRow>().Any(row => row.CanPlay);
         if (DownloadButton is not null)
         {
@@ -667,6 +681,9 @@ public partial class MainWindow : Window
     }
     private async void Window_KeyDown(object sender, KeyEventArgs e)
     {
+        if (!_closed && !e.Handled && _section == "queue" && e.Key == Key.Z && Keyboard.Modifiers == ModifierKeys.Control
+            && !IsPlaybackTextInput(e.OriginalSource as DependencyObject))
+        { e.Handled = true; UndoQueueRemoval_Click(sender, e); return; }
         // WPF's Modifiers property reports Alt/Control/Shift, but omits Win.
         if (_closed || e.Handled || (e.KeyboardDevice.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Windows)) != 0
             || e.KeyboardDevice.IsKeyDown(Key.LWin) || e.KeyboardDevice.IsKeyDown(Key.RWin)) return;
@@ -716,6 +733,9 @@ public partial class MainWindow : Window
     private void OnClosed(object? sender, EventArgs e)
     {
         SavePlaybackState();
+        SaveDownloadQueueForClose();
+        DisposePlaybackOptions();
+        ClearQueueDropLine();
         SuspendDownloadQueueForAccountChange();
         _closed = true;
         ClearPlaybackContext(clearView: true);

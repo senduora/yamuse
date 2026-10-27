@@ -91,6 +91,7 @@ public partial class MainWindow
         _downloadQueueAccountGeneration = _accountGeneration;
         _downloadQueueAccountUid = _account?.Uid;
         _downloadsAutoSuspended = false;
+        BeginDownloadQueuePersistence();
         return RunDownloadQueueAsync(retryFailed: false);
     }
     private Task RunDownloadQueueAsync(bool retryFailed)
@@ -124,6 +125,7 @@ public partial class MainWindow
             var next = 0;
             try
             {
+                await PersistDownloadQueueAsync(force: true);
                 cts.Token.ThrowIfCancellationRequested();
                 // A single background pass uses the existing index/path/length checks,
                 // never hashes audio or probes the whole library on a progress frame.
@@ -166,6 +168,10 @@ public partial class MainWindow
                 if (_downloadQueueAccountGeneration != _accountGeneration) _downloadQueue.Suspend();
                 _downloadQueue.EndRun(cts.IsCancellationRequested);
                 operation?.Dispose();
+                // Keep this operation published until its checkpoint finishes;
+                // a new batch/account restore must not replace the shared queue
+                // while the prior task is still completing asynchronously.
+                if (!_closed) await PersistDownloadQueueAsync(force: true);
                 if (ReferenceEquals(_downloadCts, cts)) { _downloadCts = null; _downloadTask = null; _downloadIsAutomatic = false; }
                 cts.Dispose();
                 if (!_closed)

@@ -46,7 +46,7 @@ internal sealed partial class NativePlayer
             try
             {
                 if (slot.Input is { } input) await input.Completion.WaitAsync(slot.NormalizationCancellation.Token);
-                var path = slot.Input?.Path ?? (slot.Player.Source?.IsFile == true ? slot.Player.Source.LocalPath : null);
+                var path = slot.Input?.Path ?? (slot.OpenedSource?.IsFile == true ? slot.OpenedSource.LocalPath : null);
                 if (path is null) return;
                 var result = await Task.Run(() => _loudnessCache.MeasureAsync(path, slot.NormalizationCancellation.Token), slot.NormalizationCancellation.Token);
                 if (slot.Closed) return;

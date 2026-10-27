@@ -176,7 +176,7 @@
             <ProgressBar x:Name="PlaylistTransferBar" Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100" Height="3" Foreground="{StaticResource DownloadBrush}" Margin="0,7,0,0"/>
           </Grid>
         </Border>
-        <WrapPanel x:Name="QueueActions" Visibility="Collapsed" Margin="0,0,0,12"><Button Content="↑ Выше" Click="MoveQueueUp_Click" Padding="12,7" Margin="0,0,8,0"/><Button Content="↓ Ниже" Click="MoveQueueDown_Click" Padding="12,7" Margin="0,0,8,0"/><Button Content="Убрать из очереди" Click="RemoveQueue_Click" Padding="12,7"/></WrapPanel>
+        <WrapPanel x:Name="QueueActions" Visibility="Collapsed" Margin="0,0,0,12"><Button Content="↑ Выше" Click="MoveQueueUp_Click" Padding="12,7" Margin="0,0,8,0"/><Button Content="↓ Ниже" Click="MoveQueueDown_Click" Padding="12,7" Margin="0,0,8,0"/><Button Content="Убрать из очереди" Click="RemoveQueue_Click" Padding="12,7" Margin="0,0,8,0"/><Button x:Name="QueueUndoButton" Content="↶ Вернуть удалённые" Click="UndoQueueRemoval_Click" Padding="12,7" ToolTip="Ctrl+Z · вернуть треки без изменения воспроизведения"/></WrapPanel>
         <StackPanel x:Name="CatalogSearchPanel" Visibility="Collapsed" Margin="0,0,0,12">
           <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
             <TextBox x:Name="CatalogQuery" KeyDown="CatalogQuery_KeyDown" AutomationProperties.Name="Поиск в каталоге Яндекса" ToolTip="Трек, исполнитель, подборка, альбом или плейлист"/>
@@ -488,6 +488,7 @@
             <TextBlock Text="Плавный переход между треками — от 0 до 10 секунд. Ноль выключает наложение. Новая длительность применяется к следующим переходам." Style="{StaticResource SettingsNote}" Margin="0,8,0,0"/>
             <CheckBox x:Name="SettingsNormalizeVolume" Content="Выравнивать громкость треков" Margin="0,20,0,8" Checked="SettingsCheck_Changed" Unchecked="SettingsCheck_Changed"/>
             <TextBlock Text="Снижает перепады громкости между композициями. Тихие треки не усиливаются. Сохранённые аудиофайлы остаются без изменений." Style="{StaticResource SettingsNote}"/>
+            <ContentControl x:Name="PlaybackOptionsHost" Margin="0,20,0,0"/>
           </StackPanel></Border>
           <Border Style="{StaticResource SettingsCard}"><StackPanel>
             <TextBlock Text="Файлы и загрузки" Style="{StaticResource SettingsHeading}"/>

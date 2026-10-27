@@ -30,6 +30,7 @@ public partial class MainWindow
             _player.SetSpeed(preferences.PlaybackSpeed);
             _player.SetCrossfade(preferences.CrossfadeSeconds);
             _player.SetNormalization(preferences.NormalizeVolume);
+            _preferredOutputDeviceId = preferences.OutputDeviceId;
             _minimizeToTray = preferences.MinimizeToTray;
             _autoFavoritesEnabled = preferences.AutoDownloadFavorites;
             _concurrentDownloads = preferences.ConcurrentDownloads;
@@ -47,7 +48,7 @@ public partial class MainWindow
     private void SavePreferences()
     {
         if (!_preferencesReady || _preferenceStore is null) return;
-        try { _preferenceStore.Save(new() { Quality = SelectedQuality, Volume = VolumeSlider.Value / 100, PlaybackSpeed = _player.SpeedRatio, MinimizeToTray = _minimizeToTray, AutoDownloadFavorites = _autoFavoritesEnabled, ConcurrentDownloads = _concurrentDownloads, CrossfadeSeconds = _player.CrossfadeSeconds, NormalizeVolume = _player.NormalizeVolume, AccentFromCover = _accentFromCover, StaticAccentColor = _staticAccentColor, Theme = ThemeManager.Mode, UpdateCheckFrequency = _updateCheckFrequency }); }
+        try { _preferenceStore.Save(new() { Quality = SelectedQuality, Volume = VolumeSlider.Value / 100, PlaybackSpeed = _player.SpeedRatio, MinimizeToTray = _minimizeToTray, OutputDeviceId = _preferredOutputDeviceId, AutoDownloadFavorites = _autoFavoritesEnabled, ConcurrentDownloads = _concurrentDownloads, CrossfadeSeconds = _player.CrossfadeSeconds, NormalizeVolume = _player.NormalizeVolume, AccentFromCover = _accentFromCover, StaticAccentColor = _staticAccentColor, Theme = ThemeManager.Mode, UpdateCheckFrequency = _updateCheckFrequency }); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { _diagnostics.LastErrorType = "PreferencesSave:" + ex.GetType().Name; SetStatus("Не удалось сохранить настройки на диске.", true); }
     }
     private void InitializeShell()
@@ -117,6 +118,7 @@ public partial class MainWindow
         SetSettingsVisible(true);
         SettingsScroll.ScrollToTop();
         SettingsBackButton.Focus();
+        _ = RefreshAudioOutputsAsync();
     }
 
     private void SetSettingsVisible(bool visible)
