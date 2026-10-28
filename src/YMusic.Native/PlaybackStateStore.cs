@@ -4,14 +4,15 @@ using System.Text.Json.Serialization;
 
 namespace YMusic.Native;
 
-// Deliberately contains metadata only. Audio locations, artwork URLs, credentials,
+// Only trusted anonymous artwork metadata is optional. Audio locations, credentials,
 // download descriptors, and the native player's temporary files are never saved.
 internal sealed record PlaybackTrackState(
     [property: JsonRequired] string Id, [property: JsonRequired] string RequestId,
     [property: JsonRequired] string Title, [property: JsonRequired] string Artist,
     [property: JsonRequired] string Album, [property: JsonRequired] long DurationMs,
     [property: JsonRequired] bool Available, [property: JsonRequired] IReadOnlyList<ArtistReference> Artists,
-    string? AlbumId = null);
+    string? AlbumId = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CoverUri = null);
 
 internal sealed record PlaybackSnapshot(
     [property: JsonRequired] int Version, [property: JsonRequired] string AccountUid,
@@ -153,7 +154,7 @@ internal sealed class PlaybackStateStore
     {
         ArgumentNullException.ThrowIfNull(queue);
         var tracks = queue.Items.Select(row => new PlaybackTrackState(row.Id, row.RequestId, row.Title, row.Artist,
-            row.Album, row.DurationMs, row.Available, CopyArtists(row.Artists), row.AlbumId)).ToArray();
+            row.Album, row.DurationMs, row.Available, CopyArtists(row.Artists), row.AlbumId, ArtworkUri.Metadata(row.CoverUri))).ToArray();
         var index = queue.CurrentIndex;
         var snapshot = new PlaybackSnapshot(CurrentVersion, accountUid, DateTimeOffset.UtcNow, Array.AsReadOnly(tracks), index,
             ClampPosition(positionSeconds, index < 0 ? 0 : tracks[index].DurationMs), queue.Shuffle, queue.Repeat);
@@ -177,7 +178,7 @@ internal sealed class PlaybackStateStore
             if (localOnly && local is null) continue;
             var row = ToRow(metadata, rows.Count + 1, available: !localOnly && metadata.Available,
                 local is null ? null : offline.ResolvePath(local.FileName),
-                local is null ? null : OfflineQuality(local));
+                local is null ? null : OfflineQuality(local), local?.CoverUri);
             if (i == snapshot.CurrentIndex) currentIndex = rows.Count;
             rows.Add(row);
         }
@@ -188,11 +189,12 @@ internal sealed class PlaybackStateStore
     internal static double ClampPosition(double seconds, long durationMs)
         => !double.IsFinite(seconds) || durationMs <= 0 ? 0 : Math.Clamp(seconds, 0, durationMs / 1000.0);
 
-    private static TrackRow ToRow(PlaybackTrackState track, int number, bool available, string? path = null, string? quality = null)
+    private static TrackRow ToRow(PlaybackTrackState track, int number, bool available, string? path = null, string? quality = null, string? offlineCover = null)
         => new()
         {
             Number = number, Id = track.Id, RequestId = track.RequestId, Title = track.Title, Artist = track.Artist,
             Artists = CopyArtists(track.Artists), Album = track.Album, AlbumId = track.AlbumId, DurationMs = track.DurationMs,
+            CoverUri = ArtworkUri.Metadata(track.CoverUri) ?? ArtworkUri.Metadata(offlineCover),
             Available = available, DownloadedPath = path, DownloadedQuality = quality
         };
     private static string OfflineQuality(OfflineItem item) => item.Codec.StartsWith("flac", StringComparison.Ordinal)
@@ -217,6 +219,7 @@ internal sealed class PlaybackStateStore
         {
             if (track is null || !ValidId(track.Id) || !ValidRequestId(track.RequestId, track.Id)
                 || track.AlbumId is not null && !ValidId(track.AlbumId)
+                || track.CoverUri is not null && ArtworkUri.Metadata(track.CoverUri) is null
                 || !ValidText(track.Title) || !ValidText(track.Artist) || !ValidText(track.Album)
                 || track.DurationMs < 0 || track.DurationMs > MaximumDurationMs || track.Artists is null || track.Artists.Count > 100)
                 throw new JsonException("Некорректные метаданные сохранённого трека.");

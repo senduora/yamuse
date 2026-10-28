@@ -188,6 +188,7 @@ internal sealed class DownloadQueueStore
         {
             if (entry is null || entry.Track is not { } track || !ValidId(track.Id) || !ids.Add(track.Id)
                 || !ValidRequestId(track.RequestId, track.Id) || track.AlbumId is not null && !ValidId(track.AlbumId)
+                || track.CoverUri is not null // Download snapshots deliberately remain metadata-only.
                 || !ValidText(track.Title) || !ValidText(track.Artist) || !ValidText(track.Album)
                 || track.DurationMs < 0 || track.DurationMs > PlaybackStateStore.MaximumDurationMs
                 || track.Artists is null || track.Artists.Count > 100 || !Enum.IsDefined(entry.State)

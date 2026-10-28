@@ -34,7 +34,7 @@ internal sealed partial class MusicApi : IDisposable
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, "https://oauth.yandex.ru/device/code")
         {
-            Content = Form(("client_id", ClientId), ("device_id", deviceId), ("device_name", "Yamuse"))
+            Content = Form(("client_id", ClientId), ("device_id", deviceId), ("device_name", "Yamuse"), ("scope", RequiredScopes))
         };
         using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
         using var json = await ReadJsonAsync(response, cancellationToken).ConfigureAwait(false);
@@ -84,6 +84,7 @@ internal sealed partial class MusicApi : IDisposable
 
     public async Task<Session> RefreshAsync(Session session, CancellationToken cancellationToken)
     {
+        RequirePlayerScopes(session);
         if (string.IsNullOrEmpty(session.RefreshToken)) throw new MusicException("Срок входа истёк. Войдите заново.", true);
         using var request = new HttpRequestMessage(HttpMethod.Post, "https://oauth.yandex.ru/token")
         {
@@ -128,16 +129,26 @@ internal sealed partial class MusicApi : IDisposable
         var result = Result(json);
         if (result.ValueKind != JsonValueKind.Array) throw new MusicException("Изменился формат списка треков.");
         var byId = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        var byAlbum = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
         foreach (var track in result.EnumerateArray())
         {
             var id = Text(track, "id");
             if (id.Length > 0) byId.TryAdd(id, track);
             var realId = Text(track, "realId");
             if (realId.Length > 0) byId.TryAdd(realId, track);
+            if (track.ValueKind == JsonValueKind.Object && track.TryGetProperty("albums", out var trackAlbums)
+                && trackAlbums.ValueKind == JsonValueKind.Array)
+                foreach (var trackAlbum in trackAlbums.EnumerateArray())
+                {
+                    var albumId = Text(trackAlbum, "id");
+                    if (albumId.Length == 0) continue;
+                    if (id.Length > 0) byAlbum.TryAdd(id + ":" + albumId, track);
+                    if (realId.Length > 0) byAlbum.TryAdd(realId + ":" + albumId, track);
+                }
         }
         return ids.Select((id, index) =>
         {
-            if (!byId.TryGetValue(id.Id, out var track)) return new TrackRow { Number = offset + index + 1, Id = id.Id, RequestId = id.RequestId };
+            if (!byAlbum.TryGetValue(id.RequestId, out var track) && !byId.TryGetValue(id.Id, out track)) return new TrackRow { Number = offset + index + 1, Id = id.Id, RequestId = id.RequestId };
             var artists = track.TryGetProperty("artists", out var a) && a.ValueKind == JsonValueKind.Array
                 ? string.Join(", ", a.EnumerateArray().Select(x => Text(x, "name"))) : "";
             var album = TrackAlbum(track, id.AlbumId);
@@ -146,7 +157,7 @@ internal sealed partial class MusicApi : IDisposable
             {
                 Number = offset + index + 1, Id = id.Id, RequestId = id.RequestId,
                 Title = Text(track, "title") + (version.Length > 0 ? " · " + version : ""),
-                Artist = artists, Artists = ArtistReferences(track), Album = album.Title, AlbumId = album.Id, CoverUri = TrackArtwork(track),
+                Artist = artists, Artists = ArtistReferences(track), Album = album.Title, AlbumId = album.Id, CoverUri = TrackArtwork(track, id.AlbumId ?? album.Id),
                 DurationMs = Int(track, "durationMs"), Available = Bool(track, "available") || Bool(track, "availableForPremiumUsers") || Bool(track, "availableFullWithoutPermission")
             };
         }).ToArray();
@@ -226,6 +237,7 @@ internal sealed partial class MusicApi : IDisposable
 
     private async Task<JsonDocument> ApiAsync(HttpMethod method, string path, Session session, HttpContent? content, CancellationToken cancellationToken, IReadOnlyDictionary<string, string>? headers = null)
     {
+        RequirePlayerScopes(session);
         using var request = new HttpRequestMessage(method, new Uri("https://api.music.yandex.net" + path)) { Content = content };
         request.Headers.Authorization = new AuthenticationHeaderValue("OAuth", session.AccessToken);
         if (headers is not null) foreach (var header in headers) request.Headers.Add(header.Key, header.Value);
@@ -260,7 +272,7 @@ internal sealed partial class MusicApi : IDisposable
     {
         var token = Text(root, "access_token");
         if (string.IsNullOrWhiteSpace(token) || token.Any(char.IsWhiteSpace)) throw new MusicException("Яндекс не вернул действующий токен.");
-        return new(token, Optional(root, "refresh_token"), DateTimeOffset.UtcNow.AddSeconds(Math.Max(1, Int(root, "expires_in", 86400))), deviceId);
+        return new(token, Optional(root, "refresh_token"), DateTimeOffset.UtcNow.AddSeconds(Math.Max(1, Int(root, "expires_in", 86400))), deviceId, GrantedPlayerScope(root));
     }
     public void Dispose() { ResetWaveState(); _http.Dispose(); }
 }

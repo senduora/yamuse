@@ -184,7 +184,7 @@ internal static partial class Program
                 Tp0317Invoke(Window,"RestorePlaybackState","position-fixture");A=Queue.Current!;
                 Tp0317Need(!Player.HasSource && Tp0317Get<double?>(Window,"_restoredPlaybackSeconds")==30,"disk restoration did not retain paused source-free position");
             }
-            if(delayed is not null) Tp0317Set(Window,"_session",new Session("private-fake-token",null,DateTimeOffset.UtcNow.AddHours(1),"fixture"));
+            if(delayed is not null) Tp0317Set(Window,"_session",new Session("private-fake-token",null,DateTimeOffset.UtcNow.AddHours(1),"fixture",MusicApi.RequiredScopes));
         }
         static TrackRow Row(string id,string directory,int hz)
         {

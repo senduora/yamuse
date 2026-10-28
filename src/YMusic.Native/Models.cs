@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 
 namespace YMusic.Native;
 
-internal sealed record Session(string AccessToken, string? RefreshToken, DateTimeOffset ExpiresAtUtc, string DeviceId);
+internal sealed record Session(string AccessToken, string? RefreshToken, DateTimeOffset ExpiresAtUtc, string DeviceId, string? Scope = null);
 internal sealed record DeviceCode(string Code, string UserCode, Uri VerificationUri, int IntervalSeconds, int ExpiresInSeconds);
 internal sealed record Account(string Uid, string DisplayName, bool Plus, string? AvatarUri = null);
 internal enum AudioQuality { Economical, Optimal, Excellent }
@@ -31,7 +31,16 @@ internal sealed class TrackRow : INotifyPropertyChanged
     public IReadOnlyList<ArtistReference> Artists { get; init; } = [];
     public string Album { get; init; } = "";
     public string? AlbumId { get; init; }
-    public string? CoverUri { get; init; }
+    private string? _coverUri;
+    public string? CoverUri { get => _coverUri; init => _coverUri = value; }
+    internal bool SetMissingArtwork(string? value)
+    {
+        var safe = ArtworkUri.Metadata(value);
+        if (_coverUri is not null || safe is null) return false;
+        _coverUri = safe;
+        Changed(nameof(CoverUri));
+        return true;
+    }
     public long DurationMs { get; init; }
     public bool Available { get; init; }
     public string? LocalPath { get; init; }

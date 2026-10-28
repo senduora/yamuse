@@ -117,7 +117,7 @@ public partial class MainWindow : Window
         try { saved = _store.Load(); }
         catch (Exception ex) when (ex is CryptographicException or IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
         {
-            SetStatus("Не удалось прочитать сохранённый вход. Новый вход заменит повреждённое сохранение.", true);
+            SetStatus("Не удалось прочитать сохранённый вход. Отзовите прежний доступ устройства Yamuse в Яндекс ID и удалите повреждённую сохранённую сессию перед новым входом.", true);
             return;
         }
         if (saved is null) return;
@@ -128,6 +128,12 @@ public partial class MainWindow : Window
         Busy(true);
         try
         {
+            if (!MusicApi.HasPlayerScopes(saved))
+            {
+                await RevokeLegacyLoginAsync(saved, cts.Token);
+                if (!_closed) ShowPlayerLoginRequired();
+                return;
+            }
             SetStatus("Восстанавливаем вход…");
             if (saved.ExpiresAtUtc <= DateTimeOffset.UtcNow.AddMinutes(1)) saved = await _api.RefreshAsync(saved, cts.Token);
             await ActivateAsync(saved, cts.Token);
@@ -157,6 +163,8 @@ public partial class MainWindow : Window
         Busy(true);
         try
         {
+            await PreparePlayerLoginAsync(cts.Token);
+            cts.Token.ThrowIfCancellationRequested();
             _deviceCode = await _api.BeginLoginAsync(_deviceId, cts.Token);
             cts.Token.ThrowIfCancellationRequested();
             CodeText.Text = _deviceCode.UserCode;
@@ -231,6 +239,7 @@ public partial class MainWindow : Window
         try
         {
             var session = _session ?? throw new MusicException("Войдите в аккаунт.", true);
+            if (!MusicApi.HasPlayerScopes(session)) throw new MusicException("Войдите заново с доступом только к музыке.", true);
             if (session.ExpiresAtUtc > DateTimeOffset.UtcNow.AddMinutes(1)) return session;
             var renewed = await _api.RefreshAsync(session, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
