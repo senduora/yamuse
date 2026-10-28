@@ -45,12 +45,14 @@ public partial class MainWindow
                 current.IsPlaying = false;
                 TrackTitle.Text = current.Title; TrackArtist.Text = current.Artist;
                 QualityText.Text = "";
-                Artwork.SetSourceUri(PlayerCover, null);
+                Artwork.SetSourceUri(PlayerCover, current.CoverUri);
                 _diagnostics.Stage = "restored_paused";
                 SetStatus("Очередь восстановлена · нажмите «Воспроизвести»");
             }
             RefreshPlaybackView();
             UpdateControls(); UpdateProgress();
+            if (_session is not null && restored.Tracks.Any(row => row.CoverUri is null))
+                _restoredArtworkTask = RestorePlaybackArtworkAsync(restored.Tracks, accountUid, _accountCts.Token);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or MusicException or JsonException)
         {

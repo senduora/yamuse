@@ -113,6 +113,7 @@ internal sealed partial class MusicApi
 
     private async Task<JsonDocument> DiscoveryJsonAsync(Session session, string path, bool android, CancellationToken cancellationToken)
     {
+        RequirePlayerScopes(session);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(25));
         try

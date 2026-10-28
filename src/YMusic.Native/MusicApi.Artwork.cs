@@ -5,14 +5,18 @@ namespace YMusic.Native;
 internal sealed partial class MusicApi
 {
     // Artwork is taken from metadata already in the response; a row never makes an API request.
-    internal static string? TrackArtwork(JsonElement track)
+    internal static string? TrackArtwork(JsonElement track, string? preferredAlbumId = null)
     {
         var direct = ArtworkUri.Metadata(Text(track, "coverUri"));
         if (direct is not null) return direct;
         if (track.ValueKind == JsonValueKind.Object && track.TryGetProperty("albums", out var albums)
             && albums.ValueKind == JsonValueKind.Array)
             foreach (var album in albums.EnumerateArray())
+            {
+                if (preferredAlbumId is not null && Text(album, "id") != preferredAlbumId) continue;
                 if (ArtworkUri.Metadata(Text(album, "coverUri")) is { } cover) return cover;
+                if (preferredAlbumId is not null) return null;
+            }
         return null;
     }
 

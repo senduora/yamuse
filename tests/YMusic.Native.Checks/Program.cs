@@ -20,7 +20,7 @@ internal static partial class Program
     private static int _failed;
     private static string[] _only = [];
     private static bool _realAccount;
-    private static readonly Session FakeSession = new("fake-test-token-DO-NOT-USE", "fake-test-refresh", DateTimeOffset.UtcNow.AddHours(1), "test-device");
+    private static readonly Session FakeSession = new("fake-test-token-DO-NOT-USE", "fake-test-refresh", DateTimeOffset.UtcNow.AddHours(1), "test-device", MusicApi.RequiredScopes);
 
     [STAThread]
     private static int Main(string[] args)
@@ -92,6 +92,8 @@ internal static partial class Program
 
     private static async Task CheckAll(bool online)
     {
+        await CheckOAuthScopes();
+        await CheckCatalogPlaylistWrites();
         await CheckFavoritesCacheStore();
         await CheckFavoritesCache();
         await CheckQueueEditing();
@@ -484,6 +486,7 @@ internal static partial class Program
         await CheckUninstall();
         await CheckDownloadCenter();
         await CheckPlaybackPersistence();
+        await CheckPlaybackArtworkRestore();
         await CheckScrollPerformance();
         await CheckLoudness();
         await CheckProgressivePlayback();

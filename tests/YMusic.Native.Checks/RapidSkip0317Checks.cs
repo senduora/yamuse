@@ -188,7 +188,7 @@ internal static partial class Program
                 preferences: new PreferencesStore(Path.Combine(directory, "preferences")));
             ((Slider)Window.FindName("VolumeSlider")).Value = 0; Player.SetVolume(0);
             if (bitrate is not null)
-            { Rs0317Set(Window, "_session", new Session("synthetic", null, DateTimeOffset.UtcNow.AddHours(1), "synthetic")); Rs0317Set(Window, "_account", new Account("fixture", "Synthetic", true)); }
+            { Rs0317Set(Window, "_session", new Session("synthetic", null, DateTimeOffset.UtcNow.AddHours(1), "synthetic", MusicApi.RequiredScopes)); Rs0317Set(Window, "_account", new Account("fixture", "Synthetic", true)); }
             Rs0317Set(Window, "_playbackQueue", new PlaybackQueue(new Random(Seed)));
             // The native MainWindow is never shown: all stores are injected and
             // no shell, SMTC, real profile, login, updater or external media is used.

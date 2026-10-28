@@ -41,7 +41,8 @@ internal static partial class Program
             && fixture.Handler.Seen.Count(r => r.Uri.AbsolutePath == "/account/about") == 1,
             "profile did not read the exact authenticated about response once");
         var account = Control<TextBlock>(window, "AccountText").DataContext as Account;
-        Assert(account is { Uid: "12345", AvatarUri: ClAvatar } && Artwork.GetSourceUri(avatar) == ClAvatar,
+        Assert(account is { Uid: "12345", AvatarUri: ClAvatar } && Artwork.GetSourceUri(avatar) == ClAvatar
+            && Control<TextBlock>(window, "AccountText").Text == account.DisplayName,
             "avatar binding did not retain the server portrait for the confirmed account UID");
         Assert(avatar.Clip is EllipseGeometry { RadiusX: 16, RadiusY: 16 } && fixture.ArtworkRequests == 1,
             "profile avatar is not a single frozen round artwork rendition");

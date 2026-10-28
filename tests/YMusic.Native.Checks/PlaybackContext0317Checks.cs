@@ -295,7 +295,7 @@ internal static partial class Program
             Window = new MainWindow(api:new MusicApi(Handler),store:new SessionStore(Path.Combine(directory,"session")),restore:false,diagnosticsDirectory:Path.Combine(directory,"diagnostics"),
                 offline:new OfflineLibrary(Path.Combine(directory,"offline"),new AudioBuffer(Path.Combine(directory,"download"),Handler)),player:Player,preferences:Preferences);
             Pc0317Set(Window,"_account",new Account("fixture","Private fixture",true));
-            Pc0317Set(Window,"_session",new Session("private-fake-token",null,DateTimeOffset.UtcNow.AddHours(1),"fixture"));
+            Pc0317Set(Window,"_session",new Session("private-fake-token",null,DateTimeOffset.UtcNow.AddHours(1),"fixture",MusicApi.RequiredScopes));
             Pc0317Set(Window,"_playbackQueue",new PlaybackQueue(new Random(97)));
             // Deliberately never Show: no shell, SMTC, browser, updater or profile.
             Player.SetVolume(0);

@@ -111,7 +111,7 @@ internal sealed partial class MusicApi
         foreach (var entry in entries.EnumerateArray())
         {
             var id = CatalogRequiredText(entry, "id", "трека плейлиста");
-            var albumId = Text(entry, "albumId");
+            var albumId = CatalogPlaylistAlbumId(entry, id);
             references.Add(new(id, albumId.Length == 0 ? null : albumId));
         }
         var rows = new List<TrackRow>(references.Count);
@@ -228,7 +228,7 @@ internal sealed partial class MusicApi
         {
             CatalogTrackReference(track, requireAlbum: true);
         }
-        var diff = JsonSerializer.Serialize(new[] { new { op = "insert", at, tracks = tracks.Select(t => new { id = t.Id, album_id = t.AlbumId }).ToArray() } });
+        var diff = JsonSerializer.Serialize(new[] { new { op = "insert", at, tracks = tracks.Select(t => new { id = t.Id, albumId = t.AlbumId }).ToArray() } });
         var desired = expected.Tracks.Select(t => t.RequestId).ToList();
         desired.InsertRange(at, tracks.Select(t => t.RequestId));
         return await CatalogChangeAsync(session, expected, diff, desired, cancellationToken).ConfigureAwait(false);
@@ -253,7 +253,7 @@ internal sealed partial class MusicApi
         try
         {
             var fresh = await CatalogWritableAsync(session, expected, cancellationToken).ConfigureAwait(false);
-            // Upstream's wire contract is form fields; diff itself is serialized JSON (album_id, exclusive to).
+            // The form carries a JSON diff: albumId is camel case, and delete.to is exclusive.
             using var json = await CatalogWriteAsync(CatalogPlaylistPath(fresh) + "/change", session,
                 Form(("kind", fresh.Kind), ("revision", fresh.Revision.ToString(CultureInfo.InvariantCulture)), ("diff", diff)), cancellationToken).ConfigureAwait(false);
             var response = CatalogMutationHeader(CatalogResult(json), fresh.Owner, fresh.Kind);
@@ -329,6 +329,24 @@ internal sealed partial class MusicApi
 
     private static string CatalogPlaylistPath(PlaylistDetails playlist)
         => $"/users/{CatalogId(playlist.Owner)}/playlists/{CatalogId(playlist.Kind)}";
+
+    private static string CatalogPlaylistAlbumId(JsonElement entry, string trackId)
+    {
+        // New playlist responses can embed a track instead of the old albumId.
+        // Use only an unambiguous reference in this exact playlist response;
+        // later bulk metadata must never invent or override its album context.
+        if (entry.TryGetProperty("albumId", out _)) return Text(entry, "albumId");
+        if (!entry.TryGetProperty("track", out var track) || track.ValueKind != JsonValueKind.Object
+            || Text(track, "id") != trackId || !track.TryGetProperty("albums", out var albums)
+            || albums.ValueKind != JsonValueKind.Array || albums.GetArrayLength() != 1) return "";
+        var albumId = Text(albums[0], "id");
+        if (albumId.Length > 0)
+        {
+            try { _ = CatalogId(albumId); }
+            catch (ArgumentException) { throw new MusicException("В ответе плейлиста некорректный идентификатор альбома."); }
+        }
+        return albumId;
+    }
 
     private static PlaylistDetails CatalogPlaylistHeader(JsonElement result, string owner, string kind)
     {

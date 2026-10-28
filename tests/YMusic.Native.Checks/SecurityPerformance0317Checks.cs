@@ -177,7 +177,7 @@ internal static partial class Program
             Host = new Window { Content = content, Width = 1280, Height = 860, Left = -16000, Top = 0, ShowActivated = false,
                 ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.Manual, UseLayoutRounding = true };
         }
-        internal void SetSession() => Sp0317Set(Window, "_session", new Session("synthetic", null, DateTimeOffset.UtcNow.AddHours(1), "synthetic"));
+        internal void SetSession() => Sp0317Set(Window, "_session", new Session("synthetic", null, DateTimeOffset.UtcNow.AddHours(1), "synthetic", MusicApi.RequiredScopes));
         internal void SelectUnavailable() => Sp0317Invoke(Window, "SelectUnavailableDownloads");
         internal HashSet<string> SelectedIds() => List.SelectedItems.OfType<DownloadEntry>().Select(e => e.Track.Id).ToHashSet(StringComparer.Ordinal);
         internal string Fingerprint() => string.Join(";", Directory.EnumerateFiles(_path, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal)
