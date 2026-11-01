@@ -52,6 +52,7 @@ public partial class MainWindow
         HideCatalog();
         HideCollectionHero();
         _section = section;
+        FitTrackColumns();
         CollectionOptionsPopup.IsOpen = false;
         CollectionToolbar.Visibility = section is "search" or "download-center" ? Visibility.Collapsed : Visibility.Visible;
         CollectionSummary.Visibility = section is "search" or "download-center" ? Visibility.Collapsed : Visibility.Visible;

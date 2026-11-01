@@ -82,7 +82,8 @@ internal sealed partial class MusicApi
                 rows.Add(CatalogTrack(track, rows.Count + 1, albumId));
         }
         return new(albumId, CatalogMetadataText(album, "title"), CatalogArtistNames(album), rows,
-            EntityArtwork(album, "album"), CatalogOptionalYear(album), CatalogOptionalDate(album, "releaseDate"));
+            EntityArtwork(album, "album"), CatalogOptionalYear(album), CatalogOptionalDate(album, "releaseDate"),
+            CatalogAlbumArtistCredits(album));
     }
 
     public async Task<IReadOnlyList<TrackRow>> GetArtistTracksAsync(Session session, string artistId, int page, CancellationToken cancellationToken)
@@ -410,6 +411,22 @@ internal sealed partial class MusicApi
     private static string CatalogArtistNames(JsonElement row)
         => row.TryGetProperty("artists", out var artists) && artists.ValueKind == JsonValueKind.Array
             ? string.Join(", ", artists.EnumerateArray().Select(a => Text(a, "name")).Where(n => n.Length > 0)) : "";
+
+    private static IReadOnlyList<ArtistReference> CatalogAlbumArtistCredits(JsonElement album)
+    {
+        if (!album.TryGetProperty("artists", out var artists) || artists.ValueKind != JsonValueKind.Array) return [];
+        var credits = new List<ArtistReference>();
+        foreach (var artist in artists.EnumerateArray())
+        {
+            var name = Text(artist, "name");
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            var id = Text(artist, "id");
+            // Preserve name-only credits in place without guessing a navigation ID.
+            if (string.IsNullOrWhiteSpace(id) || id.Length > 512 || id.Any(char.IsControl)) id = "";
+            credits.Add(new(id, name));
+        }
+        return Array.AsReadOnly(credits.ToArray());
+    }
 
     // Optional presentation metadata cannot make a previously readable collection fail.
     // Accept only the documented field types and ISO dates; never infer a release from tracks or titles.

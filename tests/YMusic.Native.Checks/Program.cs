@@ -525,6 +525,7 @@ internal static partial class Program
         await CheckThemeIntegration040();
         await CheckTrackActions0317();
         await CheckPopupGlyph0317();
+        await CheckMenuHoverPreview3();
         await CheckInterfacePolish0317();
         await CheckTrackPosition0317();
         await CheckUpdateSchedule0317();

@@ -12,7 +12,7 @@ internal static partial class Program
 {
     private static async Task CheckVersioning040()
     {
-        await Run("Versioning040: runtime footer and update state retain the preview identity", V040Metadata);
+        await Run("Versioning040: runtime footer and update state retain the full release identity", V040Metadata);
         await Run("Versioning040: portable stable feed promotes preview to final and prevents equal or older offers", V040Portable);
         await Run("Versioning040: Velopack stable GitHub feed promotes preview to final without preview assets or downloads", V040InstalledFeed);
     }
@@ -20,13 +20,13 @@ internal static partial class Program
     private static Task V040Metadata()
     {
         var assembly = typeof(UpdateSupport).Assembly;
-        const string expected = "0.5.2";
-        Assert(assembly.GetName().Version == new Version(0, 5, 2, 0), "numeric assembly identity drifted");
-        Assert(assembly.GetCustomAttribute<AssemblyFileVersionAttribute>()?.Version == "0.5.2.0", "numeric file identity drifted");
+        const string expected = "0.5.3";
+        Assert(assembly.GetName().Version == new Version(0, 5, 3, 0), "numeric assembly identity drifted");
+        Assert(assembly.GetCustomAttribute<AssemblyFileVersionAttribute>()?.Version == "0.5.3.0", "numeric file identity drifted");
         Assert(assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion == expected,
-            "full preview identity was lost in informational metadata");
-        Assert(FileVersionInfo.GetVersionInfo(assembly.Location).ProductVersion == expected, "Windows product metadata claims a stable version");
-        Assert(AppBranding.CurrentVersion == expected && AppBranding.VersionLabel == "v" + expected, "footer identity lost the preview suffix");
+            "full release identity was lost in informational metadata");
+        Assert(FileVersionInfo.GetVersionInfo(assembly.Location).ProductVersion == expected, "Windows product metadata disagrees with the expected release");
+        Assert(AppBranding.CurrentVersion == expected && AppBranding.VersionLabel == "v" + expected, "footer identity disagrees with the full release version");
         var service = new UpdateSupport(Path.Combine(_directory, "versioning040-missing-feed.json"), false,
             _ => throw new InvalidOperationException("metadata check created an update backend"));
         Assert(service.State.CurrentVersion == expected && service.State.Status == AppUpdateStatus.NotConfigured,

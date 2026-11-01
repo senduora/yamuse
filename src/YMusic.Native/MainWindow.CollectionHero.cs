@@ -21,7 +21,7 @@ public partial class MainWindow
     private void ShowCollectionHero(AlbumDetails album, string? fallbackTitle = null)
     {
         _activeAlbumDetails = album;
-        ShowCollectionHero(BuildAlbumHero(album, fallbackTitle));
+        ShowCollectionHero(BuildAlbumHero(album, fallbackTitle, ArtistName_Click));
     }
 
     private void ShowCollectionHero(PlaylistDetails playlist)
@@ -146,10 +146,12 @@ public partial class MainWindow
         }
     }
 
-    internal static FrameworkElement BuildAlbumHero(AlbumDetails album, string? fallbackTitle = null)
+    internal static FrameworkElement BuildAlbumHero(AlbumDetails album, string? fallbackTitle = null,
+        RoutedEventHandler? artistClick = null)
         => BuildCollectionHero("АЛЬБОМ", string.IsNullOrWhiteSpace(album.Title) ? fallbackTitle ?? "Альбом" : album.Title,
             album.Artists, album.ReleaseDate is { } released ? released.ToString("d MMMM yyyy", CollectionHeroCulture)
-                : album.Year?.ToString(CultureInfo.InvariantCulture), album.Tracks, album.CoverUri, "");
+                : album.Year?.ToString(CultureInfo.InvariantCulture), album.Tracks, album.CoverUri, "",
+            album.ArtistCredits, artistClick);
 
     internal static FrameworkElement BuildPlaylistHero(PlaylistDetails playlist)
         => BuildCollectionHero("ПЛЕЙЛИСТ", playlist.Title, playlist.OwnerName ?? "",
@@ -160,7 +162,8 @@ public partial class MainWindow
     private static readonly CultureInfo CollectionHeroCulture = CultureInfo.GetCultureInfo("ru-RU");
 
     private static FrameworkElement BuildCollectionHero(string kind, string title, string creator, string? date,
-        IReadOnlyList<TrackRow> tracks, string? coverUri, string description)
+        IReadOnlyList<TrackRow> tracks, string? coverUri, string description,
+        IReadOnlyList<ArtistReference>? artistCredits = null, RoutedEventHandler? artistClick = null)
     {
         var hero = new Grid { Name = "CollectionHeroSurface", MinHeight = 120, MaxHeight = 128, ClipToBounds = true };
         hero.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(138) });
@@ -193,7 +196,33 @@ public partial class MainWindow
         var creditsRow = new Grid { Name = "CollectionHeroCreatorRow", Margin = new Thickness(0, string.IsNullOrWhiteSpace(creator) ? 0 : 2, 200, 0) };
         creditsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         creditsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        if (!string.IsNullOrWhiteSpace(creator))
+        if (artistCredits is { Count: > 0 })
+        {
+            var artists = new DockPanel { Name = "CollectionHeroArtistLinks", LastChildFill = false, ClipToBounds = true };
+            foreach (var artist in artistCredits)
+            {
+                if (artists.Children.Count > 0)
+                {
+                    var comma = HeroText("", ", ", 13); comma.VerticalAlignment = VerticalAlignment.Center;
+                    artists.Children.Add(comma);
+                }
+                if (string.IsNullOrWhiteSpace(artist.Id))
+                {
+                    var name = HeroText("CollectionHeroCreator", artist.Name, 13); name.VerticalAlignment = VerticalAlignment.Center;
+                    artists.Children.Add(name);
+                    continue;
+                }
+                var link = new Button { Name = "CollectionHeroArtistLink", Tag = artist, ToolTip = "Открыть исполнителя",
+                    Content = new TextBlock { Name = "CollectionHeroCreator", Text = artist.Name, FontSize = 13,
+                        TextTrimming = TextTrimming.CharacterEllipsis }, VerticalAlignment = VerticalAlignment.Center };
+                link.SetResourceReference(StyleProperty, "ArtistLink");
+                AutomationProperties.SetName(link, "Открыть исполнителя «" + artist.Name + "»");
+                if (artistClick is not null) link.Click += artistClick;
+                artists.Children.Add(link);
+            }
+            creditsRow.Children.Add(artists);
+        }
+        else if (!string.IsNullOrWhiteSpace(creator))
         {
             var byline = HeroText("CollectionHeroCreator", creator, 13);
             creditsRow.Children.Add(byline);

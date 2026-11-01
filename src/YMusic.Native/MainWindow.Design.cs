@@ -58,9 +58,19 @@ public partial class MainWindow
     // should not hide the album/duration or create a horizontal scrollbar.
     private void FitTrackColumns()
     {
-        if (TracksList.View is not GridView view || view.Columns.Count != 6 || TracksList.ActualWidth < 360) return;
-        var flexible = Math.Max(160, TracksList.ActualWidth - 22 - 40 - 66 - 64);
-        double[] widths = [40, 66, Math.Floor(flexible * .47), Math.Floor(flexible * .29), Math.Floor(flexible * .24), 64];
+        if (TracksList.View is not GridView view) return;
+        var favorites = _section == "favorites";
+        if (favorites) view.Columns.Remove(TrackNumberColumn);
+        else if (!view.Columns.Contains(TrackNumberColumn)) view.Columns.Insert(0, TrackNumberColumn);
+        var statusIndex = view.Columns.IndexOf(TrackStatusColumn);
+        var statusPosition = favorites ? 0 : 1;
+        if (statusIndex != statusPosition) view.Columns.Move(statusIndex, statusPosition);
+        if (view.Columns.Count != (favorites ? 5 : 6) || TracksList.ActualWidth < 360) return;
+        var flexible = Math.Max(160, TracksList.ActualWidth - 22 - (favorites ? 0 : 40) - 66 - 64);
+        var title = Math.Floor(flexible * .47);
+        var artist = Math.Floor(flexible * .29);
+        var album = Math.Floor(flexible * .24);
+        double[] widths = favorites ? [66, title, artist, album, 64] : [40, 66, title, artist, album, 64];
         for (var i = 0; i < widths.Length; i++)
             if (double.IsNaN(view.Columns[i].Width) || Math.Abs(view.Columns[i].Width - widths[i]) > .5)
                 view.Columns[i].Width = widths[i];

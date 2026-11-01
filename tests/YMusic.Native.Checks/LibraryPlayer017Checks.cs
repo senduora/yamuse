@@ -19,6 +19,7 @@ internal static partial class Program
         await Run("Library017: like marks follow confirmed exact track IDs across separate view instances", Library017LikeMarks);
         await Run("Library017: failed like writes retain confirmed state and release the action", Library017FailedLike);
         await Run("Library017: saved audio is green across other playlists, albums, search and artist; removal clears every mark", Library017OfflineMarks);
+        await Run("Library017: marks precede covers and only favorites omit ordinal numbers across album playlist and queue navigation", Library017FavoritesLayout);
         await Run("Library017: track cover single click uses the selected filtered sorted playlist without album navigation", Library017CoverPlay);
         await Run("Library017: transparent Play is visible only over the cover and absent from playlist cards", Library017CoverHover);
         await Run("Library017: saved track cover plays without an account and unavailable covers cannot play", Library017OfflinePlay);
@@ -106,6 +107,97 @@ internal static partial class Program
         Assert(f.MediaRequests == 1 && f.Writes.Count == 0, "reading/removing download marks downloaded or mutated a track");
     }
 
+    private static async Task Library017FavoritesLayout()
+    {
+        using var f = new Library017Fixture("favorites-layout"); await f.SaveShared();
+        var window = f.Window; var list = Control<ListView>(window, "TracksList"); var grid = (GridView)list.View;
+        var rows = Enumerable.Range(0, 120).Select(index => new TrackRow
+        {
+            Number = index + 1, Id = index == 23 ? "shared" : "layout-" + index,
+            RequestId = (index == 23 ? "shared" : "layout-" + index) + ":album-layout", AlbumId = "album-layout",
+            Title = $"Трек {119 - index:000} с длинным названием для проверки расположения отметок",
+            Artist = "Исполнитель", Album = "Альбом", DurationMs = 4000, Available = true
+        }).ToArray();
+        SaField<List<TrackRow>>(window, "_favoritesCache").AddRange(rows);
+        SaInvoke(window, "ShowRows", (object)rows); window.UpdateLayout(); await Task.Delay(80);
+        string[] Fields() => grid.Columns.Select(column => (string)((GridViewColumnHeader)column.Header).Tag).ToArray();
+        Assert(SaField<string>(window, "_section") == "favorites"
+            && Fields().SequenceEqual(new[] { "Downloaded", "Title", "Artist", "Album", "Duration" }),
+            "first favorites view retained numbering or placed marks after covers");
+        var columns = grid.Columns.ToArray();
+        list.SelectedItems.Add(rows[0]); list.SelectedItems.Add(rows[23]);
+        SortHeader(window, ListSortField.Downloaded);
+        Assert(ReferenceEquals(list.Items[0], rows[23]) && list.SelectedItems.Contains(rows[0]) && list.SelectedItems.Contains(rows[23]),
+            "relocated download header lost its sort action or multi-selection");
+        foreach (var (width, height) in new[] { (1280, 860), (1050, 680) })
+        {
+            window.Width = width; window.Height = height; list.ScrollIntoView(rows[23]); window.UpdateLayout(); await Task.Delay(100);
+            var container = (ListViewItem)list.ItemContainerGenerator.ContainerFromItem(rows[23])!;
+            var cover = Library017Cover(window, rows[23]); var heart = Library017LikeButton(window, rows[23]);
+            var badge = SaVisuals<TextBlock>(container).Single(text => text.Name == "TrackDownloadedBadge");
+            var title = SaVisuals<Button>(container).Single(button => button.Content is TextBlock text && text.Text == rows[23].Title);
+            var artist = SaVisuals<Button>(container).Single(button => button.Content is TextBlock text && text.Text == rows[23].Artist);
+            Rect Bounds(FrameworkElement element) => new(element.TranslatePoint(new Point(), list), element.RenderSize);
+            var coverRect = Bounds(cover); var titleRect = Bounds(title); var heartRect = Bounds(heart); var badgeRect = Bounds(badge); var artistRect = Bounds(artist);
+            Assert(heartRect.Left < 20 && heartRect.Right <= badgeRect.Left + 1 && badgeRect.Right <= coverRect.Left + 1
+                && coverRect.Right <= titleRect.Left + 1 && titleRect.Right <= artistRect.Left + 1,
+                "favorites heart and download mark do not precede the cover and title");
+            Assert(heart.IsVisible && badge.IsVisible && artistRect.Right <= list.ActualWidth && grid.Columns.Sum(column => column.Width) <= list.ActualWidth,
+                "favorites actions or trailing columns clipped at a supported width");
+            foreach (var target in new[] { cover, heart })
+            {
+                var center = target.TranslatePoint(new Point(target.ActualWidth / 2, target.ActualHeight / 2), window);
+                Assert(window.InputHitTest(center) is DependencyObject hit && Library017Within(hit, target), "relocated action lost its actual hit area");
+            }
+            var downloadedHeader = (GridViewColumnHeader)grid.Columns[0].Header;
+            var titleHeader = (GridViewColumnHeader)grid.Columns[1].Header;
+            Assert(titleHeader.IsVisible && downloadedHeader.IsVisible && titleHeader.ActualWidth > 100 && downloadedHeader.ActualWidth >= 62
+                && downloadedHeader.TranslatePoint(new Point(), list).X < titleHeader.TranslatePoint(new Point(), list).X,
+                "title/download sort headers no longer align with their columns");
+            App.Capture(window, Path.Combine(_directory, $"library-017-favorites-layout-{width}.png"));
+        }
+        list.ScrollIntoView(rows[^1]); window.UpdateLayout(); await Task.Delay(80);
+        Assert(list.ItemContainerGenerator.ContainerFromItem(rows[^1]) is ListViewItem
+            && SaVisuals<ListViewItem>(list).Count() < 80 && VirtualizingPanel.GetVirtualizationMode(list) == VirtualizationMode.Recycling,
+            "favorites column move disabled bounded recycling or access to the list tail");
+        async Task CheckNumberedLayout(string section)
+        {
+            Assert(Fields().SequenceEqual(new[] { "Original", "Downloaded", "Title", "Artist", "Album", "Duration" }) && grid.Columns[0].Width == 40,
+                section + " lost its ordinal column or placed marks after the cover");
+            list.ScrollIntoView(rows[23]); window.UpdateLayout(); await Task.Delay(100);
+            var container = (ListViewItem)list.ItemContainerGenerator.ContainerFromItem(rows[23])!;
+            var number = SaVisuals<TextBlock>(container).Single(text => text.Text == rows[23].Number.ToString());
+            var heart = Library017LikeButton(window, rows[23]); var cover = Library017Cover(window, rows[23]);
+            var badge = SaVisuals<TextBlock>(container).Single(text => text.Name == "TrackDownloadedBadge");
+            Rect Bounds(FrameworkElement element) => new(element.TranslatePoint(new Point(), list), element.RenderSize);
+            Assert(number.IsVisible && heart.IsVisible && badge.IsVisible && Bounds(number).Left < 40
+                && Bounds(number).Right <= Bounds(heart).Left + 1 && Bounds(heart).Right <= Bounds(badge).Left + 1
+                && Bounds(badge).Right <= Bounds(cover).Left + 1, section + " does not show number, marks and cover in order");
+            App.Capture(window, Path.Combine(_directory, "library-017-" + section + "-numbered-layout.png"));
+        }
+        SaInvoke(window, "SetSection", "album-detail", "Альбом"); SaInvoke(window, "ShowRows", (object)rows); window.UpdateLayout();
+        await CheckNumberedLayout("album");
+        var numberColumn = grid.Columns[0];
+        SaClick(Control<Button>(window, "BrowseBackButton")); window.UpdateLayout(); await Task.Delay(80);
+        Assert(SaField<string>(window, "_section") == "favorites" && grid.Columns.SequenceEqual(columns)
+            && (ListSortField)Control<ComboBox>(window, "ListSortCombo").SelectedValue == ListSortField.Downloaded,
+            "Back lost the favorites column identities/order or its sort");
+        SaInvoke(window, "SetSection", "playlist-detail", "Плейлист");
+        SaInvoke(window, "ShowPlaylist", new PlaylistDetails("owner", "layout-list", "Плейлист", "", 1, rows));
+        await CheckNumberedLayout("playlist");
+        SaClick(Control<Button>(window, "BrowseBackButton")); window.UpdateLayout(); await Task.Delay(80);
+        Assert(SaField<string>(window, "_section") == "favorites" && grid.Columns.SequenceEqual(columns),
+            "returning from a playlist did not restore favorites without numbers");
+        SaField<PlaybackQueue>(window, "_playbackQueue").SetItems(rows);
+        SaInvoke(window, "ShowQueue"); window.UpdateLayout();
+        Assert(Fields().SequenceEqual(new[] { "Original", "Downloaded", "Title", "Artist", "Album", "Duration" })
+            && ReferenceEquals(grid.Columns[0], numberColumn), "queue did not restore the original numbered columns");
+        SortHeader(window, ListSortField.Original);
+        SaClick(Control<Button>(window, "FavoritesNav")); window.UpdateLayout();
+        Assert(grid.Columns.SequenceEqual(columns) && ReferenceEquals(list.Items[0], rows[23]) && !f.Player.HasSource && f.Writes.Count == 0,
+            "returning to favorites retained queue columns/sort or changed playback/likes");
+    }
+
     private static async Task Library017CoverPlay()
     {
         using var f = new Library017Fixture("track-cover");
@@ -137,24 +229,61 @@ internal static partial class Program
         SaInvoke(f.Window, "ShowRows", (object)new[] { row }); f.Window.UpdateLayout(); await Task.Delay(250);
         var list = Control<ListView>(f.Window, "TracksList"); var cover = Library017Cover(f.Window, row);
         var glyph = (System.Windows.Shapes.Path)cover.Template.FindName("TrackCoverPlayGlyph", cover);
-        Assert(glyph.Visibility == Visibility.Collapsed && ((SolidColorBrush)cover.Background).Color.A == 0
+        Assert(glyph.Opacity == 0 && ((SolidColorBrush)cover.Background).Color.A == 0
             && cover.BorderThickness == new Thickness(0), "idle cover has a Play badge or opaque button background");
         var container = (ListViewItem)list.ItemContainerGenerator.ContainerFromIndex(0);
+        var rowHover = (Border)container.Template.FindName("RowHover", container);
+        async Task<double> MidFade(FrameworkElement element)
+        {
+            // WPF starts the clock on the next render tick; reading immediately
+            // after ChangeMouseOver can still return the new base value.
+            await Task.Delay(40);
+            var opacity = element.Opacity;
+            Assert(!Motion.CanAnimate || opacity > 0 && opacity < 1,
+                $"hover did not render an intermediate opacity: {element.Name}={opacity}");
+            return opacity;
+        }
         var previous = Mouse.PrimaryDevice.DirectlyOver;
         try
         {
+            list.SelectedIndex = -1;
+            Library017MouseOver(null);
+            f.Window.UpdateLayout(); await Task.Delay(250);
+            Assert(rowHover.IsVisible && rowHover.Opacity == 0 && !container.IsMouseOver,
+                $"row hover fixture is not idle: visible={rowHover.IsVisible}, opacity={rowHover.Opacity}, selected={container.IsSelected}, over={container.IsMouseOver}");
             Library017MouseOver(container);
-            Assert(!cover.IsMouseOver && glyph.Visibility == Visibility.Collapsed, "hovering the row reveals the cover Play");
+            Assert(!cover.IsMouseOver && glyph.Opacity == 0, "hovering the row reveals the cover Play");
+            Assert(!Motion.CanAnimate || rowHover.HasAnimatedProperties,
+                $"row hover appeared without a transition: animated={rowHover.HasAnimatedProperties}, opacity={rowHover.Opacity}, visible={rowHover.IsVisible}, selected={container.IsSelected}, over={container.IsMouseOver}");
+            var rowFadeIn = await MidFade(rowHover);
+            await Task.Delay(250);
+            Assert(rowHover.Opacity == 1, "row hover did not settle");
             Library017MouseOver(cover);
-            Assert(cover.IsMouseOver && glyph.Visibility == Visibility.Visible && ((SolidColorBrush)cover.Background).Color.A == 0,
+            Assert(!Motion.CanAnimate || glyph.HasAnimatedProperties, "cover Play appeared without a transition");
+            var coverFadeIn = await MidFade(glyph);
+            await Task.Delay(250);
+            Assert(cover.IsMouseOver && glyph.Visibility == Visibility.Visible && glyph.Opacity == 1 && ((SolidColorBrush)cover.Background).Color.A == 0,
                 "cover hover did not reveal a transparent Play");
             var inside = VisualTreeHelper.HitTest(cover, new Point(17, 17));
             var outside = VisualTreeHelper.HitTest(list, cover.TranslatePoint(new Point(cover.ActualWidth + 3, 17), list));
             Assert(inside is not null && !Library017Within(outside?.VisualHit, cover), "cover hit area extends into the title/row gap");
             App.Capture(f.Window, Path.Combine(_directory, "track-cover-017-hover.png"));
             SaClick(cover); Library017MouseOver(container);
-            Assert(!cover.IsMouseOver && glyph.Visibility == Visibility.Collapsed, "click left Play visible after the cursor left the cover");
+            Assert(!Motion.CanAnimate || glyph.HasAnimatedProperties, "cover Play disappeared without a transition");
+            var coverFadeOut = await MidFade(glyph);
+            await Task.Delay(250);
+            Assert(!cover.IsMouseOver && glyph.Opacity == 0, "click left Play visible after the cursor left the cover");
             await Until(() => f.Player.IsPlaying && !SaField<bool>(f.Window, "_loadingStream"));
+            Assert(container.IsSelected && rowHover.Visibility == Visibility.Collapsed, "hover overlay obscures the selected track");
+            list.SelectedIndex = -1;
+            Library017MouseOver(null);
+            Assert(!Motion.CanAnimate || rowHover.HasAnimatedProperties, "row hover disappeared without a transition");
+            var rowFadeOut = await MidFade(rowHover);
+            await Task.Delay(250);
+            Assert(rowHover.Opacity == 0, "row hover remained after pointer exit");
+            File.WriteAllText(Path.Combine(_directory, "track-hover-motion.json"), JsonSerializer.Serialize(new
+            { animationAssertionsRun = Motion.CanAnimate, rowFadeIn, rowFadeOut, coverFadeIn, coverFadeOut,
+                rowAndCoverFadeInOut = true, selectedTrackPreserved = true, localWpfHoverOnly = true, nativeInputSent = false }));
             App.Capture(f.Window, Path.Combine(_directory, "track-cover-017-idle.png"));
         }
         finally { Library017MouseOver(previous); }

@@ -37,7 +37,7 @@ internal static partial class Program
         }
         foreach(var pair in new[]{(-1d,0d),(11d,10d),(double.NaN,3d),(double.PositiveInfinity,3d)})
             Assert(PreferencesStore.Normalize(old with {CrossfadeSeconds=pair.Item1}).CrossfadeSeconds==pair.Item2,"invalid value normalization");
-        File.WriteAllText(store.FilePath,"{\"quality\":\"Excellent\",\"volume\":0.42,\"playbackSpeed\":1.25,\"concurrentDownloads\":7,\"crossfadeSeconds\":10,\"retiredOption\":true,\"extraPlaybackFlag\":200,\"unknownSettings\":{\"depth\":2}}");
+        File.WriteAllText(store.FilePath,"{\"quality\":\"Excellent\",\"volume\":0.42,\"playbackSpeed\":1.25,\"concurrentDownloads\":7,\"crossfadeSeconds\":10,\"ambientAnimationStyle\":\"Kaleidoscope\",\"ambientBlurAmount\":100,\"retiredOption\":true,\"extraPlaybackFlag\":200,\"unknownSettings\":{\"depth\":2}}");
         var imported=store.Load(); Assert(imported.CrossfadeSeconds==10 && imported.Volume==.42 && imported.PlaybackSpeed==1.25 && imported.ConcurrentDownloads==7,"supported preferences lost");
         store.Save(imported);var json=File.ReadAllText(store.FilePath);
         using var document = JsonDocument.Parse(json);

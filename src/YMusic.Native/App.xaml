@@ -190,8 +190,10 @@
       <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}"/><Setter Property="Background" Value="Transparent"/><Setter Property="Padding" Value="9,7"/><Setter Property="FontSize" Value="12"/>
       <Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="FocusVisualStyle" Value="{x:Null}"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="MenuItem">
-        <Border x:Name="ItemSurface" Background="{TemplateBinding Background}" CornerRadius="7" Padding="{TemplateBinding Padding}">
+        <Border x:Name="ItemSurface" Background="{TemplateBinding Background}" CornerRadius="7">
           <Grid>
+            <Border x:Name="ItemHover" Background="{DynamicResource HoverBrush}" CornerRadius="7" local:Motion.Opacity="0" IsHitTestVisible="False"/>
+            <Grid Margin="{TemplateBinding Padding}">
             <Grid.ColumnDefinitions><ColumnDefinition Width="25"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="12"/></Grid.ColumnDefinitions>
             <ContentPresenter x:Name="ItemIcon" ContentSource="Icon" Width="16" Height="16" VerticalAlignment="Center" HorizontalAlignment="Left"/>
             <Path x:Name="ItemCheck" Data="M2,7 L6,11 L13,3" Width="14" Height="12" Stretch="Uniform" Stroke="{TemplateBinding Foreground}" StrokeThickness="1.5" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" HorizontalAlignment="Left" VerticalAlignment="Center" Visibility="Collapsed"/>
@@ -201,11 +203,12 @@
             <Popup x:Name="PART_Popup" IsOpen="{TemplateBinding IsSubmenuOpen}" Placement="Right" HorizontalOffset="1" AllowsTransparency="True" Focusable="False">
               <Border Background="{DynamicResource PopupBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="12" Padding="5"><ScrollViewer CanContentScroll="True" VerticalScrollBarVisibility="Auto" Focusable="False"><ItemsPresenter KeyboardNavigation.DirectionalNavigation="Cycle"/></ScrollViewer></Border>
             </Popup>
+            </Grid>
           </Grid>
         </Border>
         <ControlTemplate.Triggers>
-          <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="ItemSurface" Property="Background" Value="{DynamicResource HoverBrush}"/><Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}"/></Trigger>
-          <Trigger Property="IsSubmenuOpen" Value="True"><Setter TargetName="ItemSurface" Property="Background" Value="{DynamicResource HoverBrush}"/></Trigger>
+          <MultiTrigger><MultiTrigger.Conditions><Condition Property="IsEnabled" Value="True"/><Condition Property="IsHighlighted" Value="True"/></MultiTrigger.Conditions><Setter TargetName="ItemHover" Property="local:Motion.Opacity" Value="1"/><Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}"/></MultiTrigger>
+          <MultiTrigger><MultiTrigger.Conditions><Condition Property="IsEnabled" Value="True"/><Condition Property="IsSubmenuOpen" Value="True"/></MultiTrigger.Conditions><Setter TargetName="ItemHover" Property="local:Motion.Opacity" Value="1"/></MultiTrigger>
           <Trigger Property="IsEnabled" Value="False"><Setter TargetName="ItemSurface" Property="Opacity" Value="0.4"/></Trigger>
           <Trigger Property="IsChecked" Value="True"><Setter TargetName="ItemIcon" Property="Visibility" Value="Collapsed"/><Setter TargetName="ItemCheck" Property="Visibility" Value="Visible"/></Trigger>
           <Trigger Property="HasItems" Value="True"><Setter TargetName="ItemArrow" Property="Visibility" Value="Visible"/></Trigger>

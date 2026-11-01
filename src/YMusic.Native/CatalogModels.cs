@@ -15,4 +15,5 @@ internal sealed record PlaylistDetails(string Owner, string Kind, string Title, 
     string? CoverUri = null, string? OwnerName = null, DateOnly? Created = null, DateOnly? Modified = null);
 
 internal sealed record AlbumDetails(string Id, string Title, string Artists, IReadOnlyList<TrackRow> Tracks,
-    string? CoverUri = null, int? Year = null, DateOnly? ReleaseDate = null);
+    string? CoverUri = null, int? Year = null, DateOnly? ReleaseDate = null,
+    IReadOnlyList<ArtistReference>? ArtistCredits = null);

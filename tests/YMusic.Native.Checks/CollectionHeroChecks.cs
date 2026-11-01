@@ -17,6 +17,7 @@ internal static partial class Program
         await Run("Collection hero: playlist artwork, named owner and ISO dates remain optional read metadata", CollectionHeroPlaylistRead);
         await Run("Collection hero: unknown dates and duration are omitted, partial duration is explicit and Russian counts agree", CollectionHeroOptionalPresentation);
         await Run("Collection hero: inline album and playlist render at both sizes and navigation clears the header", CollectionHeroInline);
+        await Run("Collection hero: album artists use exact independent text links and Back restores the album without changing playback", CollectionHeroArtistLinks);
     }
 
     private const string HeroAlbumCover = "https://avatars.yandex.net/get-music-content/hero/album/%%";
@@ -39,6 +40,8 @@ internal static partial class Program
         var album = await api.GetAlbumDetailsAsync(FakeSession, "hero-album", default);
         Assert(album is { Id: "hero-album", Title: "Ночной маршрут", Artists: "Северный берег, Океан", Year: 2024, CoverUri: HeroAlbumCover }
             && album.ReleaseDate == new DateOnly(2024, 11, 8), "album presentation metadata lost exact server fields or shifted the date through local time");
+        Assert(album.ArtistCredits is { } credits && credits.SequenceEqual(new[] { new ArtistReference("1", "Северный берег"), new ArtistReference("2", "Океан") }),
+            "album credits lost their exact IDs, names or server order");
         Assert(album.Tracks.Select(track => track.Id).SequenceEqual(new[] { "hero-2", "hero-1" })
             && album.Tracks.Select(track => track.Number).SequenceEqual(new[] { 1, 2 })
             && album.Tracks.Select(track => track.RequestId).SequenceEqual(new[] { "hero-2:hero-album", "hero-1:hero-album" }), "header changed disc order, numbering or playback context");
@@ -65,13 +68,20 @@ internal static partial class Program
             && playlist.Created == new DateOnly(2025, 4, 15) && playlist.Modified == new DateOnly(2026, 10, 25)
             && handler.Seen.Count == 1, "playlist metadata changed the read protocol, dates or author identity");
         var malformed = new FakeHandler((request, _) => Task.FromResult(Json(request.RequestUri!.AbsolutePath.StartsWith("/albums/", StringComparison.Ordinal)
-            ? """{"result":{"id":"optional","title":false,"year":"2024","releaseDate":2024,"volumes":[]}}"""
+            ? """{"result":{"id":"optional","title":false,"year":"2024","releaseDate":2024,"artists":[{"name":"Без ID"},{"id":55,"name":"Одинаковое имя"},{"id":"bad\u0001","name":"Некорректный ID"},{"id":56,"name":"Одинаковое имя"}],"volumes":[]}}"""
             : """{"result":{"kind":"optional","owner":{"uid":"12345","name":12},"title":"Optional","revision":1,"trackCount":0,"tracks":[],"created":"03/04/2024","modified":true}}""")));
         using var optionalApi = new MusicApi(malformed);
         var emptyAlbum = await optionalApi.GetAlbumDetailsAsync(FakeSession, "optional", default);
         var emptyPlaylist = await optionalApi.GetPlaylistAsync(FakeSession, "12345", "optional", default);
         Assert(emptyAlbum is { Title: "", Year: null, ReleaseDate: null, CoverUri: null }
             && emptyPlaylist is { OwnerName: null, Created: null, Modified: null, CoverUri: null }, "optional fields were guessed from incompatible JSON types or ambiguous dates");
+        Assert(emptyAlbum.ArtistCredits?.Select(artist => artist.Id).SequenceEqual(new[] { "", "55", "", "56" }) == true,
+            "name-only credits disappeared or an invalid/duplicate-name credit acquired another artist's ID");
+        var hero = MainWindow.BuildAlbumHero(emptyAlbum);
+        Assert(HeroVisuals<Button>(hero).Where(button => button.Tag is ArtistReference).Select(button => ((ArtistReference)button.Tag).Id)
+            .SequenceEqual(new[] { "55", "56" }) && HeroVisuals<TextBlock>(hero).Where(text => text.Name == "CollectionHeroCreator")
+                .Select(text => text.Text).SequenceEqual(new[] { "Без ID", "Некорректный ID" }),
+            "unknown credits became clickable or known credits displaced the name-only metadata");
     }
 
     private static Task CollectionHeroOptionalPresentation()
@@ -198,6 +208,54 @@ internal static partial class Program
             foreach (var child in HeroVisuals<T>(VisualTreeHelper.GetChild(root, index))) yield return child;
     }
 
+    private static async Task CollectionHeroArtistLinks()
+    {
+        using var fixture = new CollectionHeroFixture(); var window = fixture.Window; await fixture.Activate();
+        await Call(window, "OpenCatalogAsync", new CatalogItem("hero-album", "album", "Альбом", ""), true);
+        var host = Control<ContentControl>(window, "CollectionHero"); var list = Control<ListView>(window, "TracksList");
+        var album = SaField<AlbumDetails>(window, "_activeAlbumDetails"); var queue = SaField<PlaybackQueue>(window, "_playbackQueue");
+        queue.SetItems(album.Tracks, album.Tracks[0]); var queueVersion = queue.Version; var current = queue.Current;
+        Control<TextBox>(window, "FilterBox").Text = "Огни"; await Until(() => list.Items.Count == 1); list.SelectedIndex = 0;
+        var previousMode = ThemeManager.Mode;
+        try
+        {
+            foreach (var mode in new[] { "Dark", "Light" })
+            {
+                ThemeManager.SetMode(mode); window.Width = 1280; window.Height = 860; window.UpdateLayout(); await Task.Delay(120);
+                var links = HeroVisuals<Button>((FrameworkElement)host.Content).Where(button => button.Tag is ArtistReference).ToArray();
+                Assert(links.Select(button => ((ArtistReference)button.Tag).Id).SequenceEqual(new[] { "1", "2" }), "header artist links are not independent exact references");
+                foreach (var link in links) Ui015BoundedHit(window, link, true);
+                App.Capture(window, Path.Combine(_directory, "collection-hero-artist-links-" + mode + ".png"));
+            }
+        }
+        finally { ThemeManager.SetMode(previousMode); }
+        foreach (var artistId in new[] { "1", "2" })
+        {
+            window.UpdateLayout();
+            var surface = host.Content as FrameworkElement ?? throw new InvalidOperationException("album header was not restored");
+            var link = HeroVisuals<Button>(surface).Single(button => button.Tag is ArtistReference artist && artist.Id == artistId);
+            SaClick(link);
+            await Until(() => SaField<ArtistDetails?>(window, "_artistDetails")?.Id == artistId && SaField<CancellationTokenSource?>(window, "_featureCts") is null);
+            Assert(fixture.Handler.Seen.Any(call => call.Uri.AbsolutePath == "/artists/" + artistId + "/brief-info")
+                && !fixture.Handler.Seen.Any(call => call.Uri.AbsolutePath == "/search"), "header artist navigation guessed by name");
+            Assert(host.Content is null && host.Visibility == Visibility.Collapsed, "artist navigation retained the album's clickable header");
+            SaClick(Control<Button>(window, "ArtistBackButton")); window.UpdateLayout();
+            File.WriteAllText(Path.Combine(_directory, "collection-hero-artist-back-" + artistId + ".json"), JsonSerializer.Serialize(new
+            { albumRestored = ReferenceEquals(SaField<AlbumDetails?>(window, "_activeAlbumDetails"), album), visible = host.IsVisible,
+                filter = Control<TextBox>(window, "FilterBox").Text, selectedIndex = list.SelectedIndex, itemCount = list.Items.Count }));
+            // Restored filter text follows the same 250 ms debounce as typing.
+            await Until(() => list.Items.Count == 1 && list.SelectedIndex == 0);
+            Assert(ReferenceEquals(SaField<AlbumDetails?>(window, "_activeAlbumDetails"), album) && host.IsVisible
+                && Control<TextBox>(window, "FilterBox").Text == "Огни" && list.SelectedIndex == 0,
+                "Back lost album metadata, filter, selection or restored artist links");
+        }
+        Assert(queue.Version == queueVersion && ReferenceEquals(queue.Current, current) && !fixture.Player.HasSource,
+            "header artist navigation changed the playback queue or opened audio");
+        File.WriteAllText(Path.Combine(_directory, "collection-hero-artist-links.json"), JsonSerializer.Serialize(new
+        { exactArtistIds = new[] { "1", "2" }, independentTextHitAreas = true, themes = new[] { "Dark", "Light" },
+            backRetainedAlbumFilterAndSelection = true, queueUnchanged = true, audioOpened = false, externalNetworkUsed = false }));
+    }
+
     private sealed class CollectionHeroFixture : IDisposable
     {
         internal MainWindow Window { get; }
@@ -225,6 +283,9 @@ internal static partial class Program
                 "/account/about" => """{"result":{"uid":"12345"}}""",
                 "/users/12345/likes/tracks" => """{"result":{"library":{"tracks":[]}}}""",
                 "/albums/hero-album/with-tracks" => HeroAlbumJson,
+                "/artists/1/brief-info" => """{"result":{"artist":{"id":1,"name":"Северный берег"},"stats":{"lastMonthListeners":10}}}""",
+                "/artists/2/brief-info" => """{"result":{"artist":{"id":2,"name":"Океан"},"stats":{"lastMonthListeners":20}}}""",
+                "/users/12345/likes/artists" => """{"result":[]}""",
                 "/users/12345/playlists/hero-list" => """{"result":{"kind":"hero-list","owner":{"uid":"12345","name":"Александр"},"title":"Тихий вечер","description":"Музыка для неспешных прогулок у моря.","revision":8,"trackCount":0,"tracks":[],"created":"2025-04-15T23:30:00+10:00","cover":{"uri":"avatars.yandex.net/get-music-content/hero/playlist/%%"}}}""",
                 _ => throw new InvalidOperationException("Unexpected collection hero fixture endpoint")
                 }));
