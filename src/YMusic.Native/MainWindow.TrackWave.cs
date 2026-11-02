@@ -10,21 +10,25 @@ public partial class MainWindow
     private int _waveRequestGeneration;
     private const string TrackWaveActionText = "Волна по этому треку";
     private string WaveViewTitle => _waveViewMode switch
-    { WaveMode.Track => "Волна по треку", WaveMode.Collection => "Волна по коллекции", _ => "Моя волна" };
+    { WaveMode.Track => "Волна по треку", WaveMode.Album => "Волна по альбому", WaveMode.Collection => "Волна по коллекции", _ => "Моя волна" };
     private bool IsCurrentWaveView => _waveBatch?.Mode == _waveViewMode
-        && (_waveViewMode != WaveMode.Track || _waveBatch.TrackSeedId == _waveSeedTrack?.Id);
+        && (_waveViewMode != WaveMode.Track || _waveBatch.TrackSeedId == _waveSeedTrack?.Id)
+        && (_waveViewMode != WaveMode.Album || _waveBatch.AlbumSeedId == _waveSeedAlbum?.Id);
     private bool IsWaveTrackInView(TrackRow track) => _waveSources.TryGetValue(track, out var source) && source.Mode == _waveViewMode
-        && (_waveViewMode != WaveMode.Track || source.TrackSeedId == _waveSeedTrack?.Id);
+        && (_waveViewMode != WaveMode.Track || source.TrackSeedId == _waveSeedTrack?.Id)
+        && (_waveViewMode != WaveMode.Album || source.AlbumSeedId == _waveSeedAlbum?.Id);
     private string WaveSourceLabel(TrackRow track) => _waveSources[track].Mode switch
-    { WaveMode.Track => "Волна по треку · рекомендации Яндекса", WaveMode.Collection => "Волна по коллекции · персональные рекомендации", _ => "Моя волна · персональные рекомендации" };
+    { WaveMode.Track => "Волна по треку · рекомендации Яндекса", WaveMode.Album => "Волна по альбому · рекомендации Яндекса", WaveMode.Collection => "Волна по коллекции · персональные рекомендации", _ => "Моя волна · персональные рекомендации" };
 
-    private void SelectWaveView(WaveMode mode, TrackRow? seed)
+    private void SelectWaveView(WaveMode mode, TrackRow? seed) => SelectSeededWaveView(mode, seed, null);
+
+    private void SelectSeededWaveView(WaveMode mode, TrackRow? seed, CatalogItem? albumSeed)
     {
         // Capture the old mode and seed before changing the view. Two track
         // stations share the same section but are distinct history entries.
         if (!_restoringBrowse && _featuresReady && _account is not null
-            && (_section != "wave" || _waveViewMode != mode || _waveSeedTrack?.Id != seed?.Id)) RememberBrowseView();
-        _waveViewMode = mode; _waveSeedTrack = seed;
+            && (_section != "wave" || _waveViewMode != mode || _waveSeedTrack?.Id != seed?.Id || _waveSeedAlbum?.Id != albumSeed?.Id)) RememberBrowseView();
+        _waveViewMode = mode; _waveSeedTrack = seed; _waveSeedAlbum = albumSeed;
         NavigateSection("wave", WaveViewTitle, remember: false);
     }
 

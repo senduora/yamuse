@@ -44,6 +44,7 @@ public partial class MainWindow
 
     private void ClearPlaybackContext(bool clearView = false)
     {
+        _restoredSourceAlbum = null; _restoredSourceAlbumQueue = null;
         _playbackContext = null; _playbackContextQueue = null; _playbackContextUid = null; _playbackContextSort = null;
         _playbackContextOccurrences = [];
         if (clearView) _playbackContextRows = new(StringComparer.Ordinal);

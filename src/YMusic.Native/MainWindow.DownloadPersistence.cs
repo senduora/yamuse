@@ -73,17 +73,20 @@ public partial class MainWindow
             _downloadQueuePlaylist = restored.Playlist; _downloadQueueQuality = restored.Quality;
             _downloadQueueAutomatic = restored.Automatic;
             _downloadQueueAccountUid = accountUid; _downloadQueueAccountGeneration = generation;
-            // This flag also suppresses automatic favorites replacement for a
-            // restored failed-only queue. Only an explicit download can lift it.
-            _downloadsAutoSuspended = true; _pendingAutoFavorites = null;
+            // Preserve unfinished and failed work for explicit continuation.
+            // Completed history must not suppress new automatic favorites.
+            _downloadsAutoSuspended = _downloadQueue.CanResume || _downloadQueue.CanRetry;
+            ClearPendingAutoFavorites();
             _downloadPersistenceDirty = true;
             RefreshDownloadCenter(); UpdatePlaylistDownloadedStatus();
-            if (_downloadQueue.Entries.Count > 0) SetStatus("Очередь загрузок восстановлена на паузе. Продолжите её в «Центре загрузок».");
+            if (_downloadQueue.Entries.Count > 0) SetStatus(_downloadsAutoSuspended
+                ? "Очередь загрузок восстановлена на паузе. Продолжите её в «Центре загрузок»."
+                : "История загрузок восстановлена.");
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or MusicException or JsonException)
         {
             if (!IsCurrentAdmission() || _downloadPersistenceInvalidated) return;
-            _downloadPersistenceWriteBlocked = true; _downloadsAutoSuspended = true; _pendingAutoFavorites = null;
+            _downloadPersistenceWriteBlocked = true; _downloadsAutoSuspended = true; ClearPendingAutoFavorites();
             _diagnostics.LastErrorType = "DownloadRestore:" + error.GetType().Name;
         }
     }

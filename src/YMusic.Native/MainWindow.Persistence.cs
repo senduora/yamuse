@@ -36,6 +36,8 @@ public partial class MainWindow
         {
             var restored = PlaybackStateStore.RestoreQueue(snapshot, _offline);
             _playbackQueue.RestoreItems(restored.Tracks, restored.CurrentIndex, snapshot.Shuffle, snapshot.Repeat);
+            _restoredSourceAlbum = snapshot.SourceAlbum;
+            _restoredSourceAlbumQueue = _playbackQueue.Items;
             _current = _playbackQueue.Current;
             _restoredPlaybackTrack = _current;
             _restoredPlaybackSeconds = _current is null ? null : restored.PositionSeconds;
@@ -71,7 +73,7 @@ public partial class MainWindow
         {
             var seconds = ReferenceEquals(_current, _playbackQueue.Current)
                 ? RestoredPlaybackPosition?.TotalSeconds ?? DisplayPosition(_player.Position).TotalSeconds : 0;
-            _playbackStateStore.Save(PlaybackStateStore.Capture(_account.Uid, _playbackQueue, seconds));
+            _playbackStateStore.Save(PlaybackStateStore.Capture(_account.Uid, _playbackQueue, seconds, PlaybackSourceAlbum()));
             _lastPlaybackStateSave = DateTimeOffset.UtcNow;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
@@ -90,7 +92,7 @@ public partial class MainWindow
         try
         {
             var seconds = RestoredPlaybackPosition?.TotalSeconds ?? DisplayPosition(_player.Position).TotalSeconds;
-            var snapshot = PlaybackStateStore.Capture(_account.Uid, _playbackQueue, seconds);
+            var snapshot = PlaybackStateStore.Capture(_account.Uid, _playbackQueue, seconds, PlaybackSourceAlbum());
             _playbackStateWriteTask = SaveAsync(snapshot);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)

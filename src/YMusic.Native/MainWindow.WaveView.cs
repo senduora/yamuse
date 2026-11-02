@@ -51,17 +51,19 @@ public partial class MainWindow
 
     private void UpdateWavePresentation()
     {
+        UpdateAlbumWaveButton();
         if (WavePanel is null) return;
         var collection = _waveViewMode == WaveMode.Collection;
         var byTrack = _waveViewMode == WaveMode.Track;
+        var byAlbum = _waveViewMode == WaveMode.Album;
         if (WaveFallbackGlyph is not null) WaveFallbackGlyph.Data = (Geometry)FindResource(collection ? "CollectionWaveGeometry" : "MenuWaveGeometry");
         WaveHeading.Text = WaveViewTitle;
-        WaveModeCaption.Text = byTrack ? "По треку «" + _waveSeedTrack?.Title + "»" : collection ? "Ваша коллекция задаёт настроение" : "Музыка, которая подходит именно вам";
+        WaveModeCaption.Text = byTrack ? "По треку «" + _waveSeedTrack?.Title + "»" : byAlbum ? "По альбому «" + _waveSeedAlbum?.Title + "»" : collection ? "Ваша коллекция задаёт настроение" : "Музыка, которая подходит именно вам";
         WaveModeCaption.ToolTip = WaveModeCaption.Text;
         var ownWave = IsCurrentWaveView;
         var track = ownWave && _current is not null && IsWaveTrackInView(_current) ? _current : ownWave ? _waveTracks.FirstOrDefault() : null;
         WaveTrackTitle.Text = track?.Title ?? (_waveStarting ? "Подбираем музыку…" : "Откройте свою музыку заново");
-        WaveTrackArtist.Text = track?.Artist ?? (byTrack ? _waveSeedTrack?.Artist : collection ? "Любимые треки и близкая вам музыка" : "Персональные рекомендации Яндекса");
+        WaveTrackArtist.Text = track?.Artist ?? (byTrack ? _waveSeedTrack?.Artist : byAlbum ? _waveSeedAlbum?.Subtitle : collection ? "Любимые треки и близкая вам музыка" : "Персональные рекомендации Яндекса");
         if (!ReferenceEquals(track, _waveHeroTrack))
         {
             _waveHeroTrack = track;

@@ -89,6 +89,7 @@ public partial class MainWindow
 
     private void CommitSeek(double seconds)
     {
+        CancelAutomaticWave();
         if (!_player.HasSource || !double.IsFinite(seconds)) return;
         var target = Math.Clamp(seconds, 0, _player.Duration.TotalSeconds);
         PlaybackTimeline.Stop(SeekSlider);

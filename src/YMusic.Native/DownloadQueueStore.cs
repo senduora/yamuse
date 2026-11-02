@@ -199,7 +199,10 @@ internal sealed class DownloadQueueStore
         }
         if (snapshot.Playlist is { } p && (!ValidKey(p.Owner) || !ValidKey(p.Kind) || !ValidText(p.Title) || p.Revision < 0
             || p.TrackIds is null || p.TrackIds.Count > MaximumEntries || p.TrackIds.Any(id => id is null || !ids.Contains(id)))) throw new JsonException();
-        if (snapshot.FavoritesBatch && snapshot.Playlist is not { Owner: "local:favorites", Kind: "liked" }) throw new JsonException();
+        // A confirmed-like batch has favorites removal semantics without claiming
+        // that its few tracks form the complete offline collection snapshot.
+        if (snapshot.FavoritesBatch && snapshot.Playlist is not { Owner: "local:favorites", Kind: "liked" }
+            && !(snapshot.Automatic && snapshot.Playlist is null)) throw new JsonException();
     }
     private static bool ValidId(string? value) => value is { Length: > 0 and <= 512 }
         && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');

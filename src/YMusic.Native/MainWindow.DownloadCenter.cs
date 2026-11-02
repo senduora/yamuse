@@ -186,7 +186,7 @@ public partial class MainWindow
     private void PauseDownloadQueue()
     {
         if (_downloadCts is null) return;
-        _downloadsAutoSuspended = true; _pendingAutoFavorites = null;
+        _downloadsAutoSuspended = true; ClearPendingAutoFavorites();
         _downloadQueue.Pause(); _downloadCts.Cancel(); RefreshDownloadCenter();
         _ = PersistDownloadQueueAsync(force: true);
     }
@@ -202,7 +202,7 @@ public partial class MainWindow
     {
         ClearPersistedDownloadQueue();
         _compactDownloadOperation?.Dispose();
-        _downloadsAutoSuspended = true; _pendingAutoFavorites = null;
+        _downloadsAutoSuspended = true; ClearPendingAutoFavorites();
         _downloadQueue.Suspend(); _downloadCts?.Cancel(); RefreshDownloadCenter();
     }
     private void DownloadCenter_Click(object sender, RoutedEventArgs e)

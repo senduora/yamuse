@@ -22,11 +22,14 @@ public partial class MainWindow
     {
         _activeAlbumDetails = album;
         ShowCollectionHero(BuildAlbumHero(album, fallbackTitle, ArtistName_Click));
+        AlbumWaveButton.Visibility = Visibility.Visible;
+        UpdateAlbumWaveButton();
     }
 
     private void ShowCollectionHero(PlaylistDetails playlist)
     {
         _activeAlbumDetails = null;
+        AlbumWaveButton.Visibility = Visibility.Collapsed;
         ShowCollectionHero(BuildPlaylistHero(playlist));
     }
 
@@ -87,6 +90,7 @@ public partial class MainWindow
     private void HideCollectionHero()
     {
         _activeAlbumDetails = null;
+        AlbumWaveButton.Visibility = Visibility.Collapsed;
         RestoreCollectionHeroLayout();
         if (FindName("CollectionHero") is ContentControl host)
         {

@@ -15,7 +15,7 @@ public partial class MainWindow
         bool IsCatalog, string Filter, PlaylistDetails? Playlist, CatalogItem? Opened, int ArtistPage,
         ArtistDetails? Artist, bool? ArtistLiked, bool SearchVisible, double Offset, int SelectedIndex,
         object? Selection, AlbumDetails? Album, string SearchText, string SearchType, int SearchPage, bool CollectionsSearch,
-        string SearchCategory, bool SearchHasMore, string Query, WaveMode WaveMode, TrackRow? WaveSeedTrack);
+        string SearchCategory, bool SearchHasMore, string Query, WaveMode WaveMode, TrackRow? WaveSeedTrack, CatalogItem? WaveSeedAlbum);
 
     private void RememberBrowseView()
     {
@@ -34,7 +34,7 @@ public partial class MainWindow
             _catalogShowing ? CatalogList.SelectedIndex : TracksList.SelectedIndex, _catalogShowing ? CatalogList.SelectedItem : TracksList.SelectedItem,
             _activeAlbumDetails, _searchText, _searchType, _searchPage, _collectionsSearch,
             (CatalogType.SelectedItem as ComboBoxItem)?.Tag as string ?? "all", MoreCatalogButton.IsEnabled,
-            CatalogQuery.Text, _waveViewMode, _waveSeedTrack);
+            CatalogQuery.Text, _waveViewMode, _waveSeedTrack, _waveSeedAlbum);
     }
     private static void PushBrowse(Stack<BrowseSnapshot> stack, BrowseSnapshot snapshot)
     {
@@ -61,7 +61,7 @@ public partial class MainWindow
         _restoringBrowse = true;
         try
         {
-        _waveViewMode = previous.WaveMode; _waveSeedTrack = previous.WaveSeedTrack;
+        _waveViewMode = previous.WaveMode; _waveSeedTrack = previous.WaveSeedTrack; _waveSeedAlbum = previous.WaveSeedAlbum;
         NavigateSection(previous.Section, previous.Title, remember: false);
         _openedCatalogItem = previous.Opened; _artistPage = previous.ArtistPage;
         _searchText = previous.SearchText; _searchType = previous.SearchType; _searchPage = previous.SearchPage;

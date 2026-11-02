@@ -101,7 +101,9 @@ internal sealed class DownloadQueueState
             AddEntry(entry);
         }
         Label = restored.Label; FavoritesBatch = restored.FavoritesBatch; Suspended = false;
-        Notice = "Очередь восстановлена на паузе. Нажмите «Продолжить»; готовые файлы не скачиваются повторно. Ошибки можно повторить отдельно.";
+        Notice = CanResume || CanRetry
+            ? "Очередь восстановлена на паузе. Нажмите «Продолжить»; готовые файлы не скачиваются повторно. Ошибки можно повторить отдельно."
+            : "История загрузок восстановлена. Незавершённых загрузок нет.";
         StateChanged?.Invoke();
     }
     private void ClearEntries()

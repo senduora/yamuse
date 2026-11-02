@@ -29,6 +29,7 @@ public partial class MainWindow
     private bool _offlineMaintenance;
     private bool _favoritesSnapshotReady;
     private PlaylistDetails? _pendingAutoFavorites;
+    private readonly Dictionary<string, TrackRow> _pendingConfirmedFavorites = new(StringComparer.Ordinal);
     private readonly HashSet<string> _deletedUntilFavoritesRefresh = new(StringComparer.Ordinal);
     private (string Owner, string Kind)? _viewedOfflinePlaylist;
 
@@ -91,7 +92,7 @@ public partial class MainWindow
     {
         if (_downloadCts is not null || _offlineMaintenance || _session is null || _closed) return Task.CompletedTask;
         if (automatic && (_downloadsAutoSuspended || _downloadQueue.HasPaused)) return Task.CompletedTask;
-        _downloadQueue.Replace(tracks, label, playlist is { Owner: LocalFavoritesOwner, Kind: LocalFavoritesKind });
+        _downloadQueue.Replace(tracks, label, automatic || playlist is { Owner: LocalFavoritesOwner, Kind: LocalFavoritesKind });
         _downloadQueuePlaylist = playlist;
         _downloadQueueQuality = SelectedQuality; _downloadQueueAutomatic = automatic;
         _downloadQueueAccountGeneration = _accountGeneration;
@@ -152,17 +153,17 @@ public partial class MainWindow
                 // in the snapshot; audio is streamed to disk with bounded buffers.
                 await Task.WhenAll(Enumerable.Range(0, Math.Min(concurrentDownloads, selected.Length)).Select(_ => WorkerAsync()));
                 _downloadsAutoSuspended = _downloadQueue.HasPaused;
-                if (_downloadQueue.Entries.Any(entry => entry.State == DownloadEntryState.Failed)) _pendingAutoFavorites = null;
+                if (_downloadQueue.Entries.Any(entry => entry.State == DownloadEntryState.Failed)) ClearPendingAutoFavorites();
                 ReportDownloadOutcome();
             }
             catch (OperationCanceledException) when (cts.IsCancellationRequested)
             {
-                _downloadsAutoSuspended = true; _pendingAutoFavorites = null;
+                _downloadsAutoSuspended = true; ClearPendingAutoFavorites();
                 if (!_closed && _session is not null && !_offlineMaintenance) SetStatus("Загрузка на паузе. Откройте «Загрузки», чтобы продолжить очередь.");
             }
             catch (Exception ex)
             {
-                _pendingAutoFavorites = null;
+                ClearPendingAutoFavorites();
                 _diagnostics.LastErrorType = "DownloadQueue:" + ex.GetType().Name;
                 foreach (var entry in selected.Where(entry => entry.Active || entry.State == DownloadEntryState.Queued))
                     entry.SetState(DownloadEntryState.Failed, DownloadFailure.Describe(ex));
@@ -266,6 +267,21 @@ public partial class MainWindow
         _pendingAutoFavorites = null;
         UpdatePlaylistDownloadedStatus();
     }
+    private void ClearPendingAutoFavorites()
+    {
+        _pendingAutoFavorites = null;
+        _pendingConfirmedFavorites.Clear();
+    }
+    private void ScheduleConfirmedFavoriteDownload(TrackRow row)
+    {
+        if (!_autoFavoritesEnabled || _session is null || _demo || _closed || _offlineMaintenance
+            || _downloadsAutoSuspended || _downloadQueue.HasPaused || !_favoriteTrackIds.Contains(row.Id)) return;
+        // Confirmed metadata is already available. A held/failed full refresh
+        // must not postpone this track or erase earlier pending confirmed likes.
+        _pendingConfirmedFavorites[row.Id] = row;
+        _deletedUntilFavoritesRefresh.Remove(row.Id);
+        TryStartPendingAutoFavorites();
+    }
     private void ScheduleAutoFavoritesDownloads()
     {
         _favoritesSnapshotReady = true;
@@ -277,7 +293,16 @@ public partial class MainWindow
     }
     private void TryStartPendingAutoFavorites()
     {
-        if (!_autoFavoritesEnabled || _pendingAutoFavorites is not { } snapshot || _downloadCts is not null || _offlineMaintenance || _session is null || _closed || _downloadsAutoSuspended || _downloadQueue.HasPaused) return;
+        if (!_autoFavoritesEnabled || _downloadCts is not null || _offlineMaintenance || _session is null || _closed || _downloadsAutoSuspended || _downloadQueue.HasPaused) return;
+        if (_pendingConfirmedFavorites.Count > 0)
+        {
+            var tracks = _pendingConfirmedFavorites.Values.ToArray();
+            _pendingConfirmedFavorites.Clear();
+            // This is an incremental batch, not a complete collection snapshot.
+            _ = StartDownloadBatchAsync(tracks, "Автоскачивание «Мне нравится»", null, automatic: true);
+            return;
+        }
+        if (_pendingAutoFavorites is not { } snapshot) return;
         _pendingAutoFavorites = null; // No automatic retry loop after errors or cancellation.
         _ = StartDownloadBatchAsync(snapshot.Tracks, "Автоскачивание «Мне нравится»", snapshot, automatic: true);
     }
@@ -293,7 +318,7 @@ public partial class MainWindow
         }
         else
         {
-            _pendingAutoFavorites = null;
+            ClearPendingAutoFavorites();
             if (_downloadIsAutomatic) PauseDownloadQueue();
             SetStatus("Автоскачивание выключено. Уже сохранённая музыка останется офлайн.");
         }
@@ -337,7 +362,7 @@ public partial class MainWindow
     private async Task ClearOfflineAfterConfirmationAsync()
     {
         if (_offlineMaintenance || _cacheMaintenance) return;
-        _offlineMaintenance = true; _pendingAutoFavorites = null;
+        _offlineMaintenance = true; ClearPendingAutoFavorites();
         var maintenanceGeneration = ++_maintenanceGeneration;
         InvalidateOfflineViewState(); RefreshMaintenanceActions(); ShowMaintenance("Подготавливаем очистку музыки…", 0);
         try

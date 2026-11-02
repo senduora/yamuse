@@ -252,6 +252,7 @@ public partial class MainWindow
         if (liked) _favoriteTrackIds.Add(row.Id);
         else
         {
+            _pendingConfirmedFavorites.Remove(row.Id);
             var wasLiked = _favoriteTrackIds.Remove(row.Id);
             _libraryRemovedLikes?.Add(row.Id);
             var removed = _favoritesCache.RemoveAll(t => t.Id == row.Id);
@@ -267,7 +268,11 @@ public partial class MainWindow
         { _downloadQueue.SetCollectionLike(row.Id, liked); RefreshDownloadCenter(); }
         if (showStatus) SetStatus(liked ? "Трек добавлен в избранное" : "Трек убран из избранного");
         PersistFavoritesCache();
-        if (liked) _ = RefreshLibraryAsync();
+        if (liked)
+        {
+            _ = RefreshLibraryAsync();
+            ScheduleConfirmedFavoriteDownload(row);
+        }
     }
     private async void CreatePlaylist_Click(object sender, RoutedEventArgs e)
     {

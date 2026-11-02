@@ -9,7 +9,7 @@ public partial class MainWindow
 {
     private readonly List<TrackRow> _favoritesCache = [];
     private readonly List<TrackRow> _waveTracks = [];
-    private readonly Dictionary<TrackRow, (string SessionId, string BatchId, WaveMode Mode, string? TrackSeedId)> _waveSources = new();
+    private readonly Dictionary<TrackRow, (string SessionId, string BatchId, WaveMode Mode, string? TrackSeedId, string? AlbumSeedId)> _waveSources = new();
     private readonly OfflineLibrary _offline;
     private CancellationTokenSource? _featureCts;
     private CancellationTokenSource? _downloadCts;
@@ -121,8 +121,10 @@ public partial class MainWindow
     private async Task StartWaveViewAsync(bool renew)
     {
         if (_session is null) { SetStatus("Войдите в Яндекс, чтобы запустить персональную волну."); return; }
+        CancelAutomaticWave();
         var mode = _waveViewMode;
         var seed = _waveSeedTrack?.Id;
+        var albumSeed = _waveSeedAlbum?.Id;
         SetSection("wave", WaveViewTitle);
         if (!renew && IsCurrentWaveView && _waveTracks.Count > 0) { ShowRows(_waveTracks); UpdateWavePresentation(); return; }
         _featureCts?.Cancel();
@@ -133,9 +135,10 @@ public partial class MainWindow
         _waveStarting = true; Busy(true); UpdateWavePresentation();
         try
         {
-            SetStatus(mode == WaveMode.Track ? "Подбираем волну по треку…" : "Подбираем треки Моей волны…");
+            SetStatus(mode switch { WaveMode.Track => "Подбираем волну по треку…", WaveMode.Album => "Подбираем волну по альбому…", _ => "Подбираем треки Моей волны…" });
             var session = await EnsureSessionAsync(cts.Token);
-            var batch = await _api.StartWaveAsync(session, cts.Token, mode, mode == WaveMode.Track ? seed : null);
+            var batch = await _api.StartWaveAsync(session, cts.Token, mode, mode == WaveMode.Track ? seed : null,
+                mode == WaveMode.Album ? albumSeed : null);
             cts.Token.ThrowIfCancellationRequested();
             if (_closed || account != _accountGeneration || request != _waveRequestGeneration || !ReferenceEquals(_featureCts, cts)) return;
             if (_playbackGeneration != playback || _playbackQueue.Version != queueVersion)
@@ -155,7 +158,7 @@ public partial class MainWindow
     private void AddWaveBatch(RadioBatch batch)
     {
         _waveBatch = batch;
-        foreach (var row in batch.Tracks) { _waveTracks.Add(row); _waveSources[row] = (batch.SessionId, batch.BatchId, batch.Mode, batch.TrackSeedId); }
+        foreach (var row in batch.Tracks) { _waveTracks.Add(row); _waveSources[row] = (batch.SessionId, batch.BatchId, batch.Mode, batch.TrackSeedId, batch.AlbumSeedId); }
         while (_waveTracks.Count > 300)
         {
             var old = _waveTracks[0]; _waveTracks.RemoveAt(0);
@@ -167,7 +170,8 @@ public partial class MainWindow
     {
         if (_waveBatch is null || _session is null) return;
         if (_current is null || !ReferenceEquals(_playbackQueue.Current, _current) || !_waveSources.TryGetValue(_current, out var activeSource)
-            || activeSource.Mode != _waveBatch.Mode || activeSource.TrackSeedId != _waveBatch.TrackSeedId) return;
+            || activeSource.Mode != _waveBatch.Mode || activeSource.TrackSeedId != _waveBatch.TrackSeedId
+            || activeSource.AlbumSeedId != _waveBatch.AlbumSeedId) return;
         if (_advancingWave) return;
         _advancingWave = true; UpdateControls();
         var generation = _playbackGeneration;
@@ -202,6 +206,7 @@ public partial class MainWindow
     }
     private void SetWavePaused(bool paused)
     {
+        if (paused) CancelAutomaticWave();
         foreach (var listening in new[] { _waveListening, _fadingWaveListening })
             if (listening is not null) { if (paused) listening.Clock.Stop(); else listening.Clock.Start(); }
     }
@@ -244,7 +249,7 @@ public partial class MainWindow
     private async void Download_Click(object sender, RoutedEventArgs e) => await DownloadSelectedAsync();
     private async Task DownloadSelectedAsync()
     {
-        if (_downloadCts is not null) { _pendingAutoFavorites = null; _downloadCts.Cancel(); return; }
+        if (_downloadCts is not null) { ClearPendingAutoFavorites(); _downloadCts.Cancel(); return; }
         // Materialize SelectedItems before starting: Ctrl/Shift selection remains exact.
         var selected = TracksList.SelectedItems.Cast<TrackRow>().Where(t => t.Available && t.LocalPath is null).ToArray();
         if (selected.Length == 0 || _session is null) return;
@@ -257,10 +262,11 @@ public partial class MainWindow
     }
     private void ResetFeatures()
     {
-        _accountGeneration++; _waveRequestGeneration++; _waveStarting = false; _waveSeedTrack = null; _waveViewMode = WaveMode.Personal; _featureCts?.Cancel(); _downloadCts?.Cancel();
+        _accountGeneration++; _waveRequestGeneration++; _waveStarting = false; _waveSeedTrack = null; _waveSeedAlbum = null; _waveViewMode = WaveMode.Personal; _featureCts?.Cancel(); _downloadCts?.Cancel();
+        CancelAutomaticWave();
         ResetBrowseState();
         CancelNextPreparation();
-        _pendingAutoFavorites = null;
+        ClearPendingAutoFavorites();
         CloseDiscovery();
         _waveListening?.Clock.Stop(); _waveListening = null;
         _api.ResetWaveState(); _favoritesCache.Clear(); _waveTracks.Clear(); _waveSources.Clear(); _waveBatch = null;

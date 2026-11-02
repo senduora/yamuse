@@ -14,12 +14,15 @@ internal sealed record PlaybackTrackState(
     string? AlbumId = null,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CoverUri = null);
 
+internal sealed record PlaybackAlbumState(string Id, string Title, string Artist);
+
 internal sealed record PlaybackSnapshot(
     [property: JsonRequired] int Version, [property: JsonRequired] string AccountUid,
     [property: JsonRequired] DateTimeOffset SavedUtc,
     [property: JsonRequired] IReadOnlyList<PlaybackTrackState> Tracks,
     [property: JsonRequired] int CurrentIndex, [property: JsonRequired] double PositionSeconds,
-    [property: JsonRequired] bool Shuffle, [property: JsonRequired] RepeatMode Repeat);
+    [property: JsonRequired] bool Shuffle, [property: JsonRequired] RepeatMode Repeat,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] PlaybackAlbumState? SourceAlbum = null);
 
 internal sealed record RestoredPlaybackQueue(IReadOnlyList<TrackRow> Tracks, int CurrentIndex, double PositionSeconds);
 internal enum PlaybackStateReadStatus { Missing, Disabled, Loaded, OtherAccount, Invalid, Unavailable }
@@ -150,14 +153,14 @@ internal sealed class PlaybackStateStore
         }
     }
 
-    public static PlaybackSnapshot Capture(string accountUid, PlaybackQueue queue, double positionSeconds)
+    public static PlaybackSnapshot Capture(string accountUid, PlaybackQueue queue, double positionSeconds, PlaybackAlbumState? sourceAlbum = null)
     {
         ArgumentNullException.ThrowIfNull(queue);
         var tracks = queue.Items.Select(row => new PlaybackTrackState(row.Id, row.RequestId, row.Title, row.Artist,
             row.Album, row.DurationMs, row.Available, CopyArtists(row.Artists), row.AlbumId, ArtworkUri.Metadata(row.CoverUri))).ToArray();
         var index = queue.CurrentIndex;
         var snapshot = new PlaybackSnapshot(CurrentVersion, accountUid, DateTimeOffset.UtcNow, Array.AsReadOnly(tracks), index,
-            ClampPosition(positionSeconds, index < 0 ? 0 : tracks[index].DurationMs), queue.Shuffle, queue.Repeat);
+            ClampPosition(positionSeconds, index < 0 ? 0 : tracks[index].DurationMs), queue.Shuffle, queue.Repeat, sourceAlbum);
         Validate(snapshot);
         return snapshot;
     }
@@ -215,6 +218,8 @@ internal sealed class PlaybackStateStore
             || snapshot.CurrentIndex < -1 || snapshot.CurrentIndex >= snapshot.Tracks.Count
             || !double.IsFinite(snapshot.PositionSeconds) || snapshot.PositionSeconds < 0 || !Enum.IsDefined(snapshot.Repeat))
             throw new JsonException("Некорректное сохранённое состояние воспроизведения.");
+        if (snapshot.SourceAlbum is { } album && (!MusicApi.IsAlbumWaveSeed(album.Id) || !ValidText(album.Title) || !ValidText(album.Artist)))
+            throw new JsonException("Некорректный источник альбомной очереди.");
         foreach (var track in snapshot.Tracks)
         {
             if (track is null || !ValidId(track.Id) || !ValidRequestId(track.RequestId, track.Id)

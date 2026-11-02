@@ -173,6 +173,7 @@ internal static partial class Program
             _player = new NativePlayer(new AudioBuffer(Path.Combine(directory, "buffer"), new R4NoNetwork()));
             Window = (MainWindow)RuntimeHelpers.GetUninitializedObject(typeof(MainWindow));
             R4Set(Window, "_lifetime", Lifetime); R4Set(Window, "_downloadQueue", new DownloadQueueState());
+            R4Set(Window, "_pendingConfirmedFavorites", new Dictionary<string, TrackRow>(StringComparer.Ordinal));
             R4Set(Window, "_appUpdatesOverride", Updates); R4Set(Window, "_player", _player);
             R4Set(Window, "_preferencesReady", true); R4Set(Window, "_preferenceStore", preferences);
             R4Set(Window, "_autoFavoritesEnabled", true); R4Set(Window, "_concurrentDownloads", 3);

@@ -328,6 +328,7 @@ public partial class MainWindow : Window
     private async Task PlayTrackCoreAsync(TrackRow track, PreparedPlayback? prepared, bool automatic)
     {
         if (_closed) return;
+        CancelAutomaticWave();
         ForgetRestoredPositionFor(track);
         ApplyOfflineStates([track]);
         var localPath = track.LocalPath ?? track.DownloadedPath;
@@ -425,6 +426,10 @@ public partial class MainWindow : Window
     private async void PlayPause_Click(object sender, RoutedEventArgs e) => await TogglePlaybackAsync();
     private async Task TogglePlaybackAsync()
     {
+        if (_automaticWaveCts is not null)
+        {
+            CancelAutomaticWave(); StopCompletedQueue(); SetStatus("Воспроизведение на паузе."); return;
+        }
         if (_loadingStream) return;
         if (!_player.HasSource)
         {
@@ -466,12 +471,10 @@ public partial class MainWindow : Window
         }
         if (next is null)
         {
+            if (automatic && direction > 0 && await TryStartAutomaticWaveAsync()) return;
             if (automatic)
             {
-                _player.Stop(); _progressTimer.Stop(); if (_current is not null) _current.IsPlaying = false;
-                CancelNextPreparation(); ReportWaveEnd(true);
-                HighlightTrack(null);
-                _diagnostics.Stage = "library_ready"; SetStatus("Очередь завершена"); UpdateControls(); UpdateProgress();
+                StopCompletedQueue();
             }
             return;
         }
@@ -499,7 +502,7 @@ public partial class MainWindow : Window
             DownloadButton.IsEnabled = _downloadCts is not null || !_catalogShowing && _session is not null && TracksList.SelectedItems.Cast<TrackRow>().Any(t => t is { Available: true, LocalPath: null });
         }
         PlayPauseButton.IsEnabled = !_loadingStream && (_current is not null || PlaySelectionButton.IsEnabled);
-        PlayPauseButton.Content = _player.IsPlaying ? "\uE769" : "\uE768";
+        PlayPauseButton.Content = _player.IsPlaying || _automaticWaveCts is not null ? "\uE769" : "\uE768";
         PreviousButton.IsEnabled = _current is not null && _queue.Count > 0;
         NextButton.IsEnabled = !_advancingWave && (_playbackQueue.CanNext || _current is not null && _waveSources.ContainsKey(_current));
         SeekSlider.IsEnabled = !_loadingStream && _player.HasSource && _player.Duration.TotalSeconds > 0;

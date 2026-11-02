@@ -99,6 +99,7 @@ internal static partial class Program
         await CheckQueueEditing();
         await CheckPlaybackOptions();
         await CheckDownloadRestore();
+        await CheckAutoFavoritesLive060();
         await CheckHomeDiscovery041();
         await CheckHomeWaveUi041();
         await CheckAmbientLight041();
@@ -503,6 +504,7 @@ internal static partial class Program
         await CheckLargeCollection015();
         await CheckTransferMaintenance015();
         await CheckTrackWave015();
+        await CheckInfiniteMix060();
         await CheckCoverAccent015();
         await CheckAmbientBackdrop015();
         await CheckCoverPalette016();
