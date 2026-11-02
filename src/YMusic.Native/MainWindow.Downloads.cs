@@ -373,7 +373,11 @@ public partial class MainWindow
             ReleaseOfflinePlayback(null);
             var result = await _offline.ClearAsync(_lifetime.Token, new Progress<OfflineCleanupProgress>(progress =>
             { if (maintenanceGeneration == _maintenanceGeneration) ReportOfflineCleanup(progress); }));
-            _downloadQueue.Removed(null); RefreshDownloadCenter(); RefreshDownloadStorage();
+            _downloadQueue.Removed(null);
+            // The cleared queue stays suspended; enabling automatic favorites
+            // may start a fresh batch without reviving the removed work.
+            _downloadsAutoSuspended = false;
+            RefreshDownloadCenter(); RefreshDownloadStorage();
             RefreshOfflineView(); RefreshDownloadedMarks();
             SetStatus(RemovalStatus(result) + " · автоскачивание выключено", result.Preserved + result.Failed > 0);
             ShowMaintenance(RemovalStatus(result), 100);

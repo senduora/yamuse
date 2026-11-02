@@ -11,6 +11,55 @@ internal static partial class Program
 {
     private static async Task CheckAutoFavoritesLive060()
     {
+        await Run("AutoFavoritesReenable061: confirmed clear then enabling the checkbox downloads the ready collection without manual action", async () =>
+        {
+            using var f = new Af060Fixture("clear-reenable-ready");
+            await f.Like(Af060Row("101")); await f.Like(Af060Row("102"));
+            f.RefreshReleased.TrySetResult();
+            await Until(() => f.Library.Read().Count == 2 && SaField<bool>(f.Window, "_favoritesSnapshotReady")
+                && SaField<CancellationTokenSource?>(f.Window, "_downloadCts") is null);
+            await Call(f.Window, "ClearOfflineAfterConfirmationAsync");
+            Assert(f.Library.Read().Count == 0 && !Control<CheckBox>(f.Window, "AutoFavoritesCheckBox").IsChecked.GetValueOrDefault()
+                && f.Queue.Entries.All(entry => entry.State == DownloadEntryState.Removed), "clear retained audio or enabled automatic downloads");
+            var before = f.Downloads.Values.Sum(); await Task.Delay(100);
+            Assert(f.Downloads.Values.Sum() == before, "clear redownloaded favorites before explicit enable");
+            Control<CheckBox>(f.Window, "AutoFavoritesCheckBox").IsChecked = true;
+            await Until(() => f.Library.Read().Count == 2 && SaField<CancellationTokenSource?>(f.Window, "_downloadCts") is null);
+            Assert(f.Downloads.GetValueOrDefault("101") == 2 && f.Downloads.GetValueOrDefault("102") == 2,
+                "enabling after clear did not redownload each missing favorite exactly once");
+            Control<CheckBox>(f.Window, "AutoFavoritesCheckBox").IsChecked = false;
+            Control<CheckBox>(f.Window, "AutoFavoritesCheckBox").IsChecked = true;
+            await Until(() => SaField<CancellationTokenSource?>(f.Window, "_downloadCts") is null);
+            Assert(f.Downloads.Values.Sum() == before + 2, "re-enabling redownloaded existing offline files");
+        });
+        await Run("AutoFavoritesReenable061: enabling after clear waits for the held collection then downloads it automatically", async () =>
+        {
+            using var f = new Af060Fixture("clear-reenable-refresh");
+            await f.Like(Af060Row("101")); await f.RefreshEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Until(() => f.Library.Read().Count == 1 && SaField<CancellationTokenSource?>(f.Window, "_downloadCts") is null);
+            await Call(f.Window, "ClearOfflineAfterConfirmationAsync");
+            Control<CheckBox>(f.Window, "AutoFavoritesCheckBox").IsChecked = true; await Task.Delay(100);
+            Assert(f.Library.Read().Count == 0 && f.Downloads.GetValueOrDefault("101") == 1
+                && !SaField<bool>(f.Window, "_favoritesSnapshotReady"), "incomplete collection was downloaded before refresh");
+            f.RefreshReleased.TrySetResult();
+            await Until(() => f.Library.Read().Count == 1 && SaField<CancellationTokenSource?>(f.Window, "_downloadCts") is null);
+            Assert(f.Downloads.GetValueOrDefault("101") == 2, "completed refresh did not start downloads after clear and enable");
+        });
+        await Run("AutoFavoritesReenable061: clear cancels active work and enabling starts only the current favorite snapshot", async () =>
+        {
+            using var f = new Af060Fixture("clear-reenable-active", "900");
+            var manual = f.StartManual(Af060Row("900")); await f.MediaEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await f.Like(Af060Row("101")); f.RefreshReleased.TrySetResult();
+            await Until(() => SaField<bool>(f.Window, "_favoritesSnapshotReady"));
+            await Call(f.Window, "ClearOfflineAfterConfirmationAsync"); await manual;
+            Assert(f.Library.Read().Count == 0 && f.Downloads.GetValueOrDefault("101") == 0
+                && SaField<Dictionary<string, TrackRow>>(f.Window, "_pendingConfirmedFavorites").Count == 0,
+                "clear retained audio or started a pending favorite");
+            Control<CheckBox>(f.Window, "AutoFavoritesCheckBox").IsChecked = true;
+            await Until(() => f.Library.Read().Count == 1 && SaField<CancellationTokenSource?>(f.Window, "_downloadCts") is null);
+            Assert(f.Library.Read().Single().Id == "101" && f.Downloads.GetValueOrDefault("101") == 1
+                && f.Downloads.GetValueOrDefault("900") == 1, "enable lost the favorite or resumed canceled manual work");
+        });
         await Run("AutoFavoritesLive060: restored completed and empty history permits a new player like without resuming old work", async () =>
         {
             foreach (var completed in new[] { true, false })
@@ -52,6 +101,8 @@ internal static partial class Program
                 await Call(f.Window, "RestoreDownloadQueueAsync", "12345");
                 Assert(SaField<bool>(f.Window, "_downloadsAutoSuspended") && (f.Queue.CanResume || f.Queue.CanRetry),
                     "unfinished restored work lost its explicit continuation requirement");
+                Control<CheckBox>(f.Window, "AutoFavoritesCheckBox").IsChecked = false;
+                Control<CheckBox>(f.Window, "AutoFavoritesCheckBox").IsChecked = true;
                 await f.Like(Af060Row("101")); await Task.Delay(100);
                 Assert(f.Downloads.Count == 0 && f.Queue.Entries.Single().Track.Id == "900", "new like replaced or resumed unfinished restored work");
             }

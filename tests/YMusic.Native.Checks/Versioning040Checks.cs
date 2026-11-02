@@ -20,9 +20,9 @@ internal static partial class Program
     private static Task V040Metadata()
     {
         var assembly = typeof(UpdateSupport).Assembly;
-        const string expected = "0.6.0";
-        Assert(assembly.GetName().Version == new Version(0, 6, 0, 0), "numeric assembly identity drifted");
-        Assert(assembly.GetCustomAttribute<AssemblyFileVersionAttribute>()?.Version == "0.6.0.0", "numeric file identity drifted");
+        const string expected = "0.6.1";
+        Assert(assembly.GetName().Version == new Version(0, 6, 1, 0), "numeric assembly identity drifted");
+        Assert(assembly.GetCustomAttribute<AssemblyFileVersionAttribute>()?.Version == "0.6.1.0", "numeric file identity drifted");
         Assert(assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion == expected,
             "full release identity was lost in informational metadata");
         Assert(FileVersionInfo.GetVersionInfo(assembly.Location).ProductVersion == expected, "Windows product metadata disagrees with the expected release");
