@@ -354,7 +354,9 @@ public partial class MainWindow
         if (!_catalogShowing) return;
         CountText.Text = $"{_catalogItems.Count:N0} результатов";
         EmptyState.Visibility = _catalogItems.Count > 0 ? Visibility.Collapsed : Visibility.Visible;
-        EmptyTitle.Text = "Пока нет результатов";
-        EmptyDescription.Text = _section == "search" ? "Введите запрос для поиска в каталоге Яндекса" : "Дождитесь загрузки или обновите раздел";
+        var searchCompleted = _section == "search" && _searchText.Length > 0;
+        EmptyTitle.Text = searchCompleted ? "Ничего не найдено" : "Пока нет результатов";
+        EmptyDescription.Text = _section != "search" ? "Дождитесь загрузки или обновите раздел"
+            : searchCompleted ? "Попробуйте изменить запрос" : "Введите запрос для поиска в каталоге Яндекса";
     }
 }

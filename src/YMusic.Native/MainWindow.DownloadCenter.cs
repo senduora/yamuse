@@ -186,12 +186,21 @@ public partial class MainWindow
     private void PauseDownloadQueue()
     {
         if (_downloadCts is null) return;
+        ++_downloadQueueAdmissionRevision;
         _downloadsAutoSuspended = true; ClearPendingAutoFavorites();
         _downloadQueue.Pause(); _downloadCts.Cancel(); RefreshDownloadCenter();
         _ = PersistDownloadQueueAsync(force: true);
     }
     private Task ResumeDownloadQueue() => ContinueDownloadQueue(retryFailed: false);
     private Task RetryFailedDownloads() => ContinueDownloadQueue(retryFailed: true);
+    private void PauseDownloadQueueForAppUpdate()
+    {
+        // Updating is a pause in the same account, not account invalidation.
+        // Reject a held restore, but retain entries and their resumable snapshot.
+        ++_downloadQueueAdmissionRevision;
+        _downloadsAutoSuspended = true; ClearPendingAutoFavorites();
+        _downloadQueue.Pause(); _downloadCts?.Cancel(); RefreshDownloadCenter();
+    }
     private Task ContinueDownloadQueue(bool retryFailed)
     {
         if (_downloadCts is not null || _offlineMaintenance || _session is null || _closed || _catalogWriting || _downloadQueue.Suspended) return Task.CompletedTask;

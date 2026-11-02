@@ -22,6 +22,7 @@ public partial class MainWindow
     private bool _playbackOptionsInitializing, _audioOutputSwitching, _audioOutputUnavailable;
     private bool _audioOutputFixture;
     private int _audioOutputRefreshRevision;
+    internal Func<TimeSpan>? SleepElapsedForChecks { get; set; }
 
     private void InitializePlaybackOptions(IAudioOutputDevices? audioOutputDevices = null)
     {
@@ -99,7 +100,7 @@ public partial class MainWindow
     }
 
     private void SleepTimer_Tick(object? sender, EventArgs e)
-        => ApplySleepTimerElapsed(_sleepClock.Elapsed);
+        => ApplySleepTimerElapsed(SleepElapsedForChecks?.Invoke() ?? _sleepClock.Elapsed);
 
     private void ApplySleepTimerElapsed(TimeSpan elapsed)
     {
@@ -187,7 +188,8 @@ public partial class MainWindow
             _diagnostics.LastErrorType = "AudioOutput:" + ex.GetType().Name;
             if (restoring) _audioOutputUnavailable = true;
             if (_loadingStream) _playCts?.Cancel();
-            _player.Pause(); SavePlaybackState(); SetWavePaused(true); UpdateControls();
+            _player.Pause(); SavePlaybackState(); SetWavePaused(true); _progressTimer.Stop();
+            _diagnostics.Stage = "paused"; UpdateControls();
             if (_audioOutputText is not null) _audioOutputText.Text = "Устройство недоступно. Музыка на паузе; выберите доступное устройство.";
             SetStatus("Не удалось выбрать аудиоустройство. Музыка на паузе.", true);
         }
@@ -219,7 +221,8 @@ public partial class MainWindow
                 if (!_audioOutputUnavailable)
                 {
                     if (_loadingStream) _playCts?.Cancel();
-                    _audioOutputUnavailable = true; _player.Pause(); SavePlaybackState(); SetWavePaused(true); UpdateControls();
+                    _audioOutputUnavailable = true; _player.Pause(); SavePlaybackState(); SetWavePaused(true); _progressTimer.Stop();
+                    _diagnostics.Stage = "paused"; UpdateControls();
                     if (_audioOutputText is not null) _audioOutputText.Text = "Устройство отключено. Музыка на паузе; выберите доступное устройство.";
                     SetStatus("Аудиоустройство отключено. Музыка на паузе.");
                 }

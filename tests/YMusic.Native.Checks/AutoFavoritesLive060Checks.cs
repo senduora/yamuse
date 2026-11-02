@@ -11,6 +11,7 @@ internal static partial class Program
 {
     private static async Task CheckAutoFavoritesLive060()
     {
+        await CheckSingleRemovalAuto061();
         await Run("AutoFavoritesReenable061: confirmed clear then enabling the checkbox downloads the ready collection without manual action", async () =>
         {
             using var f = new Af060Fixture("clear-reenable-ready");
@@ -224,6 +225,198 @@ internal static partial class Program
         });
     }
 
+    private static async Task CheckSingleRemovalAuto061()
+    {
+        await Run("QaFixes061: single offline deletion waits for favorites refresh then fills only missing tracks", async () =>
+        {
+            using var f = new Af060Fixture("qa-single-removal-ready");
+            var removed = Af060Row("101"); var retained = Af060Row("102");
+            await Af061Ready(f, removed, retained);
+            var retainedPath = f.Library.ResolvePath(f.Library.Find(retained)!.FileName);
+            var retainedHash = System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(retainedPath));
+            await Call(f.Window, "DeleteOfflineTrackAsync", removed);
+            Control<CheckBox>(f.Window, "AutoFavoritesCheckBox").IsChecked = false;
+            Control<CheckBox>(f.Window, "AutoFavoritesCheckBox").IsChecked = true;
+            SaInvoke(f.Window, "TryStartPendingAutoFavorites");
+            Assert(f.Library.Read().Single().Id == retained.Id && f.Downloads.GetValueOrDefault("101") == 1
+                && SaField<CancellationTokenSource?>(f.Window, "_downloadCts") is null,
+                "single removal immediately returned the deleted favorite before refresh");
+            await f.Window.RefreshLibraryAsync(refreshMetadata: true);
+            await Af061DownloadsIdle(f);
+            Assert(f.Library.Read().Count == 2, "refresh did not restore the expected offline collection");
+            Assert(f.Downloads.GetValueOrDefault("101") == 2 && f.Downloads.GetValueOrDefault("102") == 1
+                && retainedHash.SequenceEqual(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(retainedPath))),
+                "refresh did not fill only the deleted favorite or changed retained audio");
+            await f.Window.RefreshLibraryAsync(refreshMetadata: true);
+            await Af061DownloadsIdle(f);
+            await f.Like(Af060Row("103"));
+            await Af061DownloadsIdle(f);
+            Assert(f.Library.Read().Count == 3, "new confirmed like did not complete the offline collection");
+            Assert(f.Downloads.GetValueOrDefault("101") == 2 && f.Downloads.GetValueOrDefault("102") == 1
+                && f.Downloads.GetValueOrDefault("103") == 1, "single removal left new confirmed likes blocked or redownloaded ready music");
+        });
+        await Run("QaFixes061: single offline deletion during automatic work restarts only after refreshed favorites", async () =>
+        {
+            using var f = new Af060Fixture("qa-single-removal-active-auto", "102");
+            await Af061Ready(f, Af060Row("101"));
+            await f.Like(Af060Row("102")); await f.MediaEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(SaField<bool>(f.Window, "_downloadIsAutomatic"), "fixture did not reach an automatic worker");
+            await Call(f.Window, "DeleteOfflineTrackAsync", Af060Row("101"));
+            Assert(f.Library.Read().Count == 0 && f.Downloads.GetValueOrDefault("101") == 1
+                && f.Downloads.GetValueOrDefault("102") == 1 && f.Queue.HasPaused
+                && SaField<CancellationTokenSource?>(f.Window, "_downloadCts") is null,
+                "single removal restarted the canceled automatic cohort before refresh");
+            f.MediaReleased.TrySetResult();
+            await f.Window.RefreshLibraryAsync(refreshMetadata: true);
+            await Af061DownloadsIdle(f);
+            Assert(f.Library.Read().Count == 2, "refreshed automatic cohort did not save both missing tracks");
+            Assert(f.Downloads.GetValueOrDefault("101") == 2 && f.Downloads.GetValueOrDefault("102") == 2
+                && !f.Queue.Suspended && !SaField<bool>(f.Window, "_downloadsAutoSuspended"),
+                "maintenance-created suspended auto work permanently blocked the next refresh");
+        });
+        await Run("QaFixes061: single offline deletion preserves explicit user pause and paused failed restore", async () =>
+        {
+            foreach (var mode in new[] { "user-pause", "restore-paused", "restore-failed", "active-manual" })
+            {
+                using var f = new Af060Fixture("qa-single-removal-guard-" + mode, "900");
+                await Af061Ready(f, Af060Row("101"));
+                if (mode is "user-pause" or "active-manual")
+                {
+                    var manual = f.StartManual(Af060Row("900")); await f.MediaEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                    if (mode == "user-pause") { SaInvoke(f.Window, "PauseDownloadQueue"); await manual; }
+                    await Call(f.Window, "DeleteOfflineTrackAsync", Af060Row("101"));
+                    await manual;
+                }
+                else
+                {
+                    var previous = Af060Row("900"); f.Queue.Replace([previous], "Восстановленная очередь", favoritesBatch: true);
+                    f.Queue.Entries.Single().SetState(mode == "restore-failed" ? DownloadEntryState.Failed : DownloadEntryState.Paused);
+                    var store = new DownloadQueueStore(Path.Combine(_directory, "qa-single-removal-store-" + mode));
+                    store.Save(DownloadQueueStore.Capture("12345", f.Queue, AudioQuality.Excellent, true,
+                        new PlaylistDetails("local:favorites", "liked", "Мне нравится", "", 0, [previous])));
+                    UlSet(f.Window, "_downloadQueueStore", store);
+                    await Call(f.Window, "RestoreDownloadQueueAsync", "12345");
+                    await Call(f.Window, "DeleteOfflineTrackAsync", Af060Row("101"));
+                }
+                var removalStatus = Control<TextBlock>(f.Window, "StatusText").Text;
+                var before = f.Downloads.Values.Sum();
+                f.MediaReleased.TrySetResult(); await f.Window.RefreshLibraryAsync(refreshMetadata: true);
+                SaInvoke(f.Window, "TryStartPendingAutoFavorites");
+                Assert(f.Library.Read().Count == 0 && f.Downloads.Values.Sum() == before
+                    && SaField<bool>(f.Window, "_downloadsAutoSuspended")
+                    && !removalStatus.Contains("вернёт трек", StringComparison.Ordinal),
+                    "single removal erased a protected pause or advertised an automatic restart: " + mode);
+            }
+        });
+        await Run("QaFixes061: user pause while single offline deletion awaits automatic workers invalidates refresh restart", async () =>
+        {
+            using var f = new Af060Fixture("qa-single-removal-pause-race", "102") { HoldMediaCancellation = true };
+            await Af061Ready(f, Af060Row("101"));
+            await f.Like(Af060Row("102")); await f.MediaEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var removal = Call(f.Window, "DeleteOfflineTrackAsync", Af060Row("101"));
+            await f.MediaCancellationEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var beforePause = SaField<long>(f.Window, "_downloadQueueAdmissionRevision");
+            SaInvoke(f.Window, "PauseDownloadQueue");
+            Assert(SaField<long>(f.Window, "_downloadQueueAdmissionRevision") > beforePause,
+                "the explicit pause did not invalidate the held removal admission");
+            f.MediaCancellationReleased.TrySetResult();
+            await removal;
+            var before = f.Downloads.Values.Sum(); f.MediaReleased.TrySetResult();
+            await f.Window.RefreshLibraryAsync(refreshMetadata: true);
+            Assert(f.Library.Read().Count == 0 && f.Downloads.Values.Sum() == before
+                && SaField<bool>(f.Window, "_downloadsAutoSuspended"), "a later explicit pause was mistaken for maintenance cancellation");
+        });
+        await Run("QaFixes061: DownloadSelectedAsync cancel during single offline deletion invalidates automatic restart", async () =>
+        {
+            using var f = new Af060Fixture("qa-single-removal-download-cancel-race", "102") { HoldMediaCancellation = true };
+            await Af061Ready(f, Af060Row("101"));
+            await f.Like(Af060Row("102")); await f.MediaEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var removal = Call(f.Window, "DeleteOfflineTrackAsync", Af060Row("101"));
+            await f.MediaCancellationEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Call(f.Window, "DownloadSelectedAsync");
+            f.MediaCancellationReleased.TrySetResult();
+            await removal;
+            Assert(!Control<TextBlock>(f.Window, "StatusText").Text.Contains("вернёт трек", StringComparison.Ordinal),
+                "explicit DownloadButton cancellation still advertised automatic restart after removal");
+            var before = f.Downloads.Values.Sum(); f.MediaReleased.TrySetResult();
+            await f.Window.RefreshLibraryAsync(refreshMetadata: true);
+            Assert(f.Library.Read().Count == 0 && f.Downloads.Values.Sum() == before && f.Queue.Suspended
+                && SaField<bool>(f.Window, "_downloadsAutoSuspended"),
+                "DownloadSelectedAsync cancel was erased by the held removal continuation and next refresh");
+        });
+        await Run("QaFixes061: update pause invalidates a completed single removal automatic restart admission", async () =>
+        {
+            using var f = new Af060Fixture("qa-single-removal-update-pause", "102");
+            await Af061Ready(f, Af060Row("101"));
+            await f.Like(Af060Row("102")); await f.MediaEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Call(f.Window, "DeleteOfflineTrackAsync", Af060Row("101"));
+            var before = f.Downloads.Values.Sum();
+            Assert(SaField<CancellationTokenSource?>(f.Window, "_downloadCts") is null, "removal workers have not finished");
+            SaInvoke(f.Window, "PauseDownloadQueueForAppUpdate");
+            f.MediaReleased.TrySetResult(); await f.Window.RefreshLibraryAsync(refreshMetadata: true);
+            Assert(f.Library.Read().Count == 0 && f.Downloads.Values.Sum() == before
+                && SaField<bool>(f.Window, "_downloadsAutoSuspended"), "pending removal admission cleared the later update pause");
+        });
+        await Run("QaFixes061: failed single offline removal keeps automatic downloading suspended", async () =>
+        {
+            using var f = new Af060Fixture("qa-single-removal-io-failure"); var row = Af060Row("101");
+            await Af061Ready(f, row);
+            var path = f.Library.ResolvePath(f.Library.Find(row)!.FileName); var attributes = File.GetAttributes(path);
+            try
+            {
+                File.SetAttributes(path, attributes | FileAttributes.ReadOnly);
+                await Call(f.Window, "DeleteOfflineTrackAsync", row);
+                Assert(f.Library.Read().Count == 1 && SaField<bool>(f.Window, "_downloadsAutoSuspended")
+                    && !Control<TextBlock>(f.Window, "StatusText").Text.Contains("вернёт трек", StringComparison.Ordinal),
+                    "failed removal granted automatic restart or promised to redownload a retained file");
+                await f.Window.RefreshLibraryAsync(refreshMetadata: true);
+                Assert(f.Downloads.GetValueOrDefault("101") == 1 && SaField<bool>(f.Window, "_downloadsAutoSuspended"),
+                    "a successful refresh cleared the removal failure guard");
+            }
+            finally { File.SetAttributes(path, attributes); }
+        });
+        await Run("QaFixes061: account change during single offline removal cannot grant automatic restart", async () =>
+        {
+            using var f = new Af060Fixture("qa-single-removal-account");
+            await Af061Ready(f, Af060Row("101"));
+            f.Library.RemovalCheckpoint = stage =>
+            {
+                if (stage == "after-stage") f.Window.Dispatcher.Invoke(() => f.Window.SignOut());
+            };
+            await Call(f.Window, "DeleteOfflineTrackAsync", Af060Row("101"));
+            f.Library.RemovalCheckpoint = null;
+            var before = f.Downloads.Values.Sum();
+            SaInvoke(f.Window, "ScheduleAutoFavoritesDownloads");
+            Assert(SaField<Session?>(f.Window, "_session") is null && f.Queue.Suspended
+                && SaField<bool>(f.Window, "_downloadsAutoSuspended") && f.Downloads.Values.Sum() == before,
+                "single removal granted a restart after the account changed");
+        });
+    }
+
+    private static async Task Af061Ready(Af060Fixture fixture, params TrackRow[] rows)
+    {
+        foreach (var row in rows) await fixture.Like(row);
+        fixture.RefreshReleased.TrySetResult();
+        await Af061DownloadsIdle(fixture);
+        Assert(fixture.Library.Read().Count == rows.Length, "ready fixture did not save the expected favorite snapshot");
+    }
+
+    private static async Task Af061DownloadsIdle(Af060Fixture fixture)
+    {
+        await Until(() => SaField<bool>(fixture.Window, "_favoritesSnapshotReady")
+            && SaField<CancellationTokenSource?>(fixture.Window, "_libraryCts") is null);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        // A confirmed like and the completed collection refresh can own successive
+        // batches. Await each published owner before opening its offline index.
+        while (SaField<Task?>(fixture.Window, "_downloadTask") is { } download)
+        {
+            timeout.Token.ThrowIfCancellationRequested();
+            await download.WaitAsync(timeout.Token);
+        }
+        Assert(SaField<CancellationTokenSource?>(fixture.Window, "_downloadCts") is null && !fixture.Queue.Running,
+            "download task completion left an active fixture writer");
+    }
+
     private static TrackRow Af060Row(string id, bool available = true) => new() { Id = id, RequestId = id + ":91", Title = "Тестовый трек " + id,
         Artist = "Тестовый исполнитель", Album = "Тестовый альбом", AlbumId = "91", Available = available, DurationMs = 180000 };
 
@@ -238,6 +431,9 @@ internal static partial class Program
         internal TaskCompletionSource RefreshReleased { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource MediaEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource MediaReleased { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource MediaCancellationEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource MediaCancellationReleased { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal bool HoldMediaCancellation;
         internal bool FailWrite, FailReadback, FailAudio;
         private readonly HashSet<string> _liked = new(StringComparer.Ordinal);
         private int _readback;
@@ -280,19 +476,36 @@ internal static partial class Program
             {
                 Assert(request.RequestUri!.Host == "s1.vlx.yandex.net" && request.Headers.Authorization is null, "fixture audio escaped the anonymous CDN boundary");
                 var id = Path.GetFileNameWithoutExtension(request.RequestUri.AbsolutePath); Downloads.AddOrUpdate(id, 1, (_, count) => count + 1);
-                if (id == heldMedia) { MediaEntered.TrySetResult(); await MediaReleased.Task.WaitAsync(token); }
+                if (id == heldMedia)
+                {
+                    MediaEntered.TrySetResult();
+                    try { await MediaReleased.Task.WaitAsync(token); }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested && HoldMediaCancellation)
+                    {
+                        MediaCancellationEntered.TrySetResult();
+                        await MediaCancellationReleased.Task;
+                        throw;
+                    }
+                }
                 return new HttpResponseMessage(FailAudio ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK) { Content = new ByteArrayContent(DownloadCenterFixture.Media) };
             });
             Library = new OfflineLibrary(Path.Combine(directory, "music"), new AudioBuffer(Path.Combine(directory, "buffer"), media));
+            var player = new NativePlayer(new AudioBuffer(Path.Combine(directory, "player-buffer"),
+                new FakeHandler((_, _) => throw new InvalidOperationException("auto-favorites fixture must not start playback"))));
             Window = new MainWindow(api: api, store: new SessionStore(Path.Combine(directory, "session")), restore: false,
-                diagnosticsDirectory: Path.Combine(directory, "diagnostics"), offline: Library, preferences: new PreferencesStore(Path.Combine(directory, "preferences")));
+                diagnosticsDirectory: Path.Combine(directory, "diagnostics"), offline: Library, player: player,
+                preferences: new PreferencesStore(Path.Combine(directory, "preferences")));
+            player.Volume = 0;
             UlSet(Window, "_session", FakeSession); UlSet(Window, "_account", new Account("12345", "Fixture", true));
             UlSet(Window, "_favoriteIdsKnown", true); UlSet(Window, "_favoritesAccountUid", "12345"); UlSet(Window, "_favoritesCacheRead", true);
             Control<CheckBox>(Window, "AutoFavoritesCheckBox").IsChecked = true;
         }
         internal Task Like(TrackRow row, bool liked = true) => Call(Window, "SetTrackLikeAsync", row, liked);
         internal Task StartManual(params TrackRow[] rows) => Call(Window, "StartDownloadBatchAsync", rows, "Ручная загрузка", null!, false);
-        public void Dispose() { RefreshReleased.TrySetResult(); MediaReleased.TrySetResult(); Window.Close(); }
+        public void Dispose()
+        {
+            RefreshReleased.TrySetResult(); MediaReleased.TrySetResult(); MediaCancellationReleased.TrySetResult(); Window.Close();
+        }
     }
     private static Dictionary<string, string> Af060Form(string form) => form.Split('&', StringSplitOptions.RemoveEmptyEntries)
         .Select(part => part.Split('=', 2)).ToDictionary(part => WebUtility.UrlDecode(part[0]), part => WebUtility.UrlDecode(part.ElementAtOrDefault(1) ?? ""), StringComparer.Ordinal);

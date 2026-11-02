@@ -8,6 +8,8 @@ public partial class MainWindow
 {
     private ArtistDetails? _artistDetails;
     private bool? _artistLiked;
+    private ArtistMembershipRead? _artistMembershipRead;
+    private sealed record ArtistMembershipRead(string Id, string OwnerUid, int AccountGeneration);
     private readonly Dictionary<string, IReadOnlyList<ArtistReference>> _resolvedArtists = new(StringComparer.Ordinal);
     private int _resolvedArtistGeneration = -1;
 
@@ -35,15 +37,19 @@ public partial class MainWindow
             SetStatus("Популярные треки · " + details.TopTracks.Count.ToString("N0"));
             if (_account is { } account)
             {
+                var membershipRead = new ArtistMembershipRead(id, account.Uid, _accountGeneration);
+                _artistMembershipRead = membershipRead;
                 try
                 {
                     var liked = await _api.GetLikedArtistsAsync(session, account.Uid, token);
                     token.ThrowIfCancellationRequested();
-                    if (_section == "artist-detail" && _artistDetails?.Id == id)
-                    { _artistLiked = liked.Any(item => item.Id == id); UpdateArtistLike(); }
+                    if (ReferenceEquals(_artistMembershipRead, membershipRead) && _accountGeneration == membershipRead.AccountGeneration
+                        && _account?.Uid == account.Uid && _section == "artist-detail" && _artistDetails?.Id == id)
+                        ApplyArtistMembership(id, liked.Any(item => item.Id == id));
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
                 catch (Exception ex) { _diagnostics.LastErrorType = "ArtistLike:" + ex.GetType().Name; }
+                finally { if (ReferenceEquals(_artistMembershipRead, membershipRead)) _artistMembershipRead = null; }
             }
         });
     }
@@ -152,14 +158,32 @@ public partial class MainWindow
         ArtistLikeButton.IsEnabled = _artistDetails is not null && _artistLiked.HasValue && !_catalogWriting && _session is not null;
         ArtistLikeButton.Content = _artistLiked == true ? "♥ В коллекции" : "♡ В коллекцию";
     }
+    private void ApplyArtistMembership(string id, bool liked)
+    {
+        UpdateBrowseArtistMembership(id, liked);
+        if (_section != "artist-detail" || _artistDetails?.Id != id) return;
+        _artistLiked = liked;
+        UpdateArtistLike();
+    }
     private async void ArtistLike_Click(object sender, RoutedEventArgs e)
     {
         if (_artistDetails is not { } artist || !_artistLiked.HasValue || _account is not { } account) return;
         var liked = !_artistLiked.Value;
         var item = new CatalogItem(artist.Id, "artist", artist.Name, "", CoverUri: artist.CoverUri);
+        var view = _viewGeneration;
         await CatalogMutationAsync(async (session, token) =>
         { await _api.SetEntityLikeAsync(session, account.Uid, item, liked, token); return liked; },
-        result => { _artistLiked = result; UpdateArtistLike(); SetStatus(result ? "Исполнитель добавлен в коллекцию" : "Исполнитель убран из коллекции"); });
+        result =>
+        {
+            if (_account?.Uid != account.Uid) return;
+            // A page GET formed before this confirmed write may still return.
+            // Invalidate only that artist/account read, without another request.
+            if (_artistMembershipRead is { } read && read.Id == artist.Id && read.OwnerUid == account.Uid
+                && read.AccountGeneration == _accountGeneration) _artistMembershipRead = null;
+            ApplyArtistMembership(artist.Id, result);
+            var message = result ? "Исполнитель добавлен в коллекцию" : "Исполнитель убран из коллекции";
+            SetStatus(view == _viewGeneration ? message : "Изменение сохранено в аккаунте.");
+        }, requireSameView: false);
         UpdateArtistLike();
     }
 }

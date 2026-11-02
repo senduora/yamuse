@@ -61,6 +61,69 @@ internal static partial class Program
             return Task.CompletedTask;
         });
         await Run("QueueEditing: 3900-row recycled selection moves and removes exact offscreen duplicate occurrences", QueueEditingVirtualizedDuplicates);
+        await Run("QaFixes061: queue idle text follows remaining empty and restored rows without autoplay", async () =>
+        {
+            var directory = Path.Combine(_directory, "qa-fixes061-queue-idle"); Directory.CreateDirectory(directory);
+            var requests = 0;
+            FakeHandler NoNetwork() => new((_, _) =>
+            {
+                Interlocked.Increment(ref requests); throw new InvalidOperationException("queue idle fixture attempted network");
+            });
+            var originalArtwork = typeof(Artwork).GetField("_cache", BindingFlags.NonPublic | BindingFlags.Static)!.GetValue(null);
+            using var artwork = new ArtworkCache(Path.Combine(directory, "artwork"), NoNetwork());
+            using var player = new NativePlayer(new AudioBuffer(Path.Combine(directory, "audio"), NoNetwork()));
+            using var offline = new OfflineLibrary(Path.Combine(directory, "music"), new AudioBuffer(Path.Combine(directory, "downloads"), NoNetwork()));
+            var preferences = new PreferencesStore(Path.Combine(directory, "preferences"));
+            preferences.Save(new PlayerPreferences { Volume = 0, CrossfadeSeconds = 0, Theme = "Dark" });
+            var previousTheme = ThemeManager.Mode;
+            MainWindow? window = null;
+            try
+            {
+                Artwork.Cache = artwork;
+                window = new MainWindow(api: new MusicApi(NoNetwork()), store: new SessionStore(Path.Combine(directory, "session")), restore: false,
+                    diagnosticsDirectory: directory, offline: offline, player: player, preferences: preferences, audioOutputDevices: new PlaybackOptionsFakeOutputs());
+                var wav = WriteWave("qa-fixes061-queue-idle.wav", 30);
+                var rows = Enumerable.Range(0, 3).Select(index => new TrackRow { Id = "queue-idle-" + index, RequestId = "queue-idle-" + index,
+                    Title = "Queue idle fixture " + index, Artist = "Fixture", Available = true, DurationMs = 30000, LocalPath = wav }).ToArray();
+                var queue = EpField<PlaybackQueue>(window, "_playbackQueue");
+                queue.SetItems(rows, rows[2]);
+                var tokens = Enumerable.Range(0, rows.Length).Select(queue.OccurrenceTokenAt).ToArray();
+                await window.PlayTrackAsync(rows[2]);
+                EpInvoke(window, "ShowQueueCore", false);
+                Assert(player.IsPlaying && player.HasSource && player.Volume == 0 && Control<TextBlock>(window, "TrackTitle").Text == rows[2].Title,
+                    "fixture did not start the actual muted last-track lifecycle before queue removal");
+                await Call(window, "RemoveSelectedQueueAsync");
+                Assert(queue.Items.SequenceEqual(rows.Take(2)) && Enumerable.Range(0, 2).Select(queue.OccurrenceTokenAt).SequenceEqual(tokens.Take(2)),
+                    "last-current removal changed the remaining occurrences or playback order");
+                void AssertIdleText(string title, string artist) => Assert(queue.Current is null && EpField<TrackRow?>(window, "_current") is null
+                    && !player.HasSource && !player.IsPlaying && Control<TextBlock>(window, "TrackTitle").Text == title
+                    && Control<TextBlock>(window, "TrackArtist").Text == artist && Control<TextBlock>(window, "QualityText").Text == "",
+                    "queue idle message disagrees with rows or restarted playback");
+                AssertIdleText("Выберите трек", "Двойной щелчок или кнопка «Слушать»");
+                EpInvoke(window, "UndoQueueRemoval_Click", window, new RoutedEventArgs());
+                Assert(queue.Items.SequenceEqual(rows) && Enumerable.Range(0, 3).Select(queue.OccurrenceTokenAt).SequenceEqual(tokens),
+                    "undo did not restore the exact last occurrence in its original order");
+                AssertIdleText("Выберите трек", "Двойной щелчок или кнопка «Слушать»");
+                queue.SetItems([rows[2]], rows[2]);
+                var onlyToken = queue.CurrentOccurrenceToken;
+                await window.PlayTrackAsync(rows[2]); EpInvoke(window, "ShowQueueCore", false);
+                Assert(player.IsPlaying && player.HasSource && Control<TextBlock>(window, "TrackTitle").Text == rows[2].Title,
+                    "fixture did not restart its local source for the truly empty queue case");
+                await Call(window, "RemoveSelectedQueueAsync");
+                Assert(queue.Items.Count == 0, "removing the only occurrence did not empty the queue");
+                AssertIdleText("Очередь пуста", "Добавьте треки в очередь");
+                EpInvoke(window, "UndoQueueRemoval_Click", window, new RoutedEventArgs());
+                Assert(queue.Items.Count == 1 && queue.OccurrenceTokenAt(0) == onlyToken && (int)EpInvokeResultForQueue(window, "SelectedQueueIndex")! == 0,
+                    "empty-queue undo lost the occurrence or explicit-Play selection");
+                AssertIdleText("Выберите трек", "Двойной щелчок или кнопка «Слушать»");
+                Assert(requests == 0, "queue idle fixture accessed a network seam");
+            }
+            finally
+            {
+                window?.Close(); ThemeManager.SetMode(previousTheme);
+                typeof(Artwork).GetField("_cache", BindingFlags.NonPublic | BindingFlags.Static)!.SetValue(null, originalArtwork);
+            }
+        });
         await Run("QueueEditing: WPF multiple selection move remove undo and themed layouts", async () =>
         {
             var directory = Path.Combine(_directory, "queue-editing"); var noNetwork = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)));

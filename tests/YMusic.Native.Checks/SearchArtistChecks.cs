@@ -17,6 +17,10 @@ internal static partial class Program
         await Run("Search/Artist: old playlist artist resolves exact ID, profile data and Back preserve browse and queue", SaPlaylistArtist);
         await Run("Search/Artist: Home retains server shelves, full All source and correct card navigation", SaHomeNavigation);
         await Run("Search/Artist: late canceled profile and signout cannot restore prior artist or Home data", SaCanceledArtist);
+        await Run("QaFixes061: artist confirmed add and remove stay current across duplicate Back and Forward snapshots", SaArtistMembershipHistory061);
+        await Run("QaFixes061: delayed artist confirmation follows exact ID while denied writes leave history unchanged", SaArtistMembershipDelayed061);
+        await Run("QaFixes061: late artist membership result cannot cross logout into another account history", SaArtistMembershipAccount061);
+        await Run("QaFixes061: stale artist membership read cannot overwrite confirmed write or refreshed history", SaArtistMembershipReadRace061);
     }
 
     private static async Task SaSearchCategories()
@@ -148,6 +152,151 @@ internal static partial class Program
         Assert(!Control<Grid>(window, "ArtistPanel").IsVisible && !Control<Grid>(window, "HomePanel").IsVisible && SaField<PlaybackQueue>(window, "_playbackQueue").Items.Count == 0, "signout left personalized pages/queue active");
     }
 
+    private static async Task SaArtistMembershipHistory061()
+    {
+        foreach (var initiallyLiked in new[] { false, true })
+        {
+            using var fixture = new SaMembershipFixture061("history-" + initiallyLiked);
+            if (initiallyLiked) fixture.Members("12345").Add("42");
+            var window = fixture.Browse.Window; await fixture.Browse.Activate();
+            var queue = SaField<PlaybackQueue>(window, "_playbackQueue");
+            var queued = new TrackRow { Id = "membership-queue", RequestId = "membership-queue", Title = "Не менять очередь", Available = true };
+            queue.SetItems([queued], queued); var version = queue.Version;
+            await Call(window, "OpenArtistAsync", "84", "Другой исполнитель", true);
+            await Call(window, "OpenArtistAsync", "42", "Тот же исполнитель", true);
+            await Call(window, "OpenCatalogAsync", new CatalogItem("314", "album", "Промежуточный альбом", ""), true);
+            await Call(window, "OpenArtistAsync", "42", "Тот же исполнитель", true);
+            SaClick(Control<Button>(window, "ArtistLikeButton"));
+            await Until(() => fixture.Writes.Count == 1 && !SaField<bool>(window, "_catalogWriting"));
+            SaAssertMembership061(window, "42", !initiallyLiked);
+            Assert(fixture.Members("12345").Contains("42") == !initiallyLiked, "artist membership was not confirmed by the fake service");
+            var reads = fixture.Reads;
+            SaInvoke(window, "BrowseBack_Click", null!, null!);
+            Assert(SaField<string>(window, "_section") == "album-detail", "Back changed the history order");
+            SaInvoke(window, "BrowseBack_Click", null!, null!);
+            SaAssertMembership061(window, "42", !initiallyLiked);
+            // The forward stack already contains the second opening. Confirm
+            // the opposite mutation here, then restore that older forward page.
+            SaClick(Control<Button>(window, "ArtistLikeButton"));
+            await Until(() => fixture.Writes.Count == 2 && !SaField<bool>(window, "_catalogWriting"));
+            SaInvoke(window, "BrowseForward");
+            Assert(SaField<string>(window, "_section") == "album-detail", "Forward changed the history order");
+            SaInvoke(window, "BrowseForward");
+            SaAssertMembership061(window, "42", initiallyLiked);
+            Assert(fixture.Reads == reads + 1 && fixture.Writes.Count == 2, "Back/Forward added membership reads or repeated a mutation");
+            SaInvoke(window, "BrowseBack_Click", null!, null!); SaInvoke(window, "BrowseBack_Click", null!, null!);
+            SaInvoke(window, "BrowseBack_Click", null!, null!);
+            SaAssertMembership061(window, "84", false);
+            Assert(queue.Version == version && ReferenceEquals(queue.Current, queued) && !fixture.Browse.Player.HasSource,
+                "artist membership navigation changed playback or opened audio");
+        }
+    }
+
+    private static async Task SaArtistMembershipDelayed061()
+    {
+        foreach (var deny in new[] { false, true })
+        {
+            using var fixture = new SaMembershipFixture061("delayed-" + deny) { HoldWrite = true, DenyWrite = deny };
+            var window = fixture.Browse.Window; await fixture.Browse.Activate();
+            await Call(window, "OpenArtistAsync", "84", "Другой исполнитель", true);
+            await Call(window, "OpenArtistAsync", "42", "Тот же исполнитель", true);
+            await Call(window, "OpenCatalogAsync", new CatalogItem("314", "album", "Промежуточный альбом", ""), true);
+            await Call(window, "OpenArtistAsync", "42", "Тот же исполнитель", true);
+            SaClick(Control<Button>(window, "ArtistLikeButton"));
+            await fixture.WriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            SaAssertMembership061(window, "42", false);
+            SaInvoke(window, "BrowseBack_Click", null!, null!); SaInvoke(window, "BrowseBack_Click", null!, null!);
+            SaInvoke(window, "BrowseBack_Click", null!, null!);
+            SaAssertMembership061(window, "84", false);
+            fixture.WriteRelease.TrySetResult();
+            await Until(() => !SaField<bool>(window, "_catalogWriting"));
+            SaAssertMembership061(window, "84", false);
+            var reads = fixture.Reads;
+            SaInvoke(window, "BrowseForward");
+            SaAssertMembership061(window, "42", !deny);
+            SaInvoke(window, "BrowseForward"); SaInvoke(window, "BrowseForward");
+            SaAssertMembership061(window, "42", !deny);
+            Assert(fixture.Writes.Count == 1 && fixture.Members("12345").Contains("42") == !deny
+                && fixture.Reads == reads && !fixture.Browse.Player.HasSource,
+                "delayed/denied artist write changed another ID, retried or refreshed navigation");
+        }
+    }
+
+    private static async Task SaArtistMembershipAccount061()
+    {
+        using var fixture = new SaMembershipFixture061("account") { HoldWrite = true };
+        var window = fixture.Browse.Window; await fixture.Browse.Activate();
+        await Call(window, "OpenArtistAsync", "42", "Первый аккаунт", true);
+        await Call(window, "OpenCatalogAsync", new CatalogItem("314", "album", "Промежуточный альбом", ""), true);
+        await Call(window, "OpenArtistAsync", "42", "Первый аккаунт", true);
+        SaClick(Control<Button>(window, "ArtistLikeButton"));
+        await fixture.WriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        window.SignOut();
+        fixture.CurrentUid = "67890"; await fixture.Browse.Activate();
+        await Call(window, "OpenArtistAsync", "42", "Второй аккаунт", true);
+        await Call(window, "OpenCatalogAsync", new CatalogItem("314", "album", "Новый альбом", ""), true);
+        await Call(window, "OpenArtistAsync", "42", "Второй аккаунт", true);
+        // The old fake handler deliberately completes even after cancellation.
+        // Its account owns the server mutation; the new UI must ignore it.
+        fixture.WriteRelease.TrySetResult();
+        await Until(() => !SaField<bool>(window, "_catalogWriting"));
+        SaAssertMembership061(window, "42", false);
+        SaInvoke(window, "BrowseBack_Click", null!, null!); SaInvoke(window, "BrowseBack_Click", null!, null!);
+        SaAssertMembership061(window, "42", false);
+        SaInvoke(window, "BrowseForward"); SaInvoke(window, "BrowseForward");
+        SaAssertMembership061(window, "42", false);
+        Assert(SaField<Account>(window, "_account").Uid == "67890" && fixture.Members("67890").Count == 0
+            && fixture.Writes.SequenceEqual(new[] { ("12345", "42", true) }) && !fixture.Browse.Player.HasSource,
+            "late artist confirmation crossed the account boundary or wrote the new account");
+    }
+
+    private static async Task SaArtistMembershipReadRace061()
+    {
+        foreach (var initiallyLiked in new[] { false, true })
+        foreach (var readId in new[] { "42", "84" })
+        {
+            using var fixture = new SaMembershipFixture061("read-race-" + initiallyLiked + "-" + readId) { HoldWrite = true };
+            if (initiallyLiked) fixture.Members("12345").Add("42");
+            var window = fixture.Browse.Window; await fixture.Browse.Activate();
+            await Call(window, "OpenArtistAsync", "42", "Тот же исполнитель", true);
+            await Call(window, "OpenCatalogAsync", new CatalogItem("314", "album", "Первый альбом", ""), true);
+            await Call(window, "OpenArtistAsync", "42", "Тот же исполнитель", true);
+            SaClick(Control<Button>(window, "ArtistLikeButton"));
+            await fixture.WriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Call(window, "OpenCatalogAsync", new CatalogItem("314", "album", "Второй альбом", ""), true);
+            fixture.HoldNextMembershipRead = true;
+            var pendingRead = Call(window, "OpenArtistAsync", readId, "Удержанное чтение", true);
+            await fixture.ReadEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(fixture.HeldReadContains42 == initiallyLiked, "held membership GET did not capture the old service state");
+            fixture.WriteRelease.TrySetResult();
+            await Until(() => !SaField<bool>(window, "_catalogWriting"));
+            Assert(fixture.Members("12345").Contains("42") == !initiallyLiked && fixture.Writes.Count == 1,
+                "write/readback did not confirm the new state before the old GET was delivered");
+            if (readId == "42") SaAssertMembership061(window, "42", !initiallyLiked);
+            fixture.ReadRelease.TrySetResult();
+            await pendingRead;
+            SaAssertMembership061(window, readId, readId == "42" && !initiallyLiked);
+            var reads = fixture.Reads;
+            SaInvoke(window, "BrowseBack_Click", null!, null!); SaInvoke(window, "BrowseBack_Click", null!, null!);
+            SaAssertMembership061(window, "42", !initiallyLiked);
+            SaInvoke(window, "BrowseForward"); SaInvoke(window, "BrowseForward");
+            SaAssertMembership061(window, readId, readId == "42" && !initiallyLiked);
+            SaInvoke(window, "BrowseBack_Click", null!, null!); SaInvoke(window, "BrowseBack_Click", null!, null!);
+            SaInvoke(window, "BrowseBack_Click", null!, null!); SaInvoke(window, "BrowseBack_Click", null!, null!);
+            SaAssertMembership061(window, "42", !initiallyLiked);
+            Assert(fixture.Reads == reads && reads == 4 && fixture.Writes.Count == 1 && !fixture.Browse.Player.HasSource,
+                "stale read reconciliation requested more data, repeated a write or opened audio");
+        }
+    }
+
+    private static void SaAssertMembership061(MainWindow window, string id, bool liked)
+    {
+        Assert(SaField<string>(window, "_section") == "artist-detail" && SaField<ArtistDetails>(window, "_artistDetails").Id == id
+            && SaField<bool?>(window, "_artistLiked") == liked
+            && Control<Button>(window, "ArtistLikeButton").Content.ToString() == (liked ? "♥ В коллекции" : "♡ В коллекцию"),
+            "restored artist membership differs from the confirmed exact ID state");
+    }
+
     private static T SaField<T>(MainWindow window, string name) => (T)typeof(MainWindow).GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(window)!;
     private static void SaInvoke(MainWindow window, string name, params object[] args) => typeof(MainWindow).GetMethod(name, BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(window, args);
     private static void SaClick(Button button) => button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
@@ -166,6 +315,7 @@ internal static partial class Program
         internal NativePlayer Player { get; }
         internal FakeHandler Handler { get; }
         internal List<SaSearch> Searches { get; } = [];
+        internal Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage?>>? RespondOverride;
         internal string? HoldArtist;
         internal TaskCompletionSource Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -187,6 +337,7 @@ internal static partial class Program
         {
             var uri = request.RequestUri!; var path = uri.AbsolutePath;
             Assert(uri.Host == "api.music.yandex.net", "browse fixture left the API host");
+            if (RespondOverride is { } respond && await respond(request, token) is { } response) return response;
             if (path == "/account/status") return Json(Profile);
             if (path == "/users/12345/likes/tracks") return Json("""{"result":{"library":{"tracks":[]}}}""");
             if (path == "/users/12345/likes/artists") return Json("""{"result":[{"artist":{"id":"artist-42","name":"Исполнитель 42"}}]}""");
@@ -215,6 +366,59 @@ internal static partial class Program
             throw new InvalidOperationException("Unexpected search/artist fixture endpoint " + path);
         }
         public void Dispose() { Release.TrySetResult(); Window.Close(); Player.Dispose(); Handler.Dispose(); }
+    }
+
+    private sealed class SaMembershipFixture061 : IDisposable
+    {
+        internal SaFixture Browse { get; }
+        internal string CurrentUid = "12345";
+        internal int Reads;
+        internal List<(string Uid, string Id, bool Liked)> Writes = [];
+        internal bool HoldWrite, DenyWrite, HoldNextMembershipRead;
+        internal bool? HeldReadContains42;
+        internal TaskCompletionSource WriteEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource WriteRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource ReadEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource ReadRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly Dictionary<string, HashSet<string>> _members = new(StringComparer.Ordinal)
+        { ["12345"] = new(StringComparer.Ordinal), ["67890"] = new(StringComparer.Ordinal) };
+        internal HashSet<string> Members(string uid) => _members[uid];
+        internal SaMembershipFixture061(string name)
+        {
+            Browse = new SaFixture("membership061-" + name);
+            Browse.RespondOverride = Respond;
+        }
+        private async Task<HttpResponseMessage?> Respond(HttpRequestMessage request, CancellationToken token)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            if (path == "/account/status") return Json(JsonSerializer.Serialize(new
+            { result = new { account = new { uid = CurrentUid, displayName = "Membership fixture " + CurrentUid }, plus = new { hasPlus = true } } }));
+            var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 4 || parts[0] != "users" || parts[2] != "likes") return null;
+            var members = Members(parts[1]);
+            if (parts.Length == 4 && parts[3] == "tracks") return Json("{\"result\":{\"library\":{\"tracks\":[]}}}");
+            if (parts.Length == 4 && parts[3] == "artists")
+            {
+                Reads++;
+                var response = Json(JsonSerializer.Serialize(new { result = members.Select(id => new { artist = new { id, name = "Исполнитель " + id } }).ToArray() }));
+                if (HoldNextMembershipRead)
+                {
+                    HoldNextMembershipRead = false; HeldReadContains42 = members.Contains("42");
+                    ReadEntered.TrySetResult(); await ReadRelease.Task;
+                }
+                return response;
+            }
+            if (parts.Length != 5 || parts[3] != "artists" || parts[4] is not ("add-multiple" or "remove")) return null;
+            var body = await request.Content!.ReadAsStringAsync(token);
+            Assert(request.Method == HttpMethod.Post && body == "artist-ids=42", "membership write lost its exact fixture artist ID");
+            var liked = parts[4] == "add-multiple";
+            Writes.Add((parts[1], "42", liked));
+            if (HoldWrite) { WriteEntered.TrySetResult(); await WriteRelease.Task; }
+            if (DenyWrite) return Json("{\"error\":{\"name\":\"fixture-denied\"}}", System.Net.HttpStatusCode.Forbidden);
+            if (liked) members.Add("42"); else members.Remove("42");
+            return Json("{\"result\":\"ok\"}");
+        }
+        public void Dispose() { WriteRelease.TrySetResult(); ReadRelease.TrySetResult(); Browse.Dispose(); }
     }
 
     private static object SaTrack(string id) => new { id, title = "Трек " + id, available = true, durationMs = 180000, artists = new[] { new { id = "artist-42", name = "Одинаковое имя" } }, albums = new[] { new { id = "1", title = "Альбом" } } };

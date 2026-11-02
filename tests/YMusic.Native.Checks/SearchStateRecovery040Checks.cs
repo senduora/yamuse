@@ -18,6 +18,7 @@ internal static partial class Program
         await Run("SearchRecovery040: collections and albums restore separate categories and continuation requests", Search040Collections);
         await Run("SearchRecovery040: a late search response cannot overwrite mouse Back or a signed-out view", Search040LateHistory);
         await Run("SearchRecovery040: choosing an empty category cancels the previous query and clears its cursor", Search040EmptyCategory);
+        await Run("QaFixes061: search distinguishes initial and completed empty results before a new successful query", Search061EmptyResultCopy);
     }
 
     private static async Task Search040SidebarReset()
@@ -134,6 +135,36 @@ internal static partial class Program
         Search040Facts(f, "empty-category");
     }
 
+    private static async Task Search061EmptyResultCopy()
+    {
+        using var f = new Search040Fixture("empty-copy061"); await f.Activate(); var w = f.Window;
+        SaClick(Control<Button>(w, "SearchNav"));
+        Assert(f.Searches.Length == 0 && Control<StackPanel>(w, "EmptyState").Visibility == Visibility.Visible
+            && Control<TextBlock>(w, "EmptyTitle").Text == "Пока нет результатов"
+            && Control<TextBlock>(w, "EmptyDescription").Text == "Введите запрос для поиска в каталоге Яндекса",
+            "initial search lost its query prompt or issued a hidden request");
+
+        await Search040Start(f, "track", "empty results qa061");
+        Search040Assert(w, "track", "track", false, "empty results qa061", 0, false, []);
+        Assert(Control<StackPanel>(w, "EmptyState").Visibility == Visibility.Visible
+            && Control<TextBlock>(w, "EmptyTitle").Text == "Ничего не найдено"
+            && Control<TextBlock>(w, "EmptyDescription").Text == "Попробуйте изменить запрос",
+            "completed zero-result search still asks for an initial query");
+        SaClick(Control<Button>(w, "FavoritesNav")); NavMouse(w, MouseButton.XButton1);
+        Search040Assert(w, "track", "track", false, "empty results qa061", 0, false, []);
+        Assert(Control<TextBlock>(w, "EmptyDescription").Text == "Попробуйте изменить запрос" && f.Searches.Length == 1,
+            "Back lost the completed empty-search state or repeated the request");
+
+        Control<TextBox>(w, "CatalogQuery").Text = "matching results qa061";
+        SaClick(Search040Find(w)); await Search040Idle(w);
+        Search040Assert(w, "track", "track", false, "matching results qa061", 0, true, ["track-0"]);
+        Assert(Control<StackPanel>(w, "EmptyState").Visibility == Visibility.Collapsed && !f.Player.HasSource
+            && f.Searches.SequenceEqual(new[] { new Search040Request("track", 0, "empty results qa061"),
+                new Search040Request("track", 0, "matching results qa061") }),
+            "the next query retained the empty state, wrong cursor, extra request or opened audio");
+        Search040Facts(f, "empty-copy061");
+    }
+
     private static async Task Search040Start(Search040Fixture f, string category, string query)
     {
         SaClick(Control<Button>(f.Window, "SearchNav")); Control<TextBox>(f.Window, "CatalogQuery").Text = query;
@@ -238,6 +269,8 @@ internal static partial class Program
     }
     private static string Search040Json(Search040Request search)
     {
+        if (search is { Type: "track", Text: "empty results qa061" })
+            return JsonSerializer.Serialize(new { result = new { tracks = new { total = 0, perPage = 1, results = Array.Empty<object>() } } });
         var collections = search.Text == "collections query";
         var result = new Dictionary<string, object>();
         if (search.Type == "track") result["tracks"] = new { total = 2, perPage = 1, results = new[] { SaTrack("track-" + search.Page) } };

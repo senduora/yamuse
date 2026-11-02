@@ -46,6 +46,20 @@ public partial class MainWindow
         stack.Push(snapshot);
     }
 
+    private void UpdateBrowseArtistMembership(string id, bool liked)
+    {
+        // Reconcile only existing, bounded page history; membership is not a
+        // historical property of an artist and must survive Back/Forward.
+        foreach (var stack in new[] { _browseHistory, _browseForward })
+        {
+            if (!stack.Any(view => view.Section == "artist-detail" && view.Artist?.Id == id && view.ArtistLiked != liked)) continue;
+            var views = stack.Reverse().ToArray();
+            stack.Clear();
+            foreach (var view in views)
+                stack.Push(view.Section == "artist-detail" && view.Artist?.Id == id ? view with { ArtistLiked = liked } : view);
+        }
+    }
+
     private void BrowseBack_Click(object sender, RoutedEventArgs e)
     {
         if (!_browseHistory.TryPop(out var previous)) return;
@@ -117,6 +131,7 @@ public partial class MainWindow
     private void ResetBrowseState()
     {
         _browseHistory.Clear(); _browseForward.Clear(); _resolvedArtists.Clear(); _resolvedArtistGeneration = -1;
+        _artistMembershipRead = null;
         _artistDetails = null; _artistLiked = null; _homeSections = [];
         _catalogItems.Clear(); _openedCatalogItem = null;
         HomeShelves.ItemsSource = null;

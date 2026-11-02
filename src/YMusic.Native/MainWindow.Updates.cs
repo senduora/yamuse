@@ -175,19 +175,35 @@ public partial class MainWindow
     {
         if (_closed || _lifetime.IsCancellationRequested) return false;
         if (AppUpdateMaintenanceActive) { RefreshAppUpdateUi(); return false; }
-        SuspendDownloadQueueForAccountChange();
+        // Let initial account restoration finish before superseding its admission.
+        // A failed apply must not strand an otherwise valid checkpoint unloaded.
+        if (_downloadQueueStore is not null && _account is { } restoringAccount
+            && _downloadQueueAccountUid != restoringAccount.Uid && !_downloadPersistenceInvalidated && !_downloadPersistenceWriteBlocked)
+        {
+            SetStatus("Дождитесь восстановления очереди загрузок и повторите обновление.");
+            return false;
+        }
+        var accountUid = _account?.Uid;
+        var accountGeneration = _accountGeneration;
+        PauseDownloadQueueForAppUpdate();
+        var admissionRevision = _downloadQueueAdmissionRevision;
+        if (!SaveDownloadQueueForAppUpdate()) return false;
         // Preserve committed preferences, and finish an atomic offline write
         // before the SDK exits the process. Closing the window cancels this wait.
-        // Queue suspension already blocks automatic downloads. The preference
+        // Queue pause already blocks automatic downloads. The preference
         // remains the user's choice and can change while this wait yields.
         var pending = _downloadTask;
-        _downloadCts?.Cancel();
         if (pending is not null)
             try { await pending.WaitAsync(_lifetime.Token); } catch (OperationCanceledException) { }
         if (_closed || _lifetime.IsCancellationRequested) return false;
+        // Logout, replacement work or another account must not revive an old
+        // checkpoint or apply while a newly admitted download is still running.
+        if (accountUid != _account?.Uid || accountGeneration != _accountGeneration
+            || admissionRevision != _downloadQueueAdmissionRevision || _downloadCts is not null || _downloadQueue.Running) return false;
         // Cleanup can start while the pending download yields. Recheck on
         // the dispatcher immediately before saving state and exiting.
         if (AppUpdateMaintenanceActive) { RefreshAppUpdateUi(); return false; }
+        if (!SaveDownloadQueueForAppUpdate()) return false;
         SavePreferences(); SavePlaybackState();
         updates.ApplyAndRestart();
         return true;

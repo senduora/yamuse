@@ -206,7 +206,7 @@ internal static partial class Program
     private static async Task MiniIconChecks()
     {
         Assert(AppBranding.Name == "Yamuse" && AppBranding.WindowIcon.IsFrozen && AppBranding.WindowIcon is BitmapSource, "packaged brand icon missing or not frozen");
-        var owner = new Window { Width = 100, Height = 100, Left = -16000, Top = 0, ShowActivated = false, ShowInTaskbar = false };
+        var owner = new MiniPlayerWindow { Left = -16000, Top = 0, WindowStartupLocation = WindowStartupLocation.Manual, ShowActivated = false, ShowInTaskbar = false };
         try
         {
             var handle = new WindowInteropHelper(owner).EnsureHandle();
@@ -224,7 +224,7 @@ internal static partial class Program
             icon.Dispose(); Assert(icon.IsClosed && !MiniGetIconInfo(native, out _), "owned HICON remained valid after disposal");
             File.WriteAllText(Path.Combine(_directory, "mini-scope.json"), JsonSerializer.Serialize(new
             {
-                title = AppBranding.Name, miniWidth = 484, miniHeight = 300, miniMinimumWidth = 360, miniMinimumHeight = 264, trayIconPixels = width,
+                title = AppBranding.Name, miniWidth = owner.Width, miniHeight = owner.Height, miniMinimumWidth = owner.MinWidth, miniMinimumHeight = owner.MinHeight, trayIconPixels = width,
                 ownedHiconDestroyed = true, frozenPackagedWindowIcon = true, externalNetworkRequests = 0,
                 playerOrAudioEngineConstructed = false, userAccountLoaded = false, globalInputUsed = false,
                 actualTrayRegistrationTested = false, offscreenWpfWindows = true

@@ -11,6 +11,7 @@ public partial class MainWindow
     {
         SetSection("queue", "Очередь воспроизведения"); QueueActions.Visibility = Visibility.Visible;
         ShowRows(_playbackQueue.Items);
+        UpdateIdleQueueMessage();
         SelectVisibleQueueOccurrence(_playbackQueue.CurrentIndex);
         SetStatus(CanDragQueue ? "Перетащите треки для изменения порядка. Ctrl/Shift — несколько треков, Ctrl+Z — вернуть удалённые."
             : "Перетаскивание доступно в исходном порядке без поиска. Кнопки выше меняют порядок воспроизведения.");
@@ -69,11 +70,19 @@ public partial class MainWindow
             {
                 _playbackGeneration++; _playCts?.Cancel(); ReportWaveEnd(false); _player.Stop(); _progressTimer.Stop();
                 if (_current is not null) _current.IsPlaying = false;
-                _current = null; HighlightTrack(null); TrackTitle.Text = "Очередь пуста"; TrackArtist.Text = "Добавьте треки в очередь"; QualityText.Text = "";
+                _current = null; HighlightTrack(null); UpdateIdleQueueMessage();
             }
         }
         UpdateControls(); UpdateProgress();
         SavePlaybackState();
+    }
+    private void UpdateIdleQueueMessage()
+    {
+        if (_current is not null || _playbackQueue.Current is not null) return;
+        var empty = _queue.Count == 0;
+        TrackTitle.Text = empty ? "Очередь пуста" : "Выберите трек";
+        TrackArtist.Text = empty ? "Добавьте треки в очередь" : "Двойной щелчок или кнопка «Слушать»";
+        QualityText.Text = "";
     }
     private void MoveQueueUp_Click(object sender, RoutedEventArgs e) => MoveSelectedQueue(-1);
     private void MoveQueueDown_Click(object sender, RoutedEventArgs e) => MoveSelectedQueue(1);

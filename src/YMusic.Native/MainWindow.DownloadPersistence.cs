@@ -128,6 +128,25 @@ public partial class MainWindow
         { _diagnostics.LastErrorType = "DownloadSave:" + error.GetType().Name; }
         finally { _downloadPersistenceClosing = true; }
     }
+    private bool SaveDownloadQueueForAppUpdate()
+    {
+        if (!CanPersistDownloadQueue) return true;
+        try
+        {
+            // The updater can exit without the normal close hook. Commit the
+            // paused checkpoint synchronously; do not mark persistence closing.
+            _downloadQueueStore!.Save(DownloadQueueStore.Capture(_account!.Uid, _downloadQueue,
+                _downloadQueueQuality, _downloadQueueAutomatic, _downloadQueuePlaylist));
+            _downloadPersistenceDirty = false;
+            return true;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
+        {
+            _diagnostics.LastErrorType = "DownloadSave:" + error.GetType().Name;
+            SetStatus("Не удалось сохранить очередь загрузок. Обновление отложено.", true);
+            return false;
+        }
+    }
     private bool ClearPersistedDownloadQueue()
     {
         ++_downloadQueueAdmissionRevision;

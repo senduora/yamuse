@@ -18,6 +18,10 @@ internal static partial class Program
         await Run("Security stability0317: lifetime cancellation and closed window prevent a pending restart", R4CanceledRestart);
         await Run("Security stability0317: both update controls follow maintenance without replacing the settings draft", R4MaintenanceUpdateControls);
         await Run("Security stability0317: deleting one local fixture track disables restart then restores retry controls", R4SingleTrackMaintenanceControls);
+        await Run("QaFixes061: update aborted by real cache maintenance keeps paused checkpoint and explicit continuation", Qf061A10UpdateMaintenance);
+        await Run("QaFixes061: failed update apply and checkpoint replacement preserve recoverable downloads", Qf061A10UpdateErrors);
+        await Run("QaFixes061: update close cancellation logout and same-account login preserve download isolation", Qf061A10UpdateBoundaries);
+        await Run("QaFixes061: pending restore and superseding admission prevent stale update checkpoint writes", Qf061A10UpdateAdmission);
     }
 
     private static async Task R4ActiveMaintenance()
@@ -142,6 +146,222 @@ internal static partial class Program
     private static object? R4Call(object target, string name, params object[] args) => target.GetType().GetMethod(name, BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(target, args);
     private static Task R4Task(object target, string name, params object[] args) => (Task)R4Call(target, name, args)!;
     private static Task<T> R4Task<T>(object target, string name, params object[] args) => (Task<T>)R4Call(target, name, args)!;
+
+    private static async Task Qf061A10UpdateMaintenance()
+    {
+        using var f = new Qf061A10UpdateFixture("maintenance");
+        var previousCache = Artwork.Cache;
+        using var cache = new ArtworkCache(Path.Combine(f.DirectoryPath, "artwork"), new R4NoNetwork());
+        var gate = R4Get<SemaphoreSlim>(cache, "_diskGate");
+        await gate.WaitAsync();
+        Task? cleanup = null;
+        try
+        {
+            Artwork.Cache = cache;
+            var update = f.BeginUpdate();
+            Assert(!update.IsCompleted && R4Get<bool>(f.Window, "_appUpdateActionInProgress")
+                && Control<Button>(f.Window, "SettingsClearCache").IsEnabled,
+                "update did not enter its worker wait or blocked the real cache entry");
+            cleanup = R4Task(f.Window, "ClearCachesAsync");
+            Assert(R4Get<bool>(f.Window, "_cacheMaintenance") && !cleanup.IsCompleted,
+                "real cache cleanup did not overlap the pending update");
+            f.FinishWorker(); await update.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(f.Backend.Applies == 0 && !R4Get<bool>(f.Window, "_startupUpdateRestartRequested"),
+                "late maintenance allowed an update apply");
+            f.AssertPausedCheckpoint();
+        }
+        finally
+        {
+            gate.Release();
+            try { if (cleanup is not null) await cleanup.WaitAsync(TimeSpan.FromSeconds(5)); }
+            finally { Artwork.Cache = previousCache; }
+        }
+        f.AssertPausedCheckpoint();
+        Assert(f.Queue.CanResume && !f.Queue.Running && R4Get<bool>(f.Window, "_downloadsAutoSuspended")
+            && R4Get<Task?>(f.Window, "_downloadTask") is null && f.Requests == 0,
+            "aborted update resumed downloads automatically or disabled explicit continuation");
+        await R4Task(f.Window, "ResumeDownloadQueue");
+        Assert(f.Queue.Entries.All(entry => entry.State == DownloadEntryState.Unavailable) && !f.Queue.Running && f.Requests == 0,
+            "explicit continuation did not process the paused fixture queue without network");
+    }
+
+    private static async Task Qf061A10UpdateErrors()
+    {
+        using (var f = new Qf061A10UpdateFixture("apply-error"))
+        {
+            f.Backend.FailApply = true;
+            var update = f.BeginUpdate(); f.FinishWorker();
+            await update.WaitAsync(TimeSpan.FromSeconds(5));
+            f.AssertPausedCheckpoint();
+            Assert(f.Backend.Applies == 1 && !R4Get<bool>(f.Window, "_startupUpdateRestartRequested") && f.Queue.CanResume
+                && R4Get<bool>(f.Window, "_downloadsAutoSuspended") && f.Requests == 0,
+                "failed fake apply discarded or automatically resumed the paused queue");
+        }
+        using (var f = new Qf061A10UpdateFixture("checkpoint-error"))
+        {
+            var before = File.ReadAllBytes(f.SnapshotPath);
+            using (var locked = new FileStream(f.SnapshotPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                var update = f.BeginUpdate();
+                try { await update.WaitAsync(TimeSpan.FromSeconds(5)); }
+                finally { f.FinishWorker(); }
+                Assert(f.Backend.Applies == 0 && before.SequenceEqual(File.ReadAllBytes(f.SnapshotPath))
+                    && R4Get<Diagnostics>(f.Window, "_diagnostics").LastErrorType?.StartsWith("DownloadSave:", StringComparison.Ordinal) == true,
+                    "failed checkpoint replacement allowed apply or damaged the previous snapshot");
+            }
+            f.AssertPausedCheckpoint();
+            Assert(f.Queue.CanResume && f.Requests == 0, "checkpoint failure stranded the live paused queue");
+        }
+    }
+
+    private static async Task Qf061A10UpdateBoundaries()
+    {
+        foreach (var action in new[] { "close", "cancel", "logout", "same-account" })
+        {
+            using var f = new Qf061A10UpdateFixture(action);
+            var update = f.BeginUpdate();
+            Assert(!update.IsCompleted, action + ": fixture did not enter the update wait");
+            if (action == "close") f.Window.Close();
+            else if (action == "cancel") R4Get<CancellationTokenSource>(f.Window, "_lifetime").Cancel();
+            else
+            {
+                f.Window.SignOut();
+                if (action == "same-account")
+                {
+                    R4Set(f.Window, "_account", new Account(Qf061A10UpdateFixture.AccountUid, "Fixture relogin", false));
+                    R4Set(f.Window, "_session", FakeSession);
+                }
+            }
+            f.FinishWorker(); await update.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(f.Backend.Applies == 0 && f.Requests == 0, action + ": stale update applied or accessed the service");
+            if (action is "close" or "cancel") f.AssertPausedCheckpoint();
+            else Assert(!File.Exists(f.SnapshotPath) && f.Queue.Suspended
+                && R4Get<bool>(f.Window, "_downloadPersistenceInvalidated"),
+                action + ": old account checkpoint or resumable entries were revived");
+        }
+    }
+
+    private static async Task Qf061A10UpdateAdmission()
+    {
+        using var f = new Qf061A10UpdateFixture("new-admission");
+        var update = f.BeginUpdate();
+        f.FinishWorker();
+        // Worker completion queues the update continuation. A new user batch can
+        // be admitted before that continuation runs on this same dispatcher.
+        f.Queue.Replace([new TrackRow { Id = "replacement", RequestId = "replacement", Title = "New queue", Available = false }], "New queue");
+        R4Call(f.Window, "BeginDownloadQueuePersistence");
+        f.Store.Save(DownloadQueueStore.Capture(Qf061A10UpdateFixture.AccountUid, f.Queue, AudioQuality.Optimal, false, null));
+        var replacement = File.ReadAllBytes(f.SnapshotPath);
+        await update.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert(f.Backend.Applies == 0 && replacement.SequenceEqual(File.ReadAllBytes(f.SnapshotPath))
+            && f.Store.Load(Qf061A10UpdateFixture.AccountUid)?.Entries.Single().Track.Id == "replacement",
+            "superseded update applied or rewrote the newly admitted download checkpoint");
+
+        using var restoring = new Qf061A10UpdateFixture("pending-restore");
+        var snapshot = restoring.Store.Load(Qf061A10UpdateFixture.AccountUid)!;
+        restoring.Queue.EndRun(true); restoring.Queue.Replace([], "Restoring");
+        R4Set(restoring.Window, "_downloadQueueAccountUid", null); R4Set(restoring.Window, "_downloadPersistenceAccountUid", null);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var read = new TaskCompletionSource<DownloadQueueSnapshot?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        restoring.Window.DownloadQueueRestoreReadAsync = _ => { entered.TrySetResult(); return read.Task; };
+        var restore = R4Task(restoring.Window, "RestoreDownloadQueueAsync", Qf061A10UpdateFixture.AccountUid);
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var admission = R4Get<long>(restoring.Window, "_downloadQueueAdmissionRevision");
+            await R4Task(restoring.Window, "InstallStartupUpdateAsync").WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(restoring.Backend.Applies == 0 && !restore.IsCompleted
+                && R4Get<long>(restoring.Window, "_downloadQueueAdmissionRevision") == admission,
+                "update superseded an in-flight initial restore before it could load the saved queue");
+        }
+        finally
+        {
+            read.TrySetResult(snapshot);
+            await restore.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        restoring.AssertPausedCheckpoint();
+        Assert(restoring.Queue.CanResume && !restoring.Queue.Running && restoring.Requests == 0,
+            "rejected update left the initial restored queue unloaded or started its downloads");
+    }
+
+    private sealed class Qf061A10UpdateFixture : IDisposable
+    {
+        internal const string AccountUid = "qa-fixes061-update";
+        internal string DirectoryPath { get; }
+        internal string SnapshotPath => Path.Combine(DirectoryPath, DownloadQueueStore.FileName);
+        internal MainWindow Window { get; }
+        internal DownloadQueueState Queue => R4Get<DownloadQueueState>(Window, "_downloadQueue");
+        internal DownloadQueueStore Store => R4Get<DownloadQueueStore>(Window, "_downloadQueueStore");
+        internal Qf061A10UpdateBackend Backend { get; } = new();
+        internal int Requests { get; private set; }
+        private readonly OfflineLibrary _offline;
+        private readonly CancellationTokenSource _workerCancellation;
+        private TaskCompletionSource? _worker;
+        internal Qf061A10UpdateFixture(string name)
+        {
+            DirectoryPath = Path.Combine(_directory, "qa-fixes061-update-" + name); Directory.CreateDirectory(DirectoryPath);
+            var feed = Path.Combine(DirectoryPath, "feed.json");
+            File.WriteAllText(feed, "{\"githubRepository\":\"https://github.com/example/qa-update-fixture\"}");
+            var updates = new UpdateSupport(feed, true, _ => Backend);
+            updates.CheckAsync().GetAwaiter().GetResult();
+            _offline = new OfflineLibrary(Path.Combine(DirectoryPath, "music"),
+                new AudioBuffer(Path.Combine(DirectoryPath, "download-buffer"), new R4NoNetwork()));
+            var player = new NativePlayer(new AudioBuffer(Path.Combine(DirectoryPath, "player-buffer"), new R4NoNetwork()));
+            var preferences = new PreferencesStore(DirectoryPath); preferences.Save(new() { Volume = 0, AutoDownloadFavorites = true });
+            Window = new MainWindow(restore: false,
+                api: new MusicApi(new FakeHandler((_, _) => { Requests++; throw new InvalidOperationException("Update fixture forbids network"); })),
+                store: new SessionStore(DirectoryPath), diagnosticsDirectory: DirectoryPath, offline: _offline, player: player,
+                preferences: preferences, audioOutputDevices: new PlaybackOptionsFakeOutputs());
+            R4Set(Window, "_restore", true); R4Set(Window, "_account", new Account(AccountUid, "Fixture", false));
+            R4Set(Window, "_session", FakeSession); R4Set(Window, "_appUpdatesOverride", updates);
+            R4Call(Window, "InitializeDownloadPersistence"); R4Call(Window, "BeginDownloadQueuePersistence");
+            R4Set(Window, "_downloadQueueAccountUid", AccountUid); R4Set(Window, "_downloadQueueQuality", AudioQuality.Optimal);
+            Queue.Replace(Enumerable.Range(1, 2).Select(id => new TrackRow
+            { Id = "pending-" + id, RequestId = "pending-" + id, Title = "Pending fixture", Available = false }), "Update fixture");
+            Queue.BeginRun(false); // A live batch can yield in preflight before workers inspect availability.
+            Store.Save(DownloadQueueStore.Capture(AccountUid, Queue, AudioQuality.Optimal, false, null));
+            _workerCancellation = CancellationTokenSource.CreateLinkedTokenSource(R4Get<CancellationTokenSource>(Window, "_lifetime").Token);
+        }
+        internal Task BeginUpdate()
+        {
+            _worker = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            R4Set(Window, "_downloadTask", _worker.Task); R4Set(Window, "_downloadCts", _workerCancellation);
+            return R4Task(Window, "InstallStartupUpdateAsync");
+        }
+        internal void FinishWorker()
+        {
+            if (_worker is null || _worker.Task.IsCompleted) return;
+            if (R4Get<int>(Window, "_downloadQueueAccountGeneration") != R4Get<int>(Window, "_accountGeneration")) Queue.Suspend();
+            Queue.EndRun(true);
+            R4Set(Window, "_downloadCts", null); R4Set(Window, "_downloadTask", null);
+            _worker.TrySetResult();
+        }
+        internal void AssertPausedCheckpoint()
+        {
+            var snapshot = Store.Load(AccountUid);
+            Assert(snapshot is not null, "update lost the paused download checkpoint");
+            var restored = new DownloadQueueState(); restored.Restore(DownloadQueueStore.PrepareRestore(snapshot!, _offline));
+            Assert(restored.Entries.Count == 2 && restored.CanResume && !restored.Running
+                && restored.Entries.All(entry => entry.State == DownloadEntryState.Paused),
+                "update checkpoint did not restore unfinished downloads paused and resumable");
+        }
+        public void Dispose()
+        {
+            FinishWorker();
+            if (!R4Get<bool>(Window, "_closed")) Window.Close();
+            _offline.Dispose(); _workerCancellation.Dispose();
+        }
+    }
+    private sealed class Qf061A10UpdateBackend : IAppUpdateBackend
+    {
+        internal int Applies;
+        internal bool FailApply;
+        public string? PendingVersion => "9.1.0";
+        public Task<string?> CheckAsync() => throw new InvalidOperationException("Fake pending update must not check the service");
+        public Task DownloadAsync(Action<int> progress, CancellationToken token) => throw new InvalidOperationException("Fake pending update must not download");
+        public void ApplyAndRestart()
+        { Applies++; if (FailApply) throw new IOException("Fixture apply failure"); }
+    }
 
     // The product constructor reads several optional stores before a fixture
     // could replace them. This private fixture never calls it or shows a window.

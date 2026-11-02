@@ -354,27 +354,41 @@ public partial class MainWindow : Window
         if (_current is not null) _current.IsPlaying = false;
         HighlightTrack(null);
         _current = track;
-        RefreshPlaybackView();
-        RefreshLyrics();
         _loadingStream = true;
         TrackTitle.Text = track.Title; TrackArtist.Text = track.Artist;
         Artwork.SetSourceUri(PlayerCover, track.CoverUri);
         QualityText.Text = "";
         SetStatus(promoted ? "" : localPath is not null ? "Открываем локальный трек…" : "Получаем аудиопоток…");
         _diagnostics.Stage = "resolving_stream";
-        UpdateControls(); UpdateProgress();
         var clock = Stopwatch.StartNew();
+        var playbackGeneration = _playbackGeneration;
+        var accountGeneration = _accountGeneration;
+        var occurrence = _playbackQueue.CurrentOccurrenceToken;
         try
         {
-            await EnsureAudioOutputReadyAsync();
+            if (promoted)
+            {
+                cts.Token.ThrowIfCancellationRequested();
+                if (!OwnsOpenedTrack()) return;
+                ValidateOpenedDuration();
+                // Promotion has already made this exact source live. Commit its
+                // lifecycle before any pause producer can cancel pending routing.
+                CommitOpenedTrack(prepared!.Offline, prepared.QualityLabel);
+            }
+            // Queue selection and controls may synchronously expire a sleep
+            // deadline. A live promoted source must already own its lifecycle.
+            RefreshPlaybackView(); RefreshLyrics();
+            UpdateControls(); UpdateProgress();
+            await EnsureAudioOutputReadyAsync().WaitAsync(cts.Token);
             cts.Token.ThrowIfCancellationRequested();
+            if (promoted) return; // Never repeat listening/track-change/save work.
             AudioDescriptor? audio = null;
-            if (!promoted && localPath is null)
+            if (localPath is null)
             {
                 var session = await EnsureSessionAsync(cts.Token);
                 audio = await _api.ResolveAudioAsync(session, track.RequestId, SelectedQuality, cts.Token);
             }
-            else if (!promoted)
+            else
             {
                 audio = await TryResolveOfflineUpgradeAsync(track, localPath!, SelectedQuality, cts.Token);
                 if (audio is not null) { localPath = null; localQuality = null; SetStatus("Получаем аудиопоток…"); }
@@ -386,33 +400,14 @@ public partial class MainWindow : Window
                 if (!ReferenceEquals(_playCts, cts) || cts.IsCancellationRequested) return;
                 SetStatus($"Загрузка аудио · {value.Bytes / 1048576.0:F1}" + (value.Total.HasValue ? $" из {value.Total / 1048576.0:F1}" : "") + " МБ");
             });
-            if (!promoted)
-            {
-                if (localPath is not null) await _player.OpenPausedAsync(new Uri(localPath), cts.Token);
-                else await _player.OpenPausedAsync(audio!, cts.Token, bufferProgress);
-            }
+            if (localPath is not null) await _player.OpenPausedAsync(new Uri(localPath), cts.Token);
+            else await _player.OpenPausedAsync(audio!, cts.Token, bufferProgress);
             cts.Token.ThrowIfCancellationRequested();
-            if (track.DurationMs > 60_000 && _player.Duration.TotalSeconds is > 0 and <= 35)
-            {
-                _player.Stop();
-                throw new MusicException("Длительность потока похожа на фрагмент. Проверьте подписку; воспроизведение остановлено.");
-            }
-            if (!promoted)
-            {
-                ApplyRestoredPositionAfterOpen(track);
-                _player.Toggle();
-            }
-            _diagnostics.Timing("play_requested_to_media_open_ms", clock.Elapsed.TotalMilliseconds);
-            var playingOffline = promoted ? prepared!.Offline : localPath is not null;
-            _diagnostics.Stage = playingOffline ? "playing_offline" : "playing";
-            track.IsPlaying = true;
-            HighlightTrack(track);
-            QualityText.Text = (playingOffline ? "Офлайн · " : "") + (promoted ? prepared!.QualityLabel : localQuality ?? audio?.QualityLabel ?? "Локальное аудио");
-            SetStatus(!playingOffline && _waveSources.ContainsKey(track) ? WaveSourceLabel(track) : "");
-            BeginWaveListening(track);
-            PlaybackOptionsTrackChanged();
-            _progressTimer.Start();
-            SavePlaybackState();
+            if (!OwnsOpenedTrack()) return;
+            ValidateOpenedDuration();
+            ApplyRestoredPositionAfterOpen(track);
+            _player.Toggle();
+            CommitOpenedTrack(localPath is not null, localQuality ?? audio?.QualityLabel ?? "Локальное аудио");
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
         catch (Exception ex) { _diagnostics.Stage = "playback_error"; ShowError(ex); }
@@ -421,16 +416,53 @@ public partial class MainWindow : Window
             if (ReferenceEquals(_playCts, cts)) { _playCts = null; _loadingStream = false; UpdateControls(); UpdateProgress(); SyncPlaybackContextSelection(); }
             cts.Dispose();
         }
+
+        bool OwnsOpenedTrack() => !_closed && !cts.IsCancellationRequested && ReferenceEquals(_playCts, cts)
+            && playbackGeneration == _playbackGeneration && accountGeneration == _accountGeneration
+            && ReferenceEquals(_current, track) && occurrence == _playbackQueue.CurrentOccurrenceToken;
+        void ValidateOpenedDuration()
+        {
+            if (track.DurationMs <= 60_000 || _player.Duration.TotalSeconds is not (> 0 and <= 35)) return;
+            _player.Stop();
+            throw new MusicException("Длительность потока похожа на фрагмент. Проверьте подписку; воспроизведение остановлено.");
+        }
+        void CommitOpenedTrack(bool playingOffline, string quality)
+        {
+            _diagnostics.Timing("play_requested_to_media_open_ms", clock.Elapsed.TotalMilliseconds);
+            var playing = _player.IsPlaying;
+            _diagnostics.Stage = !playing ? "paused" : playingOffline ? "playing_offline" : "playing";
+            track.IsPlaying = true;
+            HighlightTrack(track);
+            QualityText.Text = (playingOffline ? "Офлайн · " : "") + quality;
+            SetStatus(!playingOffline && _waveSources.ContainsKey(track) ? WaveSourceLabel(track) : "");
+            BeginWaveListening(track);
+            SetWavePaused(!playing);
+            PlaybackOptionsTrackChanged();
+            if (playing) _progressTimer.Start(); else _progressTimer.Stop();
+            SavePlaybackState();
+        }
     }
 
     private async void PlayPause_Click(object sender, RoutedEventArgs e) => await TogglePlaybackAsync();
     private async Task TogglePlaybackAsync()
     {
+        if (_closed) return;
         if (_automaticWaveCts is not null)
         {
             CancelAutomaticWave(); StopCompletedQueue(); SetStatus("Воспроизведение на паузе."); return;
         }
-        if (_loadingStream) return;
+        // A promoted source already owns its lifecycle while readiness is pending.
+        // Pause stays available without turning a still-unopened source into Play.
+        if (_loadingStream && !_player.IsPlaying) return;
+        // Pause stays available during routing. A blocked resume is not queued:
+        // completing a device switch must never revive an obsolete Play intent.
+        if (!_player.IsPlaying && (_audioOutputUnavailable || _audioOutputSwitching))
+        {
+            SetStatus(_audioOutputUnavailable
+                ? "Аудиоустройство недоступно. Выберите устройство в настройках воспроизведения."
+                : "Дождитесь завершения переключения аудиоустройства.");
+            return;
+        }
         if (!_player.HasSource)
         {
             if (_current is not null) await PlayTrackAsync(_current);
@@ -501,7 +533,7 @@ public partial class MainWindow : Window
             DownloadButton.ToolTip = _downloadCts is not null ? "Отменить загрузку" : "Скачать выбранные треки";
             DownloadButton.IsEnabled = _downloadCts is not null || !_catalogShowing && _session is not null && TracksList.SelectedItems.Cast<TrackRow>().Any(t => t is { Available: true, LocalPath: null });
         }
-        PlayPauseButton.IsEnabled = !_loadingStream && (_current is not null || PlaySelectionButton.IsEnabled);
+        PlayPauseButton.IsEnabled = _player.IsPlaying || !_loadingStream && (_current is not null || PlaySelectionButton.IsEnabled);
         PlayPauseButton.Content = _player.IsPlaying || _automaticWaveCts is not null ? "\uE769" : "\uE768";
         PreviousButton.IsEnabled = _current is not null && _queue.Count > 0;
         NextButton.IsEnabled = !_advancingWave && (_playbackQueue.CanNext || _current is not null && _waveSources.ContainsKey(_current));

@@ -249,7 +249,7 @@ public partial class MainWindow
     private async void Download_Click(object sender, RoutedEventArgs e) => await DownloadSelectedAsync();
     private async Task DownloadSelectedAsync()
     {
-        if (_downloadCts is not null) { ClearPendingAutoFavorites(); _downloadCts.Cancel(); return; }
+        if (_downloadCts is not null) { PauseDownloadQueue(); return; }
         // Materialize SelectedItems before starting: Ctrl/Shift selection remains exact.
         var selected = TracksList.SelectedItems.Cast<TrackRow>().Where(t => t.Available && t.LocalPath is null).ToArray();
         if (selected.Length == 0 || _session is null) return;

@@ -31,6 +31,7 @@ public partial class MainWindow
     private PlaylistDetails? _pendingAutoFavorites;
     private readonly Dictionary<string, TrackRow> _pendingConfirmedFavorites = new(StringComparer.Ordinal);
     private readonly HashSet<string> _deletedUntilFavoritesRefresh = new(StringComparer.Ordinal);
+    private (long AdmissionRevision, int AccountGeneration, string AccountUid)? _autoFavoritesRemovalRestart;
     private (string Owner, string Kind)? _viewedOfflinePlaylist;
 
     // These are explicitly local snapshot keys. They never enter a server API request.
@@ -92,6 +93,7 @@ public partial class MainWindow
     {
         if (_downloadCts is not null || _offlineMaintenance || _session is null || _closed) return Task.CompletedTask;
         if (automatic && (_downloadsAutoSuspended || _downloadQueue.HasPaused)) return Task.CompletedTask;
+        _autoFavoritesRemovalRestart = null;
         _downloadQueue.Replace(tracks, label, automatic || playlist is { Owner: LocalFavoritesOwner, Kind: LocalFavoritesKind });
         _downloadQueuePlaylist = playlist;
         _downloadQueueQuality = SelectedQuality; _downloadQueueAutomatic = automatic;
@@ -282,15 +284,29 @@ public partial class MainWindow
         _deletedUntilFavoritesRefresh.Remove(row.Id);
         TryStartPendingAutoFavorites();
     }
-    private void ScheduleAutoFavoritesDownloads()
+    private void ScheduleAutoFavoritesDownloads() => ScheduleAutoFavoritesFromSnapshot(collectionRefreshed: true);
+    private void ScheduleAutoFavoritesFromSnapshot(bool collectionRefreshed)
     {
         _favoritesSnapshotReady = true;
-        _deletedUntilFavoritesRefresh.Clear();
+        if (collectionRefreshed || !CanRestartAutoFavoritesAfterRemoval()) _deletedUntilFavoritesRefresh.Clear();
         UpdatePlaylistDownloadedStatus();
-        if (!_autoFavoritesEnabled || _session is null || _demo || _closed || _offlineMaintenance || _downloadsAutoSuspended || _downloadQueue.HasPaused) return;
+        if (!_autoFavoritesEnabled || _session is null || _demo || _closed || _offlineMaintenance) return;
+        if (collectionRefreshed && CanRestartAutoFavoritesAfterRemoval() && _downloadCts is null)
+        {
+            // Only this successful refresh may replace work suspended by a single
+            // removal. Account changes, update pauses and new batches invalidate
+            // the admission; a pre-existing user/restore pause never gets a ticket.
+            if (_downloadQueue.HasPaused) _downloadQueue.Replace([], _downloadQueue.Label, favoritesBatch: true);
+            _downloadsAutoSuspended = false;
+            _autoFavoritesRemovalRestart = null;
+        }
+        if (_downloadsAutoSuspended || _downloadQueue.HasPaused) return;
         _pendingAutoFavorites = FavoritesDownloadSnapshot();
         TryStartPendingAutoFavorites();
     }
+    private bool CanRestartAutoFavoritesAfterRemoval() => _autoFavoritesRemovalRestart is { } restart
+        && restart.AdmissionRevision == _downloadQueueAdmissionRevision && restart.AccountGeneration == _accountGeneration
+        && restart.AccountUid == _account?.Uid;
     private void TryStartPendingAutoFavorites()
     {
         if (!_autoFavoritesEnabled || _downloadCts is not null || _offlineMaintenance || _session is null || _closed || _downloadsAutoSuspended || _downloadQueue.HasPaused) return;
@@ -313,7 +329,7 @@ public partial class MainWindow
         SavePreferences();
         if (_autoFavoritesEnabled)
         {
-            if (_favoritesSnapshotReady) ScheduleAutoFavoritesDownloads();
+            if (_favoritesSnapshotReady) ScheduleAutoFavoritesFromSnapshot(collectionRefreshed: false);
             SetStatus($"Автоскачивание включено. Избранное скачивается после загрузки списка, до {_concurrentDownloads} треков одновременно.");
         }
         else
@@ -330,18 +346,29 @@ public partial class MainWindow
     private async Task DeleteOfflineTrackAsync(TrackRow track)
     {
         if (_closed || _offlineMaintenance) return;
+        var pendingAutomaticRestart = CanRestartAutoFavoritesAfterRemoval();
+        var canRestartAfterRefresh = pendingAutomaticRestart || !_downloadsAutoSuspended && !_downloadQueue.HasPaused;
+        var automaticCancellation = _downloadQueueAutomatic && (_downloadQueue.Running || pendingAutomaticRestart);
+        var accountGeneration = _accountGeneration; var accountUid = _account?.Uid;
         _offlineMaintenance = true;
         if (!_closed) RefreshMaintenanceActions();
         _deletedUntilFavoritesRefresh.Add(track.Id);
         try
         {
             SuspendDownloadQueueForAccountChange();
+            var admissionRevision = _downloadQueueAdmissionRevision;
             if (_downloadTask is { } task) await task;
             ReleaseOfflinePlayback(track.Id);
             var result = await _offline.RemoveTrackAsync(track.Id, _lifetime.Token);
             _downloadQueue.Removed(track.Id); RefreshDownloadCenter(); RefreshDownloadStorage();
+            if (canRestartAfterRefresh && result.Preserved == 0 && result.Failed == 0 && !_closed && !_lifetime.IsCancellationRequested
+                && _session is not null && accountUid is not null && accountGeneration == _accountGeneration && accountUid == _account?.Uid
+                && admissionRevision == _downloadQueueAdmissionRevision && (!_downloadQueue.HasPaused || automaticCancellation)
+                && !_downloadQueue.Entries.Any(entry => entry.State == DownloadEntryState.Failed))
+                _autoFavoritesRemovalRestart = (admissionRevision, accountGeneration, accountUid);
             RefreshOfflineView(); RefreshDownloadedMarks();
-            SetStatus(RemovalStatus(result) + (_autoFavoritesEnabled ? " · автоскачивание вернёт трек после следующего обновления избранного" : ""), result.Preserved + result.Failed > 0);
+            SetStatus(RemovalStatus(result) + (_autoFavoritesEnabled && CanRestartAutoFavoritesAfterRemoval()
+                ? " · автоскачивание вернёт трек после следующего обновления избранного" : ""), result.Preserved + result.Failed > 0);
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
         catch (Exception ex) { ShowError(ex); }
