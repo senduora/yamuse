@@ -247,6 +247,7 @@ internal static partial class Program
                 Assert(request.RequestUri!.Host == "api.music.yandex.net", "media fixture attempted non-API host");
                 var path = request.RequestUri.AbsolutePath;
                 if (path == "/account/status") return Json(Profile);
+                if (request.Method == HttpMethod.Get && path == "/account/about") return Json(ProfileAboutWithoutAvatar);
                 if (request.Method == HttpMethod.Get && path == "/users/12345/likes/tracks")
                     return Json(JsonSerializer.Serialize(new { result = new { library = new { tracks = Favorites.OrderBy(id => id, StringComparer.Ordinal).Select(id => new { id, albumId = "91" }).ToArray() } } }));
                 if (request.Method == HttpMethod.Post && path is "/users/12345/likes/tracks/remove" or "/users/12345/likes/tracks/add-multiple")

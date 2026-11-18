@@ -178,7 +178,7 @@ public partial class MainWindow
     {
         // The displayed occurrence must still belong to this account and exact
         // snapshot. SelectAt keeps duplicate instances and the queue origin intact.
-        if (!_expandedQueueOpen || !IsExpandedPlayerOpen || _closed || _expandedQueueAccountGeneration != _accountGeneration
+        if (_expandedCollapse is not null || !_expandedQueueOpen || !IsExpandedPlayerOpen || _closed || _expandedQueueAccountGeneration != _accountGeneration
             || _expandedQueueVersion != _playbackQueue.Version || !ReferenceEquals(row.Items, _playbackQueue.Items)
             || row.Index < 0 || row.Index >= _playbackQueue.Items.Count || !ReferenceEquals(row.Track, _playbackQueue.Items[row.Index]) || !row.Track.CanPlay) return;
         if (!_playbackQueue.SelectAt(row.Index)) return;

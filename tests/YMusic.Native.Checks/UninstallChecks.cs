@@ -4,6 +4,9 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Windows;
+using System.Windows.Controls;
 using Microsoft.Win32.SafeHandles;
 using YMusic.Native;
 
@@ -11,6 +14,129 @@ internal static partial class Program
 {
     private static async Task CheckUninstall()
     {
+        await Run("Uninstall: corrupt startup marker is archived only after recovery confirmation", () => Task.Run(() =>
+        {
+            var paths = UninstallFixture("corrupt-receipt");
+            var marker = Path.Combine(paths.Install, "full-uninstall.pending.json");
+            const string broken = "{broken";
+            Directory.CreateDirectory(paths.Music);
+            Directory.CreateDirectory(paths.Data);
+            var existingTrack = Path.Combine(paths.Music, "saved.mp3");
+            var existingSettings = Path.Combine(paths.Data, "settings.json");
+            File.WriteAllText(existingTrack, "download fixture");
+            File.WriteAllText(existingSettings, "settings fixture");
+            Assert(!UninstallSupport.HasStartupMarker(paths.LocalData), "fixture started with a pending marker");
+            File.WriteAllText(marker, broken);
+            Assert(UninstallSupport.HasStartupMarker(paths.LocalData), "corrupt marker allowed startup");
+
+            var prompts = 0;
+            bool ConfirmRecovery()
+            {
+                prompts++;
+                // The same marker must deny writers across the confirmation dialog.
+                RejectUninstall(() => { using var writer = new FileStream(marker, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete); });
+                return true;
+            }
+            using (var locked = new FileStream(marker, FileMode.Open, FileAccess.Read, FileShare.None))
+                RejectUninstall(() => UninstallSupport.InspectPendingReceipt(paths, ConfirmRecovery));
+            Assert(prompts == 0 && File.ReadAllText(marker) == broken, "sharing failure was treated as corruption");
+            Assert(UninstallSupport.InspectPendingReceipt(paths, () => false) == UninstallSupport.PendingReceiptState.RecoveryDeclined
+                && File.ReadAllText(marker) == broken, "declining recovery changed the original marker");
+            Assert(UninstallSupport.InspectPendingReceipt(paths, ConfirmRecovery) == UninstallSupport.PendingReceiptState.Recovered
+                && prompts == 1 && !UninstallSupport.HasStartupMarker(paths.LocalData), "explicit recovery did not unblock startup");
+            var archived = Directory.EnumerateFiles(paths.Install, "full-uninstall.archived-*.json").Single();
+            Assert(File.ReadAllText(archived) == broken && File.ReadAllText(existingTrack) == "download fixture"
+                && File.ReadAllText(existingSettings) == "settings fixture" && File.Exists(paths.Updater),
+                "recovery did not preserve the exact marker, profile, music, and install files");
+        }));
+        await Run("Uninstall: missing updater permits only confirmed marker recovery", () => Task.Run(() =>
+        {
+            var paths = UninstallFixture("absent-updater", withUpdater: false);
+            var marker = Path.Combine(paths.Install, "full-uninstall.pending.json");
+            var nonce = UninstallSupport.CreateReceipt(paths);
+            UninstallSupport.ValidateReceipt(paths, nonce);
+            RejectUninstall(() => UninstallSupport.ValidateInstallation(paths, "YMusic.Native", false, true,
+                paths.Install, Path.GetDirectoryName(paths.Executable)!, paths.Updater, paths.Executable));
+            var original = File.ReadAllBytes(marker);
+            Assert(UninstallSupport.RecoverWithoutInstallation(paths.LocalData, () => false) == UninstallSupport.PendingReceiptState.RecoveryDeclined
+                && original.SequenceEqual(File.ReadAllBytes(marker)), "recovering a broken installation ignored a declined reset");
+            Assert(UninstallSupport.RecoverWithoutInstallation(paths.LocalData, () => true) == UninstallSupport.PendingReceiptState.Recovered
+                && !UninstallSupport.HasStartupMarker(paths.LocalData)
+                && original.SequenceEqual(File.ReadAllBytes(Directory.EnumerateFiles(paths.Install, "full-uninstall.archived-*.json").Single()))
+                && File.Exists(paths.Executable) && !File.Exists(paths.Updater), "recovery touched the install or failed to archive its pending marker");
+
+            nonce = UninstallSupport.CreateReceipt(paths);
+            UninstallSupport.ScheduleNativeHandoffAfterCleanup(paths, nonce, Environment.ProcessId, _ => Process.GetCurrentProcess());
+            Assert(UninstallSupport.RecoverWithoutInstallation(paths.LocalData, () => throw new InvalidOperationException("consumed marker offered for reset"))
+                == UninstallSupport.PendingReceiptState.Consumed && UninstallSupport.HasStartupMarker(paths.LocalData),
+                "missing updater cancelled a completed cleanup");
+        }));
+        await Run("Uninstall: startup reset rejects a replacement marker after confirmation", () => Task.Run(() =>
+        {
+            var paths = UninstallFixture("startup-reset", withUpdater: false);
+            var marker = Path.Combine(paths.Install, "full-uninstall.pending.json");
+            var nonce = UninstallSupport.CreateReceipt(paths);
+            var bytes = File.ReadAllBytes(marker);
+            var candidate = UninstallSupport.InspectStartupMarkerForReset(paths.LocalData)!;
+            var replacement = Path.Combine(paths.Install, "replacement-marker.json");
+            File.WriteAllBytes(replacement, bytes);
+            File.SetLastWriteTimeUtc(replacement, candidate.LastWriteUtc);
+            File.Move(replacement, marker, overwrite: true);
+            Assert(!UninstallSupport.TryResetStartupMarker(paths.LocalData, candidate) && UninstallSupport.HasStartupMarker(paths.LocalData),
+                "a different file with identical contents replaced the confirmed marker");
+            UninstallSupport.ScheduleNativeHandoffAfterCleanup(paths, nonce, Environment.ProcessId, _ => Process.GetCurrentProcess());
+            var consumed = UninstallSupport.InspectStartupMarkerForReset(paths.LocalData)!;
+            Assert(consumed.Consumed && !UninstallSupport.TryResetStartupMarker(paths.LocalData, consumed), "startup reset bypassed a consumed marker");
+
+            File.WriteAllText(marker, "{broken");
+            candidate = UninstallSupport.InspectStartupMarkerForReset(paths.LocalData)!;
+            Assert(UninstallSupport.TryResetStartupMarker(paths.LocalData, candidate) && !UninstallSupport.HasStartupMarker(paths.LocalData),
+                "explicit startup reset did not unblock the portable/normal launch without the Windows uninstall entry");
+        }));
+        await Run("Uninstall: relocated folders permit pending recovery and preserve consumed markers", () => Task.Run(() =>
+        {
+            var paths = UninstallFixture("relocated-receipt");
+            var relocated = UninstallPaths.FromKnownFolders(paths.LocalData, paths.Documents + "-relocated");
+            var marker = Path.Combine(paths.Install, "full-uninstall.pending.json");
+            var originalNonce = UninstallSupport.CreateReceipt(paths);
+            RejectUninstall(() => UninstallSupport.ValidateReceipt(relocated, originalNonce));
+            Assert(UninstallSupport.InspectPendingReceipt(relocated, () => true) == UninstallSupport.PendingReceiptState.Recovered,
+                "unconsumed marker for old folders could not be reset");
+
+            var nonce = UninstallSupport.CreateReceipt(paths);
+            UninstallSupport.ScheduleNativeHandoffAfterCleanup(paths, nonce, Environment.ProcessId, _ => Process.GetCurrentProcess());
+            var consumed = File.ReadAllBytes(marker);
+            Assert(UninstallSupport.InspectPendingReceipt(relocated, () => throw new InvalidOperationException("consumed marker offered for recovery"))
+                == UninstallSupport.PendingReceiptState.Consumed, "consumed marker no longer routed to native retry");
+            Assert(UninstallSupport.IsReceiptConsumed(relocated) && !UninstallSupport.CancelPendingReceipt(relocated)
+                && File.ReadAllBytes(marker).SequenceEqual(consumed), "consumed marker was changed or startup protection removed");
+        }));
+        await Run("Uninstall: settings and confirmation defer to active cache and offline maintenance", () =>
+        {
+            using var fixture = new DownloadCenterFixture("uninstall-maintenance", 1);
+            using var fakeListener = new ManualResetEvent(false);
+            var window = fixture.Window;
+            R4Set(window, "_uninstallListener", fakeListener);
+            var button = Control<Button>(window, "SettingsUninstall");
+            foreach (var flag in new[] { "_cacheMaintenance", "_offlineMaintenance", "_clearOfflineConfirmationPending" })
+            {
+                R4Set(window, flag, true);
+                SaInvoke(window, "Settings_Click", button, new RoutedEventArgs());
+                Assert(!button.IsEnabled && !window.ConfirmBeforeFullUninstall(() => throw new InvalidOperationException("confirmation opened during maintenance")),
+                    "settings or confirmation ignored an active maintenance operation");
+                SaInvoke(window, "SetSettingsVisible", false);
+                R4Set(window, flag, false);
+                Assert(!window.ConfirmBeforeFullUninstall(() =>
+                {
+                    R4Set(window, flag, true);
+                    return true;
+                }) && SaField<bool>(window, flag), "maintenance started during confirmation and was ignored or reset");
+                R4Set(window, flag, false);
+            }
+            SaInvoke(window, "Settings_Click", button, new RoutedEventArgs());
+            Assert(button.IsEnabled && window.ConfirmBeforeFullUninstall(() => true), "idle confirmation remained disabled");
+            return Task.CompletedTask;
+        });
         await Run("Uninstall: fixed app data and indexed audio removed; parents and unrelated siblings retained; retry idempotent", () => Task.Run(() =>
         {
             var paths = UninstallFixture("full");
@@ -137,7 +263,7 @@ internal static partial class Program
             File.WriteAllText(receipt, original.Replace(paths.Data.Replace("\\", "\\\\"), paths.Documents.Replace("\\", "\\\\"), StringComparison.Ordinal));
             RejectUninstall(() => UninstallSupport.ValidateReceipt(paths, nonce));
             File.WriteAllText(receipt, original);
-            UninstallSupport.MarkReceiptConsumed(paths, nonce);
+            UninstallSupport.ScheduleNativeHandoffAfterCleanup(paths, nonce, Environment.ProcessId, _ => Process.GetCurrentProcess());
             RejectUninstall(() => UninstallSupport.ValidateReceipt(paths, nonce));
             Assert(UninstallSupport.HasPendingReceipt(paths), "consumed pending marker lost its startup guard");
             var consumed = File.ReadAllBytes(receipt);
@@ -157,6 +283,118 @@ internal static partial class Program
             RejectUninstall(() => UninstallSupport.ValidateReceipt(paths, nonce));
             Assert(!File.Exists(receipt), "receipt remains");
         }));
+        await Run("Uninstall: receipt expiry rejects admission but permits cancellation and handoff after admitted cleanup", () => Task.Run(() =>
+        {
+            var paths = UninstallFixture("aged-receipt");
+            var receipt = Path.Combine(paths.Install, "full-uninstall.pending.json");
+            void AgeReceipt()
+            {
+                var marker = JsonNode.Parse(File.ReadAllText(receipt))!.AsObject();
+                marker["CreatedUtc"] = JsonValue.Create(DateTimeOffset.UtcNow.AddHours(-1));
+                File.WriteAllText(receipt, marker.ToJsonString());
+            }
+
+            var cancelled = UninstallSupport.CreateReceipt(paths);
+            UninstallSupport.ValidateReceipt(paths, cancelled);
+            AgeReceipt();
+            RejectUninstall(() => UninstallSupport.ValidateReceipt(paths, cancelled));
+            RejectUninstall(() => UninstallSupport.DeleteReceipt(paths, new string('a', 64)));
+            Assert(UninstallSupport.HasPendingReceipt(paths), "other nonce removed the expired marker");
+            UninstallSupport.DeleteReceipt(paths, cancelled);
+            Assert(!UninstallSupport.HasPendingReceipt(paths), "cancelling an expired request left startup blocked");
+
+            var admitted = UninstallSupport.CreateReceipt(paths);
+            UninstallSupport.ValidateReceipt(paths, admitted);
+            AgeReceipt();
+            var launches = 0;
+            var guardedAtLaunch = false;
+            RejectUninstall(() => UninstallSupport.ScheduleNativeHandoffAfterCleanup(paths, admitted, Environment.ProcessId, _ =>
+            {
+                launches++;
+                guardedAtLaunch = UninstallSupport.IsReceiptConsumed(paths);
+                throw new IOException("injected handoff failure");
+            }));
+            Assert(launches == 1 && guardedAtLaunch && UninstallSupport.HasPendingReceipt(paths) && !UninstallSupport.IsReceiptConsumed(paths),
+                "handoff was blocked by expiry or failure did not restore the pending marker");
+            RejectUninstall(() => UninstallSupport.ValidateReceipt(paths, admitted));
+            UninstallSupport.ScheduleNativeHandoffAfterCleanup(paths, admitted, Environment.ProcessId, _ => Process.GetCurrentProcess());
+            Assert(UninstallSupport.IsReceiptConsumed(paths) && !UninstallSupport.CancelPendingReceipt(paths),
+                "an admitted cleanup lost its startup guard during handoff");
+        }));
+        await Run("Uninstall: failed waiter launch leaves downloads resumable after closing and reopening", async () =>
+        {
+            const string name = "uninstall-launch-failure";
+            using (var fixture = new DownloadCenterFixture(name, 1) { HoldFirstAttempts = true })
+            {
+                DrEnable(fixture);
+                var download = fixture.Start([DcTrack("2")]);
+                await Until(() => fixture.Active == 1);
+                var error = await Throws<IOException>(() => fixture.Window.StartFullUninstallHandoffAsync(() =>
+                {
+                    Assert(fixture.Active == 0, "waiter launch ran before download shutdown");
+                    throw new IOException("injected waiter failure");
+                }));
+                Assert(error.Message == "injected waiter failure", "failed before the injected waiter launch");
+                await download;
+                var checkpoint = new DownloadQueueStore(fixture.DirectoryPath).Load("fixture");
+                Assert(fixture.Queue.CanResume && checkpoint?.Entries.Single().State == DownloadEntryState.Paused,
+                    "failed launch invalidated the in-memory queue or its checkpoint");
+            }
+
+            using var reopened = new DownloadCenterFixture(name, 1);
+            DrEnable(reopened);
+            await Call(reopened.Window, "RestoreDownloadQueueAsync", "fixture");
+            Assert(reopened.Queue.CanResume && reopened.Requests.Count == 0, "reopen lost the paused queue or started it automatically");
+            await Call(reopened.Window, "ResumeDownloadQueue");
+            Assert(reopened.Queue.Entries.Single().State == DownloadEntryState.Completed, "explicit resume did not complete the held download");
+        });
+        await Run("Uninstall: handoff drains admitted writes and saves playback before a failing waiter", async () =>
+        {
+            using var fixture = new PlaybackOptionsFixture("uninstall-pending-writes");
+            await fixture.Play();
+            await fixture.Rendered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Call(fixture.Window, "TogglePlaybackAsync");
+            fixture.Player.Seek(TimeSpan.FromSeconds(7));
+            await Until(() => fixture.Player.Position.TotalSeconds >= 6.9 && !fixture.Player.IsPlaying);
+
+            var store = new PlaybackStateStore(Path.Combine(_directory, "uninstall-pending-writes-state"));
+            const string account = "uninstall-fixture";
+            R4Set(fixture.Window, "_restore", true);
+            R4Set(fixture.Window, "_account", new Account(account, "Fixture", false));
+            R4Set(fixture.Window, "_playbackStateAccountUid", account);
+            R4Set(fixture.Window, "_playbackStateStore", store);
+            var session = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var favorites = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            R4Set(fixture.Window, "_sessionRefreshWrite", session.Task);
+            R4Set(fixture.Window, "_favoritesCacheSaveTask", favorites.Task);
+            R4Set(fixture.Window, "_fullUninstallCommitting", true);
+            var launchCalled = false;
+            try
+            {
+                var failed = Throws<IOException>(() => fixture.Window.StartFullUninstallHandoffAsync(() =>
+                {
+                    launchCalled = true;
+                    Assert(store.Load(account) is { CurrentIndex: 0, PositionSeconds: >= 6.9 }, "waiter did not have the paused playback checkpoint");
+                    throw new IOException("injected waiter failure after drain");
+                }));
+                Assert(!launchCalled && !failed.IsCompleted, "waiter started with writes outstanding");
+                fixture.Window.Close();
+                Assert(!SaField<bool>(fixture.Window, "_closed"), "a competing close interrupted the handoff");
+                session.TrySetResult();
+                await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
+                Assert(!launchCalled && !failed.IsCompleted, "handoff waited for session but skipped favorites");
+                favorites.TrySetResult();
+                var error = await failed.WaitAsync(TimeSpan.FromSeconds(5));
+                Assert(error.Message == "injected waiter failure after drain" && fixture.Player.HasSource && !fixture.Player.IsPlaying
+                    && fixture.Player.Position.TotalSeconds >= 6.9, "failed waiter discarded or rewound the playback source");
+            }
+            finally
+            {
+                session.TrySetResult();
+                favorites.TrySetResult();
+                R4Set(fixture.Window, "_fullUninstallCommitting", false);
+            }
+        });
         await Run("Uninstall: official waitPid chain uses exact targets and argument list; private fakes never launch updater", () => Task.Run(() =>
         {
             var paths = UninstallFixture("orchestration");
@@ -179,14 +417,15 @@ internal static partial class Program
         }));
     }
 
-    private static UninstallPaths UninstallFixture(string name)
+    private static UninstallPaths UninstallFixture(string name, bool withUpdater = true)
     {
         var root = Path.GetFullPath(Path.Combine(_directory, "uninstall", name + "-" + Guid.NewGuid().ToString("N")));
         Assert(root.StartsWith(Path.GetFullPath(_directory) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase), "fixture escaped results directory");
         var paths = UninstallPaths.FromKnownFolders(Path.Combine(root, "LocalAppData"), Path.Combine(root, "Documents"));
         Directory.CreateDirectory(paths.LocalData); Directory.CreateDirectory(paths.Documents);
         Directory.CreateDirectory(Path.GetDirectoryName(paths.Executable)!);
-        File.WriteAllText(paths.Executable, "fake executable: never run"); File.WriteAllText(paths.Updater, "fake updater: never run");
+        File.WriteAllText(paths.Executable, "fake executable: never run");
+        if (withUpdater) File.WriteAllText(paths.Updater, "fake updater: never run");
         return paths;
     }
     private static void WriteUninstallAudio(UninstallPaths paths, string name, string content)

@@ -2,7 +2,11 @@ using System.IO;
 using System.Reflection;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Automation.Peers;
+using System.Windows.Automation.Provider;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -17,6 +21,8 @@ internal static partial class Program
         await Run("FullscreenCollapse040: reverse from an opening frame without a full-opacity flash", Fc040ReverseOpening);
         await Run("FullscreenCollapse040: repeated close reopen track account lifetime and power cleanup", Fc040Lifetime);
         await Run("FullscreenCollapse040: immediate API missing HWND reduced motion artwork and zero bounds", Fc040Fallbacks);
+        await Run("FullscreenCollapse040: closing cancels a keyboard seek and ignores late releases", Fc040SeekDuringClose);
+        await Run("FullscreenCollapse040: closing blocks keyboard and direct queue activation", Fc040QueueDuringClose);
         File.WriteAllText(Path.Combine(_directory, "fullscreen-collapse040-scope.json"), JsonSerializer.Serialize(new
         {
             fixtureWindowsShown = false, nativeHandlesCreated = false, desktopInputUsed = false,
@@ -177,6 +183,81 @@ internal static partial class Program
         return Task.CompletedTask;
     }
 
+    private static async Task Fc040SeekDuringClose()
+    {
+        if (!Motion.CanAnimate) return;
+        using var f = new Fr0317Fixture("collapse-keyboard-seek");
+        var w = f.Window;
+        var player = Fr0317Get<NativePlayer>(w, "_player");
+        await player.OpenPausedAsync(new Uri(WriteWave("fullscreen-collapse-seek.wav", 30)), CancellationToken.None);
+        Fr0317Call(w, "UpdateControls");
+        f.Open();
+        var seek = Fr0317Get<Slider>(w, "_expandedPlayerSeek");
+        var gesture = Fr0317Get<SliderGesture>(w, "_expandedSeekGesture");
+        var keyboard = new Pk040Keyboard(ModifierKeys.None);
+        var source = new Pk040Source(seek);
+        Assert(seek.IsEnabled && seek.Maximum > 12 && !player.IsPlaying, "fixture has no paused seekable source");
+
+        RaiseKey(Keyboard.PreviewKeyDownEvent);
+        seek.Value = 12;
+        Assert(gesture.IsKeyboardActive, "fixture did not start a keyboard seek");
+        Fc040Begin(f, f.SourceBounds);
+        Fc040Clock(Fr0317Get<object>(w, "_expandedCollapse")).Controller!.Pause();
+        RaiseKey(Keyboard.PreviewKeyUpEvent);
+        Assert(!gesture.IsActive && Fr0317Get<double?>(w, "_pendingSeek") is null,
+            "releasing the held arrow during collapse committed a seek or retained its gesture");
+
+        // A progress update must not re-enable the timeline before another late release.
+        Fr0317Call(w, "UpdateProgress");
+        RaiseKey(Keyboard.PreviewKeyUpEvent);
+        Assert(!seek.IsEnabled && Fr0317Get<double?>(w, "_pendingSeek") is null && player.Position.TotalSeconds < 1,
+            "a standalone release during collapse reached the player");
+
+        Fr0317Call(w, "CloseExpandedPlayer");
+        f.Open();
+        RaiseKey(Keyboard.PreviewKeyDownEvent);
+        seek.Value = 12;
+        RaiseKey(Keyboard.PreviewKeyUpEvent);
+        Assert(seek.IsEnabled && Fr0317Get<double?>(w, "_pendingSeek") == 12,
+            "reopening fullscreen did not restore keyboard seeking");
+
+        void RaiseKey(RoutedEvent routedEvent) => seek.RaiseEvent(new KeyEventArgs(keyboard, source, Environment.TickCount, Key.Right)
+        { RoutedEvent = routedEvent });
+    }
+
+    private static async Task Fc040QueueDuringClose()
+    {
+        if (!Motion.CanAnimate) return;
+        using var f = new Fr0317Fixture("collapse-queue-input"); f.Open();
+        var w = f.Window;
+        Fr0317Call(w, "SetExpandedQueueVisible", true, false);
+        f.Layout();
+        var list = Fr0317Get<ListBox>(w, "_expandedQueueList");
+        var queue = Fr0317Get<PlaybackQueue>(w, "_playbackQueue");
+        Fr0317Call(w, "UpdateControls");
+        var next = Fr0317Visuals<Button>(Fr0317Get<Grid>(w, "_expandedPlayerSurface")).Single(button => button.Name == "ExpandedPlayerNext");
+        var invoke = (IInvokeProvider)new ButtonAutomationPeer(next).GetPattern(PatternInterface.Invoke);
+        Assert(next.IsEnabled, "fixture did not offer the available next track before collapse");
+        list.SelectedIndex = 1;
+        var row = list.SelectedItem ?? throw new InvalidOperationException("fixture did not select the next queue row");
+        var originalIndex = queue.CurrentIndex;
+        Fc040Begin(f, f.SourceBounds);
+        Fc040Clock(Fr0317Get<object>(w, "_expandedCollapse")).Controller!.Pause();
+        var keyboard = new Pk040Keyboard(ModifierKeys.None);
+        foreach (var key in new[] { Key.Enter, Key.P, Key.OemCloseBrackets })
+        {
+            var press = new KeyEventArgs(keyboard, new Pk040Source(list), Environment.TickCount, key) { RoutedEvent = Keyboard.PreviewKeyDownEvent };
+            list.RaiseEvent(press);
+            Assert(press.Handled && queue.CurrentIndex == originalIndex, "a key from the closing queue changed playback: " + key);
+        }
+        await Call(w, "PlayExpandedQueueRowAsync", row);
+        Assert(!list.IsEnabled && !next.IsEnabled && queue.CurrentIndex == originalIndex, "the shared queue activation route accepted a closing row");
+        var automationBlocked = false;
+        try { invoke.Invoke(); }
+        catch (ElementNotEnabledException) { automationBlocked = true; }
+        Assert(automationBlocked, "UI Automation could invoke a closing transport button");
+    }
+
     private static void Fc040Begin(Fr0317Fixture f, Rect target) => Fr0317Call(f.Window, "BeginExpandedCollapseFromLocalCover", target, f.Artwork);
     private static ClockGroup Fc040Clock(object collapse) => (ClockGroup)collapse.GetType().GetProperty("Completion")!.GetValue(collapse)!;
     private static void Fc040Clean(Fr0317Fixture f, Transform original, string context = "completed")
@@ -184,7 +265,7 @@ internal static partial class Program
         var w = f.Window; var stage = Fr0317Get<Grid>(w, "_expandedRevealStage"); var cover = Fr0317Get<Button>(w, "_expandedPlayerCoverButton");
         Assert(Fr0317Get<object?>(w, "_expandedCollapse") is null && Fr0317Get<object?>(w, "_expandedReveal") is null
             && Fr0317Get<object?>(w, "_expandedRevealPending") is null && stage.Opacity == 1 && cover.Opacity == 1
-            && stage.IsHitTestVisible && !stage.HasAnimatedProperties && ReferenceEquals(stage.RenderTransform, original)
+            && stage.IsHitTestVisible && stage.IsEnabled && !stage.HasAnimatedProperties && ReferenceEquals(stage.RenderTransform, original)
             && !Fr0317Visuals<Image>(stage).Any(image => image.Name is "ExpandedCoverCollapse" or "ExpandedCoverTransition")
             && ((ContentControl)w.FindName("ExpandedPlayerHost")).Visibility == Visibility.Collapsed,
             $"{context}: close retained clocks ghost transform opacity or expanded state; visibility={((ContentControl)w.FindName("ExpandedPlayerHost")).Visibility}, opacity={stage.Opacity}, cover={cover.Opacity}, hit={stage.IsHitTestVisible}, animated={stage.HasAnimatedProperties}, originalTransform={ReferenceEquals(stage.RenderTransform, original)}");

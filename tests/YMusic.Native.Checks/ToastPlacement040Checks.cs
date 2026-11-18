@@ -5,6 +5,8 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Automation.Peers;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -35,6 +37,19 @@ internal static partial class Program
                 && w.FindName("BusyBar") is null && text.TextWrapping == TextWrapping.NoWrap && text.TextTrimming == TextTrimming.CharacterEllipsis
                 && text.FontSize == Control<TextBlock>(w, "MemoryText").FontSize && text.FontSize == Control<TextBlock>(w, "VersionText").FontSize,
                 "notification retains a card, indicator, extra row or different footer typography");
+            return Task.CompletedTask;
+        });
+        await Run("ToastPlacement040: a new visible status exposes its exact text through the polite automation peer", () =>
+        {
+            using var fixture = new Toast040Fixture("live-region");
+            var text = Control<TextBlock>(fixture.Window, "StatusText");
+            var peer = new TextBlockAutomationPeer(text);
+            Assert(peer.GetLiveSetting() == AutomationLiveSetting.Polite, "status text lost its polite live region");
+            Toast040Invoke(fixture.Window, "SetStatus", "Проверим обновление", false);
+            Assert(peer.GetName() == "Проверим обновление" && Control<Border>(fixture.Window, "StatusNotification").Visibility == Visibility.Visible,
+                "status peer did not expose the newly shown text");
+            Toast040Invoke(fixture.Window, "SetStatus", "Обновление готово", false);
+            Assert(peer.GetName() == "Обновление готово", "status peer retained the previous text");
             return Task.CompletedTask;
         });
         await Run("ToastPlacement040: minimum normal and large private layouts keep one line clear of footer links", () =>

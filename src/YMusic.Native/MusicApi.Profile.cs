@@ -19,14 +19,12 @@ internal sealed partial class MusicApi
             return ProfileAvatarUri(profile);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return null; }
-        catch (MusicException error) when (!error.Authentication) { return null; }
-        catch (Exception error) when (error is HttpRequestException or JsonException or InvalidOperationException) { return null; }
+        catch (Exception error) when (error is MusicException or HttpRequestException or IOException) { return null; }
     }
 
     private static string? ProfileAvatarUri(JsonElement profile)
     {
-        if (profile.ValueKind != JsonValueKind.Object || !profile.TryGetProperty("avatarId", out var avatar)
-            || avatar.ValueKind != JsonValueKind.String || avatar.GetString() is not { Length: > 0 and <= 160 } id) return null;
+        if (JsonString(profile, "avatarId") is not { Length: > 0 and <= 160 } id) return null;
         var parts = id.Split('/');
         if (parts.Length is < 1 or > 2 || parts[0].Length is < 1 or > 20 || !parts[0].All(char.IsAsciiDigit)) return null;
         if (parts.Length == 2 && (parts[1].Length is < 1 or > 128

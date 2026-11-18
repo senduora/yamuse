@@ -13,14 +13,14 @@ namespace YMusic.Native;
 // capability-addressed loopback resource; no remote headers or credentials pass through.
 internal sealed class PlaybackInput : IDisposable
 {
-    private readonly IDisposable? _resource;
+    private readonly IDisposable _resource;
     internal Uri Uri { get; }
     internal string Path { get; }
-    internal bool Progressive => _resource is not null;
+    internal bool Progressive => _resource is ProgressiveAudio;
     internal Task Completion => _resource is ProgressiveAudio audio ? audio.Completion : Task.CompletedTask;
-    internal PlaybackInput(Uri uri, string path, IDisposable? resource = null)
+    internal PlaybackInput(Uri uri, string path, IDisposable resource)
         { Uri = uri; Path = path; _resource = resource; }
-    public void Dispose() { _resource?.Dispose(); AudioBuffer.Delete(Path); }
+    public void Dispose() => _resource.Dispose();
 }
 
 internal sealed class ProgressiveAudio : IDisposable
@@ -29,10 +29,10 @@ internal sealed class ProgressiveAudio : IDisposable
     private readonly AudioBuffer _owner;
     private readonly AudioDescriptor _audio;
     private readonly long _length;
-    private readonly string _path;
-    private FileStream _file;
+    private readonly BufferedAudioFile _file;
+    private readonly AudioBuffer.PlaybackRepresentation _representation;
     private readonly SemaphoreSlim _fileGate = new(1);
-    private readonly ConcurrentDictionary<int, Lazy<Task>> _chunks = new();
+    private readonly ConcurrentDictionary<int, ChunkAttempt> _chunks = new();
     private readonly SemaphoreSlim _fetchGate = new(2);
     private readonly SemaphoreSlim _clients = new(8);
     private readonly CancellationTokenSource _lifetime = new();
@@ -44,18 +44,17 @@ internal sealed class ProgressiveAudio : IDisposable
     internal Uri Uri { get; }
     internal Task Completion { get; }
 
-    internal ProgressiveAudio(AudioBuffer owner, AudioDescriptor audio, long length, string path,
-        byte[] firstChunk, IProgress<AudioProgress>? progress)
+    internal ProgressiveAudio(AudioBuffer owner, AudioDescriptor audio, long length, BufferedAudioFile file,
+        byte[] firstChunk, AudioBuffer.PlaybackRepresentation representation, IProgress<AudioProgress>? progress)
     {
-        _owner = owner; _audio = audio; _length = length; _path = path; _progress = progress;
-        _file = new(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.Asynchronous | FileOptions.RandomAccess);
+        _owner = owner; _audio = audio; _length = length; _file = file; _representation = representation; _progress = progress;
+        _listener = new(IPAddress.Loopback, 0);
         try
         {
-            _file.SetLength(length);
-            RandomAccess.Write(_file.SafeFileHandle, firstChunk, 0);
+            file.Stream.SetLength(length);
+            RandomAccess.Write(file.Stream.SafeFileHandle, firstChunk, 0);
             _downloaded = firstChunk.Length;
             _chunks[0] = new(() => Task.CompletedTask);
-            _listener = new(IPAddress.Loopback, 0);
             _listener.Start(8);
             _requestPath = "/audio/" + Convert.ToHexString(RandomNumberGenerator.GetBytes(32)) + audio.Extension;
             Uri = new($"http://127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}{_requestPath}");
@@ -63,7 +62,7 @@ internal sealed class ProgressiveAudio : IDisposable
             Completion = PrefetchAsync();
             _ = Completion.ContinueWith(task => { _ = task.Exception; }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
         }
-        catch { _file.Dispose(); AudioBuffer.Delete(path); throw; }
+        catch { _listener.Stop(); throw; }
     }
 
     private async Task PrefetchAsync()
@@ -71,13 +70,13 @@ internal sealed class ProgressiveAudio : IDisposable
         // Let Windows obtain its first headers/frames before filling the rest.
         await Task.Delay(100, _lifetime.Token).ConfigureAwait(false);
         for (var index = 1; index * (long)ChunkBytes < _length; index++)
-            await EnsureChunkAsync(index, _lifetime.Token).ConfigureAwait(false);
+            await PrefetchChunkAsync(index).ConfigureAwait(false);
         await _fileGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
         try
         {
-            await _file.FlushAsync(_lifetime.Token).ConfigureAwait(false);
-            _file.Dispose();
-            _file = new(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.Asynchronous | FileOptions.RandomAccess);
+            await _file.Stream.FlushAsync(_lifetime.Token).ConfigureAwait(false);
+            _lifetime.Token.ThrowIfCancellationRequested();
+            _file.Seal();
         }
         finally { _fileGate.Release(); }
     }
@@ -89,7 +88,7 @@ internal sealed class ProgressiveAudio : IDisposable
             while (!_lifetime.IsCancellationRequested)
             {
                 var client = await _listener.AcceptTcpClientAsync(_lifetime.Token).ConfigureAwait(false);
-                if (!await _clients.WaitAsync(0, _lifetime.Token).ConfigureAwait(false)) { client.Dispose(); continue; }
+                if (!_clients.Wait(0)) { client.Dispose(); continue; }
                 _ = ServeAsync(client);
             }
         }
@@ -155,7 +154,7 @@ internal sealed class ProgressiveAudio : IDisposable
                     var available = (int)Math.Min(buffer.Length, Math.Min(last - position + 1, (chunk + 1L) * ChunkBytes - position));
                     await _fileGate.WaitAsync(timeout.Token).ConfigureAwait(false);
                     int read;
-                    try { read = await RandomAccess.ReadAsync(_file.SafeFileHandle, buffer.AsMemory(0, available), position, timeout.Token).ConfigureAwait(false); }
+                    try { read = await RandomAccess.ReadAsync(_file.Stream.SafeFileHandle, buffer.AsMemory(0, available), position, timeout.Token).ConfigureAwait(false); }
                     finally { _fileGate.Release(); }
                     if (read == 0) throw new IOException("Incomplete playback cache.");
                     await stream.WriteAsync(buffer.AsMemory(0, read), timeout.Token).ConfigureAwait(false);
@@ -168,7 +167,41 @@ internal sealed class ProgressiveAudio : IDisposable
     }
 
     private Task EnsureChunkAsync(int chunk, CancellationToken caller)
-        => _chunks.GetOrAdd(chunk, index => new Lazy<Task>(() => FetchAsync(index), LazyThreadSafetyMode.ExecutionAndPublication)).Value.WaitAsync(caller);
+    {
+        caller.ThrowIfCancellationRequested();
+        var entry = _chunks.GetOrAdd(chunk, NewChunk);
+        if (entry.Fetch.IsValueCreated && entry.Fetch.Value.Exception?.InnerException is AudioBuffer.RangeUnavailableException failure
+            && failure.RemainingDelay == TimeSpan.Zero)
+        {
+            var replacement = NewChunk(chunk);
+            if (_chunks.TryUpdate(chunk, replacement, entry)) entry.Replaced.TrySetResult();
+            entry = _chunks[chunk];
+        }
+        return entry.Fetch.Value.WaitAsync(caller);
+    }
+
+    private async Task PrefetchChunkAsync(int chunk)
+    {
+        while (true)
+        {
+            var entry = _chunks.GetOrAdd(chunk, NewChunk);
+            try { await entry.Fetch.Value.ConfigureAwait(false); return; }
+            catch (AudioBuffer.RangeUnavailableException)
+            {
+                // Only a reader may replace a failed attempt. Prefetch follows that
+                // attempt and resumes filling the file after recovery.
+                await entry.Replaced.Task.WaitAsync(_lifetime.Token).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private ChunkAttempt NewChunk(int index) => new(() => FetchAsync(index));
+
+    private sealed class ChunkAttempt(Func<Task> fetch)
+    {
+        internal Lazy<Task> Fetch { get; } = new(fetch, LazyThreadSafetyMode.ExecutionAndPublication);
+        internal TaskCompletionSource Replaced { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
 
     private async Task FetchAsync(int chunk)
     {
@@ -176,9 +209,9 @@ internal sealed class ProgressiveAudio : IDisposable
         try
         {
             var start = chunk * (long)ChunkBytes; var end = Math.Min(_length - 1, start + ChunkBytes - 1);
-            var bytes = await _owner.ReadPlaybackRangeAsync(_audio, start, end, _length, _lifetime.Token).ConfigureAwait(false);
+            var bytes = await _owner.ReadPlaybackRangeAsync(_audio, start, end, _length, _lifetime.Token, _representation).ConfigureAwait(false);
             await _fileGate.WaitAsync(_lifetime.Token).ConfigureAwait(false);
-            try { await RandomAccess.WriteAsync(_file.SafeFileHandle, bytes, start, _lifetime.Token).ConfigureAwait(false); }
+            try { await RandomAccess.WriteAsync(_file.Stream.SafeFileHandle, bytes, start, _lifetime.Token).ConfigureAwait(false); }
             finally { _fileGate.Release(); }
             var downloaded = Interlocked.Add(ref _downloaded, bytes.Length);
             _progress?.Report(new(downloaded, _length));
@@ -212,7 +245,6 @@ internal sealed class ProgressiveAudio : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _lifetime.Cancel(); _listener.Stop(); _file.Dispose();
-        AudioBuffer.Delete(_path);
         // In-flight requests own their token registrations and finish after cancellation.
     }
 }

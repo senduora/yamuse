@@ -109,9 +109,9 @@ public partial class MainWindow
             wave.IsEnabled = online && MusicApi.IsTrackWaveSeed(track!.Id);
             next.IsEnabled = enqueue.IsEnabled = track!.CanPlay;
             playlist.IsEnabled = online && _account is not null && !_catalogWriting && track.LocalPath is null && TrackReference(track).AlbumId is not null;
-            download.IsEnabled = online && state.Downloads.Length > 0 && !_offlineMaintenance && _downloadCts is null;
+            download.IsEnabled = _offline.IsAvailable && online && state.Downloads.Length > 0 && !_offlineMaintenance && _downloadCts is null;
             download.Header = state.Downloads.Length > 1 ? $"Скачать выбранные · {state.Downloads.Length}" : "Скачать для офлайн";
-            remove.IsEnabled = track.IsDownloaded && !_offlineMaintenance;
+            remove.IsEnabled = _offline.IsAvailable && track.IsDownloaded && !_offlineMaintenance;
             album.IsEnabled = online && track.LocalPath is null && track.Id.Length > 0;
             foreach (var artist in track.Artists)
             {

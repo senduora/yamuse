@@ -161,13 +161,7 @@ internal static partial class Program
             var music=Path.Combine(directory,"offline");Directory.CreateDirectory(music);
             A=Row("A",music,440);B=Row("B",music,880);Network=delayed is null?new Tp0317RejectNetwork():delayed;
             var diagnostics=Path.Combine(directory,"diagnostics");
-            if(restored || delayed is not null)
-            {
-                var items=new[]{A,B}.Select(row=>new OfflineItem(row.Id,row.RequestId,row.Title,row.Artist,"private fixture",60000,
-                    Path.GetFileName(row.LocalPath!),"mp3",delayed is not null && row.Id=="B"?128:320,new FileInfo(row.LocalPath!).Length,
-                    Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(row.LocalPath!))),DateTimeOffset.UtcNow)).ToArray();
-                File.WriteAllText(Path.Combine(music,"library.index.json"),JsonSerializer.Serialize(items));
-            }
+            WriteFixtureAudioIndex(music, [A, B], index => delayed is not null && index == 1 ? 128 : 320);
             if(restored)
             {
                 var saved=new PlaybackQueue();saved.SetItems([A],A);saved.Repeat=RepeatMode.All;

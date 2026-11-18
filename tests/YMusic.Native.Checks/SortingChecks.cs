@@ -2,6 +2,8 @@ using System.Collections;
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -93,6 +95,81 @@ internal static partial class Program
             Assert(queue.Items.SequenceEqual([a,b]) && queue.CurrentOccurrenceToken==token,"remove deleted the current duplicate instead of selected occurrence");
             Assert(!fixture.Player.HasSource,"sorting or removing noncurrent queue item started audio");
         });
+        await Run("Sorting: equal queue keys keep interleaved occurrences and sorting preserves exact multi-selection", async () =>
+        {
+            using var fixture = new SaFixture("sorting-queue-tied-occurrences");
+            await fixture.Activate();
+            var window = fixture.Window;
+            var queue = SaField<PlaybackQueue>(window, "_playbackQueue");
+            var a = SortTrack("repeat", "Ясно", "", "", 100000);
+            var b = SortTrack("between", "Альфа", "", "", 100000);
+            queue.SetItems([a, b, a], a);
+            var version = queue.Version;
+            var current = queue.CurrentOccurrenceToken;
+            SaInvoke(window, "ShowQueueCore", false);
+            window.UpdateLayout();
+            var list = Control<ListView>(window, "TracksList");
+            list.SelectedIndex = 2;
+            list.SelectedItems.Add(b);
+
+            SortChoose(window, ListSortField.Duration);
+            Assert(list.Items.Cast<TrackRow>().SequenceEqual([a, b, a]), "equal durations moved a repeated reference ahead of the intervening row");
+            SaClick(Control<Button>(window, "SortDirectionButton"));
+            Assert(list.Items.Cast<TrackRow>().SequenceEqual([a, b, a]), "descending equal keys lost occurrence order");
+            SortChoose(window, ListSortField.Title);
+            Assert(list.Items.Cast<TrackRow>().SequenceEqual([b, a, a]), "display rows were not sorted by title");
+            var selected = (int[])SaInvokeResult(window, "SelectedQueueIndices")!;
+            Assert(selected.SequenceEqual([1, 2]), "sorting lost part of the selection or selected the other occurrence");
+            Assert(queue.Version == version && queue.CurrentOccurrenceToken == current && queue.Items.SequenceEqual([a, b, a]),
+                "changing the display sort modified the active queue");
+        });
+        await Run("Sorting: queue Back restores live filtered rows commands and surviving selected occurrences", async () =>
+        {
+            using var fixture = new SaFixture("sorting-queue-back");
+            await fixture.Activate();
+            var window = fixture.Window;
+            var queue = SaField<PlaybackQueue>(window, "_playbackQueue");
+            var a = SortTrack("repeat", "Выбор Ясно", "", "", 100000);
+            var hidden = SortTrack("hidden", "Другая песня", "", "", 100000);
+            var removed = SortTrack("old", "Выбор раньше", "", "", 100000);
+            var added = SortTrack("new", "Выбор теперь", "", "", 100000);
+            queue.SetItems([a, hidden, a, removed], a);
+            var selectedToken = queue.OccurrenceTokenAt(2);
+            SaInvoke(window, "ShowQueueCore", false);
+            var list = Control<ListView>(window, "TracksList");
+            SortChoose(window, ListSortField.Duration);
+            Control<TextBox>(window, "FilterBox").Text = "Выбор";
+            await Until(() => list.Items.Count == 3);
+            window.UpdateLayout();
+            list.SelectedIndex = 1;
+            list.SelectedItems.Add(removed);
+            SaClick(Control<Button>(window, "SearchNav"));
+            queue.RemoveMany([3]);
+            queue.Enqueue(added);
+            var version = queue.Version;
+
+            SaInvoke(window, "BrowseBack_Click", null!, null!);
+            Assert(Control<WrapPanel>(window, "QueueActions").Visibility == Visibility.Visible, "queue commands disappeared after Back");
+            Assert(Control<TextBox>(window, "FilterBox").Text == "Выбор" && list.Items.Cast<TrackRow>().SequenceEqual([a, a, added]),
+                "Back restored a stale or unfiltered queue");
+            Assert(list.SelectedItems.Count == 1 && (int)SaInvokeResult(window, "SelectedQueueIndex")! == 2 && queue.OccurrenceTokenAt(2) == selectedToken,
+                "Back lost the surviving selected occurrence or selected the new row in place of the removed one");
+            Assert(queue.Version == version, "Back changed the active queue");
+        });
+        await Run("Sorting: changing sort keeps all 3900 selected tracks", async () =>
+        {
+            using var fixture = new SaFixture("sorting-large-selection");
+            await fixture.Activate();
+            var window = fixture.Window;
+            var rows = Enumerable.Range(1, 3900).Reverse().Select(i => SortTrack(i.ToString(), "Трек", "", "", i * 1000L)).ToArray();
+            SaInvoke(window, "ShowRows", (object)rows);
+            var list = Control<ListView>(window, "TracksList");
+            list.SelectAll();
+
+            SortChoose(window, ListSortField.Duration);
+            Assert(list.SelectedItems.Count == rows.Length && ReferenceEquals(list.Items[0], rows[^1])
+                && ReferenceEquals(list.Items[list.Items.Count - 1], rows[0]), "sorting a fully selected collection lost rows or selection");
+        });
         await Run("Sorting: bounded preference store roundtrip, malformed recovery and atomic failure preserve prior data", () =>
         {
             var directory=Path.Combine(_directory,"sorting-store");var store=new ListSortStore(directory);
@@ -107,6 +184,27 @@ internal static partial class Program
             File.WriteAllText(path,"{broken");Assert(store.Load().Count==0 && File.ReadAllText(path)=="{broken","corrupt load modified data");
             File.WriteAllText(path,new string(' ',8193));Assert(store.Load().Count==0,"oversized sort data accepted");
             Assert(!File.ReadAllText(path).Contains("http"),"unexpected location persisted");
+            return Task.CompletedTask;
+        });
+        await Run("Sorting: first save creates missing parents and replacement preserves the existing DACL", () =>
+        {
+            var directory = Path.Combine(_directory, "sorting-dacl", "preferences");
+            var store = new ListSortStore(directory);
+            Assert(store.Load().Count == 0 && !Directory.Exists(directory), "read created the missing sorting directory");
+            var rules = new Dictionary<string, ListSortRule> { ["tracks:favorites"] = new(ListSortField.Title) };
+            store.Save(rules);
+            var file = new FileInfo(Path.Combine(directory, "list-sorting.json"));
+            var security = file.GetAccessControl(AccessControlSections.Access);
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: true);
+            var fixtureSid = new SecurityIdentifier("S-1-5-21-111111111-222222222-333333333-4444");
+            security.AddAccessRule(new FileSystemAccessRule(fixtureSid, FileSystemRights.ReadData, AccessControlType.Deny));
+            file.SetAccessControl(security);
+            var expected = file.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access);
+            rules["tracks:favorites"] = new(ListSortField.Artist, true);
+            store.Save(rules);
+            Assert(store.Load()["tracks:favorites"] == rules["tracks:favorites"]
+                && file.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access) == expected,
+                "sorting replacement changed the DACL or lost the new rule");
             return Task.CompletedTask;
         });
         await Run("Sorting: explicit Play uses visible offline order and changing a playing list preserves the active queue", async () =>
@@ -144,6 +242,8 @@ internal static partial class Program
         {
             using var fixture=new SaFixture("sorting-downloads");await fixture.Activate();var w=fixture.Window;
             var queue=SaField<DownloadQueueState>(w,"_downloadQueue");queue.Replace([SortTrack("1","Ясно","A","",1000),SortTrack("2","Альфа","Б","",2000)],"Проверка сортировки");
+            UlSet(w, "_downloadQueueAccountUid", SaField<Account>(w, "_account").Uid);
+            UlSet(w, "_downloadQueueAccountGeneration", SaField<int>(w, "_accountGeneration"));
             var entries=queue.Entries.ToArray();entries[0].Begin();entries[0].Progress(new AudioProgress(900,1000));entries[1].Begin();entries[1].Progress(new AudioProgress(1000,10000));
             SaInvoke(w,"DownloadCenter_Click",null!,null!);SortChoose(w,ListSortField.Size);
             var list=((Grid)Control<ContentControl>(w,"DownloadCenterPanel").Content).Children.OfType<ListView>().Single();

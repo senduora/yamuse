@@ -7,8 +7,10 @@ namespace YMusic.Native;
 
 public partial class MainWindow
 {
+    private const string PreferencesReadError = "Не удалось прочитать настройки. Перезапустите Yamuse, чтобы снова сохранять изменения.";
     private PreferencesStore? _preferenceStore;
     private bool _preferencesReady;
+    private bool _preferencesLoadFailed;
     private bool _minimizeToTray;
     private bool _autoFavoritesEnabled;
     private int _concurrentDownloads = PlayerPreferences.DefaultConcurrentDownloads;
@@ -20,8 +22,9 @@ public partial class MainWindow
     private void LoadPreferences()
     {
         _preferencesReady = false;
+        _preferencesLoadFailed = false;
         _settingsInitializing = true;
-        if (_restore && !_demo) _preferenceStore ??= new PreferencesStore(App.DataDirectory);
+        if (_restore && !_demo) _preferenceStore ??= new PreferencesStore(_diagnosticsDirectory);
         try
         {
             var preferences = _preferenceStore?.Load() ?? new PlayerPreferences();
@@ -41,43 +44,74 @@ public partial class MainWindow
             _coverAccent?.Configure(_accentFromCover, _staticAccentColor);
             AutoFavoritesCheckBox.IsChecked = _autoFavoritesEnabled;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { _diagnostics.LastErrorType = "PreferencesLoad:" + ex.GetType().Name; }
-        _settingsInitializing = false;
-        _preferencesReady = true;
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _preferencesLoadFailed = true;
+            _diagnostics.LastErrorType = "PreferencesLoad:" + ex.GetType().Name;
+            SetStatus(PreferencesReadError, true);
+        }
+        finally
+        {
+            _settingsInitializing = false;
+            _preferencesReady = true;
+        }
     }
-    private void SavePreferences()
+    private void SavePreferences() => TrySavePreferences(out _);
+
+    private bool TrySavePreferencesForUpdate(out string? detail)
     {
-        if (!_preferencesReady || _preferenceStore is null) return;
-        try { _preferenceStore.Save(new() { Quality = SelectedQuality, Volume = VolumeSlider.Value / 100, PlaybackSpeed = _player.SpeedRatio, MinimizeToTray = _minimizeToTray, OutputDeviceId = _preferredOutputDeviceId, AutoDownloadFavorites = _autoFavoritesEnabled, ConcurrentDownloads = _concurrentDownloads, CrossfadeSeconds = _player.CrossfadeSeconds, NormalizeVolume = _player.NormalizeVolume, AccentFromCover = _accentFromCover, StaticAccentColor = _staticAccentColor, Theme = ThemeManager.Mode, UpdateCheckFrequency = _updateCheckFrequency }); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { _diagnostics.LastErrorType = "PreferencesSave:" + ex.GetType().Name; SetStatus("Не удалось сохранить настройки на диске.", true); }
+        detail = null;
+        return !_restore || _demo || TrySavePreferences(out detail);
+    }
+
+    private bool TrySavePreferences(out string? detail, bool? autoDownloadFavorites = null)
+    {
+        detail = null;
+        if (_preferenceStore is not { } store) return true;
+        if (!_preferencesReady) return false;
+        // A runtime snapshot has no safe basis for overwriting unread settings.
+        if (_preferencesLoadFailed)
+        {
+            SetStatus(PreferencesReadError, true);
+            return false;
+        }
+        try
+        {
+            store.Save(new()
+            {
+                Quality = SelectedQuality,
+                Volume = VolumeSlider.Value / 100,
+                PlaybackSpeed = _player.SpeedRatio,
+                MinimizeToTray = _minimizeToTray,
+                OutputDeviceId = _preferredOutputDeviceId,
+                AutoDownloadFavorites = autoDownloadFavorites ?? _autoFavoritesEnabled,
+                ConcurrentDownloads = _concurrentDownloads,
+                CrossfadeSeconds = _player.CrossfadeSeconds,
+                NormalizeVolume = _player.NormalizeVolume,
+                AccentFromCover = _accentFromCover,
+                StaticAccentColor = _staticAccentColor,
+                Theme = ThemeManager.Mode,
+                UpdateCheckFrequency = _updateCheckFrequency
+            });
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _diagnostics.LastErrorType = "PreferencesSave:" + ex.GetType().Name;
+            if (ex is OversizedSettingsArchiveException) detail = ex.Message;
+            SetStatus(detail ?? "Не удалось сохранить настройки на диске.", true);
+            return false;
+        }
     }
     private void InitializeShell()
     {
         try
         {
             _shell = new DesktopShell(this) { MinimizeToTray = _minimizeToTray };
-            _shell.Command += async action =>
-            {
-                switch (action)
-                {
-                    case ShellAction.PlayPause: await TogglePlaybackAsync(); break;
-                    case ShellAction.Next: await AdvanceAsync(1, false); break;
-                    case ShellAction.Previous:
-                        if (_player.Position.TotalSeconds > 3) { CommitSeek(0); }
-                        else await AdvanceAsync(-1, false);
-                        break;
-                    case ShellAction.ToggleLike: await ToggleCurrentLikeAsync(); break;
-                    case ShellAction.Exit: _shell.RequestExit(); break;
-                }
-            };
+            _shell.Command += async action => await HandleShellCommandAsync(action);
             _shell.SeekRequested += seconds => { if (!_closed && SeekSlider.IsEnabled) { CommitSeek(seconds); UpdateShellState(); } };
             _shell.VolumeRequested += percent => { if (!_closed && double.IsFinite(percent)) VolumeSlider.Value = Math.Clamp(percent, 0, 100); };
-            if (System.ComponentModel.DependencyPropertyDescriptor.FromProperty(Image.SourceProperty, typeof(Image)) is { } coverSource)
-            {
-                EventHandler coverChanged = (_, _) => UpdateShellState();
-                coverSource.AddValueChanged(PlayerCover, coverChanged);
-                Closed += (_, _) => coverSource.RemoveValueChanged(PlayerCover, coverChanged);
-            }
+            _shell.MiniCoverChanged += cover => _coverAccent?.SetMiniCover(cover);
             UpdateShellState();
         }
         catch (Exception ex) { _diagnostics.LastErrorType = "DesktopShell:" + ex.GetType().Name; }
@@ -108,10 +142,7 @@ public partial class MainWindow
         SettingsDownloads.SelectedItem = _concurrentDownloads;
         SettingsUpdates.Content ??= CreateUpdateSettingsPanel();
         if (_updateFrequencyCombo is not null) _updateFrequencyCombo.SelectedValue = _updateCheckFrequency;
-        SettingsUninstall.IsEnabled = _uninstallListener is not null;
-        SettingsUninstall.ToolTip = SettingsUninstall.IsEnabled
-            ? "Удалить приложение, сохранённый вход, настройки, кэш и скачанную музыку"
-            : "Полное удаление доступно в установленной версии Yamuse";
+        RefreshFullUninstallAction();
         }
         finally { _settingsInitializing = false; }
         SetLyricsVisible(false);
@@ -223,7 +254,7 @@ public partial class MainWindow
     private void SettingsSlider_Commit(object sender, RoutedEventArgs e) => FlushSettingsSave();
     private void SettingsSave_Closed(object? sender, EventArgs e)
     {
-        // OnClosed already saves the current runtime preferences once.
+        // Closing has already attempted to save the current runtime preferences.
         _settingsSavePending = false;
         if (_settingsSaveTimer is not null)
         { _settingsSaveTimer.Stop(); _settingsSaveTimer.Tick -= SettingsSave_Tick; _settingsSaveTimer = null; }

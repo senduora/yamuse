@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Reflection;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Documents;
@@ -21,6 +22,11 @@ internal static partial class Program
         await Run("PlaybackKeys040: retired local search shortcut and smart navigation stay absent", Pk040RetiredLocalSearch);
         await Run("PlaybackKeys040: main and numpad volume clamp persist and mute restores the last nonzero level", Pk040Volume);
         await Run("PlaybackKeys040: routed P Space brackets and media keys use shared asynchronous playback", Pk040Transport);
+        await Run("PlaybackKeys040: focused buttons keep native Space and Enter activation", Pk040ButtonActivation);
+        await Run("PlaybackKeys040: autorepeat does not toggle playback mute or fullscreen", Pk040Repeat);
+        await Run("PlaybackKeys040: Enter and double click activate the exact available row while Listen can fall back", Pk040TrackActivation);
+        await Run("PlaybackKeys040: queue undo leaves the hidden queue alone under overlays", Pk040QueueUndoOverlays);
+        await Run("PlaybackKeys040: SMTC Play and Pause are idempotent and its inactive session allows local media keys", Pk040WindowsMediaTransport);
         await Run("PlaybackKeys040: L captures current track and reuses confirmed account mutation guards", Pk040Like);
         File.WriteAllText(Path.Combine(_directory, "playback-keys040-scope.json"), JsonSerializer.Serialize(new
         {
@@ -166,6 +172,187 @@ internal static partial class Program
         f.Key(Key.P); Assert(!f.Player.IsPlaying && f.Http.Requests == 0, "P pause performed network or failed");
     }
 
+    private static async Task Pk040WindowsMediaTransport()
+    {
+        using var f = new Pk040Fixture("windows-media");
+        var media = (WindowsIntegration)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(WindowsIntegration));
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        typeof(WindowsIntegration).GetField("_window", flags)!.SetValue(media, f.Window);
+        typeof(WindowsIntegration).GetField("<IsAvailable>k__BackingField", flags)!.SetValue(media, true);
+        Pk040Set(f.Window, "_windows", media);
+        f.SetCurrent(f.Rows[1]);
+        var text = new TextBox { Text = "Поиск" };
+        var combo = new ComboBox { ItemsSource = new[] { "Треки", "Подборки" }, SelectedIndex = 0 };
+        var root = (Grid)f.Window.Content;
+        root.Children.Add(text); root.Children.Add(combo); f.Layout();
+        Assert(!media.HandlesMediaKeys && f.Key(Key.MediaPlayPause, text).Handled, "inactive SMTC lost Play on a text editor");
+        await Until(() => f.Player.IsPlaying && !Pk040Field<bool>(f.Window, "_loadingStream"));
+        Assert(f.Key(Key.MediaNextTrack, combo).Handled, "inactive SMTC lost Next on a combo box");
+        await Until(() => !Pk040Field<bool>(f.Window, "_loadingStream") && ReferenceEquals(Pk040Field<TrackRow?>(f.Window, "_current"), f.Rows[2]));
+        Assert(f.Key(Key.MediaPreviousTrack, f.Volume).Handled, "inactive SMTC lost Previous on a slider");
+        await Until(() => !Pk040Field<bool>(f.Window, "_loadingStream") && ReferenceEquals(Pk040Field<TrackRow?>(f.Window, "_current"), f.Rows[1]));
+        Assert(text.Text == "Поиск" && combo.SelectedIndex == 0, "a media key changed text or combo selection");
+
+        typeof(WindowsIntegration).GetField("_hasMedia", flags)!.SetValue(media, true);
+        Assert(media.HandlesMediaKeys && !f.Key(Key.MediaPlayPause, text).Handled && !f.Key(Key.MediaNextTrack, combo).Handled
+            && !f.Key(Key.MediaPreviousTrack, f.Volume).Handled && f.Player.IsPlaying, "active SMTC allowed a duplicate local media action");
+        var commands = new List<DesktopMediaAction>();
+        media.Command += commands.Add;
+        var dispatch = typeof(WindowsIntegration).GetMethod("DispatchButton", flags)!;
+        dispatch.Invoke(media, [Windows.Media.SystemMediaTransportControlsButton.Play]);
+        dispatch.Invoke(media, [Windows.Media.SystemMediaTransportControlsButton.Pause]);
+        Assert(commands.SequenceEqual([DesktopMediaAction.Play, DesktopMediaAction.Pause]), "SMTC lost distinct Play and Pause intentions");
+
+        await f.Window.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+        Assert(f.Player.IsPlaying, "duplicate SMTC Play paused playback");
+        f.Player.Seek(TimeSpan.FromSeconds(5));
+        await f.Window.HandleDesktopMediaCommandAsync(DesktopMediaAction.Pause);
+        var pausedAt = f.Player.Position;
+        await f.Window.HandleDesktopMediaCommandAsync(DesktopMediaAction.Pause);
+        Assert(!f.Player.IsPlaying && f.Player.HasSource && pausedAt.TotalSeconds >= 4
+            && Math.Abs((f.Player.Position - pausedAt).TotalSeconds) < .2,
+            "duplicate SMTC Pause resumed playback or discarded its position");
+        f.SetCurrent(f.Rows[1]); // Refresh controls with the paused source before the explicit Stop.
+        await f.Window.HandleDesktopMediaCommandAsync(DesktopMediaAction.Stop);
+        Assert(!media.HandlesMediaKeys && !f.Player.HasSource && !f.Rows[1].IsPlaying &&
+            ReferenceEquals(Pk040Field<PlaybackQueue>(f.Window, "_playbackQueue").Current, f.Rows[1]),
+            "SMTC Stop retained the active source or discarded the queue selection");
+        dispatch.Invoke(media, [Windows.Media.SystemMediaTransportControlsButton.Play]);
+        Assert(commands.Count == 2 && f.Key(Key.MediaPlayPause).Handled, "inactive SMTC handled Play or prevented the local key");
+        await Until(() => f.Player.IsPlaying && !Pk040Field<bool>(f.Window, "_loadingStream"));
+        Assert(f.Player.Position.TotalSeconds < 3, "Play after Stop resumed from the old paused position");
+    }
+
+    private static Task Pk040ButtonActivation()
+    {
+        using var f = new Pk040Fixture("button-activation");
+        f.SetCurrent(f.Rows[0]);
+        var w = f.Window;
+        var list = Control<ListView>(w, "TracksList");
+        list.SelectedIndex = 0;
+        f.Layout();
+        var row = (ListViewItem)list.ItemContainerGenerator.ContainerFromIndex(0);
+        var title = Pk040Visuals<Button>(row).First(button => ReferenceEquals(button.Tag, f.Rows[0]) && Equals(button.ToolTip, "Открыть альбом"));
+        var previousFocus = Keyboard.FocusedElement as DependencyObject;
+        try
+        {
+            Activate(title, Key.Enter);
+            Assert(Control<TextBlock>(w, "StatusText").Text == "Для открытия альбома подключитесь к Яндексу." && !f.Player.HasSource,
+                "Enter played the selected row instead of opening its focused title link");
+            Activate(Control<Button>(w, "QueueNav"), Key.Space);
+            Assert(Pk040Field<string>(w, "_section") == "queue" && !f.Player.HasSource,
+                "Space sent a focused navigation button to the global transport");
+        }
+        finally { Pk040Focus(previousFocus); }
+        return Task.CompletedTask;
+
+        void Activate(Button button, Key key)
+        {
+            Pk040Focus(button);
+            Assert(button.IsKeyboardFocused && !f.Key(key, button).Handled, "the focused button lost its preview key: " + key);
+            var keyboard = new Pk040Keyboard(ModifierKeys.None);
+            var source = new Pk040Source(button);
+            button.RaiseEvent(new KeyEventArgs(keyboard, source, Environment.TickCount, key) { RoutedEvent = Keyboard.KeyDownEvent });
+            if (key == Key.Space)
+                button.RaiseEvent(new KeyEventArgs(keyboard, source, Environment.TickCount, key) { RoutedEvent = Keyboard.KeyUpEvent });
+        }
+    }
+
+    private static async Task Pk040Repeat()
+    {
+        using var f = new Pk040Fixture("key-autorepeat"); f.SetCurrent(f.Rows[0]);
+        Assert(f.Key(Key.P).Handled, "a new P press was ignored");
+        await Until(() => f.Player.IsPlaying && !Pk040Field<bool>(f.Window, "_loadingStream"));
+        Assert(f.Key(Key.P, repeat: true).Handled && f.Player.IsPlaying, "held P toggled playback a second time");
+        Assert(f.Key(Key.Space).Handled && !f.Player.IsPlaying, "a new global Space press did not toggle playback");
+        Assert(f.Key(Key.Space, repeat: true).Handled && !f.Player.IsPlaying, "held Space resumed playback");
+        Assert(f.Key(Key.Space).Handled && f.Player.IsPlaying, "a second independent Space press did not resume playback");
+
+        f.Volume.Value = 37;
+        Assert(f.Key(Key.M).Handled && f.Volume.Value == 0, "a new M press did not mute");
+        Assert(f.Key(Key.M, repeat: true).Handled && f.Volume.Value == 0, "held M restored volume");
+        Assert(f.Key(Key.M).Handled && f.Volume.Value == 37, "a second independent M press did not restore volume");
+
+        Assert(f.Key(Key.F11).Handled, "a new F11 press did not open fullscreen");
+        var fullscreen = f.Fullscreen;
+        var mainPlay = Control<Button>(f.Window, "PlayPauseButton");
+        var fullPlay = Pk040Visuals<Button>(Pk040Field<Grid>(f.Window, "_expandedPlayerSurface"))
+            .Single(button => button.Name == "ExpandedPlayerPlayPause");
+        Assert(AutomationProperties.GetName(mainPlay) == "Пауза" && AutomationProperties.GetName(fullPlay) == "Пауза",
+            "active transport did not expose the Pause action in both views");
+        Assert(f.Key(Key.P, fullscreen).Handled && AutomationProperties.GetName(mainPlay) == "Воспроизвести"
+            && AutomationProperties.GetName(fullPlay) == "Воспроизвести", "paused transport did not expose the Play action in both views");
+        Assert(f.Key(Key.F11, fullscreen, repeat: true).Handled && ReferenceEquals(fullscreen, f.Fullscreen), "held F11 closed fullscreen");
+        Assert(f.Key(Key.F11, fullscreen).Handled && Pk040Field<object?>(f.Window, "_expandedFullscreenHost") is null,
+            "a second independent F11 press did not close fullscreen");
+    }
+
+    private static async Task Pk040TrackActivation()
+    {
+        using var f = new Pk040Fixture("exact-track-row");
+        var w = f.Window;
+        var unavailable = new TrackRow { Id = "not-playable", RequestId = "not-playable", Title = "Недоступный" };
+        Pk040Call(w, "ShowRows", (object)new[] { f.Rows[0], unavailable, f.Rows[2], f.Rows[2] });
+        var list = Control<ListView>(w, "TracksList");
+        list.SelectedIndex = 1; f.Layout();
+        var unavailableRow = (ListViewItem)list.ItemContainerGenerator.ContainerFromIndex(1);
+        var previousFocus = Keyboard.FocusedElement as DependencyObject;
+        try
+        {
+            Pk040Focus(unavailableRow);
+            Assert(unavailableRow.IsKeyboardFocused && f.Key(Key.Enter, unavailableRow).Handled, "fixture missed the unavailable row's Enter route");
+            var click = new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left)
+            { RoutedEvent = System.Windows.Controls.Control.MouseDoubleClickEvent, Source = unavailableRow };
+            Pk040Call(w, "Tracks_DoubleClick", list, click);
+            Assert(click.Handled && !f.Player.HasSource && !Pk040Field<bool>(w, "_loadingStream"),
+                "activating an unavailable row tried to play a different track");
+
+            var duplicateRow = (ListViewItem)list.ItemContainerGenerator.ContainerFromIndex(3);
+            Pk040Focus(duplicateRow);
+            Assert(f.Key(Key.Enter, duplicateRow).Handled, "fixture missed its focused duplicate row");
+            var queue = Pk040Field<PlaybackQueue>(w, "_playbackQueue");
+            await Until(() => f.Player.HasSource && !Pk040Field<bool>(w, "_loadingStream"));
+            Assert(queue.CurrentIndex == 3, "Enter played the first duplicate instead of the focused occurrence");
+
+            list.UnselectAll();
+            Control<Button>(w, "PlaySelectionButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            await Until(() => ReferenceEquals(Pk040Field<TrackRow?>(w, "_current"), f.Rows[0]) && !Pk040Field<bool>(w, "_loadingStream"));
+            Assert(queue.CurrentIndex == 0, "Listen lost its no-selection fallback");
+        }
+        finally { Pk040Focus(previousFocus); }
+    }
+
+    private static Task Pk040QueueUndoOverlays()
+    {
+        using var f = new Pk040Fixture("queue-undo-overlays"); f.SetCurrent(f.Rows[0]);
+        var w = f.Window;
+        var queue = Pk040Field<PlaybackQueue>(w, "_playbackQueue");
+        queue.RemoveMany([1]);
+        Pk040Call(w, "ShowQueue");
+        Pk040Call(w, "SetSettingsVisible", true);
+        Assert(!f.Key(Key.Z, modifiers: ModifierKeys.Control).Handled && queue.CanUndoRemoval,
+            "Ctrl+Z in Settings changed the hidden queue");
+        Pk040Call(w, "SetSettingsVisible", false);
+        Pk040Call(w, "SetLyricsVisible", true);
+        Assert(!f.Key(Key.Z, modifiers: ModifierKeys.Control).Handled && queue.CanUndoRemoval,
+            "Ctrl+Z in Lyrics changed the hidden queue");
+        Pk040Call(w, "SetLyricsVisible", false);
+        f.Key(Key.F11);
+        Assert(!f.Key(Key.Z, f.Fullscreen, ModifierKeys.Control).Handled && queue.CanUndoRemoval,
+            "Ctrl+Z in Fullscreen changed the hidden queue");
+        f.Key(Key.Escape, f.Fullscreen);
+        Assert(f.Key(Key.Z, modifiers: ModifierKeys.Control).Handled && !queue.CanUndoRemoval && queue.Items.Count == 3,
+            "Ctrl+Z no longer restores the removed row in Queue");
+        return Task.CompletedTask;
+    }
+
+    private static void Pk040Focus(DependencyObject? target)
+    {
+        var change = typeof(KeyboardDevice).GetMethod("ChangeFocus", BindingFlags.Instance | BindingFlags.NonPublic,
+            null, [typeof(DependencyObject), typeof(int)], null) ?? throw new InvalidOperationException("WPF local keyboard focus hook unavailable");
+        change.Invoke(Keyboard.PrimaryDevice, [target, Environment.TickCount]);
+    }
+
     private static async Task Pk040Like()
     {
         using var f = new Pk040Fixture("like"); f.Account(); f.SetCurrent(f.Rows[0]);
@@ -180,7 +367,9 @@ internal static partial class Program
         Assert(f.Http.Writes.Count == 1, "repeated L bypassed the mutation guard");
         f.Http.Hold.SetResult(); await Until(() => !Pk040Field<bool>(f.Window, "_catalogWriting")); f.Http.Hold = null;
         Assert(!favorites.Contains("keys-0") && favorites.Contains("keys-1") && !f.Rows[0].IsLiked && f.Rows[1].IsLiked, "async L confirmation was redirected to the newer current track");
-        f.SetCurrent(f.Rows[0]); f.Key(Key.F11); Assert(f.Key(Key.L, f.Fullscreen).Handled, "fullscreen L was not handled");
+        f.SetCurrent(f.Rows[0]);
+        Assert(f.Key(Key.L, repeat: true).Handled && f.Http.Writes.Count == 1, "held L toggled the like after the request finished");
+        f.Key(Key.F11); Assert(f.Key(Key.L, f.Fullscreen).Handled, "fullscreen L was not handled");
         await Until(() => f.Http.Writes.Count == 2 && !Pk040Field<bool>(f.Window, "_catalogWriting") && favorites.Contains("keys-0"));
         Assert(f.Http.Writes[1] == ("add-multiple", "keys-0:91") && f.Http.Likes.Contains("keys-0") && f.Rows[0].IsLiked, "fullscreen L did not persist the exact track like through the shared action");
         Pk040Set(f.Window, "_favoriteIdsKnown", false); f.Key(Key.L);
@@ -252,10 +441,16 @@ internal static partial class Program
         }
         internal void Layout()
         { var root = (FrameworkElement)Window.Content; root.Measure(new Size(1280, 860)); root.Arrange(new Rect(0, 0, 1280, 860)); root.UpdateLayout(); }
-        internal KeyEventArgs Key(Key key, UIElement? target = null, ModifierKeys modifiers = ModifierKeys.None)
+        internal KeyEventArgs Key(Key key, UIElement? target = null, ModifierKeys modifiers = ModifierKeys.None, bool repeat = false)
         {
             target ??= Window;
             var args = new KeyEventArgs(new Pk040Keyboard(modifiers), new Pk040Source(target), Environment.TickCount, key) { RoutedEvent = Keyboard.PreviewKeyDownEvent };
+            if (repeat)
+            {
+                var markRepeat = typeof(KeyEventArgs).GetMethod("SetRepeat", BindingFlags.Instance | BindingFlags.NonPublic)
+                    ?? throw new InvalidOperationException("WPF key repeat hook unavailable");
+                markRepeat.Invoke(args, [true]);
+            }
             target.RaiseEvent(args); return args;
         }
         public void Dispose() { Http.Hold?.TrySetCanceled(); Window.Close(); _offline.Dispose(); Http.Dispose(); }

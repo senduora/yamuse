@@ -122,6 +122,8 @@ internal static partial class Program
         var window = f.Window;
         var queue = SaField<DownloadQueueState>(window, "_downloadQueue");
         queue.Replace([DcTrack("ui-progress"), DcTrack("ui-error"), DcTrack("ui-complete")], "Тестовая очередь");
+        UlSet(window, "_downloadQueueAccountUid", SaField<Account>(window, "_account").Uid);
+        UlSet(window, "_downloadQueueAccountGeneration", SaField<int>(window, "_accountGeneration"));
         var entries = queue.BeginRun(false);
         entries[0].Begin(); entries[0].Progress(new(512, 1024));
         entries[1].SetState(DownloadEntryState.Failed, "Тестовая ошибка соединения"); entries[2].Complete(4096);
@@ -146,6 +148,7 @@ internal static partial class Program
             }
             var before = queue.Entries.Select(entry => (entry.Track.Id, entry.State, entry.Bytes)).ToArray();
             SaClick(SaVisuals<Button>(view).Single(button => button.Name == "DownloadLibraryButton"));
+            await Until(() => SaField<CancellationTokenSource?>(window, "_featureCts") is null);
             Assert(SaField<string>(window, "_section") == "offline"
                 && queue.Entries.Select(entry => (entry.Track.Id, entry.State, entry.Bytes)).SequenceEqual(before),
                 "Ready-music shortcut cleared, restarted or reordered download tasks");

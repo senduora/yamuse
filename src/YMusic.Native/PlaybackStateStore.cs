@@ -1,10 +1,12 @@
 using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Win32.SafeHandles;
 
 namespace YMusic.Native;
 
-// Only trusted anonymous artwork metadata is optional. Audio locations, credentials,
+// Only descriptive metadata is saved. Audio locations, credentials,
 // download descriptors, and the native player's temporary files are never saved.
 internal sealed record PlaybackTrackState(
     [property: JsonRequired] string Id, [property: JsonRequired] string RequestId,
@@ -12,7 +14,8 @@ internal sealed record PlaybackTrackState(
     [property: JsonRequired] string Album, [property: JsonRequired] long DurationMs,
     [property: JsonRequired] bool Available, [property: JsonRequired] IReadOnlyList<ArtistReference> Artists,
     string? AlbumId = null,
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CoverUri = null);
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? CoverUri = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PrimaryArtistName = null);
 
 internal sealed record PlaybackAlbumState(string Id, string Title, string Artist);
 
@@ -34,6 +37,7 @@ internal sealed class PlaybackStateStore
     internal const int MaximumBytes = 8 * 1024 * 1024;
     internal const long MaximumDurationMs = 7L * 24 * 60 * 60 * 1000;
     internal const string FileName = "playback-state.json";
+    private static ReadOnlySpan<byte> ClearedMarker => "{\"version\":0}"u8;
     private static readonly ConcurrentDictionary<string, object> Gates = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, long> Revisions = new(StringComparer.OrdinalIgnoreCase);
     private static readonly JsonSerializerOptions Json = new()
@@ -42,7 +46,6 @@ internal sealed class PlaybackStateStore
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
         MaxDepth = 16
     };
-    private readonly string _directory;
     private readonly string _path;
     private readonly object _gate;
     public PlaybackStateReadStatus LastReadStatus { get; private set; }
@@ -50,8 +53,7 @@ internal sealed class PlaybackStateStore
     public PlaybackStateStore(string directory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);
-        _directory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
-        _path = Path.Combine(_directory, FileName);
+        _path = Path.Combine(Path.GetFullPath(directory), FileName);
         _gate = Gates.GetOrAdd(_path, _ => new object());
     }
 
@@ -64,14 +66,17 @@ internal sealed class PlaybackStateStore
         {
             try
             {
-                EnsureSafeLocation();
-                if (!File.Exists(_path)) { LastReadStatus = PlaybackStateReadStatus.Missing; return null; }
-                using var stream = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                using var parents = UninstallPathGuard.HoldAncestors(_path);
+                using var handle = parents.Complete ? TryOpenStateFile() : null;
+                if (handle is null) { LastReadStatus = PlaybackStateReadStatus.Missing; return null; }
+                using var stream = new FileStream(handle, FileAccess.Read);
                 if (stream.Length > MaximumBytes) throw new JsonException();
                 // The opened handle bounds allocation and excludes concurrent writes;
                 // never read an unbounded string from an untrusted snapshot.
                 var bytes = new byte[checked((int)stream.Length)];
                 stream.ReadExactly(bytes);
+                if (bytes.AsSpan().SequenceEqual(ClearedMarker))
+                { LastReadStatus = PlaybackStateReadStatus.Missing; return null; }
                 var snapshot = JsonSerializer.Deserialize<PlaybackSnapshot>(bytes, Json) ?? throw new JsonException();
                 Validate(snapshot);
                 if (!string.Equals(snapshot.AccountUid, accountUid, StringComparison.Ordinal))
@@ -80,7 +85,7 @@ internal sealed class PlaybackStateStore
                 return Copy(snapshot);
             }
             catch (JsonException) { LastReadStatus = PlaybackStateReadStatus.Invalid; return null; }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
             { LastReadStatus = PlaybackStateReadStatus.Unavailable; return null; }
         }
     }
@@ -105,13 +110,23 @@ internal sealed class PlaybackStateStore
         var frozen = Copy(snapshot);
         Validate(frozen);
         using var serialized = new BoundedJsonStream();
-        JsonSerializer.Serialize(serialized, frozen, Json);
+        try { JsonSerializer.Serialize(serialized, frozen, Json); }
+        catch (JsonException) when (serialized.LimitExceeded && frozen.Tracks.Any(track => track.CoverUri is not null))
+        {
+            // Optional artwork must fit around the queue and resume position.
+            serialized.SetLength(0);
+            JsonSerializer.Serialize(serialized, frozen with
+            {
+                Tracks = frozen.Tracks.Select(track => track with { CoverUri = null }).ToArray()
+            }, Json);
+        }
         var bytes = serialized.ToArray();
         lock (_gate)
         {
             var revision = Revisions.GetOrAdd(_path, 0);
             if (expectedRevision.HasValue && expectedRevision.Value != revision) return;
-            WriteAtomic(bytes);
+            try { WriteAtomic(bytes, clear: false); }
+            catch (Win32Exception error) { throw new IOException("Не удалось сохранить состояние воспроизведения.", error); }
             Revisions[_path] = revision + 1;
         }
     }
@@ -121,46 +136,34 @@ internal sealed class PlaybackStateStore
         lock (_gate)
         {
             Revisions.AddOrUpdate(_path, 1, (_, value) => value + 1);
-            EnsureSafeLocation();
-            if (!File.Exists(_path)) return;
-            // If deletion fails after replacement, this invalid marker still
+            // If deletion fails after replacement, this marker still
             // prevents restoration of the previous account's queue.
-            WriteAtomic("{\"version\":0}"u8.ToArray());
-            File.Delete(_path);
+            try { WriteAtomic(ClearedMarker, clear: true); }
+            catch (Win32Exception error) { throw new IOException("Не удалось удалить состояние воспроизведения.", error); }
         }
     }
 
-    private void WriteAtomic(byte[] bytes)
+    private void WriteAtomic(ReadOnlySpan<byte> bytes, bool clear)
     {
-        EnsureSafeLocation();
-        Directory.CreateDirectory(_directory);
-        EnsureSafeLocation();
-        var temporary = Path.Combine(_directory, ".playback-state-" + Guid.NewGuid().ToString("N") + ".tmp");
-        try
-        {
-            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
-            { stream.Write(bytes); stream.Flush(flushToDisk: true); }
-            // Replacement is on the same volume. A failed replacement leaves
-            // the previous complete snapshot intact, never a truncated JSON.
-            EnsureSafeLocation();
-            if (File.Exists(_path)) File.Replace(temporary, _path, destinationBackupFileName: null);
-            else File.Move(temporary, _path);
-        }
-        finally
-        {
-            try { if (File.Exists(temporary)) File.Delete(temporary); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
-        }
+        using var transaction = GuardedStoreFile.BeginWrite(_path, createParents: !clear);
+        transaction.Write(bytes, clear: clear);
+    }
+
+    private SafeFileHandle? TryOpenStateFile()
+    {
+        try { return UninstallPathGuard.OpenOwnedFile(_path, read: true, deleteAccess: false); }
+        catch (Win32Exception error) when (error.NativeErrorCode == 2) { return null; }
     }
 
     public static PlaybackSnapshot Capture(string accountUid, PlaybackQueue queue, double positionSeconds, PlaybackAlbumState? sourceAlbum = null)
     {
         ArgumentNullException.ThrowIfNull(queue);
         var tracks = queue.Items.Select(row => new PlaybackTrackState(row.Id, row.RequestId, row.Title, row.Artist,
-            row.Album, row.DurationMs, row.Available, CopyArtists(row.Artists), row.AlbumId, ArtworkUri.Metadata(row.CoverUri))).ToArray();
+            row.Album, row.DurationMs, row.Available, CopyArtists(row.Artists), row.AlbumId, ArtworkUri.Metadata(row.CoverUri),
+            row.PrimaryArtistNameToPersist)).ToArray();
         var index = queue.CurrentIndex;
         var snapshot = new PlaybackSnapshot(CurrentVersion, accountUid, DateTimeOffset.UtcNow, Array.AsReadOnly(tracks), index,
-            ClampPosition(positionSeconds, index < 0 ? 0 : tracks[index].DurationMs), queue.Shuffle, queue.Repeat, sourceAlbum);
+            index < 0 ? 0 : ClampPosition(positionSeconds, tracks[index].DurationMs), queue.Shuffle, queue.Repeat, sourceAlbum);
         Validate(snapshot);
         return snapshot;
     }
@@ -179,9 +182,14 @@ internal sealed class PlaybackStateStore
             // snapshot has no path field and cannot open an arbitrary file.
             var local = offline.Find(probe);
             if (localOnly && local is null) continue;
+            // The audio may be shared by several editions. Its artwork belongs
+            // to the saved album context, when one is available.
+            var offlineCover = local is not null && local.Id == metadata.Id && ValidRequestId(local.RequestId, local.Id)
+                && ArtworkAlbumId(local.Id, local.RequestId, local.AlbumId) == ArtworkAlbumId(metadata.Id, metadata.RequestId, metadata.AlbumId)
+                ? local.CoverUri : null;
             var row = ToRow(metadata, rows.Count + 1, available: !localOnly && metadata.Available,
                 local is null ? null : offline.ResolvePath(local.FileName),
-                local is null ? null : OfflineQuality(local), local?.CoverUri);
+                local is null ? null : OfflineQuality(local), offlineCover);
             if (i == snapshot.CurrentIndex) currentIndex = rows.Count;
             rows.Add(row);
         }
@@ -190,13 +198,18 @@ internal sealed class PlaybackStateStore
     }
 
     internal static double ClampPosition(double seconds, long durationMs)
-        => !double.IsFinite(seconds) || durationMs <= 0 ? 0 : Math.Clamp(seconds, 0, durationMs / 1000.0);
+        => !double.IsFinite(seconds) ? 0 : Math.Clamp(seconds, 0, (durationMs > 0 ? durationMs : MaximumDurationMs) / 1000.0);
+
+    // Callers validate that RequestId is the bare Id or Id:AlbumId.
+    internal static string? ArtworkAlbumId(string id, string requestId, string? albumId)
+        => requestId == id ? albumId : requestId[(id.Length + 1)..];
 
     private static TrackRow ToRow(PlaybackTrackState track, int number, bool available, string? path = null, string? quality = null, string? offlineCover = null)
         => new()
         {
             Number = number, Id = track.Id, RequestId = track.RequestId, Title = track.Title, Artist = track.Artist,
-            Artists = CopyArtists(track.Artists), Album = track.Album, AlbumId = track.AlbumId, DurationMs = track.DurationMs,
+            Artists = CopyArtists(track.Artists), PrimaryArtistName = track.PrimaryArtistName,
+            Album = track.Album, AlbumId = track.AlbumId, DurationMs = track.DurationMs,
             CoverUri = ArtworkUri.Metadata(track.CoverUri) ?? ArtworkUri.Metadata(offlineCover),
             Available = available, DownloadedPath = path, DownloadedQuality = quality
         };
@@ -208,7 +221,7 @@ internal sealed class PlaybackStateStore
         => snapshot with
         {
             Tracks = Array.AsReadOnly(snapshot.Tracks.Select(track => track with { Artists = CopyArtists(track.Artists) }).ToArray()),
-            PositionSeconds = ClampPosition(snapshot.PositionSeconds, snapshot.CurrentIndex < 0 ? 0 : snapshot.Tracks[snapshot.CurrentIndex].DurationMs)
+            PositionSeconds = snapshot.CurrentIndex < 0 ? 0 : ClampPosition(snapshot.PositionSeconds, snapshot.Tracks[snapshot.CurrentIndex].DurationMs)
         };
 
     private static void Validate(PlaybackSnapshot snapshot)
@@ -226,6 +239,7 @@ internal sealed class PlaybackStateStore
                 || track.AlbumId is not null && !ValidId(track.AlbumId)
                 || track.CoverUri is not null && ArtworkUri.Metadata(track.CoverUri) is null
                 || !ValidText(track.Title) || !ValidText(track.Artist) || !ValidText(track.Album)
+                || !TrackRow.ValidPrimaryArtistName(track.PrimaryArtistName)
                 || track.DurationMs < 0 || track.DurationMs > MaximumDurationMs || track.Artists is null || track.Artists.Count > 100)
                 throw new JsonException("Некорректные метаданные сохранённого трека.");
             foreach (var artist in track.Artists)
@@ -243,17 +257,9 @@ internal sealed class PlaybackStateStore
     }
     private static bool ValidText(string? value) => value is { Length: <= 4096 } && !value.Any(char.IsControl);
 
-    private void EnsureSafeLocation()
-    {
-        for (DirectoryInfo? part = new(_directory); part is not null; part = part.Parent)
-            if (part.Exists && (part.Attributes & FileAttributes.ReparsePoint) != 0)
-                throw new IOException("Папка состояния содержит перенаправление.");
-        if (File.Exists(_path) && (File.GetAttributes(_path) & FileAttributes.ReparsePoint) != 0)
-            throw new IOException("Файл состояния содержит перенаправление.");
-    }
-
     private sealed class BoundedJsonStream : MemoryStream
     {
+        public bool LimitExceeded { get; private set; }
         public override void Write(byte[] buffer, int offset, int count)
         { CheckLength(count); base.Write(buffer, offset, count); }
         public override void Write(ReadOnlySpan<byte> buffer)
@@ -262,7 +268,9 @@ internal sealed class PlaybackStateStore
         { CheckLength(1); base.WriteByte(value); }
         private void CheckLength(int count)
         {
-            if (Length + count > MaximumBytes) throw new JsonException("Очередь слишком велика для сохранения.");
+            if (Length + count <= MaximumBytes) return;
+            LimitExceeded = true;
+            throw new JsonException("Очередь слишком велика для сохранения.");
         }
     }
 }

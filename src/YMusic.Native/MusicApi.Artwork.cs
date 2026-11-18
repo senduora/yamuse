@@ -29,7 +29,7 @@ internal sealed partial class MusicApi
         if (ArtworkUri.Metadata(Text(cover, "uri")) is { } uri) return uri;
         if (cover.TryGetProperty("itemsUri", out var items) && items.ValueKind == JsonValueKind.Array)
             foreach (var item in items.EnumerateArray())
-                if (item.ValueKind == JsonValueKind.String && ArtworkUri.Metadata(item.GetString()) is { } itemUri) return itemUri;
+                if (ArtworkUri.Metadata(JsonString(item)) is { } itemUri) return itemUri;
         return null;
     }
 }

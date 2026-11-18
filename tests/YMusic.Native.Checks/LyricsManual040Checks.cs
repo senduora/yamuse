@@ -20,6 +20,10 @@ internal static partial class Program
         { await LyricsManual040Wheel(false, -30); await LyricsManual040Wheel(true, -30); });
         await Run("LyricsManual040: inline scrollbar owns the viewport until drag completes even after the idle deadline", () => LyricsManual040Drag(false));
         await Run("LyricsManual040: expanded scrollbar owns the viewport until drag completes even after the idle deadline", () => LyricsManual040Drag(true));
+        await Run("LyricsManual040: scrollbar page buttons suspend follow during repeat and capture in both views", async () =>
+        { await LyricsManual040Page(false); await LyricsManual040Page(true); });
+        await Run("LyricsManual040: Enter seeks the focused timed line and leaves untimed text alone in both views", async () =>
+        { await LyricsManual040KeyboardSeek(false); await LyricsManual040KeyboardSeek(true); });
     }
 
     private static async Task LyricsManual040Wheel(bool expanded, int delta)
@@ -90,6 +94,64 @@ internal static partial class Program
         LyricsUiInvoke(f.Window, "UpdateLyrics", 71d);
         await Until(() => Math.Abs(viewer.VerticalOffset - offset) > 3);
         Assert(f.Requests == 0, "scrollbar following requested a provider");
+    }
+
+    private static async Task LyricsManual040Page(bool expanded)
+    {
+        using var f = new LyricsManual040Fixture(expanded, "page-scroll");
+        await Dispatcher.Yield(DispatcherPriority.ContextIdle); f.Window.UpdateLayout();
+        var viewer = LyricsUiVisuals<ScrollViewer>(f.List).First();
+        var scrollbar = LyricsUiVisuals<ScrollBar>(viewer).First(bar => bar.Orientation == Orientation.Vertical);
+        scrollbar.ApplyTemplate();
+        var deadline = expanded ? "_expandedLyricsFollowUntil" : "_lyricsFollowUntil";
+        var manual = expanded ? "_expandedLyricsManualDragging" : "_lyricsManualDragging";
+        foreach (var name in new[] { "PageBefore", "PageAfter" })
+        {
+            var page = (RepeatButton)scrollbar.Template.FindName(name, scrollbar);
+            LyricsUiSet(f.Window, deadline, DateTimeOffset.MinValue);
+            page.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
+            Assert(Toast040Field<DateTimeOffset>(f.Window, deadline) > DateTimeOffset.UtcNow.AddSeconds(2.9),
+                "a routed page repeat did not postpone lyrics follow: " + name);
+            page.RaiseEvent(new MouseEventArgs(Mouse.PrimaryDevice, Environment.TickCount) { RoutedEvent = Mouse.GotMouseCaptureEvent });
+            LyricsUiSet(f.Window, deadline, DateTimeOffset.MinValue);
+            Assert(Toast040Field<bool>(f.Window, manual), "holding a lyrics page button did not take manual control: " + name);
+            page.RaiseEvent(new MouseEventArgs(Mouse.PrimaryDevice, Environment.TickCount) { RoutedEvent = Mouse.LostMouseCaptureEvent });
+            Assert(!Toast040Field<bool>(f.Window, manual) && Toast040Field<DateTimeOffset>(f.Window, deadline) > DateTimeOffset.UtcNow.AddSeconds(2.9),
+                "page release did not start the manual idle interval: " + name);
+        }
+        Assert(f.Requests == 0, "scrollbar page buttons requested a provider");
+    }
+
+    private static async Task LyricsManual040KeyboardSeek(bool expanded)
+    {
+        using var f = new LyricsManual040Fixture(expanded, "keyboard-seek");
+        var player = LyricsUiField<NativePlayer>(f.Window, "_player")!;
+        await player.OpenPausedAsync(new Uri(WriteWave("lyrics-keyboard-seek-" + expanded + ".wav", 30)), CancellationToken.None);
+        f.List.ScrollIntoView(f.List.Items[12]); f.Window.UpdateLayout();
+        await Dispatcher.Yield(DispatcherPriority.ContextIdle);
+        var row = (ListBoxItem)f.List.ItemContainerGenerator.ContainerFromIndex(12);
+        Assert(f.List.SelectedIndex != 12, "fixture did not distinguish a focused line from the playback highlight");
+        var previousFocus = Keyboard.FocusedElement as DependencyObject;
+        try
+        {
+            Pk040Focus(row);
+            Assert(row.IsKeyboardFocused && PressEnter().Handled && Toast040Field<double?>(f.Window, "_pendingSeek") == 12,
+                "Enter did not seek to the focused timed line");
+            await Until(() => Math.Abs(player.Position.TotalSeconds - 12) < .4);
+            LyricsUiSet(f.Window, "_lyricLines", Array.Empty<LyricLine>());
+            LyricsUiInvoke(f.Window, "UpdateProgress");
+            Assert(!PressEnter().Handled && Toast040Field<double?>(f.Window, "_pendingSeek") is null && !player.IsPlaying,
+                "Enter on untimed lyrics moved or resumed playback");
+        }
+        finally { Pk040Focus(previousFocus); }
+
+        KeyEventArgs PressEnter()
+        {
+            var args = new KeyEventArgs(new Pk040Keyboard(ModifierKeys.None), new Pk040Source(row), Environment.TickCount, Key.Enter)
+            { RoutedEvent = Keyboard.PreviewKeyDownEvent };
+            row.RaiseEvent(args);
+            return args;
+        }
     }
 
     private sealed class LyricsManual040Fixture : IDisposable

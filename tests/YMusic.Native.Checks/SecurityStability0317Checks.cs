@@ -22,6 +22,17 @@ internal static partial class Program
         await Run("QaFixes061: failed update apply and checkpoint replacement preserve recoverable downloads", Qf061A10UpdateErrors);
         await Run("QaFixes061: update close cancellation logout and same-account login preserve download isolation", Qf061A10UpdateBoundaries);
         await Run("QaFixes061: pending restore and superseding admission prevent stale update checkpoint writes", Qf061A10UpdateAdmission);
+        await Run("Update apply: unavailable settings or playback storage defers restart and allows retry", UpdateApplySaveFailure);
+        await Run("Update apply: failed restart with an idle queue keeps automatic favorites working", UpdateApplyIdleQueue);
+        await Run("Update apply: same-account relogin and a replacement account can finish restoring before restart", UpdateApplyAccountRestore);
+        await Run("Update apply: a scheduled check removes an obsolete startup offer and permits a new confirmed offer", UpdateApplyObsoleteOffer);
+        await Run("Update apply: manual recheck retains a deferral for the same downloaded package and clears it when the offer changes", UpdateApplyRecheckedDeferral);
+        await Run("Update exit: switching off a startup check in flight suppresses the invitation", UpdateOffDuringStartupCheck);
+        await Run("Update exit: update and close wait for admitted session, favorites and offline writes", UpdateExitDrainsWrites);
+        await Run("Update exit: close-to-tray bypasses saves and explicit Exit retries, cancels, or discards a failed save", CloseChoices);
+        await Run("Update exit: recover an unavailable playback snapshot without replacing a corrupt snapshot", ClosePlaybackSnapshotRecovery);
+        await Run("Update exit: canceled exit reschedules only unfinished work it interrupted and retains pending favorites", CloseResumesOnlyInterruptedDownloads);
+        await Run("Update exit: retry a pending guest session save for update and a failed sign-out deletion on exit", ExitFlushesSessionChange);
     }
 
     private static async Task R4ActiveMaintenance()
@@ -284,6 +295,464 @@ internal static partial class Program
             "rejected update left the initial restored queue unloaded or started its downloads");
     }
 
+    private static async Task UpdateApplySaveFailure()
+    {
+        using (var f = new Qf061A10UpdateFixture("settings-save-failure"))
+        {
+            f.Queue.EndRun(false);
+            var preferences = R4Get<PreferencesStore>(f.Window, "_preferenceStore");
+            var before = preferences.Load().PlaybackSpeed;
+            var panel = (StackPanel)R4Call(f.Window, "CreateUpdateSettingsPanel")!;
+            var button = panel.Children.OfType<Button>().Single();
+            var status = panel.Children.OfType<TextBlock>().Last();
+            panel.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
+            try
+            {
+                using (var locked = new FileStream(preferences.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    R4Get<NativePlayer>(f.Window, "_player").SetSpeed(1.5);
+                    button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                    Assert(f.Backend.Applies == 0 && button.IsEnabled && preferences.Load().PlaybackSpeed == before
+                        && status.Text.Contains("Не удалось сохранить настройки", StringComparison.Ordinal),
+                        "settings write failure restarted the app or did not explain how to retry");
+                }
+                button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                Assert(f.Backend.Applies == 1 && !button.IsEnabled && preferences.Load().PlaybackSpeed == 1.5,
+                    "settings retry did not save and request exactly one restart");
+            }
+            finally { panel.RaiseEvent(new RoutedEventArgs(FrameworkElement.UnloadedEvent)); }
+        }
+
+        using (var f = new Qf061A10UpdateFixture("playback-save-failure"))
+        {
+            f.Queue.EndRun(false);
+            var store = R4Get<PlaybackStateStore>(f.Window, "_playbackStateStore");
+            var queue = R4Get<PlaybackQueue>(f.Window, "_playbackQueue");
+            var track = new TrackRow { Id = "1", RequestId = "1", Title = "Fixture current", DurationMs = 120000 };
+            queue.SetItems([track], track);
+            R4Set(f.Window, "_current", track);
+            Assert((bool)R4Call(f.Window, "TrySavePlaybackStateForExit")!, "could not write the initial playback checkpoint");
+            using (var locked = new FileStream(Path.Combine(f.DirectoryPath, PlaybackStateStore.FileName), FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                queue.Enqueue(new TrackRow { Id = "2", RequestId = "2", Title = "Fixture added", DurationMs = 120000 });
+                await R4Task(f.Window, "InstallStartupUpdateAsync");
+                Assert(f.Backend.Applies == 0 && store.Load(Qf061A10UpdateFixture.AccountUid)?.Tracks.Count == 1
+                    && R4Get<string>(f.Window, "_appUpdateFailure").Contains("очередь воспроизведения", StringComparison.Ordinal),
+                    "playback write failure restarted the app or did not explain the deferral");
+            }
+            await R4Task(f.Window, "InstallStartupUpdateAsync");
+            Assert(f.Backend.Applies == 1 && store.Load(Qf061A10UpdateFixture.AccountUid)?.Tracks.Count == 2,
+                "playback retry did not save the new queue before restarting");
+        }
+    }
+
+    private static async Task UpdateApplyIdleQueue()
+    {
+        foreach (var completed in new[] { false, true })
+        {
+            using var f = new Qf061A10UpdateFixture(completed ? "completed-apply-failure" : "empty-apply-failure");
+            f.Queue.EndRun(false);
+            f.Queue.Replace(completed ? [new TrackRow { Id = "1", RequestId = "1", Title = "Downloaded fixture" }] : [], "Idle fixture");
+            foreach (var entry in f.Queue.Entries) entry.SetState(DownloadEntryState.Completed);
+            f.Queue.EndRun(false);
+            var notice = f.Queue.Notice;
+            f.Backend.FailApply = true;
+            await R4Task(f.Window, "InstallStartupUpdateAsync");
+            Assert(f.Backend.Applies == 1 && !R4Get<bool>(f.Window, "_downloadsAutoSuspended") && f.Queue.Notice == notice
+                && !f.Queue.CanResume && !f.Queue.CanRetry, "idle queue remained suspended after a failed restart");
+
+            var track = new TrackRow { Id = "2", RequestId = "2", Title = "New favorite", Available = false };
+            R4Get<HashSet<string>>(f.Window, "_favoriteTrackIds").Add(track.Id);
+            R4Call(f.Window, "ScheduleConfirmedFavoriteDownload", track);
+            var work = R4Get<Task?>(f.Window, "_downloadTask");
+            Assert(work is not null, "confirmed favorite was blocked after the failed restart");
+            await work!.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(f.Queue.Entries.Single().Track.Id == track.Id && f.Requests == 0,
+                "confirmed favorite did not enter the isolated download batch");
+        }
+    }
+
+    private static async Task UpdateApplyAccountRestore()
+    {
+        foreach (var sameAccount in new[] { true, false })
+        {
+            using var f = new Qf061A10UpdateFixture(sameAccount ? "same-account-restore" : "replace-account-restore");
+            if (sameAccount) f.Queue.EndRun(true); else f.StartWorker();
+            f.Window.SignOut();
+            var accountUid = sameAccount ? Qf061A10UpdateFixture.AccountUid : "replacement-account";
+            R4Set(f.Window, "_account", new Account(accountUid, "Fixture relogin", false));
+            R4Set(f.Window, "_session", FakeSession);
+            var readEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var read = new TaskCompletionSource<DownloadQueueSnapshot?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            f.Window.DownloadQueueRestoreReadAsync = _ => { readEntered.TrySetResult(); return read.Task; };
+            var restore = R4Task(f.Window, "RestoreDownloadQueueAsync", accountUid);
+            try
+            {
+                Assert(readEntered.Task.IsCompleted == sameAccount && !restore.IsCompleted,
+                    "fixture did not hold the expected stage of account restore");
+                var admission = R4Get<long>(f.Window, "_downloadQueueAdmissionRevision");
+                await R4Task(f.Window, "InstallStartupUpdateAsync").WaitAsync(TimeSpan.FromSeconds(5));
+                Assert(f.Backend.Applies == 0 && R4Get<long>(f.Window, "_downloadQueueAdmissionRevision") == admission
+                    && R4Get<string>(f.Window, "_appUpdateFailure").Contains("восстановления очереди", StringComparison.Ordinal),
+                    "update bypassed an in-flight account restore");
+            }
+            finally
+            {
+                f.FinishWorker(); read.TrySetResult(null);
+                await restore.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            Assert(f.Queue.Entries.Count == 0 && !f.Queue.Suspended && R4Get<string>(f.Window, "_downloadQueueAccountUid") == accountUid
+                && R4Get<int>(f.Window, "_downloadQueueAccountGeneration") == R4Get<int>(f.Window, "_accountGeneration"),
+                "the new account retained the previous admission's suspended queue");
+        }
+    }
+
+    private static async Task UpdateApplyObsoleteOffer()
+    {
+        foreach (var failedCheck in new[] { false, true })
+        {
+            using var f = new SaFixture("obsolete-update-offer-" + failedCheck);
+            var window = f.Window;
+            var backend = new Su016Backend();
+            var updates = Su016Service(window, "obsolete-offer-" + failedCheck, backend);
+            var now = new DateTimeOffset(2028, 4, 1, 1, 0, 0, TimeSpan.Zero);
+            R4Set(window, "_updateClock", (Func<DateTimeOffset>)(() => now));
+            await Call(window, "CheckForAppUpdatesAsync");
+            var prompt = Su016Find<Border>(window, "StartupUpdatePrompt")!;
+            var button = Su016Find<Button>(window, "StartupUpdateButton")!;
+            Assert(prompt.Visibility == Visibility.Visible && button.IsEnabled, "fixture startup offer missing");
+            R4Set(window, "_updateCheckFrequency", UpdateCheckFrequency.Hourly);
+            backend.Version = null;
+            backend.CheckFailures = failedCheck ? 1 : 0;
+            now = now.AddHours(1);
+            await Call(window, "RunScheduledUpdateCheckAsync");
+            Assert(updates.State.Status == (failedCheck ? AppUpdateStatus.Error : AppUpdateStatus.NoUpdate)
+                && prompt.Visibility == Visibility.Collapsed && !button.IsEnabled && backend.Applies == 0,
+                "obsolete startup offer remained actionable");
+            now = now.AddHours(1);
+            backend.Version = "9.2.0";
+            backend.HoldCheck = true;
+            backend.CheckEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            var check = Call(window, "RunScheduledUpdateCheckAsync");
+            await backend.CheckEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(updates.State.Status == AppUpdateStatus.Checking && prompt.Visibility == Visibility.Collapsed,
+                "checking reopened the obsolete offer before another version was confirmed");
+            backend.CheckRelease.TrySetResult();
+            await check.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(prompt.Visibility == Visibility.Visible && button.IsEnabled && updates.State.AvailableVersion == "9.2.0",
+                "newly confirmed release did not restore the startup offer");
+        }
+    }
+
+    private static async Task UpdateApplyRecheckedDeferral()
+    {
+        foreach (var (offered, pending, expected) in new (string?, string?, AppUpdateStatus)[]
+        {
+            (null, "9.1.0", AppUpdateStatus.NoUpdate),
+            (null, "9.1.0", AppUpdateStatus.Error),
+            ("9.2.0", "9.1.0", AppUpdateStatus.Available),
+            ("9.2.0", "9.2.0", AppUpdateStatus.Downloaded)
+        })
+        {
+            using var f = new Qf061A10UpdateFixture("recheck-deferral-" + expected);
+            f.Queue.EndRun(false);
+            await Call(f.Window, "CheckForAppUpdatesAsync");
+            var prompt = R4Get<Border>(f.Window, "_startupUpdatePrompt");
+            var install = R4Get<Button>(f.Window, "_startupUpdateButton");
+            var startupText = R4Get<TextBlock>(f.Window, "_startupUpdateText");
+            var panel = (StackPanel)R4Call(f.Window, "CreateUpdateSettingsPanel")!;
+            var recheck = SaVisuals<Button>(panel).Single(button => button.Name == "AppUpdateCheckButton");
+            var settingsText = panel.Children.OfType<TextBlock>().Last();
+            panel.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
+            try
+            {
+                var preferences = R4Get<PreferencesStore>(f.Window, "_preferenceStore");
+                using var locked = new FileStream(preferences.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                SaClick(install);
+                await Until(() => !R4Get<bool>(f.Window, "_appUpdateActionInProgress"));
+                const string deferral = "Не удалось сохранить настройки.";
+                Assert(f.Backend.Applies == 0 && startupText.Text.Contains(deferral, StringComparison.Ordinal) && recheck.IsEnabled,
+                    "fixture did not defer application of the downloaded package");
+                var checks = f.Backend.Checks;
+                SaClick(recheck);
+                await Until(() => f.Backend.Checks == checks + 1 && !R4Get<bool>(f.Window, "_updateCheckInProgress"));
+                Assert(prompt.Visibility == Visibility.Visible && startupText.Text.Contains(deferral, StringComparison.Ordinal)
+                    && settingsText.Text.Contains(deferral, StringComparison.Ordinal), "reconfirming the same downloaded package lost its deferral");
+
+                f.Backend.CheckError = new HttpRequestException("Temporary fixture failure");
+                SaClick(recheck);
+                await Until(() => f.Backend.Checks == checks + 2 && !R4Get<bool>(f.Window, "_updateCheckInProgress"));
+                Assert(f.Updates.State is { Status: AppUpdateStatus.Downloaded, AvailableVersion: "9.1.0", CheckSucceeded: false }
+                    && prompt.Visibility == Visibility.Visible && startupText.Text.Contains(deferral, StringComparison.Ordinal),
+                    "temporary check failure discarded the deferral for the still downloaded package");
+
+                f.Backend.OfferedVersion = offered;
+                f.Backend.PendingVersion = pending;
+                f.Backend.CheckError = expected == AppUpdateStatus.Error ? new InvalidDataException("Invalid fixture release metadata") : null;
+                SaClick(recheck);
+                await Until(() => f.Backend.Checks == checks + 3 && !R4Get<bool>(f.Window, "_updateCheckInProgress")
+                    && f.Updates.State.Status == expected);
+                Assert(!settingsText.Text.Contains(deferral, StringComparison.Ordinal) && f.Backend.Applies == 0,
+                    "the previous package's deferral remained in Settings");
+                Assert(offered is null ? prompt.Visibility == Visibility.Collapsed && !install.IsEnabled
+                    : prompt.Visibility == Visibility.Visible && install.IsEnabled && startupText.Text.Contains(offered, StringComparison.Ordinal),
+                    "startup still offered the withdrawn package or displayed the wrong version");
+            }
+            finally { panel.RaiseEvent(new RoutedEventArgs(FrameworkElement.UnloadedEvent)); }
+        }
+    }
+
+    private static async Task UpdateOffDuringStartupCheck()
+    {
+        using var f = new SaFixture("off-during-startup-check");
+        var backend = new Su016Backend { HoldCheck = true };
+        var service = Su016Service(f.Window, "off-during-startup-check", backend);
+        var startup = Call(f.Window, "CheckForAppUpdatesAsync");
+        try
+        {
+            await backend.CheckEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            SaClick(Control<Button>(f.Window, "SettingsButton"));
+            R4Get<ComboBox>(f.Window, "_updateFrequencyCombo").SelectedValue = UpdateCheckFrequency.Off;
+            Assert(R4Get<UpdateCheckFrequency>(f.Window, "_updateCheckFrequency") == UpdateCheckFrequency.Off,
+                "fixture did not disable automatic checks in Settings");
+        }
+        finally { backend.CheckRelease.TrySetResult(); }
+        await startup.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert(service.State.Status == AppUpdateStatus.Available && backend.Checks == 1 && backend.Downloads == 0 && backend.Applies == 0
+            && Su016Find<Border>(f.Window, "StartupUpdatePrompt") is null, "disabled startup check still showed the invitation");
+    }
+
+    private static async Task UpdateExitDrainsWrites()
+    {
+        foreach (var update in new[] { true, false })
+        {
+            using var f = new Qf061A10UpdateFixture(update ? "update-drain" : "close-drain");
+            var sessionWrite = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var favoritesWrite = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            R4Set(f.Window, "_sessionRefreshWrite", sessionWrite.Task);
+            R4Set(f.Window, "_favoritesCacheSaveTask", favoritesWrite.Task);
+            Task? restart = null;
+            try
+            {
+                if (update) restart = f.BeginUpdate();
+                else
+                {
+                    ShowCloseFixture(f.Window);
+                    f.Window.CloseSaveFailurePrompt = _ => throw new InvalidOperationException("successful close displayed a dialog");
+                    f.StartWorker();
+                    f.Window.Close();
+                }
+                var preparation = update ? "_appUpdatePreparingRestart" : "_closeCommitInProgress";
+                await Until(() => R4Get<bool>(f.Window, preparation)
+                    && R4Get<CancellationTokenSource?>(f.Window, "_downloadCts")?.IsCancellationRequested == true);
+                Assert(f.Backend.Applies == 0 && !R4Get<bool>(f.Window, "_closed"), "exit skipped the pending downloader");
+                f.FinishWorker();
+                await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
+                Assert(f.Backend.Applies == 0 && !R4Get<bool>(f.Window, "_closed") && R4Get<bool>(f.Window, preparation),
+                    "exit skipped a pending session write after the downloader settled");
+                sessionWrite.TrySetResult();
+                await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
+                Assert(f.Backend.Applies == 0 && !R4Get<bool>(f.Window, "_closed") && R4Get<bool>(f.Window, preparation),
+                    "exit skipped the pending favorites write after the session settled");
+                favoritesWrite.TrySetResult();
+                if (restart is not null) await restart.WaitAsync(TimeSpan.FromSeconds(5));
+                else await Until(() => R4Get<bool>(f.Window, "_closed"));
+                Assert(update ? f.Backend.Applies == 1 : f.Backend.Applies == 0, "exit did not finish through its original route");
+                f.AssertPausedCheckpoint();
+            }
+            finally
+            {
+                sessionWrite.TrySetResult();
+                favoritesWrite.TrySetResult();
+                f.Window.CloseSaveFailurePrompt = null;
+            }
+        }
+    }
+
+    private static void ShowCloseFixture(MainWindow window)
+    {
+        window.Left = -12000; window.Top = -12000;
+        window.ShowActivated = false; window.ShowInTaskbar = false; window.WindowStartupLocation = WindowStartupLocation.Manual;
+        window.Show();
+    }
+
+    private static async Task CloseChoices()
+    {
+        foreach (var decision in new[] { MessageBoxResult.Cancel, MessageBoxResult.Yes, MessageBoxResult.No })
+        {
+            using var f = new Qf061A10UpdateFixture("close-" + decision);
+            f.Queue.EndRun(false);
+            ShowCloseFixture(f.Window);
+            R4Get<DesktopShell?>(f.Window, "_shell")?.Dispose();
+            using var shell = new DesktopShell(f.Window, _ => true) { MinimizeToTray = true };
+            R4Set(f.Window, "_shell", shell);
+            var store = R4Get<PreferencesStore>(f.Window, "_preferenceStore");
+            var old = store.Load().PlaybackSpeed;
+            using var locked = new FileStream(store.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            R4Get<NativePlayer>(f.Window, "_player").SetSpeed(1.5);
+            var prompts = 0;
+            f.Window.CloseSaveFailurePrompt = failure =>
+            {
+                prompts++;
+                Assert(failure.Contains("сохранить настройки", StringComparison.Ordinal), "close reported the wrong write failure");
+                if (decision == MessageBoxResult.Yes) locked.Dispose();
+                return decision;
+            };
+            try
+            {
+                f.Window.Close();
+                Assert(!f.Window.IsVisible && !R4Get<bool>(f.Window, "_closeCommitInProgress") && prompts == 0,
+                    "close-to-tray started saving the window state");
+                shell.ShowMainWindow();
+                R4Call(shell, "Dispatch", ShellAction.Exit);
+                await Until(() => !R4Get<bool>(f.Window, "_closeCommitInProgress"));
+                Assert(prompts == 1 && store.Load().PlaybackSpeed == (decision == MessageBoxResult.Yes ? 1.5 : old),
+                    "close did not honor its retry, cancel, or discard choice");
+                Assert(R4Get<bool>(f.Window, "_closed") == (decision != MessageBoxResult.Cancel), "close completed despite cancel or failed to exit");
+                if (decision == MessageBoxResult.Cancel)
+                {
+                    f.Window.Close();
+                    Assert(!f.Window.IsVisible && !R4Get<bool>(f.Window, "_closed") && prompts == 1,
+                        "a canceled tray Exit changed the next close-to-tray action");
+                }
+            }
+            finally
+            {
+                locked.Dispose();
+                f.Window.CloseSaveFailurePrompt = null;
+                if (!R4Get<bool>(f.Window, "_closed")) { shell.MinimizeToTray = false; f.Window.Close(); }
+            }
+        }
+    }
+
+    private static async Task CloseResumesOnlyInterruptedDownloads()
+    {
+        foreach (var alreadyPaused in new[] { false, true })
+        {
+            using var f = new Qf061A10UpdateFixture("cancel-close-resume-" + alreadyPaused);
+            f.Queue.EndRun(false);
+            var rows = Enumerable.Range(1, 4).Select(index => new TrackRow
+            { Id = index.ToString(), RequestId = index.ToString(), Title = "Fixture", Available = false }).ToArray();
+            f.Queue.Replace(rows, "Resume fixture");
+            f.Queue.BeginRun(false);
+            var active = f.Queue.Entries[0]; active.Begin();
+            var queued = f.Queue.Entries[1];
+            var paused = f.Queue.Entries[2]; paused.SetState(DownloadEntryState.Paused);
+            var failed = f.Queue.Entries[3]; failed.SetState(DownloadEntryState.Failed);
+            f.StartWorker();
+            var oldCts = R4Get<CancellationTokenSource>(f.Window, "_downloadCts");
+            if (alreadyPaused) SaInvoke(f.Window, "PauseDownloadQueue");
+            var pendingFavorite = new TrackRow { Id = "5", RequestId = "5", Title = "Pending favorite", Available = false };
+            var snapshot = new PlaylistDetails("local:favorites", "liked", "Мне нравится", "", 0, [pendingFavorite]);
+            if (!alreadyPaused) R4Set(f.Window, "_pendingAutoFavorites", snapshot);
+
+            ShowCloseFixture(f.Window);
+            var preferences = R4Get<PreferencesStore>(f.Window, "_preferenceStore");
+            using var locked = new FileStream(preferences.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var prompts = 0;
+            f.Window.CloseSaveFailurePrompt = _ => { prompts++; return MessageBoxResult.Cancel; };
+            try
+            {
+                f.Window.Close();
+                await Until(() => oldCts.IsCancellationRequested && R4Get<bool>(f.Window, "_closeCommitInProgress"));
+                f.FinishWorker();
+                await Until(() => !R4Get<bool>(f.Window, "_closeCommitInProgress"));
+                if (R4Get<Task?>(f.Window, "_downloadTask") is { } resumed) await resumed.WaitAsync(TimeSpan.FromSeconds(5));
+                var expected = alreadyPaused ? DownloadEntryState.Paused : DownloadEntryState.Unavailable;
+                Assert(prompts == 1 && !R4Get<bool>(f.Window, "_closed") && active.State == expected && queued.State == expected
+                    && paused.State == DownloadEntryState.Paused && failed.State == DownloadEntryState.Failed
+                    && !f.Queue.Running && f.Requests == 0, "canceled close dropped active work, started a second worker, or removed an earlier pause");
+                Assert(alreadyPaused || ReferenceEquals(R4Get<PlaylistDetails?>(f.Window, "_pendingAutoFavorites"), snapshot),
+                    "canceled close discarded the pending favorites snapshot");
+            }
+            finally { f.Window.CloseSaveFailurePrompt = null; }
+        }
+    }
+
+    private static async Task ExitFlushesSessionChange()
+    {
+        using (var f = new Qf061A10UpdateFixture("guest-session-update"))
+        {
+            f.Queue.EndRun(false);
+            R4Set(f.Window, "_account", null); R4Set(f.Window, "_session", null);
+            var store = R4Get<SessionStore>(f.Window, "_store");
+            store.Save(FakeSession);
+            var replacement = FakeSession with { AccessToken = "fake-rotated-guest-token-DO-NOT-USE" };
+            R4Set(f.Window, "_unactivatedSession", replacement);
+            using (var locked = new FileStream(Path.Combine(f.DirectoryPath, "session.dpapi"), FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                Assert(!(bool)R4Call(f.Window, "PersistSessionChange", replacement)!, "fixture did not block the guest session write");
+                await R4Task(f.Window, "InstallStartupUpdateAsync");
+                Assert(f.Backend.Applies == 0 && R4Get<string>(f.Window, "_appUpdateFailure").Contains("сохранить обновлённый вход", StringComparison.Ordinal),
+                    "update ignored an unwritten rotation without an active account");
+            }
+            await R4Task(f.Window, "InstallStartupUpdateAsync");
+            Assert(f.Backend.Applies == 1 && store.Load()?.AccessToken == replacement.AccessToken,
+                "retry applied without persisting the pending guest session");
+        }
+
+        using (var f = new Qf061A10UpdateFixture("signed-out-session-close"))
+        {
+            f.Queue.EndRun(false);
+            var contentReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            f.Window.ContentRendered += (_, _) => contentReady.TrySetResult();
+            ShowCloseFixture(f.Window);
+            await contentReady.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var store = R4Get<SessionStore>(f.Window, "_store");
+            store.Save(FakeSession);
+            using var locked = new FileStream(Path.Combine(f.DirectoryPath, "session.dpapi"), FileMode.Open, FileAccess.Read, FileShare.Read);
+            f.Window.SignOut();
+            var prompts = 0;
+            f.Window.CloseSaveFailurePrompt = failure =>
+            {
+                prompts++;
+                Assert(failure.Contains("снова открыть этот аккаунт", StringComparison.Ordinal) && store.Load() is not null,
+                    "exit did not explain the retained sign-in");
+                locked.Dispose();
+                return MessageBoxResult.Yes;
+            };
+            try
+            {
+                f.Window.Close();
+                await Until(() => R4Get<bool>(f.Window, "_closed"));
+                Assert(prompts == 1 && store.Load() is null, "exit did not retry the pending deletion before closing");
+            }
+            finally { f.Window.CloseSaveFailurePrompt = null; }
+        }
+    }
+
+    private static Task ClosePlaybackSnapshotRecovery()
+    {
+        foreach (var corrupt in new[] { false, true })
+        {
+            using var f = new Qf061A10UpdateFixture(corrupt ? "corrupt-playback" : "unavailable-playback");
+            var store = R4Get<PlaybackStateStore>(f.Window, "_playbackStateStore");
+            var path = Path.Combine(f.DirectoryPath, PlaybackStateStore.FileName);
+            var savedQueue = new PlaybackQueue();
+            var row = new TrackRow { Id = "1", RequestId = "1", Title = "Saved fixture", DurationMs = 120000, Available = true };
+            savedQueue.SetItems([row], row);
+            var baseline = PlaybackStateStore.Capture(Qf061A10UpdateFixture.AccountUid, savedQueue, 24);
+            Assert(baseline.CurrentIndex == 0 && baseline.PositionSeconds == 24, "fixture did not create a resumable playback checkpoint");
+            store.Save(baseline);
+            R4Set(f.Window, "_playbackStateAccountUid", null);
+            R4Set(f.Window, "_session", null);
+            if (corrupt) File.WriteAllText(path, "{");
+            using (var locked = corrupt ? null : new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                R4Call(f.Window, "RestorePlaybackState", Qf061A10UpdateFixture.AccountUid);
+                Assert(R4Get<PlaybackQueue>(f.Window, "_playbackQueue").Items.Count == 0
+                    && !(bool)R4Call(f.Window, "TrySavePlaybackStateForExit")!, "unread snapshot was replaced by the empty live queue");
+            }
+            var saved = (bool)R4Call(f.Window, "TrySavePlaybackStateForExit")!;
+            Assert(corrupt ? !saved && File.ReadAllText(path) == "{"
+                : saved && store.Load(Qf061A10UpdateFixture.AccountUid) is { PositionSeconds: 24, Tracks.Count: 1 }
+                    && R4Get<PlaybackQueue>(f.Window, "_playbackQueue").Current?.Id == row.Id,
+                "exit recovery lost the stored position or did not preserve corrupt data");
+        }
+        return Task.CompletedTask;
+    }
+
     private sealed class Qf061A10UpdateFixture : IDisposable
     {
         internal const string AccountUid = "qa-fixes061-update";
@@ -293,6 +762,7 @@ internal static partial class Program
         internal DownloadQueueState Queue => R4Get<DownloadQueueState>(Window, "_downloadQueue");
         internal DownloadQueueStore Store => R4Get<DownloadQueueStore>(Window, "_downloadQueueStore");
         internal Qf061A10UpdateBackend Backend { get; } = new();
+        internal UpdateSupport Updates { get; }
         internal int Requests { get; private set; }
         private readonly OfflineLibrary _offline;
         private readonly CancellationTokenSource _workerCancellation;
@@ -301,9 +771,9 @@ internal static partial class Program
         {
             DirectoryPath = Path.Combine(_directory, "qa-fixes061-update-" + name); Directory.CreateDirectory(DirectoryPath);
             var feed = Path.Combine(DirectoryPath, "feed.json");
-            File.WriteAllText(feed, "{\"githubRepository\":\"https://github.com/example/qa-update-fixture\"}");
-            var updates = new UpdateSupport(feed, true, _ => Backend);
-            updates.CheckAsync().GetAwaiter().GetResult();
+            File.WriteAllText(feed, "{\"githubRepository\":\"https://github.com/senduora/yamuse\"}");
+            Updates = new UpdateSupport(feed, true, _ => Backend);
+            Updates.CheckAsync().GetAwaiter().GetResult();
             _offline = new OfflineLibrary(Path.Combine(DirectoryPath, "music"),
                 new AudioBuffer(Path.Combine(DirectoryPath, "download-buffer"), new R4NoNetwork()));
             var player = new NativePlayer(new AudioBuffer(Path.Combine(DirectoryPath, "player-buffer"), new R4NoNetwork()));
@@ -313,7 +783,8 @@ internal static partial class Program
                 store: new SessionStore(DirectoryPath), diagnosticsDirectory: DirectoryPath, offline: _offline, player: player,
                 preferences: preferences, audioOutputDevices: new PlaybackOptionsFakeOutputs());
             R4Set(Window, "_restore", true); R4Set(Window, "_account", new Account(AccountUid, "Fixture", false));
-            R4Set(Window, "_session", FakeSession); R4Set(Window, "_appUpdatesOverride", updates);
+            R4Set(Window, "_session", FakeSession); R4Set(Window, "_appUpdatesOverride", Updates);
+            R4Call(Window, "InitializePlaybackPersistence"); R4Call(Window, "RestorePlaybackState", AccountUid);
             R4Call(Window, "InitializeDownloadPersistence"); R4Call(Window, "BeginDownloadQueuePersistence");
             R4Set(Window, "_downloadQueueAccountUid", AccountUid); R4Set(Window, "_downloadQueueQuality", AudioQuality.Optimal);
             Queue.Replace(Enumerable.Range(1, 2).Select(id => new TrackRow
@@ -322,10 +793,14 @@ internal static partial class Program
             Store.Save(DownloadQueueStore.Capture(AccountUid, Queue, AudioQuality.Optimal, false, null));
             _workerCancellation = CancellationTokenSource.CreateLinkedTokenSource(R4Get<CancellationTokenSource>(Window, "_lifetime").Token);
         }
-        internal Task BeginUpdate()
+        internal void StartWorker()
         {
             _worker = new(TaskCreationOptions.RunContinuationsAsynchronously);
             R4Set(Window, "_downloadTask", _worker.Task); R4Set(Window, "_downloadCts", _workerCancellation);
+        }
+        internal Task BeginUpdate()
+        {
+            StartWorker();
             return R4Task(Window, "InstallStartupUpdateAsync");
         }
         internal void FinishWorker()
@@ -354,10 +829,17 @@ internal static partial class Program
     }
     private sealed class Qf061A10UpdateBackend : IAppUpdateBackend
     {
-        internal int Applies;
+        internal int Applies, Checks;
         internal bool FailApply;
-        public string? PendingVersion => "9.1.0";
-        public Task<string?> CheckAsync() => throw new InvalidOperationException("Fake pending update must not check the service");
+        internal string? OfferedVersion = "9.1.0";
+        internal Exception? CheckError;
+        public string? PendingVersion { get; set; } = "9.1.0";
+        public Task<string?> CheckAsync(CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            Checks++;
+            return CheckError is { } error ? Task.FromException<string?>(error) : Task.FromResult(OfferedVersion);
+        }
         public Task DownloadAsync(Action<int> progress, CancellationToken token) => throw new InvalidOperationException("Fake pending update must not download");
         public void ApplyAndRestart()
         { Applies++; if (FailApply) throw new IOException("Fixture apply failure"); }
@@ -375,6 +857,7 @@ internal static partial class Program
         internal TextBlock StartupText { get; } = new();
         internal string DirectoryPath { get; }
         private readonly NativePlayer _player;
+        private readonly OfflineLibrary _offline;
         private readonly string _preferencesPath;
         private readonly byte[] _preferencesBefore;
         internal bool PreferencesUnchanged => File.ReadAllBytes(_preferencesPath).SequenceEqual(_preferencesBefore);
@@ -383,18 +866,20 @@ internal static partial class Program
         {
             var directory = DirectoryPath = Path.Combine(_directory, "security-stability0317-" + name); Directory.CreateDirectory(directory);
             var feed = Path.Combine(directory, "feed.json");
-            File.WriteAllText(feed, "{\"githubRepository\":\"https://github.com/example/r4-fixture\"}");
+            File.WriteAllText(feed, "{\"githubRepository\":\"https://github.com/senduora/yamuse\"}");
             Updates = new UpdateSupport(feed, true, _ => Backend);
-            Updates.CheckAsync().GetAwaiter().GetResult(); // PendingVersion makes this synchronous and local.
+            Updates.CheckAsync().GetAwaiter().GetResult(); // The fake backend confirms the pending version locally.
             var preferences = new PreferencesStore(directory);
             preferences.Save(new PlayerPreferences { Volume = .21, AutoDownloadFavorites = true });
             _preferencesPath = Directory.GetFiles(directory, "*.json").Single(path => Path.GetFileName(path) != "feed.json");
             _preferencesBefore = File.ReadAllBytes(_preferencesPath);
             _player = new NativePlayer(new AudioBuffer(Path.Combine(directory, "buffer"), new R4NoNetwork()));
+            _offline = new OfflineLibrary(Path.Combine(directory, "offline"),
+                new AudioBuffer(Path.Combine(directory, "offline-buffer"), new R4NoNetwork()));
             Window = (MainWindow)RuntimeHelpers.GetUninitializedObject(typeof(MainWindow));
             R4Set(Window, "_lifetime", Lifetime); R4Set(Window, "_downloadQueue", new DownloadQueueState());
             R4Set(Window, "_pendingConfirmedFavorites", new Dictionary<string, TrackRow>(StringComparer.Ordinal));
-            R4Set(Window, "_appUpdatesOverride", Updates); R4Set(Window, "_player", _player);
+            R4Set(Window, "_appUpdatesOverride", Updates); R4Set(Window, "_player", _player); R4Set(Window, "_offline", _offline);
             R4Set(Window, "_preferencesReady", true); R4Set(Window, "_preferenceStore", preferences);
             R4Set(Window, "_autoFavoritesEnabled", true); R4Set(Window, "_concurrentDownloads", 3);
             R4Set(Window, "_accentFromCover", true); R4Set(Window, "_staticAccentColor", "#EA571C");
@@ -405,13 +890,13 @@ internal static partial class Program
             R4Set(Window, "_startupUpdateButton", StartupButton); R4Set(Window, "_startupUpdateLater", new Button());
             R4Set(Window, "_settingsOpen", true); R4Set(Window, "SettingsAccentHex", new TextBox { Text = "#20A0B0" });
         }
-        public void Dispose() { Lifetime.Cancel(); _player.Dispose(); Lifetime.Dispose(); }
+        public void Dispose() { Lifetime.Cancel(); _offline.Dispose(); _player.Dispose(); Lifetime.Dispose(); }
     }
     private sealed class R4UpdateBackend : IAppUpdateBackend
     {
         internal int Applies;
         public string? PendingVersion => "9.1.0";
-        public Task<string?> CheckAsync() => throw new InvalidOperationException("Pending fake package must not check the network");
+        public Task<string?> CheckAsync(CancellationToken token) => Task.FromResult(PendingVersion);
         public Task DownloadAsync(Action<int> progress, CancellationToken token) => throw new InvalidOperationException("Fake package is already downloaded");
         public void ApplyAndRestart() => Applies++;
     }

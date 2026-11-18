@@ -4,6 +4,8 @@ using System.Reflection;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Interop;
 using YMusic.Native;
 
 internal static partial class Program
@@ -13,6 +15,69 @@ internal static partial class Program
         await Run("Playlist settings: delayed opening preserves live settings and persistence", () => PlaylistSettingsResponse(refresh: false));
         await Run("Playlist settings: delayed refresh preserves live settings and Back retains them", () => PlaylistSettingsResponse(refresh: true));
         await Run("Playlist settings: explicit navigation cancels a pending response without restoring the old page", PlaylistSettingsNavigateAway);
+        await Run("Playlist settings: playlist title dialog validates initial and edited values", PlaylistTitleDialogValidation);
+        await Run("Playlist settings: native Enter accepts a selected playlist and Escape cancels", PlaylistPickerAccessKeys);
+    }
+
+    private static Task PlaylistTitleDialogValidation()
+    {
+        var owner = new Window { ShowActivated = false, ShowInTaskbar = false };
+        TextDialog? dialog = null;
+        try
+        {
+            _ = new WindowInteropHelper(owner).EnsureHandle();
+            dialog = new TextDialog(owner, "Название плейлиста", new string('я', 201));
+            var panel = (StackPanel)dialog.Content;
+            var text = panel.Children.OfType<TextBox>().Single();
+            var save = panel.Children.OfType<StackPanel>().Single().Children.OfType<Button>().Single(button => button.IsDefault);
+            Assert(!save.IsEnabled, "an oversized initial title could be submitted");
+            text.Text = "плей\tлист";
+            Assert(!save.IsEnabled, "a title containing a control character could be submitted");
+            text.Text = "   ";
+            Assert(!save.IsEnabled, "a blank title could be submitted");
+            text.Text = " " + new string('я', 200) + " ";
+            Assert(save.IsEnabled && dialog.Value.Length == 200, "a valid title at the limit could not be submitted");
+        }
+        finally { dialog?.Close(); owner.Close(); }
+        return Task.CompletedTask;
+    }
+
+    private static Task PlaylistPickerAccessKeys()
+    {
+        var owner = new Window { ShowActivated = false, ShowInTaskbar = false };
+        try
+        {
+            _ = new WindowInteropHelper(owner).EnsureHandle();
+            var playlist = new CatalogItem("fixture-playlist", "playlist", "Проверочный плейлист", "");
+            foreach (var confirm in new[] { true, false })
+            {
+                var dialog = new PlaylistDialog(owner, [playlist])
+                {
+                    ShowActivated = false, WindowStartupLocation = WindowStartupLocation.Manual, Left = -16000, Top = 0
+                };
+                var list = ((Grid)dialog.Content).Children.OfType<ListBox>().Single();
+                var noSelectionStayedOpen = false;
+                var closedByAccessKey = false;
+                dialog.Loaded += (_, _) =>
+                {
+                    try
+                    {
+                        var source = PresentationSource.FromVisual(dialog)!;
+                        AccessKeyManager.ProcessKey(source, "\r", false);
+                        noSelectionStayedOpen = dialog.IsVisible;
+                        if (!noSelectionStayedOpen) return;
+                        list.SelectedIndex = 0;
+                        AccessKeyManager.ProcessKey(source, confirm ? "\r" : "\u001B", false);
+                        closedByAccessKey = !dialog.IsVisible;
+                    }
+                    finally { if (dialog.IsVisible) dialog.Close(); }
+                };
+                Assert(dialog.ShowDialog() == confirm && noSelectionStayedOpen && closedByAccessKey && ReferenceEquals(dialog.Selected, playlist),
+                    "playlist picker did not honor the modal access key or submitted without selection");
+            }
+        }
+        finally { owner.Close(); }
+        return Task.CompletedTask;
     }
 
     private static async Task PlaylistSettingsResponse(bool refresh)

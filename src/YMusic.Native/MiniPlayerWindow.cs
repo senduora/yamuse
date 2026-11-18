@@ -1,22 +1,27 @@
+using System.ComponentModel;
 using System.Windows;
 using System.Windows.Automation;
+using System.Windows.Automation.Peers;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Shell;
+using System.Windows.Threading;
 
 namespace YMusic.Native;
 
 // A view of the main player's state. WPF animates its display between native
-// observations; it owns no playback timer, queue, media engine or network.
+// observations and resolves artwork through the shared cache.
 internal sealed class MiniPlayerWindow : Window
 {
     private const double HeaderHeight = 32;
     private static Brush Muted => ThemeManager.Brush("#989BA7");
     private readonly TextBlock _coverPlaceholder;
     private readonly TextBlock _playbackStatus;
+    private readonly TextBlock _commandError;
+    private readonly DispatcherTimer _commandErrorTimer;
     private readonly Border _artwork;
     private readonly ColumnDefinition _artworkColumn;
     private readonly StackPanel _metadata;
@@ -43,7 +48,7 @@ internal sealed class MiniPlayerWindow : Window
     internal Image CoverImage { get; }
     internal Button PlayButton { get; }
     internal Button LikeButton { get; }
-    internal Slider SeekSlider { get; }
+    internal PlaybackSeekSlider SeekSlider { get; }
     internal Slider VolumeSlider { get; }
     internal TextBlock PositionText { get; }
     internal TextBlock DurationText { get; }
@@ -75,6 +80,14 @@ internal sealed class MiniPlayerWindow : Window
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(52) });
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(36) });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _commandError = new TextBlock { Name = "MiniCommandError", FontSize = 11, TextWrapping = TextWrapping.Wrap,
+            TextTrimming = TextTrimming.CharacterEllipsis, MaxHeight = 42, Visibility = Visibility.Collapsed };
+        _commandError.SetResourceReference(TextBlock.ForegroundProperty, "ErrorBrush");
+        AutomationProperties.SetLiveSetting(_commandError, AutomationLiveSetting.Polite);
+        Grid.SetRow(_commandError, 4); Grid.SetColumnSpan(_commandError, 2); root.Children.Add(_commandError);
+        _commandErrorTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher) { Interval = TimeSpan.FromSeconds(6) };
+        _commandErrorTimer.Tick += (_, _) => ClearCommandError();
         frame.Child = root; Content = frame;
 
         var header = new Grid { Background = Brushes.Transparent };
@@ -120,6 +133,10 @@ internal sealed class MiniPlayerWindow : Window
         _coverPlaceholder = Glyph("\uE8D6", 29); _coverPlaceholder.Foreground = Muted;
         coverLayers.Children.Add(_coverPlaceholder);
         CoverImage = new Image { Stretch = Stretch.UniformToFill };
+        var coverSource = DependencyPropertyDescriptor.FromProperty(Image.SourceProperty, typeof(Image));
+        EventHandler coverChanged = (_, _) => _coverPlaceholder.Visibility = CoverImage.Source is null ? Visibility.Visible : Visibility.Collapsed;
+        coverSource.AddValueChanged(CoverImage, coverChanged);
+        Closed += (_, _) => coverSource.RemoveValueChanged(CoverImage, coverChanged);
         coverLayers.Children.Add(CoverImage); _artwork.Child = coverLayers; info.Children.Add(_artwork);
         _artwork.SizeChanged += (_, _) => coverLayers.Clip = new RectangleGeometry(new Rect(0, 0, _artwork.ActualWidth, _artwork.ActualHeight), 12, 12);
         _metadata = new StackPanel { Margin = new Thickness(16, 0, 9, 0), VerticalAlignment = VerticalAlignment.Center };
@@ -134,7 +151,7 @@ internal sealed class MiniPlayerWindow : Window
         var timeline = new Grid();
         Grid.SetColumnSpan(timeline, 2);
         timeline.RowDefinitions.Add(new RowDefinition { Height = new GridLength(24) }); timeline.RowDefinitions.Add(new RowDefinition());
-        SeekSlider = Slider(0, 1); SeekSlider.IsMoveToPointEnabled = true; SeekSlider.SmallChange = 5; SeekSlider.LargeChange = 15;
+        SeekSlider = CreateSlider<PlaybackSeekSlider>(1); SeekSlider.IsMoveToPointEnabled = true; SeekSlider.SmallChange = 5; SeekSlider.LargeChange = 15;
         AutomationProperties.SetName(SeekSlider, "Позиция воспроизведения");
         timeline.Children.Add(SeekSlider);
         var times = new DockPanel { LastChildFill = false };
@@ -148,7 +165,7 @@ internal sealed class MiniPlayerWindow : Window
         controls.ColumnDefinitions.Add(new ColumnDefinition()); controls.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); controls.ColumnDefinitions.Add(new ColumnDefinition());
         var volume = _volume = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         var volumeGlyph = Glyph("\uE767", 14); volumeGlyph.Foreground = Muted; volume.Children.Add(volumeGlyph);
-        VolumeSlider = Slider(0, 100); VolumeSlider.Width = 66; VolumeSlider.Margin = new Thickness(8, 0, 0, 0); VolumeSlider.SmallChange = 5; VolumeSlider.LargeChange = 10;
+        VolumeSlider = CreateSlider<Slider>(100); VolumeSlider.Width = 66; VolumeSlider.Margin = new Thickness(8, 0, 0, 0); VolumeSlider.SmallChange = 5; VolumeSlider.LargeChange = 10;
         AutomationProperties.SetName(VolumeSlider, "Громкость"); volume.Children.Add(VolumeSlider); controls.Children.Add(volume);
         var transport = _transport = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         _previous = IconButton("\uE892", "Предыдущий трек", () => Command?.Invoke(ShellAction.Previous), 38, 40, 17);
@@ -165,6 +182,14 @@ internal sealed class MiniPlayerWindow : Window
 
         _seekGesture = new SliderGesture(SeekSlider, () => BeginSeek(_seekGesture?.IsKeyboardActive == true),
             commit => { if (commit) CompleteSeek(_keySeeking); else CancelSeek(); }, registerPointer: false);
+        SeekSlider.AutomationSeekRequested += seconds =>
+        {
+            _seekGesture.Cancel();
+            PlaybackTimeline.Stop(SeekSlider);
+            SeekSlider.Value = seconds;
+            PositionText.Text = Time(seconds);
+            RequestSeek(seconds);
+        };
         SeekSlider.AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(_seekGesture.Start), true);
         SeekSlider.AddHandler(Mouse.PreviewMouseUpEvent, new MouseButtonEventHandler(_seekGesture.End), true);
         _volumeGesture = new SliderGesture(VolumeSlider, () => { }, _ => { });
@@ -179,7 +204,7 @@ internal sealed class MiniPlayerWindow : Window
             _volumeText.Text = $"{Math.Round(VolumeSlider.Value):0}%";
             if (!_syncingVolume) VolumeRequested?.Invoke(VolumeSlider.Value);
         };
-        Closed += (_, _) => { _seekGesture.Cancel(); _volumeGesture.Cancel(); PlaybackTimeline.Stop(SeekSlider); Command = null; SeekRequested = null; VolumeRequested = null; ShowMainRequested = null; };
+        Closed += (_, _) => { ClearCommandError(); _seekGesture.Cancel(); _volumeGesture.Cancel(); PlaybackTimeline.Stop(SeekSlider); Command = null; SeekRequested = null; VolumeRequested = null; ShowMainRequested = null; };
         Update("", "", false, false, false); UpdateDetails(null, 0, 0, false, false, false, 70);
     }
 
@@ -189,7 +214,7 @@ internal sealed class MiniPlayerWindow : Window
         if (_title != title || _artist != artist)
         {
             CancelSeek(); _canSeek = false; SeekSlider.IsEnabled = false;
-            CoverImage.Source = null; _coverPlaceholder.Visibility = Visibility.Visible;
+            if (Artwork.GetSourceUri(CoverImage) is null) CoverImage.Source = null;
         }
         _title = title; _artist = artist; _hasTrack = !string.IsNullOrWhiteSpace(title); _isPlaying = isPlaying;
         if (!isPlaying) PlaybackTimeline.Stop(SeekSlider);
@@ -203,10 +228,33 @@ internal sealed class MiniPlayerWindow : Window
         if (!_hasTrack) UpdateDetails(null, 0, 0, false, false, false, VolumeSlider.Value);
     }
 
-    internal void UpdateDetails(ImageSource? cover, double positionSeconds, double durationSeconds, bool canSeek, bool isLiked, bool canLike, double volumePercent, string? trackKey = null, double speedRatio = 1, bool advancePlayhead = false)
+    internal void ShowCommandError(string text)
+    {
+        _commandError.Text = text;
+        _commandError.ToolTip = text;
+        _commandError.Visibility = Visibility.Visible;
+        var peer = FrameworkElementAutomationPeer.FromElement(_commandError)
+            ?? FrameworkElementAutomationPeer.CreatePeerForElement(_commandError);
+        peer?.RaiseAutomationEvent(AutomationEvents.LiveRegionChanged);
+        _commandErrorTimer.Stop();
+        _commandErrorTimer.Start();
+    }
+
+    internal void ClearCommandError()
+    {
+        _commandErrorTimer.Stop();
+        _commandError.Visibility = Visibility.Collapsed;
+        _commandError.Text = "";
+        _commandError.ToolTip = null;
+    }
+
+    internal void UpdateDetails(ImageSource? cover, double positionSeconds, double durationSeconds, bool canSeek, bool isLiked,
+        bool canLike, double volumePercent, string? trackKey = null, double speedRatio = 1, bool advancePlayhead = false,
+        string? coverUri = null)
     {
         VerifyAccess();
-        if (!string.Equals(_trackKey, trackKey, StringComparison.Ordinal)) { CancelSeek(); _trackKey = trackKey; }
+        var trackChanged = !string.Equals(_trackKey, trackKey, StringComparison.Ordinal);
+        if (trackChanged) { CancelSeek(); _trackKey = trackKey; }
         var duration = _hasTrack && double.IsFinite(durationSeconds) ? Math.Max(0, durationSeconds) : 0;
         var allowSeek = _hasTrack && canSeek && duration > 0;
         if (IsSeeking && (!allowSeek || Math.Abs(_duration - duration) > .01)) CancelSeek();
@@ -219,7 +267,10 @@ internal sealed class MiniPlayerWindow : Window
         }
         finally { _syncingSeek = false; }
         DurationText.Text = Time(duration);
-        CoverImage.Source = _hasTrack ? cover : null; _coverPlaceholder.Visibility = CoverImage.Source is null ? Visibility.Visible : Visibility.Collapsed;
+        var uri = _hasTrack ? coverUri : null;
+        if (uri is not null && Artwork.GetPixelSize(CoverImage) != 256) Artwork.SetPixelSize(CoverImage, 256);
+        Artwork.SetTrackSource(CoverImage, uri, trackChanged);
+        if (uri is null) CoverImage.Source = _hasTrack ? cover : null;
         LikeButton.IsEnabled = _hasTrack && canLike; LikeButton.Content = Glyph(isLiked && _hasTrack ? "\uEB52" : "\uEB51", 19);
         if (isLiked && _hasTrack) LikeButton.SetResourceReference(ForegroundProperty, "AccentTextBrush"); else LikeButton.Foreground = Foreground;
         LikeButton.ToolTip = isLiked ? "Убрать из Мне нравится" : "Добавить в Мне нравится"; AutomationProperties.SetName(LikeButton, LikeButton.ToolTip.ToString());
@@ -340,8 +391,11 @@ internal sealed class MiniPlayerWindow : Window
         var position = Math.Clamp(SeekSlider.Value, 0, _duration);
         _pointerSeeking = _keySeeking = _seekDirty = false;
         if (ReferenceEquals(Mouse.Captured, SeekSlider)) SeekSlider.ReleaseMouseCapture();
-        if (commit) { _position = position; SeekRequested?.Invoke(position); }
+        if (commit) RequestSeek(position);
     }
+
+    private void RequestSeek(double position)
+    { _position = position; SeekRequested?.Invoke(position); }
 
     private void CancelSeek()
     {
@@ -369,11 +423,11 @@ internal sealed class MiniPlayerWindow : Window
     }
     private static Brush Brush(string color) => ThemeManager.Brush(color);
     private static TextBlock Glyph(string glyph, double size) => new() { Text = glyph, FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-    private static Slider Slider(double minimum, double maximum)
+    private static T CreateSlider<T>(double maximum) where T : Slider, new()
     {
-        var slider = new Slider
+        var slider = new T
         {
-        Minimum = minimum, Maximum = maximum, Height = 22, VerticalAlignment = VerticalAlignment.Center,
+        Maximum = maximum, Height = 22, VerticalAlignment = VerticalAlignment.Center,
         Background = Brush("#3A3C45"), BorderThickness = new Thickness(0), IsSnapToTickEnabled = false, FocusVisualStyle = null,
         Template = (ControlTemplate)XamlReader.Parse("""
             <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Slider">
@@ -381,7 +435,7 @@ internal sealed class MiniPlayerWindow : Window
                 <Border Height="4" Margin="5,0" CornerRadius="2" Background="{DynamicResource TrackBrush}" VerticalAlignment="Center"/>
                 <Track x:Name="PART_Track" Orientation="Horizontal" IsDirectionReversed="False">
                   <Track.DecreaseRepeatButton><RepeatButton Command="Slider.DecreaseLarge" Background="{DynamicResource AccentBrush}" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Height="4" Margin="5,0,0,0" CornerRadius="2" Background="{TemplateBinding Background}" VerticalAlignment="Center"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.DecreaseRepeatButton>
-                  <Track.Thumb><Thumb Width="10" Height="10"><Thumb.Template><ControlTemplate TargetType="Thumb"><Ellipse Fill="{DynamicResource AccentBrush}"/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
+                  <Track.Thumb><Thumb Width="10" Height="10" Style="{DynamicResource MiniSliderHandle}"/></Track.Thumb>
                   <Track.IncreaseRepeatButton><RepeatButton Command="Slider.IncreaseLarge" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Background="Transparent"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.IncreaseRepeatButton>
                 </Track>
               </Grid>
@@ -390,6 +444,7 @@ internal sealed class MiniPlayerWindow : Window
             """)
         };
         slider.SetResourceReference(ForegroundProperty, "AccentBrush");
+        InputFeedback.SetEnabled(slider, true);
         return slider;
     }
     private static ControlTemplate ButtonTemplate(int radius) => (ControlTemplate)XamlReader.Parse("""

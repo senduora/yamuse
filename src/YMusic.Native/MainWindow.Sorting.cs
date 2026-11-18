@@ -72,12 +72,18 @@ public partial class MainWindow
         }
         else
         {
-            var queueIndex = preserveSelection && _section == "queue" ? SelectedQueueIndex() : -1;
-            var selected = preserveSelection ? TracksList.SelectedItems.Cast<TrackRow>().ToArray() : [];
-            ((ListCollectionView)_view).CustomSort = rule.Field == ListSortField.Original ? null : new StableListComparer(rule, _trackOrder!);
-            if (queueIndex >= 0) SelectVisibleQueueOccurrence(queueIndex);
-            else if (preserveSelection)
-                foreach (var row in selected) if (_view.Contains(row) && !TracksList.SelectedItems.Contains(row)) TracksList.SelectedItems.Add(row);
+            var view = (ListCollectionView)_view;
+            if (_section == "queue")
+            {
+                // Queue rows are ordered by occurrence before they enter the shared view.
+                if (!preserveSelection || view.CustomSort is not null) view.CustomSort = null;
+                if (preserveSelection) SortVisibleQueue(rule);
+            }
+            else
+            {
+                // WPF retains selected rows on Reset when their objects and filter remain the same.
+                view.CustomSort = rule.Field == ListSortField.Original ? null : new StableListComparer(rule, _trackOrder!);
+            }
         }
         UpdateSortHeaders(rule);
     }

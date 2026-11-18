@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Windows;
 using System.Windows.Controls;
 using YMusic.Native;
 
@@ -16,12 +17,16 @@ internal static partial class Program
         await Run("DownloadRestore: crash reconciliation pauses unfinished work and validates ready files", DrCrash);
         await Run("DownloadRestore: close reopen and explicit resume retry preserve files and playlist context", DrWindowLifecycle);
         await Run("DownloadRestore: logout and account generation reject stale restored work and writes", DrAccount);
+        await Run("DownloadRestore: account switch hides old rows and queue text while the next restore waits", DrAccountVisibility);
+        await Run("DownloadRestore: restore and automatic batches wait for the shared offline recovery task", DrPendingOfflineRecovery);
+        await Run("DownloadRestore: opening Download Center retries a transient offline recovery failure", DrRetryOfflineRecovery);
         await Run("DownloadRestore: stale load or preparation cannot replace running or completed manual work", DrManualAdmission);
         await Run("DownloadRestore: admission before pending-worker wait rejects obsolete restoration", DrPendingAdmission);
         await Run("DownloadRestore: clear close and stale preparation failures invalidate held restoration", DrRestoreInvalidation);
         await Run("DownloadRestore: invalid oversized and unknown data remain untouched", DrInvalid);
         await Run("DownloadRestore: corrupt offline index blocks restoration without overwriting evidence", DrCorruptIndex);
         await Run("DownloadRestore: newest atomic write and clear defeat outstanding background saves", DrWrites);
+        await Run("DownloadRestore: a busy checkpoint keeps the previous snapshot and retries when writable", DrRetryCheckpoint);
         await Run("DownloadRestore: full uninstall removes the owned queue snapshot", DrUninstall);
     }
     private static string DrDirectory(string name)
@@ -108,7 +113,7 @@ internal static partial class Program
         DrEnable(second);
         await Call(second.Window, "RestoreDownloadQueueAsync", "fixture");
         Assert(second.Requests.Count == 0 && second.Active == 0 && second.Queue.CanResume && second.Queue.CanRetry
-            && !second.Queue.Running && SaField<bool>(second.Window, "_downloadsAutoSuspended"), "reopening started requests or lost user-gated continuation");
+            && !second.Queue.Running && second.Queue.HasPaused, "reopening started requests or lost user-gated continuation");
         Assert(second.Queue.Entries.Select(e => e.State).SequenceEqual([DownloadEntryState.Completed, DownloadEntryState.Paused, DownloadEntryState.Unavailable, DownloadEntryState.Failed])
             && second.Queue.Entries[3].Error.Contains("Аудиосервер"), "terminal states or failure reason changed across close");
         var resume = SaVisuals<Button>(second.Window.DownloadCenterView).Single(b => b.Name == "DownloadResumeButton");
@@ -137,6 +142,108 @@ internal static partial class Program
         await Call(fixture.Window, "RestoreDownloadQueueAsync", "other");
         await Call(fixture.Window, "ResumeDownloadQueue"); await Call(fixture.Window, "RetryFailedDownloads");
         Assert(fixture.Requests.Count == 0 && fixture.Queue.Entries.Count == 0, "different account inherited previous tasks");
+    }
+    private static async Task DrAccountVisibility()
+    {
+        using var fixture = new DownloadCenterFixture("restore-account-visibility", 1) { HoldFirstAttempts = true };
+        DrEnable(fixture);
+        var window = fixture.Window;
+        var work = fixture.Start([DcTrack("2")]);
+        await Until(() => fixture.Active == 1);
+        var list = SaField<BatchSelectionListView>(window, "_downloadEntriesList");
+        var summary = SaField<TextBlock>(window, "_downloadCenterSummary");
+        var notice = SaField<TextBlock>(window, "_downloadCenterNotice");
+        var progress = SaField<FrameworkElement>(window, "_queueProgressPanel");
+        var progressDetails = SaField<TextBlock>(window, "_queueProgressDetails");
+        Assert(list.Items.Count == 1 && summary.Text.Contains("Тестовая очередь", StringComparison.Ordinal), "initial account queue was hidden");
+
+        window.SignOut();
+        AssertHidden();
+        var revision = SaField<long>(window, "_downloadQueueAdmissionRevision");
+        await Call(window, "DownloadSelectedAsync");
+        Assert(SaField<long>(window, "_downloadQueueAdmissionRevision") == revision
+            && !Control<Button>(window, "DownloadButton").IsEnabled, "signed-out cancel changed the previous worker's admission");
+        await work;
+        SaField<CancellationTokenSource>(window, "_accountCts").Dispose();
+        UlSet(window, "_accountCts", new CancellationTokenSource());
+        UlSet(window, "_session", FakeSession);
+        UlSet(window, "_account", new Account("other", "Other", false));
+        var read = new TaskCompletionSource<DownloadQueueSnapshot?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        window.DownloadQueueRestoreReadAsync = _ => read.Task;
+        var restore = Call(window, "RestoreDownloadQueueAsync", "other");
+        try
+        {
+            Assert(!restore.IsCompleted && fixture.Queue.Entries.Single().Track.Id == "2", "fixture did not hold the old model during restore");
+            SaInvoke(window, "RefreshDownloadCenter");
+            AssertHidden();
+        }
+        finally { read.TrySetResult(DrSnapshot("other", "Очередь другого аккаунта")); }
+        await restore;
+        Assert(list.Items.Count == 3 && summary.Text.Contains("Очередь другого аккаунта", StringComparison.Ordinal), "new account could not display its restored queue");
+
+        void AssertHidden() => Assert(list.Items.Count == 0 && summary.Text == DownloadQueueState.EmptyLabel
+            && notice.Text == DownloadQueueState.EmptyNotice && progress.Visibility == Visibility.Collapsed
+            && progressDetails.Text.Length == 0, "old account rows, queue text, or progress remained visible");
+    }
+    private static async Task DrPendingOfflineRecovery()
+    {
+        foreach (var restoring in new[] { true, false })
+        {
+            using var fixture = new DownloadCenterFixture("pending-offline-recovery-" + restoring, 1);
+            var state = typeof(OfflineLibrary).GetField("_directoryState", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(fixture.Library)!;
+            var recovery = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            state.GetType().GetField("RecoveryTask", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(state, recovery.Task);
+            Task work;
+            if (restoring)
+            {
+                DrEnable(fixture);
+                fixture.Window.DownloadQueueRestoreReadAsync = _ => Task.FromResult<DownloadQueueSnapshot?>(DrSnapshot());
+                work = Call(fixture.Window, "RestoreDownloadQueueAsync", "fixture");
+            }
+            else
+            {
+                work = Call(fixture.Window, "StartDownloadBatchAsync", new[] { DcTrack("1") }, "Автоскачивание", null!, true);
+            }
+            try
+            {
+                await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
+                Assert(!work.IsCompleted && fixture.Requests.Count == 0, "a download operation read through pending recovery");
+            }
+            finally { recovery.TrySetResult(); }
+            await work.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(restoring ? fixture.Queue.CanResume && !SaField<bool>(fixture.Window, "_downloadPersistenceWriteBlocked")
+                : fixture.Requests.GetValueOrDefault("1") == 1 && fixture.Queue.Entries.Single().State == DownloadEntryState.Completed,
+                "a temporary offline recovery blocked later progress");
+        }
+    }
+    private static async Task DrRetryOfflineRecovery()
+    {
+        using var fixture = new DownloadCenterFixture("retry-offline-recovery", 1);
+        DrEnable(fixture);
+        var store = new DownloadQueueStore(fixture.DirectoryPath);
+        store.Save(DrSnapshot());
+        var path = Path.Combine(fixture.DirectoryPath, DownloadQueueStore.FileName);
+        var saved = File.ReadAllBytes(path);
+        var state = typeof(OfflineLibrary).GetField("_directoryState", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(fixture.Library)!;
+        var recovery = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        state.GetType().GetField("RecoveryTask", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(state, recovery.Task);
+        var recoveryEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Window.DownloadQueueRestoreReadAsync = uid =>
+        {
+            recoveryEntered.TrySetResult();
+            return Task.FromResult(store.Load(uid));
+        };
+
+        var restore = Call(fixture.Window, "RestoreDownloadQueueAsync", "fixture");
+        await recoveryEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        recovery.TrySetException(new IOException("Fixture temporary file lock"));
+        await restore.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert(SaField<bool>(fixture.Window, "_downloadRestoreRecoveryFailed") && fixture.Queue.Entries.Count == 0
+            && File.ReadAllBytes(path).SequenceEqual(saved), "a transient recovery failure discarded or overwrote the checkpoint");
+
+        SaInvoke(fixture.Window, "DownloadCenter_Click", null!, null!);
+        await Until(() => fixture.Queue.CanResume && !SaField<bool>(fixture.Window, "_downloadPersistenceWriteBlocked"));
+        Assert(fixture.Queue.Entries.Count == 3 && fixture.Requests.Count == 0, "opening the center did not restore the paused checkpoint");
     }
     private static async Task DrManualAdmission()
     {
@@ -215,7 +322,8 @@ internal static partial class Program
             var held = new TaskCompletionSource<DownloadQueueSnapshot?>(TaskCreationOptions.RunContinuationsAsynchronously);
             fixture.Window.DownloadQueueRestoreReadAsync = _ => held.Task;
             var restore = Call(fixture.Window, "RestoreDownloadQueueAsync", "fixture");
-            SaInvoke(fixture.Window, close ? "SaveDownloadQueueForClose" : "ClearPersistedDownloadQueue");
+            if (close) SaInvoke(fixture.Window, "SaveDownloadQueueForClose");
+            else SaInvoke(fixture.Window, "ClearPersistedDownloadQueue", true);
             held.SetResult(DrSnapshot()); await restore.WaitAsync(TimeSpan.FromSeconds(5));
             Assert(fixture.Queue.Entries.Count == 0 && fixture.Requests.Count == 0 && !fixture.Queue.Running
                 && !File.Exists(Path.Combine(fixture.DirectoryPath, DownloadQueueStore.FileName)),
@@ -305,6 +413,24 @@ internal static partial class Program
         writes = Enumerable.Range(0, 40).Select(i => store.SaveInBackgroundAsync(DrSnapshot(label: "stale-" + i))).ToArray();
         new DownloadQueueStore(directory).Clear(); await Task.WhenAll(writes);
         Assert(!File.Exists(Path.Combine(directory, DownloadQueueStore.FileName)) && !Directory.EnumerateFiles(directory, "*.tmp").Any(), "clear resurrected a stale queue or leaked an atomic temporary file");
+    }
+    private static async Task DrRetryCheckpoint()
+    {
+        using var fixture = new DownloadCenterFixture("restore-busy-checkpoint", 1);
+        DrEnable(fixture);
+        var store = new DownloadQueueStore(fixture.DirectoryPath); store.Save(DrSnapshot());
+        await Call(fixture.Window, "RestoreDownloadQueueAsync", "fixture");
+        var path = Path.Combine(fixture.DirectoryPath, DownloadQueueStore.FileName);
+        var before = File.ReadAllBytes(path);
+        using (var busy = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            await Call(fixture.Window, "PersistDownloadQueueAsync", true);
+            Assert(SaField<bool>(fixture.Window, "_downloadPersistenceDirty") && before.SequenceEqual(File.ReadAllBytes(path))
+                && !Directory.EnumerateFiles(fixture.DirectoryPath, "*.tmp").Any(), "failed replacement discarded work or left its temporary file");
+        }
+        await Call(fixture.Window, "PersistDownloadQueueAsync", false);
+        Assert(store.Load("fixture")?.Entries[1].State == DownloadEntryState.Paused
+            && !SaField<bool>(fixture.Window, "_downloadPersistenceDirty"), "checkpoint did not retry after the previous file became writable");
     }
     private static Task DrUninstall()
     {

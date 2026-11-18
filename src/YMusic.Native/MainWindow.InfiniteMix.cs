@@ -3,8 +3,7 @@ namespace YMusic.Native;
 public partial class MainWindow
 {
     private CancellationTokenSource? _automaticWaveCts;
-    private PlaybackAlbumState? _restoredSourceAlbum;
-    private IReadOnlyList<TrackRow>? _restoredSourceAlbumQueue;
+    private (PlaybackAlbumState Album, long QueueVersion, int AccountGeneration, string AccountUid)? _restoredSourceAlbum;
 
     private PlaybackAlbumState? PlaybackSourceAlbum()
     {
@@ -15,11 +14,17 @@ public partial class MainWindow
             if (MusicApi.IsAlbumWaveSeed(id))
                 return new(id!, source.Album?.Title ?? source.Title, source.Album?.Artists ?? source.Opened?.Subtitle ?? "");
         }
-        return ReferenceEquals(_restoredSourceAlbumQueue, _playbackQueue.Items) ? _restoredSourceAlbum : null;
+        return !_closed && _queue.Count > 0 && _restoredSourceAlbum is { } restored
+            && restored.QueueVersion == _playbackQueue.ReplacementVersion
+            && restored.AccountGeneration == _accountGeneration && restored.AccountUid == _account?.Uid
+            ? restored.Album : null;
     }
 
-    private void CancelAutomaticWave()
+    private void CancelPendingWavePlayback()
     {
+        CancelExplicitWaveStart();
+        var pending = _pendingWaveAdvance; _pendingWaveAdvance = null;
+        pending?.Cancel();
         var cts = _automaticWaveCts; _automaticWaveCts = null;
         cts?.Cancel();
     }
@@ -50,22 +55,26 @@ public partial class MainWindow
         try
         {
             var session = await EnsureSessionAsync(cts.Token);
-            var batch = await _api.StartWaveAsync(session, cts.Token, mode, album is null ? last.Id : null, album?.Id);
+            var candidate = await _api.RequestWaveAsync(session, cts.Token, mode, album is null ? last.Id : null, album?.Id);
             if (!CurrentRequest()) return true;
-            if (!batch.Tracks.Any(track => track.CanPlay)) throw new MusicException("Волна не вернула доступных треков.");
+            var playable = WavePlayableTracks(candidate.Batch.Tracks);
+            if (!CurrentRequest()) return true;
+            if (playable.Length == 0) throw new MusicException("Волна не вернула доступных треков.");
+            var batch = _api.AcceptWave(candidate, cts.Token);
             _waveTracks.Clear();
             AddWaveBatch(batch);
             QueueWaveFeedback(batch.SessionId, batch.BatchId, "radioStarted", null, 0);
-            _playbackQueue.SetItems(batch.Tracks);
+            _playbackQueue.SetItems(playable);
             // Update an already visible wave without changing the user's page or Settings.
             if (_section == "wave")
             {
                 _waveViewMode = mode; _waveSeedTrack = album is null ? last : null;
                 _waveSeedAlbum = album is null ? null : new(album.Id, "album", album.Title, album.Artist);
-                ShowRows(_waveTracks);
             }
             _automaticWaveCts = null;
             if (_playbackQueue.Current is { } first) await PlayTrackAsync(first);
+            if (!_closed && _section == "wave" && IsCurrentWaveView && ReferenceEquals(batch.Station, _waveBatch?.Station))
+                ShowRows(_waveTracks);
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
         catch (Exception ex)

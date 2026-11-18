@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Net.Http;
 using System.Text.Json;
 
@@ -125,7 +126,7 @@ internal sealed partial class MusicApi
         return info with { Tracks = rows };
     }
 
-    public async Task SetTrackLikeAsync(Session session, string uid, LikedId track, bool liked, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<LikedId>> SetTrackLikeAsync(Session session, string uid, LikedId track, bool liked, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(track);
         CatalogTrackReference(track, requireAlbum: false);
@@ -133,19 +134,18 @@ internal sealed partial class MusicApi
         try
         {
             await CatalogVerifyOwnerAsync(session, uid, cancellationToken).ConfigureAwait(false);
-            using var json = await CatalogWriteAsync(
+            var result = await LibraryWriteResultAsync(
                 $"/users/{CatalogId(uid)}/likes/tracks/{(liked ? "add-multiple" : "remove")}", session,
                 Form(("track-ids", track.RequestId)), cancellationToken).ConfigureAwait(false);
-            var result = CatalogResult(json);
-            try { _ = CatalogNonNegativeInt(result, "revision", "изменения лайка"); }
-            catch (MusicException) { throw CatalogUnconfirmedWrite(); }
+            LibraryRequireRevision(result);
             try
             {
                 var current = await GetLikedIdsAsync(session, uid, cancellationToken).ConfigureAwait(false);
                 if (current.Any(t => t.Id == track.Id) != liked)
                     throw new MusicException("Состояние лайка не совпало с запросом.");
+                return current;
             }
-            catch (Exception ex) when (ex is MusicException or HttpRequestException or OperationCanceledException)
+            catch (Exception ex) when (CatalogReadbackUncertain(ex))
             { throw CatalogUnconfirmedWrite(); }
         }
         finally { _catalogMutationGate.Release(); }
@@ -159,15 +159,16 @@ internal sealed partial class MusicApi
         try
         {
             var account = await GetAccountAsync(session, cancellationToken, includeAvatar: false).ConfigureAwait(false);
-            using var json = await CatalogWriteAsync($"/users/{CatalogId(account.Uid)}/playlists/create", session,
+            var result = await CatalogWriteResultAsync($"/users/{CatalogId(account.Uid)}/playlists/create", session,
                 Form(("title", title), ("visibility", visibility)), cancellationToken).ConfigureAwait(false);
-            var result = CatalogResult(json);
-            var kind = Text(result, "kind");
-            var created = CatalogMutationHeader(result, account.Uid, kind);
+            if (result is not { } acknowledgement) throw CatalogUnconfirmedWrite();
+            var kind = Text(acknowledgement, "kind");
+            var created = CatalogMutationHeader(acknowledgement, account.Uid, kind);
             if (created.Title != title || created.Visibility != visibility || created.IsGenerated)
                 throw CatalogUnconfirmedWrite();
             var current = await CatalogReadAfterWriteAsync(session, created, cancellationToken).ConfigureAwait(false);
-            if (current.Title != title || current.Visibility != visibility) throw CatalogUnconfirmedWrite();
+            if (current.Revision < created.Revision || current.Title != title || current.Visibility != visibility || current.IsGenerated)
+                throw CatalogUnconfirmedWrite();
             return current;
         }
         finally { _catalogMutationGate.Release(); }
@@ -184,12 +185,20 @@ internal sealed partial class MusicApi
         try
         {
             var fresh = await CatalogWritableAsync(session, expected, cancellationToken).ConfigureAwait(false);
-            using var json = await CatalogWriteAsync(CatalogPlaylistPath(fresh) + "/name", session,
+            var result = await CatalogWriteResultAsync(CatalogPlaylistPath(fresh) + "/name", session,
                 Form(("value", title)), cancellationToken).ConfigureAwait(false);
-            var response = CatalogMutationHeader(CatalogResult(json), fresh.Owner, fresh.Kind);
-            if (response.Title != title || response.Revision < fresh.Revision) throw CatalogUnconfirmedWrite();
+            var minimumRevision = fresh.Revision;
+            if (result is { } acknowledgement)
+            {
+                minimumRevision = CatalogMutationRevision(acknowledgement, fresh, title);
+                if (minimumRevision < fresh.Revision || minimumRevision == fresh.Revision && fresh.Title == title
+                    && !acknowledgement.TryGetProperty("title", out _))
+                    throw CatalogUnconfirmedWrite();
+            }
+            else if (fresh.Title == title) throw CatalogUnconfirmedWrite();
             var current = await CatalogReadAfterWriteAsync(session, fresh, cancellationToken).ConfigureAwait(false);
-            if (current.Title != title || !CatalogSameTracks(current.Tracks, fresh.Tracks)) throw CatalogUnconfirmedWrite();
+            if (current.Revision < minimumRevision || current.Title != title || current.IsGenerated
+                || !CatalogSameTracks(current.Tracks, fresh.Tracks)) throw CatalogUnconfirmedWrite();
             return current;
         }
         finally { _catalogMutationGate.Release(); }
@@ -202,16 +211,15 @@ internal sealed partial class MusicApi
         try
         {
             var fresh = await CatalogWritableAsync(session, expected, cancellationToken).ConfigureAwait(false);
-            using var json = await CatalogWriteAsync(CatalogPlaylistPath(fresh) + "/delete", session, null, cancellationToken).ConfigureAwait(false);
-            var result = CatalogResult(json);
-            if (result.ValueKind != JsonValueKind.String || !string.Equals(result.GetString(), "ok", StringComparison.OrdinalIgnoreCase))
-                throw new MusicException("Яндекс не подтвердил удаление плейлиста. Перечитайте список перед повтором.");
+            var result = await CatalogWriteResultAsync(CatalogPlaylistPath(fresh) + "/delete", session, null, cancellationToken).ConfigureAwait(false);
+            if (result is not { } acknowledgement || !string.Equals(JsonString(acknowledgement), "ok", StringComparison.OrdinalIgnoreCase))
+                throw CatalogUnconfirmedWrite();
             try
             {
                 var current = await GetPlaylistsAsync(session, fresh.Owner, cancellationToken).ConfigureAwait(false);
                 if (current.Any(p => p.Owner == fresh.Owner && p.PlaylistKind == fresh.Kind)) throw CatalogUnconfirmedWrite();
             }
-            catch (Exception ex) when (ex is MusicException or HttpRequestException or OperationCanceledException)
+            catch (Exception ex) when (CatalogReadbackUncertain(ex))
             { throw CatalogUnconfirmedWrite(); }
         }
         finally { _catalogMutationGate.Release(); }
@@ -255,12 +263,17 @@ internal sealed partial class MusicApi
         {
             var fresh = await CatalogWritableAsync(session, expected, cancellationToken).ConfigureAwait(false);
             // The form carries a JSON diff: albumId is camel case, and delete.to is exclusive.
-            using var json = await CatalogWriteAsync(CatalogPlaylistPath(fresh) + "/change", session,
+            var result = await CatalogWriteResultAsync(CatalogPlaylistPath(fresh) + "/change", session,
                 Form(("kind", fresh.Kind), ("revision", fresh.Revision.ToString(CultureInfo.InvariantCulture)), ("diff", diff)), cancellationToken).ConfigureAwait(false);
-            var response = CatalogMutationHeader(CatalogResult(json), fresh.Owner, fresh.Kind);
-            if (response.Revision <= fresh.Revision) throw CatalogUnconfirmedWrite();
-            var current = await CatalogReadAfterWriteAsync(session, response, cancellationToken).ConfigureAwait(false);
-            if (current.Revision < response.Revision || !current.Tracks.Select(t => t.RequestId).SequenceEqual(desired, StringComparer.Ordinal))
+            var minimumRevision = fresh.Revision;
+            if (result is { } acknowledgement)
+            {
+                minimumRevision = CatalogMutationRevision(acknowledgement, fresh);
+                if (minimumRevision <= fresh.Revision) throw CatalogUnconfirmedWrite();
+            }
+            var current = await CatalogReadAfterWriteAsync(session, fresh, cancellationToken).ConfigureAwait(false);
+            if (current.Revision <= fresh.Revision || current.Revision < minimumRevision || current.IsGenerated
+                || !current.Tracks.Select(t => t.RequestId).SequenceEqual(desired, StringComparer.Ordinal))
                 throw CatalogUnconfirmedWrite();
             return current;
         }
@@ -293,18 +306,41 @@ internal sealed partial class MusicApi
     private async Task<PlaylistDetails> CatalogReadAfterWriteAsync(Session session, PlaylistDetails playlist, CancellationToken cancellationToken)
     {
         try { return await GetPlaylistAsync(session, playlist.Owner, playlist.Kind, cancellationToken).ConfigureAwait(false); }
-        catch (Exception ex) when (ex is MusicException or HttpRequestException or OperationCanceledException)
+        catch (Exception ex) when (CatalogReadbackUncertain(ex))
         { throw CatalogUnconfirmedWrite(); }
     }
 
-    private async Task<JsonDocument> CatalogWriteAsync(string path, Session session, HttpContent? content, CancellationToken cancellationToken)
+    private static bool CatalogReadbackUncertain(Exception error) =>
+        error is MusicException { Authentication: false } or HttpRequestException or IOException or OperationCanceledException;
+
+    private async Task<JsonElement?> CatalogWriteResultAsync(string path, Session session, HttpContent? content, CancellationToken cancellationToken)
     {
         using (content)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            try { return await ApiAsync(HttpMethod.Post, path, session, content, cancellationToken).ConfigureAwait(false); }
-            catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
-            { throw CatalogUnconfirmedWrite(); }
+            try { return await SendApiRequestAsync(HttpMethod.Post, path, session, content, cancellationToken, ReadCatalogWriteAcknowledgementAsync).ConfigureAwait(false); }
+            // The request may have committed before the network failed.
+            catch (Exception error) when (error is HttpRequestException or IOException or OperationCanceledException) { return null; }
+        }
+    }
+
+    private static async Task<JsonElement?> ReadCatalogWriteAcknowledgementAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        if (response.StatusCode == HttpStatusCode.Conflict)
+            throw new MusicException("Яндекс отклонил изменение из-за конфликта. Перечитайте данные перед повтором.");
+        if (response.StatusCode == HttpStatusCode.RequestTimeout || (int)response.StatusCode >= 500) return null;
+        RequireApiSuccess(response);
+        JsonDocument json;
+        try { json = await ReadJsonAsync(response, cancellationToken).ConfigureAwait(false); }
+        // A successful HTTP status with a malformed body cannot confirm the mutation.
+        catch (MusicException) { return null; }
+        using (json)
+        {
+            if (json.RootElement.TryGetProperty("error", out _))
+                throw new MusicException("Яндекс отклонил изменение. Перечитайте данные перед повтором.");
+            if (!json.RootElement.TryGetProperty("result", out var result) || result.ValueKind == JsonValueKind.Null)
+                return null;
+            return CatalogResult(json).Clone();
         }
     }
 
@@ -315,6 +351,23 @@ internal sealed partial class MusicApi
             if (kind.Length == 0) throw CatalogUnconfirmedWrite();
             return CatalogPlaylistHeader(result, owner, kind);
         }
+        catch (MusicException) { throw CatalogUnconfirmedWrite(); }
+    }
+
+    private static int CatalogMutationRevision(JsonElement result, PlaylistDetails playlist, string? expectedTitle = null)
+    {
+        // The mutation path already fixes the identity. Fields present in a partial
+        // acknowledgement must agree with that identity before readback can confirm it.
+        if (result.ValueKind != JsonValueKind.Object
+            || result.TryGetProperty("kind", out _) && Text(result, "kind") != playlist.Kind
+            || result.TryGetProperty("uid", out _) && Text(result, "uid") != playlist.Owner
+            || result.TryGetProperty("owner", out var owner) && Text(owner, "uid") != playlist.Owner
+            || Text(result, "generatedPlaylistType").Length > 0 || Text(result, "artistPlaylistType").Length > 0)
+            throw CatalogUnconfirmedWrite();
+        if (result.TryGetProperty("title", out var title)
+            && (string.IsNullOrWhiteSpace(JsonString(title)) || expectedTitle is not null && JsonString(title) != expectedTitle))
+            throw CatalogUnconfirmedWrite();
+        try { return CatalogNonNegativeInt(result, "revision", "изменения плейлиста"); }
         catch (MusicException) { throw CatalogUnconfirmedWrite(); }
     }
 
@@ -386,25 +439,16 @@ internal sealed partial class MusicApi
     private static TrackRow CatalogTrack(JsonElement track, int number, string? contextAlbumId = null)
     {
         var id = CatalogRequiredText(track, "id", "трека");
-        var albumId = contextAlbumId;
         var navigationAlbum = TrackAlbum(track, contextAlbumId);
-        if (track.TryGetProperty("albums", out var albums) && albums.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var album in albums.EnumerateArray())
-            {
-                var candidate = Text(album, "id");
-                if (albumId is null && candidate.Length > 0) albumId = candidate;
-                if (candidate == albumId) break;
-            }
-        }
-        var title = Text(track, "title");
-        var version = Text(track, "version");
+        var albumId = contextAlbumId is not null && IsTrackReferencePart(contextAlbumId) ? contextAlbumId : navigationAlbum.Id;
+        var title = TrackText(JsonString(track, "title"));
         return new()
         {
             Number = number, Id = id, RequestId = new LikedId(id, albumId).RequestId,
-            Title = title.Length == 0 ? "Недоступный трек" : title + (version.Length == 0 ? "" : " · " + version),
-            Artist = CatalogArtistNames(track), Artists = ArtistReferences(track), Album = navigationAlbum.Title, AlbumId = navigationAlbum.Id, DurationMs = Int(track, "durationMs"), CoverUri = TrackArtwork(track),
-            Available = title.Length > 0 && (Bool(track, "available") || Bool(track, "availableForPremiumUsers") || Bool(track, "availableFullWithoutPermission"))
+            Title = TrackTitle(track), Artist = TrackText(CatalogArtistNames(track)), Artists = ArtistReferences(track),
+            PrimaryArtistName = PrimaryArtistName(track),
+            Album = TrackText(navigationAlbum.Title), AlbumId = navigationAlbum.Id, DurationMs = TrackDuration(track), CoverUri = TrackArtwork(track),
+            Available = !string.IsNullOrWhiteSpace(title) && (Bool(track, "available") || Bool(track, "availableForPremiumUsers") || Bool(track, "availableFullWithoutPermission"))
         };
     }
 
@@ -431,8 +475,7 @@ internal sealed partial class MusicApi
     // Optional presentation metadata cannot make a previously readable collection fail.
     // Accept only the documented field types and ISO dates; never infer a release from tracks or titles.
     private static string CatalogMetadataText(JsonElement row, string property)
-        => row.ValueKind == JsonValueKind.Object && row.TryGetProperty(property, out var value)
-            && value.ValueKind == JsonValueKind.String ? value.GetString()?.Trim() ?? "" : "";
+        => JsonString(row, property).Trim();
 
     private static int? CatalogOptionalYear(JsonElement row)
         => row.TryGetProperty("year", out var value) && value.ValueKind == JsonValueKind.Number
@@ -501,7 +544,7 @@ internal sealed partial class MusicApi
     private static string CatalogId(string id)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(id);
-        if (id.Length > 512 || id.Any(char.IsControl)) throw new ArgumentException("Некорректный идентификатор.", nameof(id));
+        if (id.Length > 512 || id is "." or ".." || id.Any(char.IsControl)) throw new ArgumentException("Некорректный идентификатор.", nameof(id));
         return Uri.EscapeDataString(id);
     }
     private static void CatalogTrackReference(LikedId track, bool requireAlbum)

@@ -8,6 +8,58 @@ internal static partial class Program
 {
     private static async Task CheckBrandMigration()
     {
+        await Run("Brand migration: bootstrap keeps demo isolated and recognizes explicit Velopack and Yamuse commands", () => Task.Run(() =>
+        {
+            Assert(YMusic.Native.Program.GetStartupMode([]) == YMusic.Native.Program.StartupMode.Normal
+                && YMusic.Native.Program.GetStartupMode(["--login"]) == YMusic.Native.Program.StartupMode.Normal,
+                "ordinary startup or login was routed as a lifecycle command");
+            Assert(YMusic.Native.Program.GetStartupMode(["--DeMo", "--capture", "preview.png"]) == YMusic.Native.Program.StartupMode.Demo,
+                "demo was admitted as ordinary startup");
+            Assert(YMusic.Native.Program.GetStartupMode(["--demo", "--uninstall"]) == YMusic.Native.Program.StartupMode.Uninstall
+                && YMusic.Native.Program.GetStartupMode(["--complete-full-uninstall", "fixture"]) == YMusic.Native.Program.StartupMode.Uninstall,
+                "demo or normal startup displaced an explicit Yamuse uninstall command");
+            foreach (var flag in new[] { "--veloapp-install", "--VELOAPP-UPDATED", "--veloapp-obsolete", "--veloapp-uninstall",
+                "--squirrel-install", "--squirrel-updated", "--squirrel-obsolete", "--squirrel-uninstall" })
+            {
+                Assert(YMusic.Native.Program.GetStartupMode([flag, "0.6.2", "--demo", "--uninstall"]) == YMusic.Native.Program.StartupMode.VelopackFastHook,
+                    "fast SDK callback did not have priority: " + flag);
+                Assert(YMusic.Native.Program.GetStartupMode([flag]) == YMusic.Native.Program.StartupMode.Normal
+                    && YMusic.Native.Program.GetStartupMode(["--demo", flag, "0.6.2"]) == YMusic.Native.Program.StartupMode.Demo,
+                    "SDK fast flags were accepted in an unsupported position: " + flag);
+            }
+        }));
+        await Run("Brand migration: startup checks the marker under the mutex and releases the secondary handle before notification", () => Task.Run(() =>
+        {
+            var paths = BrandFixture("startup-admission");
+            var marker = Path.Combine(paths.LocalData, "fake-uninstall.pending");
+            var mutexName = @"Local\Yamuse-startup-fixture-" + Guid.NewGuid().ToString("N");
+            var probes = 0;
+            bool BlocksStartup()
+            {
+                using var observer = new Mutex(false, mutexName, out var created);
+                Assert(!created, "startup checked the marker before acquiring the mutex");
+                probes++;
+                return File.Exists(marker);
+            }
+            void UnexpectedNotification() => throw new InvalidOperationException("a closed instance still kept a mutex handle open");
+
+            using var primary = App.TryBeginNormalStartup(mutexName, BlocksStartup, UnexpectedNotification);
+            Assert(primary is not null && probes == 1, "startup failed without a pending marker");
+            using var secondary = App.TryBeginNormalStartup(mutexName, BlocksStartup, () =>
+            {
+                File.WriteAllText(marker, "fixture only");
+                primary!.ReleaseMutex();
+                primary.Dispose();
+                using var duringNotification = App.TryBeginNormalStartup(mutexName, BlocksStartup, UnexpectedNotification);
+                Assert(duringNotification is null && probes == 2, "startup ignored a marker written before the previous owner exited");
+            });
+            Assert(secondary is null && File.Exists(marker), "the secondary startup passed admission or changed the marker");
+
+            File.Delete(marker);
+            using var next = App.TryBeginNormalStartup(mutexName, BlocksStartup, UnexpectedNotification);
+            Assert(next is not null && probes == 3, "an interrupted startup blocked the next attempt");
+            next!.ReleaseMutex();
+        }));
         await Run("Brand migration: fresh install uses Yamuse paths and creates no profile files", () => Task.Run(() =>
         {
             var paths = BrandFixture("fresh");
@@ -21,6 +73,44 @@ internal static partial class Program
                 RejectUninstall(() => BrandPaths.FromKnownFolders(bad, paths.Documents));
             RejectUninstall(() => BrandPaths.FromKnownFolders(paths.LocalData, Path.Combine(paths.LocalData, "nested")));
         }));
+        await Run("Brand migration: unavailable Documents still migrates the local profile and disables offline I/O", async () =>
+        {
+            var fixture = BrandFixture("documents-unavailable");
+            WriteBrandLegacy(fixture);
+            new SessionStore(fixture.LegacyDataDirectory).Save(FakeSession);
+            var local = BrandPaths.FromStartupKnownFolders(fixture.LocalData, fixture.Documents);
+            Assert(local.AvailableMusicDirectory == fixture.MusicDirectory, "accessible local Documents was rejected");
+            var missing = Path.Combine(fixture.Documents, "missing");
+            Assert(BrandPaths.FromStartupKnownFolders(fixture.LocalData, missing).AvailableMusicDirectory is null && !Directory.Exists(missing),
+                "startup admitted or created missing Documents");
+            var redirected = Path.Combine(Path.GetDirectoryName(fixture.Documents)!, "redirected-documents");
+            CreateUninstallJunction(redirected, fixture.Documents);
+            Assert(BrandPaths.FromStartupKnownFolders(fixture.LocalData, redirected).AvailableMusicDirectory is null,
+                "startup admitted linked Documents");
+            var paths = BrandPaths.FromStartupKnownFolders(fixture.LocalData, @"\\yamuse-fixture.invalid\documents");
+            Assert(paths.AvailableMusicDirectory is null, "UNC Documents was admitted as a local store");
+            paths.MigrateLegacyData();
+            Assert(new SessionStore(paths.DataDirectory).Load() == FakeSession && File.Exists(Path.Combine(fixture.LegacyMusicDirectory, "fixture.mp3"))
+                && !Directory.Exists(fixture.MusicDirectory), "offline unavailability changed profile migration or touched music");
+
+            var buffer = Path.Combine(paths.DataDirectory, "unused-offline-buffer");
+            var library = new OfflineLibrary(downloader: new AudioBuffer(buffer), knownPaths: paths);
+            var window = new MainWindow(restore: false, diagnosticsDirectory: paths.DataDirectory, offline: library);
+            try
+            {
+                Assert(!library.IsAvailable && library.Read().Count == 0 && library.GetPlaylists().Count == 0
+                    && library.ResolvePlaybackSource(new TrackRow { Id = "fixture" }) is null,
+                    "disabled offline storage exposed rows or a local source");
+                Assert(!Control<System.Windows.Controls.Button>(window, "OfflineNav").IsEnabled
+                    && !Control<System.Windows.Controls.Button>(window, "DownloadCenterNav").IsEnabled
+                    && !Control<System.Windows.Controls.Button>(window, "SettingsClearOffline").IsEnabled
+                    && Control<System.Windows.Controls.TextBlock>(window, "SettingsOfflineLocation").Text == BrandPaths.OfflineUnavailableMessage,
+                    "offline commands were enabled or the unavailable state was hidden");
+                await Throws<MusicException>(() => library.ClearAsync(default));
+                Assert(!Directory.Exists(buffer) && !Directory.Exists(fixture.MusicDirectory), "disabled offline storage created a backup location");
+            }
+            finally { window.Close(); }
+        });
         await Run("Brand migration: encrypted login settings playback sort indexes artwork and audio retain exact bytes", () => Task.Run(() =>
         {
             var paths = BrandFixture("bytes");
@@ -101,6 +191,25 @@ internal static partial class Program
             paths.MigrateLegacyData(source => Assert(source == paths.LegacyMusicDirectory, "retry moved already completed data tree"));
             AssertBrandTree(before, paths.DataDirectory);
             Assert(File.ReadAllText(Path.Combine(paths.MusicDirectory, "fixture.mp3")) == "fixture audio", "retry failed to finish music tree");
+        }));
+        await Run("Brand migration: long local paths preserve both complete trees", () => Task.Run(() =>
+        {
+            var paths = BrandFixture("long-local-paths", longPaths: true);
+            WriteBrandLegacy(paths);
+            var nested = Path.Combine(paths.LegacyMusicDirectory, "nested");
+            Directory.CreateDirectory(nested);
+            File.WriteAllText(Path.Combine(nested, "keep.txt"), "nested fixture");
+            Directory.CreateDirectory(paths.DataDirectory);
+            Directory.CreateDirectory(paths.MusicDirectory);
+            var data = BrandTreeBytes(paths.LegacyDataDirectory);
+            var music = BrandTreeBytes(paths.LegacyMusicDirectory);
+
+            paths.MigrateLegacyData();
+            Assert(!Directory.Exists(paths.LegacyDataDirectory) && !Directory.Exists(Path.GetDirectoryName(paths.LegacyMusicDirectory)),
+                "long-path migration left the legacy tree or its empty parent");
+            paths.MigrateLegacyData(_ => throw new InvalidOperationException("repeated long-path migration attempted a move"));
+            AssertBrandTree(data, paths.DataDirectory);
+            AssertBrandTree(music, paths.MusicDirectory);
         }));
         await Run("Brand migration: sharing failure and destination races never overwrite or delete data", () => Task.Run(() =>
         {
@@ -189,10 +298,11 @@ internal static partial class Program
         }));
     }
 
-    private static BrandPaths BrandFixture(string name)
+    private static BrandPaths BrandFixture(string name, bool longPaths = false)
     {
         var root = Path.GetFullPath(Path.Combine(_directory, "brand-migration", name + "-" + Guid.NewGuid().ToString("N")));
         Assert(root.StartsWith(Path.GetFullPath(_directory) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase), "brand fixture escaped results directory");
+        while (longPaths && root.Length < 270) root = Path.Combine(root, new string('m', 72));
         var paths = BrandPaths.FromKnownFolders(Path.Combine(root, "LocalAppData"), Path.Combine(root, "Documents"));
         Directory.CreateDirectory(paths.LocalData); Directory.CreateDirectory(paths.Documents);
         return paths;

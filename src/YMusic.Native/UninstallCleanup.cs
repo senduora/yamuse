@@ -146,7 +146,7 @@ internal static class UninstallCleanup
         if (!UninstallPathGuard.EntryExists(path)) return [];
         using var file = UninstallPathGuard.OpenOwnedFile(path, read: true, deleteAccess: false);
         using var stream = new FileStream(file, FileAccess.Read);
-        if (stream.Length > 64 * 1024 * 1024) throw new IOException("Индекс музыки слишком большой. Файлы сохранены.");
+        if (stream.Length > OfflineLibrary.MaximumIndexBytes) throw new IOException("Индекс музыки слишком большой. Файлы сохранены.");
         using var document = JsonDocument.Parse(stream, new JsonDocumentOptions { MaxDepth = 48 });
         if (document.RootElement.ValueKind != JsonValueKind.Array) throw new JsonException();
         var result = new List<IndexedAudio>();
@@ -211,7 +211,9 @@ internal static class UninstallCleanup
 
     private static bool Expected(Exception error) => error is IOException or UnauthorizedAccessException or Win32Exception
         or JsonException or KeyNotFoundException or InvalidOperationException or CryptographicException or MusicException;
-    private static string Explain(Exception error) => error is CryptographicException
+    private static string Explain(Exception error) => error is MusicException { Message: OfflineLibrary.RecoveryAuthenticationFailure }
+        ? OfflineLibrary.RecoveryAuthenticationFailure
+        : error is CryptographicException
         ? "Журнал восстановления очистки повреждён или не принадлежит этой папке. Музыкальные файлы сохранены."
         : error is JsonException or KeyNotFoundException or InvalidOperationException
         ? "Индекс музыки повреждён. Файлы сохранены."
@@ -245,7 +247,7 @@ internal static class UninstallPathGuard
         catch (DirectoryNotFoundException) { return false; }
     }
 
-    internal static AncestorLease HoldAncestors(string path)
+    internal static AncestorLease HoldAncestors(string path, bool create = false)
     {
         var handles = new List<IDisposable>();
         try
@@ -255,7 +257,13 @@ internal static class UninstallPathGuard
                 ancestors.Push(directory.FullName);
             while (ancestors.TryPop(out var directory))
             {
-                if (!EntryExists(directory)) return new AncestorLease(handles, complete: false);
+                if (!EntryExists(directory))
+                {
+                    if (!create) return new AncestorLease(handles, complete: false);
+                    // Its immediate parent is already pinned. Validate the new
+                    // entry before creating or opening anything beneath it.
+                    Directory.CreateDirectory(directory);
+                }
                 handles.Add(HoldDirectory(directory));
             }
             return new AncestorLease(handles, complete: true);
@@ -285,11 +293,29 @@ internal static class UninstallPathGuard
         catch { handle.Dispose(); throw; }
     }
 
-    private static SafeFileHandle Open(string path, uint access, uint share, uint flags)
+    internal static SafeFileHandle CreateStagedFile(string path, bool asynchronous = false, bool writeThrough = false, bool writeDacl = false)
     {
-        var handle = CreateFile(path, access, share, IntPtr.Zero, 3, flags, IntPtr.Zero);
+        const uint readWriteDelete = 0xC0010000, openReparsePoint = 0x00200000;
+        const uint writeDaclAccess = 0x00040000;
+        const uint overlapped = 0x40000000, flushWrites = 0x80000000;
+        return Open(path, readWriteDelete | (writeDacl ? writeDaclAccess : 0), 0, openReparsePoint | (asynchronous ? overlapped : 0)
+            | (writeThrough ? flushWrites : 0), disposition: 1);
+    }
+
+    private static SafeFileHandle Open(string path, uint access, uint share, uint flags, uint disposition = 3)
+    {
+        var handle = CreateFile(ToWin32Path(path), access, share, IntPtr.Zero, disposition, flags, IntPtr.Zero);
         if (handle.IsInvalid) { var error = Marshal.GetLastWin32Error(); handle.Dispose(); throw new Win32Exception(error); }
         return handle;
+    }
+
+    // The managed file APIs add this prefix themselves. Keep canonical paths
+    // for validation and comparisons, and extend only at the native boundary.
+    internal static string ToWin32Path(string path)
+    {
+        if (path.Length < 260) return path;
+        var fullPath = Path.GetFullPath(path);
+        return fullPath.StartsWith(@"\\", StringComparison.Ordinal) ? fullPath : @"\\?\" + fullPath;
     }
 
     private static void Validate(SafeFileHandle handle, bool directory)
@@ -300,11 +326,28 @@ internal static class UninstallPathGuard
         if (((information.Attributes & 0x10) != 0) != directory) throw new IOException("Тип объекта изменился. Удаление остановлено.");
     }
 
-    internal static void DeleteByHandle(SafeFileHandle handle)
+    internal static void DeleteByHandle(SafeFileHandle handle) => SetDeleteDisposition(handle, delete: true);
+
+    internal static void SetDeleteDisposition(SafeFileHandle handle, bool delete)
     {
-        var disposition = new Disposition { Delete = 1 };
+        var disposition = new Disposition { Delete = delete ? (byte)1 : (byte)0 };
         if (!SetFileInformationByHandle(handle, 4, ref disposition, (uint)Marshal.SizeOf<Disposition>()))
             throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+
+    internal static void UnlinkByHandle(SafeFileHandle handle)
+    {
+        const int FileDispositionInfoEx = 21;
+        const uint Delete = 1, PosixSemantics = 2;
+        uint flags = Delete | PosixSemantics;
+        if (!SetFileInformationByHandle(handle, FileDispositionInfoEx, ref flags, sizeof(uint)))
+            DeleteByHandle(handle);
+    }
+
+    internal static void DiscardStagedFile(SafeFileHandle handle)
+    {
+        try { DeleteByHandle(handle); }
+        catch (Win32Exception) { }
     }
 
     internal sealed class AncestorLease(List<IDisposable> handles, bool complete) : IDisposable
@@ -322,4 +365,7 @@ internal static class UninstallPathGuard
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int kind, ref Disposition information, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int kind, ref uint information, uint size);
 }

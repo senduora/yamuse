@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net.Http;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 
@@ -14,30 +15,51 @@ internal sealed partial class MusicApi
     private const int WaveQueueLimit = 20;
     private readonly SemaphoreSlim _waveGate = new(1, 1);
     private readonly object _waveSync = new();
+    // Confirmed refreshes share the same in-memory owner across token rotations.
+    // A newly authenticated or loaded session starts a separate chain.
+    private readonly ConditionalWeakTable<Session, object> _waveOwners = new();
     private WaveState? _waveState;
     private long _waveGeneration;
 
     public async Task<RadioBatch> StartWaveAsync(Session session, CancellationToken cancellationToken,
         WaveMode mode = WaveMode.Personal, string? trackSeedId = null, string? albumSeedId = null)
     {
+        var candidate = await RequestWaveAsync(session, cancellationToken, mode, trackSeedId, albumSeedId).ConfigureAwait(false);
+        return AcceptWave(candidate, cancellationToken);
+    }
+
+    // Fetching a new station must not displace the playing station. The window
+    // accepts the candidate only after it has checked the current playback intent.
+    internal async Task<WaveCandidate> RequestWaveAsync(Session session, CancellationToken cancellationToken,
+        WaveMode mode, string? trackSeedId, string? albumSeedId)
+    {
         _ = WaveSeed(mode, trackSeedId, albumSeedId);
         var generation = WaveGeneration();
-        await _waveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            ThrowIfWaveReset(generation, cancellationToken);
-            var batch = await NewWaveBatchAsync(session, [], mode, trackSeedId, albumSeedId, cancellationToken).ConfigureAwait(false);
-            CommitWaveBatch(batch, [], session, generation, cancellationToken);
-            return batch;
-        }
-        finally { _waveGate.Release(); }
+        ThrowIfWaveReset(generation, cancellationToken);
+        var batch = await NewWaveBatchAsync(session, [], mode, trackSeedId, albumSeedId, cancellationToken).ConfigureAwait(false);
+        ThrowIfWaveReset(generation, cancellationToken);
+        return new(batch with { Station = new object() }, WaveOwner(session), generation);
+    }
+
+    internal RadioBatch AcceptWave(WaveCandidate candidate, CancellationToken cancellationToken)
+    {
+        CommitWaveBatch(candidate.Batch, [], candidate.Account, candidate.Generation, cancellationToken);
+        return candidate.Batch;
     }
 
     /// <summary>
     /// Gets another server batch. Its SessionId can change when the server has
     /// forgotten the session; feedback must use the batch that actually played.
     /// </summary>
-    public async Task<RadioBatch> MoreWaveAsync(Session session, string sessionId, CancellationToken cancellationToken)
+    public Task<RadioBatch> MoreWaveAsync(Session session, string sessionId, CancellationToken cancellationToken)
+        => MoreWaveCoreAsync(session, sessionId, null, cancellationToken);
+
+    // An ignored UI result can still have renewed the server ID. Only the batch's
+    // station identity grants access to a newer ID in that same account and station.
+    internal Task<RadioBatch> MoreWaveAsync(Session session, RadioBatch batch, CancellationToken cancellationToken)
+        => MoreWaveCoreAsync(session, batch.SessionId, batch.Station, cancellationToken);
+
+    private async Task<RadioBatch> MoreWaveCoreAsync(Session session, string sessionId, object? station, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
         var generation = WaveGeneration();
@@ -48,12 +70,13 @@ internal sealed partial class MusicApi
             WaveState state;
             lock (_waveSync)
             {
-                state = _waveState is { } current && current.SessionId == sessionId && current.Owner == session
+                state = _waveState is { } current && ReferenceEquals(current.Owner, WaveOwner(session))
+                    && (station is null ? current.SessionId == sessionId : ReferenceEquals(current.Station, station))
                     ? current : throw new MusicException("Сессия Моей волны больше не активна. Запустите волну заново.");
             }
             using var content = WaveJson(new { queue = state.Received });
             using var json = await ApiAsync(HttpMethod.Post,
-                $"/rotor/session/{Uri.EscapeDataString(sessionId)}/tracks", session, content, cancellationToken).ConfigureAwait(false);
+                $"/rotor/session/{CatalogId(state.SessionId)}/tracks", session, content, cancellationToken).ConfigureAwait(false);
             ThrowIfWaveReset(generation, cancellationToken);
             var result = Result(json);
             if (result.ValueKind != JsonValueKind.Object) throw WaveFormatError();
@@ -75,9 +98,10 @@ internal sealed partial class MusicApi
                     // received queue. No local shuffle or synthesized tracks.
                     batch = await NewWaveBatchAsync(session, state.Received, state.Mode, state.TrackSeedId, state.AlbumSeedId, cancellationToken).ConfigureAwait(false);
                 }
-                else { batch = ReadWaveBatch(result, sessionId, state.Mode, state.TrackSeedId, state.AlbumSeedId); }
+                else { batch = ReadWaveBatch(result, state.SessionId, state.Mode, state.TrackSeedId, state.AlbumSeedId); }
             }
-            CommitWaveBatch(batch, state.Received, session, generation, cancellationToken);
+            batch = batch with { Station = state.Station };
+            CommitWaveBatch(batch, state.Received, state.Owner, generation, cancellationToken, expectedStation: state.Station);
             return batch;
         }
         finally { _waveGate.Release(); }
@@ -108,7 +132,7 @@ internal sealed partial class MusicApi
         lock (_waveSync)
         {
             ThrowIfWaveReset(generation, cancellationToken);
-            if (_waveState is not { } current || current.Owner != session)
+            if (_waveState is not { } current || !ReferenceEquals(current.Owner, WaveOwner(session)))
                 throw new OperationCanceledException("Событие Моей волны отменено после смены входа.", cancellationToken);
         }
 
@@ -121,7 +145,7 @@ internal sealed partial class MusicApi
         if (type is "trackFinished" or "skip") radioEvent["totalPlayedSeconds"] = playedSeconds;
         using var content = WaveJson(new Dictionary<string, object?> { ["event"] = radioEvent, ["batchId"] = batchId });
         using var json = await ApiAsync(HttpMethod.Post,
-            $"/rotor/session/{Uri.EscapeDataString(sessionId)}/feedback/", session, content, cancellationToken).ConfigureAwait(false);
+            $"/rotor/session/{CatalogId(sessionId)}/feedback/", session, content, cancellationToken).ConfigureAwait(false);
         ThrowIfWaveReset(generation, cancellationToken);
         if (Result(json).ValueKind != JsonValueKind.Object)
             throw new MusicException("Сервис не подтвердил событие Моей волны.");
@@ -143,7 +167,7 @@ internal sealed partial class MusicApi
         var result = Result(json);
         if (result.ValueKind != JsonValueKind.Object) throw WaveFormatError();
         var sessionId = Text(result, "radioSessionId");
-        if (string.IsNullOrWhiteSpace(sessionId)) throw WaveFormatError();
+        if (string.IsNullOrWhiteSpace(sessionId) || sessionId.Length > 512 || sessionId is "." or ".." || sessionId.Any(char.IsControl)) throw WaveFormatError();
         return ReadWaveBatch(result, sessionId, mode, trackSeedId, albumSeedId);
     }
 
@@ -160,22 +184,20 @@ internal sealed partial class MusicApi
             if (itemType.Length > 0 && itemType != "track") continue;
             if (!item.TryGetProperty("track", out var track) || track.ValueKind != JsonValueKind.Object) throw WaveFormatError();
             var id = Text(track, "id");
-            if (string.IsNullOrWhiteSpace(id)) throw WaveFormatError();
+            if (string.IsNullOrWhiteSpace(id) || id.Length > 512 || id.Any(char.IsControl)) throw WaveFormatError();
             var albums = track.TryGetProperty("albums", out var albumArray) && albumArray.ValueKind == JsonValueKind.Array
                 ? albumArray.EnumerateArray().ToArray() : [];
             var albumId = albums.Length > 0 ? Text(albums[0], "id") : "";
             var artists = track.TryGetProperty("artists", out var artistArray) && artistArray.ValueKind == JsonValueKind.Array
                 ? string.Join(", ", artistArray.EnumerateArray().Select(artist => Text(artist, "name"))) : "";
-            var title = Text(track, "title");
-            var version = Text(track, "version");
-            long.TryParse(Text(track, "durationMs"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var durationMs);
             tracks.Add(new TrackRow
             {
                 Number = tracks.Count + 1, Id = id,
-                RequestId = albumId.Length > 0 && !id.Contains(':') ? $"{id}:{albumId}" : id,
-                Title = title.Length == 0 ? "Недоступный трек" : title + (version.Length > 0 ? " · " + version : ""),
-                Artist = artists, Artists = ArtistReferences(track), Album = albums.Length > 0 ? Text(albums[0], "title") : "", CoverUri = TrackArtwork(track),
-                DurationMs = Math.Max(0, durationMs),
+                RequestId = IsTrackReferencePart(albumId) && !id.Contains(':') ? $"{id}:{albumId}" : id,
+                Title = TrackTitle(track), Artist = TrackText(artists), Artists = ArtistReferences(track),
+                PrimaryArtistName = PrimaryArtistName(track),
+                Album = albums.Length > 0 ? TrackText(JsonString(albums[0], "title")) : "", CoverUri = TrackArtwork(track),
+                DurationMs = TrackDuration(track),
                 Available = Bool(track, "available") || Bool(track, "availableForPremiumUsers") || Bool(track, "availableFullWithoutPermission")
             });
         }
@@ -184,14 +206,15 @@ internal sealed partial class MusicApi
     }
 
     private long WaveGeneration() { lock (_waveSync) return _waveGeneration; }
+    private object WaveOwner(Session session) => _waveOwners.GetValue(session, static _ => new object());
     private void ThrowIfWaveReset(long generation, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         lock (_waveSync)
             if (generation != _waveGeneration) throw new OperationCanceledException("Запрос Моей волны отменён после сброса входа.", cancellationToken);
     }
-    private void CommitWaveBatch(RadioBatch batch, IReadOnlyList<string> received, Session owner, long generation,
-        CancellationToken cancellationToken)
+    private void CommitWaveBatch(RadioBatch batch, IReadOnlyList<string> received, object owner, long generation,
+        CancellationToken cancellationToken, object? expectedStation = null)
     {
         var tail = new List<string>(received);
         foreach (var track in batch.Tracks)
@@ -203,7 +226,9 @@ internal sealed partial class MusicApi
         lock (_waveSync)
         {
             ThrowIfWaveReset(generation, cancellationToken);
-            _waveState = new(batch.SessionId, tail.ToArray(), batch.Mode, batch.TrackSeedId, batch.AlbumSeedId, owner);
+            if (expectedStation is not null && !ReferenceEquals(expectedStation, _waveState?.Station))
+                throw new OperationCanceledException("Активная волна сменилась.", cancellationToken);
+            _waveState = new(batch.SessionId, tail.ToArray(), batch.Mode, batch.TrackSeedId, batch.AlbumSeedId, owner, batch.Station!);
         }
     }
     // Collection seed is supplied by the service's stations/list response, not a
@@ -228,5 +253,6 @@ internal sealed partial class MusicApi
     };
     private static StringContent WaveJson(object value) => new(JsonSerializer.Serialize(value), Encoding.UTF8, "application/json");
     private static MusicException WaveFormatError() => new("Изменился формат ответа Моей волны. Выдача не была принята.");
-    private sealed record WaveState(string SessionId, string[] Received, WaveMode Mode, string? TrackSeedId, string? AlbumSeedId, Session Owner);
+    internal sealed record WaveCandidate(RadioBatch Batch, object Account, long Generation);
+    private sealed record WaveState(string SessionId, string[] Received, WaveMode Mode, string? TrackSeedId, string? AlbumSeedId, object Owner, object Station);
 }

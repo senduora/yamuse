@@ -10,32 +10,37 @@ public partial class MainWindow
     private bool _advancingPlayback;
     private WaveListening? _fadingWaveListening;
     private bool _fadingWaveNatural;
+    private int? _wavePrefetchPlaybackGeneration;
 
     private sealed record PreloadIdentity(long QueueVersion, long? CurrentOccurrence, long? NextOccurrence,
-        int PlaybackGeneration, int AccountGeneration, AudioQuality Quality, string? LocalPath);
+        int PlaybackGeneration, int AccountGeneration, AudioQuality Quality, LocalAudioSource? LocalSource);
     private sealed record PreparedPlayback(PreloadIdentity Identity, TrackRow Track, Uri Source, string QualityLabel, bool Offline);
 
-    private PreloadIdentity NextPreloadIdentity(TrackRow next, bool naturalEnd = true) => new(
+    private PreloadIdentity NextPreloadIdentity(LocalAudioSource? localSource, bool naturalEnd = true) => new(
         _playbackQueue.Version, _playbackQueue.CurrentOccurrenceToken, _playbackQueue.PeekNextOccurrenceToken(naturalEnd),
-        _playbackGeneration, _accountGeneration, SelectedQuality, next.LocalPath ?? next.DownloadedPath);
+        _playbackGeneration, _accountGeneration, SelectedQuality, localSource);
 
     private void RefreshNextPreparation()
     {
-        if (_closed || _loadingStream || !_player.HasSource || _current is null || _offlineMaintenance || !CanAutoAdvancePlaybackOptions())
+        if (_closed || _loadingStream || !_player.HasSource || _current is null || _offlineMaintenance
+            || IsAudioOutputUnavailable || !CanAutoAdvancePlaybackOptions())
         { CancelNextPreparation(); return; }
-        if (_advancingPlayback || _advancingWave) return;
+        if (_advancingPlayback) return;
         // Obtain another server batch while there is still music to play. This
         // adds metadata only; a prefetched track never produces listening feedback.
-        if (_waveBatch is not null && _waveSources.ContainsKey(_current) && _playbackQueue.CurrentIndex >= _queue.Count - 2)
+        if (!_advancingWave && IsContinuableWaveTrack(_current) && _playbackQueue.CurrentIndex >= _queue.Count - 2
+            && _wavePrefetchPlaybackGeneration != _playbackGeneration)
         {
-            CancelNextPreparation();
+            _wavePrefetchPlaybackGeneration = _playbackGeneration;
             _ = ExtendWaveQueueAsync();
-            return;
         }
         var next = _playbackQueue.PeekNext(naturalEnd: true);
         if (next is null) { CancelNextPreparation(); return; }
-        ApplyOfflineStates([next]);
-        var identity = NextPreloadIdentity(next);
+        ApplyTrackLikeStates([next]);
+        var local = RefreshLocalPlaybackSource(next);
+        if (local is null && (next.IsOfflineLibraryRow || next.LocalPath is not null || _session is null || !next.Available))
+        { CancelNextPreparation(); return; }
+        var identity = NextPreloadIdentity(local);
         if (_preloadIdentity == identity) return; // Includes a failed attempt: no retry loop.
         CancelNextPreparation();
         _preloadIdentity = identity;
@@ -49,28 +54,57 @@ public partial class MainWindow
             try
             {
                 AudioDescriptor? audio = null;
-                var localPath = identity.LocalPath;
-                if (localPath is null)
+                var localSource = identity.LocalSource;
+                if (localSource is null)
                 {
                     var session = await EnsureSessionAsync(cts.Token);
                     audio = await _api.ResolveAudioAsync(session, next.RequestId, identity.Quality, cts.Token);
                 }
                 else
                 {
-                    audio = await TryResolveOfflineUpgradeAsync(next, localPath, identity.Quality, cts.Token);
-                    if (audio is not null) localPath = null;
+                    audio = await TryResolveOfflineUpgradeAsync(next, localSource.Path, identity.Quality, cts.Token);
                 }
                 cts.Token.ThrowIfCancellationRequested();
-                if (_preloadIdentity != identity || NextPreloadIdentity(next) != identity) return;
-                var source = localPath is { } path ? new Uri(path) : audio!.Uri;
-                var prepared = new PreparedPlayback(identity, next, source,
-                    localPath is not null ? next.LocalQuality ?? next.DownloadedQuality ?? "Локальное аудио" : audio!.QualityLabel, localPath is not null);
-                _preparedPlayback = prepared;
-                if (audio is null) await _player.PrepareNextAsync(source, cts.Token);
-                else await _player.PrepareNextAsync(audio, cts.Token);
+                if (_preloadIdentity != identity || NextPreloadIdentity(localSource) != identity) return;
+                if (localSource is { Bytes: not null } && BlocksOfflineOpen(next.Id)) return;
+                if (_offline.ResolvePlaybackSource(next) != localSource)
+                {
+                    _ = Dispatcher.InvokeAsync(() =>
+                    {
+                        if (_preloadIdentity == identity) RefreshNextPreparation();
+                    });
+                    return;
+                }
+                try { await PrepareSourceAsync(audio, localSource); }
+                catch (Exception error) when (audio is not null && localSource is not null && CanFallbackFromOnlineOpen(error)
+                    && !cts.IsCancellationRequested && _preloadIdentity == identity && NextPreloadIdentity(localSource) == identity
+                    && !IsAudioOutputUnavailable && !BlocksOfflineOpen(next.Id))
+                {
+                    var fallback = _offline.ResolvePlaybackSource(next);
+                    if (fallback is null) throw;
+                    _diagnostics.LastErrorType = "PreloadUpgradeOpen:" + error.GetType().Name;
+                    _preloadIdentity = identity = identity with { LocalSource = fallback };
+                    await PrepareSourceAsync(null, fallback);
+                }
                 cts.Token.ThrowIfCancellationRequested();
                 if (_preloadIdentity != identity) return;
                 _diagnostics.Timing("next_track_prepared_ms", clock.Elapsed.TotalMilliseconds);
+
+                async Task PrepareSourceAsync(AudioDescriptor? stream, LocalAudioSource? local)
+                {
+                    _preparedPlayback = new(identity, next, stream?.Uri ?? new Uri(local!.Path),
+                        stream?.QualityLabel ?? local!.Quality, stream is null);
+                    if (stream is null) await _player.PrepareLocalNextAsync(local!, cts.Token);
+                    else
+                    {
+                        await _player.PrepareNextAsync(stream, cts.Token);
+                        if (local is not null && _preloadIdentity == identity && LooksLikePreview(next, _player.PreparedDuration))
+                        {
+                            _player.DiscardPrepared();
+                            throw PreviewDurationError();
+                        }
+                    }
+                }
             }
             catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
             catch (Exception ex)
@@ -98,16 +132,21 @@ public partial class MainWindow
     {
         if (_preparedPlayback is not { } prepared || !_player.HasPrepared) return null;
         var next = _playbackQueue.PeekNext(naturalEnd);
-        return next is not null && ReferenceEquals(next, prepared.Track) && NextPreloadIdentity(next, naturalEnd) == prepared.Identity
-            ? prepared : null;
+        if (next is null || !ReferenceEquals(next, prepared.Track)
+            || NextPreloadIdentity(prepared.Identity.LocalSource, naturalEnd) != prepared.Identity
+            || LooksLikePreview(next, _player.PreparedDuration)) return null;
+        if (RefreshLocalPlaybackSource(next) == prepared.Identity.LocalSource) return prepared;
+        CancelNextPreparation();
+        return null;
     }
 
-    private bool PromotePrepared(TrackRow track, PreparedPlayback? prepared, bool automatic)
+    private bool PromotePrepared(TrackRow track, PreparedPlayback? prepared, LocalAudioSource? localSource, long? occurrence, bool automatic)
     {
-        if (prepared is null || !ReferenceEquals(prepared.Track, track) || prepared.Identity.NextOccurrence != _playbackQueue.CurrentOccurrenceToken
+        if (IsAudioOutputUnavailable || prepared is null || !ReferenceEquals(prepared.Track, track) || prepared.Identity.NextOccurrence != occurrence
             || prepared.Identity.PlaybackGeneration != _playbackGeneration || prepared.Identity.AccountGeneration != _accountGeneration
-            || prepared.Identity.Quality != SelectedQuality) return false;
-        _player.FinishTransition();
+            || prepared.Identity.Quality != SelectedQuality || prepared.Identity.LocalSource != localSource
+            || localSource is { Bytes: not null } && BlocksOfflineOpen(track.Id)
+            || LooksLikePreview(track, _player.PreparedDuration)) return false;
         var remaining = Math.Max(0, (_player.Duration - _player.Position).TotalSeconds / _player.SpeedRatio);
         var fade = _player.IsPlaying ? Math.Min(automatic ? CrossfadeSeconds : CrossfadeSeconds > 0 ? .22 : 0, remaining) : 0;
         if (!_player.TryPlayPrepared(prepared.Source, TimeSpan.FromSeconds(fade))) return false;
@@ -134,7 +173,7 @@ public partial class MainWindow
         var duration = _player.Duration.TotalSeconds;
         var remaining = (duration - _player.Position.TotalSeconds) / _player.SpeedRatio;
         var overlap = Math.Min(CrossfadeSeconds, duration / _player.SpeedRatio / 3);
-        if (duration > 0 && remaining > 0 && remaining <= overlap && ReadyNextPlayback(true) is not null)
-            _ = AdvanceAsync(1, true);
+        if (duration > 0 && remaining > 0 && remaining <= overlap && ReadyNextPlayback(true) is { } prepared)
+            _ = AdvanceCoreAsync(1, true, earlyFade: prepared);
     }
 }

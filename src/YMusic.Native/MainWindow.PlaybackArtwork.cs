@@ -20,8 +20,7 @@ public partial class MainWindow
             .Select(row => new
             {
                 Row = row,
-                Reference = new LikedId(row.Id, row.RequestId == row.Id
-                    ? row.AlbumId : row.RequestId[(row.Id.Length + 1)..])
+                Reference = new LikedId(row.Id, PlaybackStateStore.ArtworkAlbumId(row.Id, row.RequestId, row.AlbumId))
             })
             .GroupBy(item => item.Reference.RequestId, StringComparer.Ordinal)
             .OrderByDescending(group => group.Any(item => ReferenceEquals(item.Row, _current)))
@@ -32,6 +31,7 @@ public partial class MainWindow
             }).ToArray();
         try
         {
+            var anyChanged = false;
             foreach (var page in groups.Chunk(100))
             {
                 if (!OwnsAccount()) return;
@@ -54,8 +54,11 @@ public partial class MainWindow
                     foreach (var row in group.Rows)
                     {
                         if (!OwnsAccount()) return;
-                        if (liveRows.Contains(row) && row.SetMissingArtwork(source.CoverUri)
-                            && ReferenceEquals(row, _current)) currentChanged = true;
+                        if (liveRows.Contains(row) && row.SetMissingArtwork(source.CoverUri))
+                        {
+                            anyChanged = true;
+                            currentChanged |= ReferenceEquals(row, _current);
+                        }
                         if (++visited % 16 != 0) continue;
                         if (currentChanged) { ApplyRestoredPlaybackArtwork(); currentChanged = false; }
                         await Dispatcher.Yield(DispatcherPriority.Background);
@@ -65,7 +68,7 @@ public partial class MainWindow
                 }
                 if (currentChanged) ApplyRestoredPlaybackArtwork();
             }
-            if (OwnsAccount()) PersistPlaybackStateIfDue();
+            if (anyChanged && OwnsAccount()) PersistPlaybackStateIfDue();
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || _closed) { }
         catch (Exception error) when (error is MusicException or HttpRequestException or JsonException
@@ -81,6 +84,7 @@ public partial class MainWindow
     {
         if (_current is not { } current || _closed) return;
         Artwork.SetSourceUri(PlayerCover, current.CoverUri);
+        SetLyricsArtwork(current);
         // Refresh the expanded player without rebuilding the queue or changing
         // its selected occurrence. Queue images observe CoverUri notifications.
         UpdateControls();

@@ -18,7 +18,7 @@ internal sealed partial class MusicApi
         var brief = CatalogResult(briefJson);
         CatalogObject(brief, "исполнителя");
         if (!brief.TryGetProperty("artist", out var artist)) throw new MusicException("В ответе Яндекса нет исполнителя.");
-        ArtistIdentity(artist, artistId, required: true);
+        ArtistIdentity(artist, artistId);
         var name = CatalogRequiredText(artist, "name", "исполнителя");
         var top = ArtistOptionalArray(brief, "popularTracks")
             .Select((row, index) => CatalogTrack(row, index + 1)).ToArray();
@@ -31,12 +31,19 @@ internal sealed partial class MusicApi
         // service's actual monthly listener statistic is shown as this audience.
         if (listeners is null)
         {
-            using var aboutJson = await ApiAsync(HttpMethod.Get, $"/artists/{id}/about-artist", session, null, cancellationToken).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
-            var about = ArtistAboutResult(aboutJson, artistId);
-            if (description.Length == 0) description = ArtistDescription(about);
-            listeners = about.TryGetProperty("stats", out var stats) ? ArtistMonthlyListeners(stats) : null;
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(4));
+            try
+            {
+                using var aboutJson = await ApiAsync(HttpMethod.Get, $"/artists/{id}/about-artist", session, null, timeout.Token).ConfigureAwait(false);
+                var about = ArtistAboutResult(aboutJson, artistId);
+                if (description.Length == 0) description = ArtistDescription(about);
+                listeners = about.TryGetProperty("stats", out var stats) ? ArtistMonthlyListeners(stats) : null;
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { }
+            catch (Exception error) when (error is MusicException { Authentication: false } or HttpRequestException or IOException) { }
         }
+        cancellationToken.ThrowIfCancellationRequested();
         return new(artistId, name, EntityArtwork(artist, "artist"), listeners,
             Array.AsReadOnly(top), Array.AsReadOnly(albums), Array.AsReadOnly(similar), description);
     }
@@ -50,7 +57,7 @@ internal sealed partial class MusicApi
         var about = wrapped ? CatalogResult(json) : json.RootElement;
         CatalogObject(about, "сведений об исполнителе");
         if (about.TryGetProperty("artist", out var artist) && artist.ValueKind != JsonValueKind.Null)
-            ArtistIdentity(artist, artistId, required: !wrapped);
+            ArtistIdentity(artist, artistId);
         else if (!wrapped) throw new MusicException("В ответе Яндекса нет исполнителя для статистики.");
         if (!wrapped && (about.TryGetProperty("success", out var success) && success.ValueKind == JsonValueKind.False
             || Text(about, "status").Length > 0 && Text(about, "status").ToLowerInvariant() is not ("ok" or "success")))
@@ -58,11 +65,10 @@ internal sealed partial class MusicApi
         return about;
     }
 
-    private static void ArtistIdentity(JsonElement artist, string expected, bool required)
+    private static void ArtistIdentity(JsonElement artist, string expected)
     {
         CatalogObject(artist, "исполнителя");
-        var actual = Text(artist, "id");
-        if ((required || actual.Length > 0) && actual != expected)
+        if (Text(artist, "id") != expected)
             throw new MusicException("Яндекс вернул другого исполнителя.");
     }
 
@@ -80,8 +86,19 @@ internal sealed partial class MusicApi
     private static string ArtistDescription(JsonElement row)
     {
         if (!row.TryGetProperty("description", out var description)) return "";
-        return description.ValueKind == JsonValueKind.String ? description.GetString() ?? ""
+        return description.ValueKind == JsonValueKind.String ? JsonString(description)
             : description.ValueKind == JsonValueKind.Object ? Text(description, "text") : "";
+    }
+
+    private static string? PrimaryArtistName(JsonElement track)
+    {
+        if (!track.TryGetProperty("artists", out var artists) || artists.ValueKind != JsonValueKind.Array) return null;
+        foreach (var artist in artists.EnumerateArray())
+        {
+            var name = TrackText(JsonString(artist, "name"));
+            if (!string.IsNullOrWhiteSpace(name)) return name;
+        }
+        return null;
     }
 
     // Keep names for display separately; an artist is navigable only when the
@@ -93,9 +110,10 @@ internal sealed partial class MusicApi
         foreach (var artist in artists.EnumerateArray())
         {
             var id = Text(artist, "id");
-            var name = Text(artist, "name");
+            var name = TrackText(JsonString(artist, "name"));
             if (string.IsNullOrWhiteSpace(id) || id.Length > 512 || id.Any(char.IsControl) || string.IsNullOrWhiteSpace(name)) continue;
             result.Add(new(id, name));
+            if (result.Count == 100) break;
         }
         return Array.AsReadOnly(result.ToArray());
     }

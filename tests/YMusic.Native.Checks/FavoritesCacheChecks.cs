@@ -17,11 +17,17 @@ internal static partial class Program
     private static async Task CheckFavoritesCache()
     {
         await Run("FavoritesCache: 3900 cached rows render during held IDs and repeated refresh reuses metadata without Reset", FcWarm);
+        await Run("FavoritesCache: reopening and Back show current rows immediately and coalesce a held ID check", FcOpen);
+        await Run("FavoritesCache: only verified IDs change restored favorite download eligibility", FcVerifiedDownloadEligibility);
         await Run("FavoritesCache: composite album changes and reordered IDs fetch only missing metadata", FcChangedIds);
         await Run("FavoritesCache: stale and explicit refresh keep the old view until replacement metadata arrives", FcRevalidation);
         await Run("FavoritesCache: failed ID and metadata refresh preserve the complete visible and persisted snapshot", FcFailures);
         await Run("FavoritesCache: superseded refresh signout and late account cache reads cannot restore obsolete rows", FcRaces);
         await Run("FavoritesCache: confirmed unlike survives late cache ID and metadata responses", FcUnlike);
+        await Run("FavoritesCache: confirmed like preserves canonical order despite failed follow-up refresh", FcLike);
+        await Run("FavoritesCache: unlike publishes the full readback order and discards an older in-flight response", FcUnlikeReadback);
+        await Run("FavoritesCache: failed pages preserve the validated snapshot and an omitted track retains safe metadata", FcMetadataPages);
+        await Run("FavoritesCache: owner switch discards a late mutation and the close drain waits for all admitted owners", FcMutationAndDrain);
         await Run("FavoritesCache: cold 100-row IO stays off dispatcher while cooperative appends preserve queue and UI marks", FcColdWorker);
         await Run("FavoritesCache: replacement retains sort filter selection viewport and exact active queue occurrence", FcPresentation);
     }
@@ -50,6 +56,80 @@ internal static partial class Program
             "repeated unchanged refresh downloaded metadata or republished the view");
         f.Facts(new { rows = 3900, cacheVisibleMs, heldIdsDispatcherSentinel = sentinel, metadataRequests = 0,
             initialResets = resetBefore, repeatedNotifications = events.Count, f.Http.IdRequests });
+    }
+
+    private static async Task FcOpen()
+    {
+        using var f = await FcFixture.Create("reopen", 8);
+        await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+        var original = f.Source.ToArray();
+        var firstIds = f.Http.IdRequests;
+        var newFavorite = FcLiked(FcRow(15));
+        f.Http.Likes = [newFavorite, .. f.Http.Likes.Reverse()];
+        SaInvoke(f.Window, "SetSection", "queue", "Очередь");
+
+        var gate = f.Http.HoldIds();
+        SaClick(Control<Button>(f.Window, "FavoritesNav"));
+        Assert(f.Source.SequenceEqual(original), "opening favorites waited for the ID check to show the warm rows");
+        await FcEntered(gate);
+        var originalCheck = SaField<CancellationTokenSource?>(f.Window, "_libraryCts");
+        SaInvoke(f.Window, "SetSection", "queue", "Очередь");
+        SaClick(Control<Button>(f.Window, "FavoritesNav"));
+        await Dispatcher.Yield(DispatcherPriority.Background);
+        Assert(f.Source.SequenceEqual(original) && f.Http.IdRequests == firstIds + 1 && f.Http.MetadataBatches.IsEmpty
+            && originalCheck is { IsCancellationRequested: false } && ReferenceEquals(originalCheck, SaField<CancellationTokenSource?>(f.Window, "_libraryCts")),
+            "reopening favorites ran another request or cancelled the active check");
+        gate.Release.TrySetResult();
+        await FcUntil(() => SaField<CancellationTokenSource?>(f.Window, "_libraryCts") is null); await f.Saved();
+        Assert(f.Source.Select(row => row.RequestId).SequenceEqual(f.Http.Likes.Select(reference => reference.RequestId))
+            && f.Http.MetadataBatches.Single().SequenceEqual([newFavorite.RequestId]), "the ID check did not preserve the order or fetched known metadata");
+
+        var latest = f.Source.ToArray();
+        SaInvoke(f.Window, "SetSection", "queue", "Очередь");
+        gate = f.Http.HoldIds();
+        SaInvoke(f.Window, "BrowseBack_Click", f.Window, new RoutedEventArgs());
+        Assert(f.Source.SequenceEqual(latest), "Back did not show the latest warm favorites");
+        await FcEntered(gate);
+        gate.Release.TrySetResult();
+        await FcUntil(() => SaField<CancellationTokenSource?>(f.Window, "_libraryCts") is null); await f.Saved();
+        Assert(f.Http.IdRequests == firstIds + 2 && f.Http.MetadataBatches.Count == 1, "Back did not perform an IDs-only check");
+    }
+
+    private static async Task FcVerifiedDownloadEligibility()
+    {
+        var removed = FcRow(0);
+        var reliked = FcRow(1);
+        var manual = FcRow(2);
+        using var f = await FcFixture.Create("verified-download-eligibility", [removed]);
+        var queue = SaField<DownloadQueueState>(f.Window, "_downloadQueue");
+        queue.Restore(new RestoredDownloadQueue("Fixture queue", AudioQuality.Excellent, Automatic: false, FavoritesBatch: false,
+            Entries:
+            [
+                new(removed, DownloadEntryState.Paused, 0, 1, "", false, false, AudioQuality.Excellent),
+                new(reliked, DownloadEntryState.Failed, 0, 1, "", true, true, AudioQuality.Excellent),
+                new(manual, DownloadEntryState.Failed, 0, 1, "", false, false)
+            ], Playlist: null));
+        FcSet(f.Window, "_downloadQueueAccountUid", f.Uid);
+        FcSet(f.Window, "_downloadQueueAccountGeneration", SaField<int>(f.Window, "_accountGeneration"));
+        f.Http.Likes = [FcLiked(reliked)];
+        var ids = f.Http.HoldIds();
+        var metadata = f.Http.HoldMetadata();
+        var refresh = f.Window.RefreshLibraryAsync();
+        await FcEntered(ids);
+        Assert(f.Source.Single().Id == removed.Id && queue.CanResume && !queue.Entries[0].SkipFavoritesDownload
+            && queue.Entries[1].SkipFavoritesDownload && !queue.Entries[2].RemovedFromCollection,
+            "the warm cache changed the restored download state before verification");
+        ids.Release.TrySetResult();
+        await FcEntered(metadata);
+        Assert(!queue.CanResume && queue.Entries[0].RemovedFromCollection && queue.Entries[0].SkipFavoritesDownload
+            && !queue.Entries[1].RemovedFromCollection && !queue.Entries[1].SkipFavoritesDownload
+            && !queue.Entries[2].RemovedFromCollection && !queue.Entries[2].SkipFavoritesDownload,
+            "verified IDs did not exclude the removed paused track, reenable the failed track or preserve the manual track");
+        metadata.Release.TrySetResult();
+        await FcComplete(refresh); await f.Saved();
+        Assert(queue.BeginRun(retryFailed: true).Select(entry => entry.Track.Id).SequenceEqual([reliked.Id, manual.Id]),
+            "retry admitted a removed favorite or skipped an eligible failed download");
+        queue.EndRun(interrupted: true);
     }
 
     private static async Task FcChangedIds()
@@ -243,6 +323,147 @@ internal static partial class Program
         }
     }
 
+    private static async Task FcLike()
+    {
+        foreach (var mode in new[] { "known", "canonical", "missing", "offline" })
+        {
+            var existing = new[] { FcRow(0), FcRow(1) };
+            using var f = await FcFixture.Create("like-" + mode, existing);
+            await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+
+            var liked = FcRow(2, albumInRequest: mode != "canonical", localPath: mode == "offline" ? @"C:\fixture\local.wav" : null);
+            var readback = new List<LikedId> { FcLiked(liked), FcLiked(existing[1]), FcLiked(existing[0]) };
+            var missing = mode is "missing" or "offline";
+            if (mode == "missing") readback.Insert(1, FcLiked(FcRow(3)));
+            f.Http.NextMutationReadback = readback.ToArray();
+            var gate = missing ? f.Http.HoldMetadata() : f.Http.HoldIds(skip: 1);
+            if (missing) f.Http.FailMetadata = true;
+            else f.Http.FailIdsAtRequest = f.Http.IdRequests + 2;
+
+            var expected = missing ? existing.Select(row => row.RequestId).ToArray()
+                : readback.Select(reference => reference.RequestId).ToArray();
+            var before = f.CacheHash();
+            await FcComplete(f.Like(liked));
+            await FcEntered(gate);
+            await f.Saved();
+            Assert(f.Http.MutationRequest == "track-ids=" + liked.RequestId, "fixture did not perform the expected like POST");
+            Assert(SaField<HashSet<string>>(f.Window, "_favoriteTrackIds").Contains(liked.Id), "confirmed like lost its track mark");
+            Assert(f.Source.Select(row => row.RequestId).SequenceEqual(expected)
+                && f.Store.Load(f.Uid)!.Tracks.Select(track => track.RequestId).SequenceEqual(expected),
+                "confirmed readback order was lost or incomplete metadata replaced a complete snapshot");
+            Assert(SaField<bool>(f.Window, "_favoritesSnapshotReady") == !missing,
+                "collection actions lost a verified snapshot or became available for an incomplete one");
+            if (missing) Assert(f.CacheHash() == before, "incomplete readback rewrote the previous complete snapshot");
+
+            gate.Release.TrySetResult();
+            await FcUntil(() => SaField<CancellationTokenSource?>(f.Window, "_libraryCts") is null);
+            await f.Saved();
+            Assert(SaField<Diagnostics>(f.Window, "_diagnostics").Stage == "library_partial_or_error"
+                && SaField<bool>(f.Window, "_favoritesSnapshotReady") == !missing
+                && f.Source.Select(row => row.RequestId).SequenceEqual(expected)
+                && f.Store.Load(f.Uid)!.Tracks.Select(track => track.RequestId).SequenceEqual(expected),
+                "failed follow-up refresh replaced the confirmed complete snapshot");
+        }
+    }
+
+    private static async Task FcUnlikeReadback()
+    {
+        var rows = Enumerable.Range(0, 4).Select(index => FcRow(index)).ToArray();
+        using var f = await FcFixture.Create("unlike-readback", rows);
+        await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+        var gate = f.Http.HoldIds();
+        var older = f.Window.RefreshLibraryAsync();
+        await FcEntered(gate);
+
+        // Another device also removed the fourth track and changed the order.
+        var verified = new[] { FcLiked(rows[2]), FcLiked(rows[0]) };
+        f.Http.NextMutationReadback = verified;
+        await FcComplete(f.Like(rows[1], liked: false));
+        gate.Release.TrySetResult();
+        await FcComplete(older); await f.Saved();
+        var expected = verified.Select(reference => reference.RequestId).ToArray();
+        Assert(f.Http.MutationRequest == "track-ids=" + rows[1].RequestId
+            && f.Source.Select(row => row.RequestId).SequenceEqual(expected)
+            && f.Store.Load(f.Uid)!.Tracks.Select(row => row.RequestId).SequenceEqual(expected)
+            && SaField<HashSet<string>>(f.Window, "_favoriteTrackIds").SetEquals(verified.Select(reference => reference.Id))
+            && SaField<bool>(f.Window, "_favoritesSnapshotReady"), "confirmed unlike lost another device's changes or an older response won");
+    }
+
+    private static async Task FcMetadataPages()
+    {
+        using (var f = await FcFixture.Create("missing-metadata", 3))
+        {
+            await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+            var prior = f.Source[1];
+            f.Http.OmittedMetadata = prior.RequestId;
+            FcSet(f.Window, "_favoritesMetadataSavedUtc", DateTimeOffset.UtcNow.AddHours(-30));
+            await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+            var row = f.Source[1];
+            var snapshot = f.Store.Load(f.Uid)!;
+            var saved = snapshot.Tracks[1];
+            Assert(row.RequestId == prior.RequestId && row.Title == prior.Title && !row.Available
+                && saved.Title == prior.Title && !saved.Available && saved.MissingMetadata
+                && snapshot.SavedUtc > DateTimeOffset.UtcNow.AddMinutes(-5) && SaField<bool>(f.Window, "_favoritesSnapshotReady"),
+                "legal omission destroyed warm descriptive metadata or kept a missing track playable");
+            var uid = f.Uid;
+            f.Window.SignOut(); f.Account(uid);
+            f.Http.OmittedMetadata = null;
+            await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+            Assert(f.Http.MetadataBatches.Count == 2 && f.Http.MetadataBatches.Last().SequenceEqual([prior.RequestId])
+                && f.Source[1].HasTrackMetadata && f.Source[1].Available && !f.Store.Load(uid)!.Tracks[1].MissingMetadata,
+                "a former omission was not retried after reload or forced fresh metadata for unrelated tracks");
+        }
+
+        foreach (var cold in new[] { false, true })
+        {
+            using var f = await FcFixture.Create(cold ? "failed-page-cold" : "failed-page-warm", cold ? 0 : 125);
+            if (!cold) { await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved(); }
+            var before = cold ? null : f.CacheHash();
+            var visible = f.Source.Select(row => row.RequestId).ToArray();
+            f.Http.Likes = Enumerable.Range(0, 125).Select(index => FcLiked(FcRow(index))).ToArray();
+            f.Http.InvalidMetadata = FcRow(100).RequestId;
+            await FcComplete(f.Window.RefreshLibraryAsync(refreshMetadata: true)); await f.Saved();
+            Assert(f.Http.MetadataBatches.Count == 2 && f.Source.Select(row => row.RequestId).SequenceEqual(visible)
+                && SaField<bool>(f.Window, "_favoritesSnapshotReady") == !cold
+                && (cold ? f.Store.Load(f.Uid) is null : f.CacheHash() == before),
+                "invalid second page published an incomplete collection or removed a complete one");
+        }
+    }
+
+    private static async Task FcMutationAndDrain()
+    {
+        using var f = await FcFixture.Create("mutation-owner-switch", 2);
+        var uid = f.Uid;
+        var prior = f.CacheHash();
+        var pending = new FcPendingWriters();
+        FcSet(f.Window, "_favoritesStore", new FavoritesCacheStore(f.DirectoryPath, pending.Schedule));
+        await FcComplete(f.Window.RefreshLibraryAsync());
+
+        var liked = FcRow(9);
+        f.Http.NextMutationReadback = [FcLiked(liked), .. f.Http.Likes];
+        var oldReadback = f.Http.HoldIds();
+        var mutation = f.Like(liked);
+        await FcEntered(oldReadback);
+
+        f.Window.SignOut(); f.Account("67890");
+        var next = FcRow(15);
+        f.Http.Likes = [FcLiked(next)];
+        await FcComplete(f.Window.RefreshLibraryAsync());
+        oldReadback.Release.TrySetResult(); await FcComplete(mutation);
+
+        var drain = (Task)typeof(MainWindow).GetMethod("DrainFavoritesCacheWritesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(f.Window, null)!;
+        pending.Execute(1);
+        Assert(!drain.IsCompleted, "account switch lost track of an earlier admitted writer");
+        pending.Execute(0);
+        await FcComplete(drain);
+        Assert(f.Source.Select(row => row.Id).SequenceEqual([next.Id])
+            && f.Store.Load(f.Uid)!.Tracks.Single().Id == next.Id
+            && Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(f.Store.FilePath(uid)))) == prior
+            && SaField<HashSet<string>>(f.Window, "_favoriteTrackIds").SetEquals([next.Id]),
+            "late mutation crossed accounts or changed the old account's admitted snapshot");
+    }
+
     private static async Task FcColdWorker()
     {
         using var f = await FcFixture.Create("cold-worker", []);
@@ -319,11 +540,12 @@ internal static partial class Program
             offsetAfter = viewer.VerticalOffset, queueVersion = version, queueOccurrence = occurrence, playbackStarted = f.Player.HasSource });
     }
 
-    private static TrackRow FcRow(int index, string album = "91") => new()
+    private static TrackRow FcRow(int index, string album = "91", bool albumInRequest = true, string? localPath = null) => new()
     {
-        Number = index + 1, Id = "fc-" + index, RequestId = "fc-" + index + ":" + album, AlbumId = album,
+        Number = index + 1, Id = "fc-" + index, RequestId = "fc-" + index + (albumInRequest ? ":" + album : ""), AlbumId = album,
         Title = (index % 3 == 0 ? "match " : "") + "Cached " + index.ToString("D6"), Artist = "Fixture artist",
-        Artists = [new("fixture-artist", "Fixture artist")], Album = "Album " + album, DurationMs = 1000L * (index + 1), Available = true
+        Artists = [new("fixture-artist", "Fixture artist")], Album = "Album " + album, DurationMs = 1000L * (index + 1), Available = true,
+        LocalPath = localPath
     };
     private static LikedId FcLiked(TrackRow row) => new(row.Id, row.AlbumId);
     private static void FcSet(MainWindow window, string field, object? value)
@@ -394,6 +616,8 @@ internal static partial class Program
             if (SaField<Task?>(Window, "_favoritesCacheSaveTask") is { } save) await FcComplete(save);
             await FcComplete(Task.WhenAll(new[] { SaField<Task?>(Window, "_offlineMarksTask"), SaField<Task?>(Window, "_playlistStatusTask") }.OfType<Task>()));
         }
+        internal Task Like(TrackRow row, bool liked = true)
+            => (Task)typeof(MainWindow).GetMethod("SetTrackLikeAsync", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(Window, [row, liked])!;
         internal string CacheHash() => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Store.FilePath(Uid))));
         internal void Facts(object value) => File.WriteAllText(Path.Combine(DirectoryPath, "facts.json"), JsonSerializer.Serialize(value, new JsonSerializerOptions { WriteIndented = true }));
         public void Dispose() { foreach (var gate in _gates) gate.Release.TrySetResult(); Window.Close(); Player.Dispose(); Http.Dispose(); }
@@ -405,20 +629,35 @@ internal static partial class Program
         internal LikedId[] Likes { get => Volatile.Read(ref _likes); set => Volatile.Write(ref _likes, value.ToArray()); }
         internal ConcurrentQueue<string[]> MetadataBatches { get; } = [];
         internal bool FailIds, FailMetadata;
-        internal int IdRequests;
+        internal int IdRequests, FailIdsAtRequest;
+        internal LikedId[]? NextMutationReadback;
+        internal string? MutationRequest, OmittedMetadata, InvalidMetadata;
         private FcGate? _idsGate, _metadataGate;
-        internal FcGate HoldIds() => _idsGate = gateFactory();
+        private int _skipHeldIds;
+        internal FcGate HoldIds(int skip = 0)
+        {
+            _skipHeldIds = skip;
+            return _idsGate = gateFactory();
+        }
         internal FcGate HoldMetadata() => _metadataGate = gateFactory();
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token)
         {
             Assert(request.RequestUri!.Host == "api.music.yandex.net", "favorites fixture left its in-process API");
             var path = request.RequestUri.AbsolutePath;
             if (path == "/account/status") return Json(Profile);
+            if ((path is "/users/12345/likes/tracks/add-multiple" or "/users/12345/likes/tracks/remove") && request.Method == HttpMethod.Post)
+            {
+                MutationRequest = Uri.UnescapeDataString(await request.Content!.ReadAsStringAsync(token));
+                Likes = NextMutationReadback ?? throw new InvalidOperationException("Unexpected favorites fixture write.");
+                return Json("""{"result":{"revision":1}}""");
+            }
             if (path.StartsWith("/users/", StringComparison.Ordinal) && path.EndsWith("/likes/tracks", StringComparison.Ordinal))
             {
-                Interlocked.Increment(ref IdRequests); var failure = FailIds;
+                var requestNumber = Interlocked.Increment(ref IdRequests);
+                var failure = FailIds || requestNumber == FailIdsAtRequest;
                 var json = JsonSerializer.Serialize(new { result = new { library = new { tracks = Likes.Select(id => new { id = id.Id, albumId = id.AlbumId }).ToArray() } } });
-                if (Interlocked.Exchange(ref _idsGate, null) is { } gate) { gate.Entered.TrySetResult(); await gate.Release.Task; }
+                if (_idsGate is not null && Interlocked.Decrement(ref _skipHeldIds) < 0 && Interlocked.Exchange(ref _idsGate, null) is { } gate)
+                { gate.Entered.TrySetResult(); await gate.Release.Task; }
                 return failure ? new(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("Fixture ID failure") } : Json(json);
             }
             if (path == "/tracks")
@@ -426,7 +665,8 @@ internal static partial class Program
                 var body = Uri.UnescapeDataString(await request.Content!.ReadAsStringAsync(token));
                 var ids = body.Split('&').Single(part => part.StartsWith("track-ids=", StringComparison.Ordinal))[10..].Split(',');
                 MetadataBatches.Enqueue(ids); var failure = FailMetadata;
-                var json = JsonSerializer.Serialize(new { result = ids.Select(reference =>
+                var json = ids.Contains(InvalidMetadata) ? """{"result":[{"title":"no ID"}]}"""
+                    : JsonSerializer.Serialize(new { result = ids.Where(reference => reference != OmittedMetadata).Select(reference =>
                 {
                     var parts = reference.Split(':'); var index = int.Parse(parts[0][3..]); var album = parts.Length > 1 ? parts[1] : "91";
                     return new { id = parts[0], title = (index % 3 == 0 ? "match " : "") + "Live " + index.ToString("D6"), available = true, durationMs = 1000L * (index + 1),

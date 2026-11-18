@@ -23,6 +23,7 @@ internal static partial class Program
         await Run("Cleanup015: artwork clears disk and memory while preserving foreign, invalid, linked and read-only entries", Cleanup015Artwork);
         await Run("Cleanup015: artwork clear cancels pending publishers and accepts fresh requests afterward", Cleanup015ArtworkPending);
         await Run("Cleanup015: loudness clears shared memory and validates the entire fixed-file schema", Cleanup015Loudness);
+        await Run("Cleanup015: loudness retries a busy first read and merges stored plus new measurements", Cleanup015LoudnessStorage);
         await Run("Cleanup015: loudness clear invalidates an in-flight analysis without touching its audio", Cleanup015LoudnessGeneration);
     }
 
@@ -249,6 +250,53 @@ internal static partial class Program
         finally { analysisGate.Release(); }
         Assert(await pending is not null, "clearing derived cache interrupted a usable analysis");
         Assert(!File.Exists(System.IO.Path.Combine(dir, "cache", "loudness-v1.json")) && SHA256.HashData(File.ReadAllBytes(audio)).SequenceEqual(before), "old-generation analysis republished cache or changed audio");
+    }
+
+    private static Task Cleanup015LoudnessStorage()
+    {
+        var directory = Path.Combine(_directory, "cleanup015-loudness-storage", "cache");
+        var path = Path.Combine(directory, "loudness-v1.json");
+        var load = typeof(LoudnessCache).GetMethod("Load", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var save = typeof(LoudnessCache).GetMethod("Save", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var values = typeof(LoudnessCache).GetProperty("_values", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var cache = new LoudnessCache(directory);
+        var state = typeof(LoudnessCache).GetField("_state", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(cache)!;
+        var pending = (Dictionary<string, LoudnessResult>)state.GetType().GetProperty("Pending", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(state)!;
+        load.Invoke(cache, null);
+        Assert(!Directory.Exists(directory), "cache read created missing parents");
+        Directory.CreateDirectory(directory);
+        var oldKey = new string('A', 64);
+        var newKey = new string('F', 64);
+        var oldMeasurement = new LoudnessResult(-16, .5);
+        var newMeasurement = new LoudnessResult(-12, .6);
+        File.WriteAllText(path, JsonSerializer.Serialize(new Dictionary<string, LoudnessResult> { [oldKey] = oldMeasurement }));
+        var before = File.ReadAllBytes(path);
+        values.SetValue(cache, null);
+        using (File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            load.Invoke(cache, null);
+            Assert(values.GetValue(cache) is null, "a sharing error was mistaken for an empty cache");
+            pending[newKey] = newMeasurement;
+            save.Invoke(cache, null);
+            Assert(pending.Count == 1, "sharing error discarded a pending measurement");
+        }
+        using (File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            save.Invoke(cache, null);
+            Assert(before.SequenceEqual(File.ReadAllBytes(path)) && !Directory.EnumerateFiles(directory, "*.tmp").Any(),
+                "busy cache replacement changed the previous file or left staging data");
+        }
+        save.Invoke(cache, null);
+        values.SetValue(cache, null);
+        load.Invoke(cache, null);
+        var saved = (Dictionary<string, LoudnessResult>)values.GetValue(cache)!;
+        Assert(saved.Count == 2 && saved[oldKey] == oldMeasurement && saved[newKey] == newMeasurement
+            && pending.Count == 0, "retry did not merge the saved and pending measurements");
+        File.WriteAllText(path, new string(' ', 256 * 1024) + JsonSerializer.Serialize(saved));
+        values.SetValue(cache, null);
+        load.Invoke(cache, null);
+        Assert(((Dictionary<string, LoudnessResult>)values.GetValue(cache)!).Count == 0, "oversized valid cache document reached normal deserialization");
+        return Task.CompletedTask;
     }
 
     private static bool Cleanup015Denied(Action operation)

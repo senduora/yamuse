@@ -99,7 +99,9 @@ internal static partial class Program
         });
         await Run("PlaybackContext0317: source arrays are fixed at launch and normal Back selects current instead of stale selection", async () =>
         {
-            using var f = new Pc0317Fixture("snapshot"); var original = f.Rows(4); var mutable = original.ToList();
+            using var f = new Pc0317Fixture("snapshot");
+            TrackRow[] original = [f.Row("repeat", title: "Первое вхождение"), f.Row("repeat", title: "Второе вхождение"), .. f.Rows(2)];
+            var mutable = original.ToList();
             f.Playlist("origin", mutable); await f.Play(original[0]);
             f.List.SelectedItem = original[3]; f.Playlist("other", f.Rows(2, "other"));
             await Pc0317Call(f.Window, "AdvanceAsync", 1, false);

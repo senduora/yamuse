@@ -7,6 +7,18 @@ public partial class MainWindow
 {
     private readonly Dictionary<string, CatalogItem> _resolvedTrackAlbums = new(StringComparer.Ordinal);
     private int _resolvedAlbumGeneration = -1;
+    private long _trackLinkLookup;
+
+    private (CancellationToken Token, Func<bool> IsCurrent) BeginTrackLinkLookup()
+    {
+        var request = ++_trackLinkLookup;
+        var generation = _accountGeneration;
+        var uid = _account?.Uid;
+        var view = _viewGeneration;
+        var token = _accountCts.Token;
+        return (token, () => !_closed && !token.IsCancellationRequested && request == _trackLinkLookup
+            && generation == _accountGeneration && uid == _account?.Uid && view == _viewGeneration);
+    }
 
     private void UpdatePlayerArtistLinks()
     {
@@ -81,7 +93,7 @@ public partial class MainWindow
     {
         if (_session is null) { SetStatus("Для открытия альбома подключитесь к Яндексу."); return; }
         var generation = _accountGeneration;
-        var view = _viewGeneration;
+        var lookup = BeginTrackLinkLookup();
         try
         {
             var albumId = track.AlbumId;
@@ -92,13 +104,12 @@ public partial class MainWindow
                 { _resolvedTrackAlbums.Clear(); _resolvedAlbumGeneration = generation; }
                 if (!_resolvedTrackAlbums.TryGetValue(track.RequestId, out var cached))
                 {
-                    var token = _accountCts.Token;
-                    var session = await EnsureSessionAsync(token);
-                    var rows = await _api.GetTracksAsync(session, [TrackReference(track)], 0, token);
-                    token.ThrowIfCancellationRequested();
-                    if (generation != _accountGeneration || view != _viewGeneration || _closed) return;
-                    var exact = rows.FirstOrDefault(row => row.Id == track.Id);
-                    if (exact?.AlbumId is not { Length: > 0 } resolved)
+                    var session = await EnsureSessionAsync(lookup.Token);
+                    if (!lookup.IsCurrent()) return;
+                    var rows = await _api.GetTracksAsync(session, [TrackReference(track)], 0, lookup.Token);
+                    if (!lookup.IsCurrent()) return;
+                    var exact = rows.Single();
+                    if (exact.AlbumId is not { Length: > 0 } resolved)
                     { SetStatus("У этого трека Яндекс не указал альбом."); return; }
                     cached = new(resolved, "album", exact.Album, exact.Artist, CoverUri: exact.CoverUri);
                     if (_resolvedTrackAlbums.Count >= 256) _resolvedTrackAlbums.Remove(_resolvedTrackAlbums.Keys.First());
@@ -107,10 +118,9 @@ public partial class MainWindow
                 albumId = cached.Id;
                 title = cached.Title;
             }
-            if (generation != _accountGeneration || view != _viewGeneration || _closed) return;
+            if (!lookup.IsCurrent()) return;
             await OpenCatalogAsync(new(albumId, "album", string.IsNullOrWhiteSpace(title) ? "Альбом" : title, track.Artist, CoverUri: track.CoverUri));
         }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { ShowError(ex); }
+        catch (Exception ex) { if (lookup.IsCurrent()) ShowError(ex); }
     }
 }

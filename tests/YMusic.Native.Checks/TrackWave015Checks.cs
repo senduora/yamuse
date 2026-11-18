@@ -109,6 +109,9 @@ internal static partial class Program
             var queue = SaField<PlaybackQueue>(w, "_playbackQueue"); queue.SetItems([seed]); SaInvoke(w, "ShowQueue");
             var list = Control<ListView>(w, "TracksList"); list.SelectedItem = seed; TwClickWave(list); await f.Ready("5678", 2);
             var downloadQueue = SaField<DownloadQueueState>(w, "_downloadQueue"); downloadQueue.Replace([seed], "Тестовая очередь");
+            UlSet(w, "_downloadQueueAccountUid", SaField<Account>(w, "_account").Uid);
+            UlSet(w, "_downloadQueueAccountGeneration", SaField<int>(w, "_accountGeneration"));
+            SaInvoke(w, "RefreshDownloadCenter");
             var downloads = SaField<ListView>(w, "_downloadEntriesList"); downloads.SelectedIndex = 0; TwClickWave(downloads); await f.Ready("5678", 3);
             UlSet(w, "_current", seed); SaInvoke(w, "UpdateControls"); TwClickWave(Control<Button>(w, "PlayerTitleButton")); await f.Ready("5678", 4);
             var stale = TwMenu(Control<Button>(w, "PlayerTitleButton")); var calls = f.Seeds.Count;
@@ -154,6 +157,54 @@ internal static partial class Program
             Assert(ReferenceEquals(queue.Current, original) && !SaField<bool>(w, "_waveStarting") && !f.Player.HasSource, "failed session replaced queue or left action busy");
             await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Источник", false)); await f.Ready("1234", 2);
         });
+        await Run("TrackWave015: pending new station preserves active radio until playback accepts it", async () =>
+        {
+            foreach (var action in new[] { "next", "natural", "pause", "seek", "minute", "after-track", "unavailable", "refill" })
+            {
+                using var f = new TwFixture("rejected-station-" + action); var w = f.Window;
+                await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Текущая волна", true)); await f.Ready("1234");
+                var queue = SaField<PlaybackQueue>(w, "_playbackQueue");
+                var expected = action is "next" or "natural" ? queue.Items[1] : queue.Current;
+                f.HoldNext = true;
+                if (action == "unavailable") f.UnavailableStart = 2;
+                var pending = Call(w, "OpenTrackWaveAsync", TwSeed("5678", "Новая волна", true));
+                await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                switch (action)
+                {
+                    case "next": await Call(w, "AdvanceAsync", 1, false); break;
+                    case "natural":
+                        f.Player.Seek(f.Player.Duration - TimeSpan.FromSeconds(.25));
+                        await Until(() => ReferenceEquals(queue.Current, expected) && f.Player.IsPlaying);
+                        break;
+                    case "pause": await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Pause); break;
+                    case "seek": SaInvoke(w, "CommitSeek", 1d); break;
+                    case "minute":
+                        w.SetSleepTimer(SleepTimerMode.Minutes15);
+                        SaInvoke(w, "ApplySleepTimerElapsed", TimeSpan.FromMinutes(15));
+                        break;
+                    case "after-track": w.SetSleepTimer(SleepTimerMode.AfterCurrentTrack); break;
+                    case "refill":
+                        await Call(w, "ExtendWaveQueueAsync").WaitAsync(TimeSpan.FromSeconds(5));
+                        Assert(f.MoreSessions.SequenceEqual(new[] { "tw-1" }) && queue.Items.Any(row => row.Id == "901"),
+                            "a pending new station blocked refill of the playing radio");
+                        break;
+                }
+                f.Release.TrySetResult(); await pending;
+                if (action == "refill")
+                {
+                    Assert(SaField<RadioBatch>(w, "_waveBatch").SessionId == "tw-2" && queue.Current?.Id == "802" && f.Player.IsPlaying,
+                        "passive refill displaced the explicit request");
+                    continue;
+                }
+                Assert(SaField<RadioBatch>(w, "_waveBatch").SessionId == "tw-1" && ReferenceEquals(queue.Current, expected)
+                    && f.Player.IsPlaying == (action is not ("pause" or "minute")), "late station replaced active radio or playback after " + action);
+                await Call(w, "ExtendWaveQueueAsync");
+                Assert(f.MoreSessions.SequenceEqual(new[] { "tw-1" }) && queue.Items.Any(row => row.Id == "901"),
+                    "rejected station prevented another refill for the original radio");
+                await Until(() => f.FeedbackSources.Any(x => x == ("tw-1", "first-1", "trackStarted", expected!.Id)));
+                Assert(f.FeedbackSources.All(x => x.Session == "tw-1"), "rejected station emitted feedback");
+            }
+        });
         await Run("TrackWave015: late continuation cannot append to manual queue, replacement station or signed-out account", async () =>
         {
             foreach (var action in new[] { "queue", "switch", "logout" })
@@ -161,16 +212,156 @@ internal static partial class Program
                 using var f = new TwFixture("continuation-" + action); var w = f.Window;
                 await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Первая волна", false)); await f.Ready("1234");
                 var before = SaField<List<TrackRow>>(w, "_waveTracks").Count;
-                f.HoldMore = true; var pending = Call(w, "ExtendWaveQueueAsync"); await f.Entered.Task;
+                f.HoldMore = true; f.RenewMore = action == "queue";
+                var pending = Call(w, "ExtendWaveQueueAsync"); await f.Entered.Task;
                 var queue = SaField<PlaybackQueue>(w, "_playbackQueue"); var manual = TwSeed("9999", "Новая очередь", true); Task? replacement = null;
                 if (action == "queue") queue.SetItems([manual]);
                 if (action == "switch") replacement = Call(w, "OpenTrackWaveAsync", TwSeed("5678", "Вторая волна", false));
                 if (action == "logout") w.SignOut();
                 f.Release.TrySetResult(); await pending; if (replacement is not null) await replacement;
-                if (action == "queue") Assert(ReferenceEquals(queue.Current, manual) && queue.Items.Count == 1 && SaField<List<TrackRow>>(w, "_waveTracks").Count == before, "late continuation contaminated manual queue");
+                if (action == "queue")
+                {
+                    Assert(ReferenceEquals(queue.Current, manual) && queue.Items.Count == 1 && SaField<List<TrackRow>>(w, "_waveTracks").Count == before, "late continuation contaminated manual queue");
+                    SaInvoke(w, "WavePlay_Click", null!, null!);
+                    await f.Ready("1234");
+                    await Call(w, "ExtendWaveQueueAsync");
+                    Assert(f.MoreSessions.SequenceEqual(new[] { "tw-1", "tw-2" }) && queue.Items.Count == before + 4,
+                        "returning to the same station could not recover a newer server session ID");
+                }
                 if (action == "switch") Assert(SaField<RadioBatch>(w, "_waveBatch").TrackSeedId == "5678" && queue.Items.All(track => !track.Id.StartsWith("90", StringComparison.Ordinal)), "previous continuation contaminated new station");
                 if (action == "logout") Assert(SaField<RadioBatch?>(w, "_waveBatch") is null && SaField<List<TrackRow>>(w, "_waveTracks").Count == 0, "late continuation revived signed-out wave");
             }
+        });
+        await Run("TrackWave015: delayed renewal follows the live station across a prepared transition", async () =>
+        {
+            using var f = new TwFixture("renew-crossfade"); var w = f.Window;
+            await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Волна", true)); await f.Ready("1234");
+            var queue = SaField<PlaybackQueue>(w, "_playbackQueue"); var last = queue.Items[^1];
+            f.HoldMore = f.RenewMore = true;
+            await w.PlayTrackAsync(queue.Items[^2]);
+            await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Until(() => f.Player.HasPrepared);
+            await Call(w, "AdvanceAsync", 1, false);
+            Assert(ReferenceEquals(queue.Current, last) && f.Player.IsPlaying && f.MoreRequests == 1,
+                "known next track could not advance while continuation was held");
+            f.Release.TrySetResult();
+            await Until(() => SaField<RadioBatch>(w, "_waveBatch").SessionId == "tw-2");
+            Assert(queue.Items.Count == 8 && ReferenceEquals(queue.Current, last), "same-queue transition lost a renewed batch");
+            await Call(w, "ExtendWaveQueueAsync");
+            Assert(f.MoreSessions.SequenceEqual(new[] { "tw-1", "tw-2" }), "next refill used the expired session");
+            await Until(() => f.FeedbackSources.Contains(("tw-2", "first-2", "radioStarted", null)));
+            Assert(f.FeedbackSources.Contains(("tw-1", "first-1", "trackStarted", last.Id))
+                && f.FeedbackSources.Count(x => x == ("tw-2", "first-2", "radioStarted", null)) == 1,
+                "renewal moved original listening feedback or sent a repeated station start");
+        });
+        await Run("TrackWave015: pending natural continuation respects pause seek and both sleep modes", async () =>
+        {
+            foreach (var action in new[] { "continue", "minute", "after-track", "pause", "seek" })
+            {
+                using var f = new TwFixture("end-pending-" + action); var w = f.Window;
+                await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Волна", true)); await f.Ready("1234");
+                var queue = SaField<PlaybackQueue>(w, "_playbackQueue"); var last = queue.Items[^1];
+                f.HoldMore = true;
+                await w.PlayTrackAsync(last);
+                await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                if (action == "minute") w.SetSleepTimer(SleepTimerMode.Minutes15);
+                f.Player.Seek(f.Player.Duration - TimeSpan.FromSeconds(.25));
+                await Until(() => !f.Player.IsPlaying);
+                Assert(f.Player.HasSource && SaField<bool>(w, "_advancingPlayback")
+                    && Equals(Control<Button>(w, "PlayPauseButton").Content, "\uE769"), "native end abandoned the pending continuation");
+                if (action == "minute") SaInvoke(w, "ApplySleepTimerElapsed", TimeSpan.FromMinutes(15));
+                if (action == "after-track")
+                {
+                    w.SetSleepTimer(SleepTimerMode.AfterCurrentTrack);
+                    Assert(!SaField<SleepTimerState>(w, "_sleepTimer").Active, "after-track timer waited on a completed track");
+                }
+                if (action == "pause")
+                {
+                    await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Pause);
+                    await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Pause);
+                }
+                if (action == "seek") SaInvoke(w, "CommitSeek", 1d);
+                if (action != "continue")
+                    await Until(() => !SaField<bool>(w, "_advancingPlayback")
+                        && Equals(Control<Button>(w, "PlayPauseButton").Content, "\uE768"));
+                f.Release.TrySetResult();
+                await Until(() => !SaField<bool>(w, "_advancingPlayback") && !SaField<bool>(w, "_advancingWave"));
+                Assert(f.MoreRequests == 1, "native end duplicated an in-flight request");
+                if (action == "continue") Assert(f.Player.IsPlaying && queue.Current?.Id == "901", "pending continuation did not continue playback");
+                else Assert(!f.Player.IsPlaying && ReferenceEquals(queue.Current, last), "late continuation overrode " + action);
+                if (action == "seek")
+                {
+                    Assert(f.Player.Position.TotalSeconds is >= .9 and <= 1.1, "late continuation lost the sought position");
+                    await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+                    await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+                    await Until(() => f.Feedback.Count(feedback => feedback == ("trackStarted", last.Id)) == 2);
+                    Assert(f.Player.IsPlaying && f.FeedbackSources.Where(x => x.Track == last.Id)
+                        .Select(x => (x.Session, x.Batch, x.Type)).SequenceEqual(new[]
+                        { ("tw-1", "first-1", "trackStarted"), ("tw-1", "first-1", "trackFinished"), ("tw-1", "first-1", "trackStarted") }),
+                        "resuming a completed track did not begin exactly one new cycle for its original batch");
+                }
+            }
+        });
+        await Run("TrackWave015: decoder buffering pauses listening time until playback resumes", async () =>
+        {
+            using var f = new TwFixture("buffer-clock"); var w = f.Window;
+            await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Волна", true)); await f.Ready("1234");
+            var listening = SaField<object>(w, "_waveListening");
+            var clock = (System.Diagnostics.Stopwatch)listening.GetType().GetProperty("Clock")!.GetValue(listening)!;
+            var slot = typeof(NativePlayer).GetField("_current", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(f.Player)!;
+            var buffering = slot.GetType().GetMethod("SetWpfBuffering", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+            Assert(clock.IsRunning, "ready playing slot had no listening time");
+            buffering.Invoke(slot, [true]);
+            var elapsed = clock.Elapsed;
+            await Task.Delay(120);
+            Assert(!clock.IsRunning && clock.Elapsed == elapsed && f.Player.IsPlaying, "buffering was counted or changed explicit Play state");
+            buffering.Invoke(slot, [false]);
+            Assert(clock.IsRunning, "ready decoder did not restart its listening clock");
+            await Call(w, "TogglePlaybackAsync");
+            buffering.Invoke(slot, [false]);
+            Assert(!clock.IsRunning, "late buffering callback restarted the paused listening clock");
+        });
+        await Run("TrackWave015: a failed background continuation does not retry until a new playback action", async () =>
+        {
+            using var f = new TwFixture("prefetch-failure") { MoreFailures = 2 }; var w = f.Window;
+            await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Волна", true)); await f.Ready("1234");
+            var queue = SaField<PlaybackQueue>(w, "_playbackQueue");
+            await w.PlayTrackAsync(queue.Items[^1]);
+            await Until(() => f.MoreRequests > 0 && !SaField<bool>(w, "_advancingWave"));
+            SaInvoke(w, "UpdateControls");
+            Assert(f.MoreRequests == 1 && f.Player.IsPlaying, "failed background continuation retried without a new playback action");
+        });
+        await Run("TrackWave015: unavailable continuations are bounded and do not occupy playback queue capacity", async () =>
+        {
+            using var f = new TwFixture("availability") { UnavailableMore = 2, MixedMoreSize = 300 }; var w = f.Window;
+            await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Волна", true)); await f.Ready("1234");
+            var queue = SaField<PlaybackQueue>(w, "_playbackQueue");
+            await Call(w, "ExtendWaveQueueAsync");
+            Assert(f.MoreRequests == 3 && queue.Items.Count == 154 && queue.Items.All(row => row.CanPlay),
+                "refill did not skip unavailable batches or left unavailable entries in playback");
+            while (queue.CanNext) queue.Next(true);
+            UlSet(w, "_current", queue.Current);
+            await Call(w, "ExtendWaveQueueAsync");
+            Assert(f.MoreRequests == 4 && queue.Items.Count <= 300 && queue.CanNext, "long mixed wave exhausted its playback capacity");
+
+            var count = queue.Items.Count;
+            f.UnavailableMore = 10;
+            await Call(w, "ExtendWaveQueueAsync");
+            Assert(f.MoreRequests == 7 && queue.Items.Count == count && queue.CanNext, "unavailable-only tail retried without limit or replaced playable items");
+        });
+        await Run("TrackWave015: after-track timer stays armed at the position boundary and reports natural finish", async () =>
+        {
+            using var f = new TwFixture("sleep-finish"); var w = f.Window;
+            await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Волна", true)); await f.Ready("1234");
+            var queue = SaField<PlaybackQueue>(w, "_playbackQueue"); var first = queue.Current;
+            w.SetSleepTimer(SleepTimerMode.AfterCurrentTrack);
+            f.Player.Seek(f.Player.Duration);
+            SaInvoke(w, "ApplySleepTimerElapsed", TimeSpan.Zero);
+            Assert(SaField<SleepTimerState>(w, "_sleepTimer").AfterTrack, "position boundary disarmed sleep before native end");
+            await Until(() => !f.Player.IsPlaying && f.Feedback.Contains(("trackFinished", first?.Id)));
+            Assert(ReferenceEquals(queue.Current, first) && !SaField<SleepTimerState>(w, "_sleepTimer").Active
+                && f.Feedback.Count(entry => entry == ("trackFinished", first?.Id)) == 1 && !f.Feedback.Any(entry => entry.Type == "skip"),
+                "after-track timer advanced or misreported the finished track");
         });
     }
 
@@ -183,8 +374,8 @@ internal static partial class Program
     }
     private static void TwClickWave(FrameworkElement anchor)
     { var action = TwMenu(anchor); Assert(action.IsEnabled, "track wave action unexpectedly disabled on " + anchor.Name); action.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); }
-    private static string TwBatch(string session, string batch, int first) => JsonSerializer.Serialize(new { result = new { radioSessionId = session, batchId = batch,
-        sequence = Enumerable.Range(first, 4).Select(id => new { type = "track", track = new { id = id.ToString(), title = "Рекомендация Яндекса " + id, available = true, durationMs = 30000,
+    private static string TwBatch(string session, string batch, int first, int count = 4, Func<int, bool>? available = null) => JsonSerializer.Serialize(new { result = new { radioSessionId = session, batchId = batch,
+        sequence = Enumerable.Range(first, count).Select(id => new { type = "track", track = new { id = id.ToString(), title = "Рекомендация Яндекса " + id, available = available?.Invoke(id) ?? true, durationMs = 30000,
             artists = new[] { new { name = "Тестовый исполнитель" } }, albums = new[] { new { id = "91", title = "Рекомендованный альбом" } } } }).ToArray() } });
 
     private sealed class TwFixture : IDisposable
@@ -193,7 +384,10 @@ internal static partial class Program
         internal NativePlayer Player { get; }
         internal List<string> Seeds { get; } = [];
         internal List<(string Type, string? Track)> Feedback { get; } = [];
-        internal bool HoldNext, HoldMore, FailNext;
+        internal List<(string Session, string Batch, string Type, string? Track)> FeedbackSources { get; } = [];
+        internal List<string> MoreSessions { get; } = [];
+        internal bool HoldNext, HoldMore, FailNext, RenewMore;
+        internal int MoreRequests, MoreFailures, UnavailableStart, UnavailableMore, MixedMoreSize;
         internal TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _sessions;
@@ -215,14 +409,31 @@ internal static partial class Program
                     var ordinal = ++_sessions;
                     if (HoldNext) { HoldNext = false; Entered.TrySetResult(); await Release.Task; }
                     if (FailNext) { FailNext = false; return Json("{}", HttpStatusCode.ServiceUnavailable); }
-                    return Json(TwBatch("tw-" + ordinal, "first-" + ordinal, 800 + ordinal));
+                    return Json(TwBatch("tw-" + ordinal, "first-" + ordinal, 800 + ordinal,
+                        available: ordinal == UnavailableStart ? static _ => false : null));
                 }
                 if (path.EndsWith("/tracks", StringComparison.Ordinal) && path.StartsWith("/rotor/session/", StringComparison.Ordinal))
-                { if (HoldMore) { HoldMore = false; Entered.TrySetResult(); await Release.Task; } return Json(TwBatch(path.Split('/')[3], "more", 901)); }
+                {
+                    MoreRequests++; MoreSessions.Add(path.Split('/')[3]);
+                    if (HoldMore) { HoldMore = false; Entered.TrySetResult(); await Release.Task; }
+                    if (MoreFailures > 0) { MoreFailures--; return Json("{}", HttpStatusCode.ServiceUnavailable); }
+                    if (RenewMore) { RenewMore = false; return Json("{\"result\":{\"unknownSession\":true}}"); }
+                    if (UnavailableMore > 0)
+                    {
+                        UnavailableMore--;
+                        return Json(TwBatch(path.Split('/')[3], "unavailable-" + MoreRequests, 2000 + 4 * MoreRequests, available: static _ => false));
+                    }
+                    if (MixedMoreSize > 0)
+                        return Json(TwBatch(path.Split('/')[3], "mixed-" + MoreRequests, 3000 + MixedMoreSize * MoreRequests, MixedMoreSize, static id => id % 2 == 0));
+                    return Json(TwBatch(path.Split('/')[3], "more", 901));
+                }
                 if (path.EndsWith("/feedback/", StringComparison.Ordinal))
                 {
                     using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(token)); var feedback = body.RootElement.GetProperty("event");
-                    Feedback.Add((feedback.GetProperty("type").GetString()!, feedback.TryGetProperty("trackId", out var id) ? id.GetString() : null)); return Json("{\"result\":{}}");
+                    var type = feedback.GetProperty("type").GetString()!; var track = feedback.TryGetProperty("trackId", out var id) ? id.GetString() : null;
+                    Feedback.Add((type, track));
+                    FeedbackSources.Add((path.Split('/')[3], body.RootElement.GetProperty("batchId").GetString()!, type, track));
+                    return Json("{\"result\":{}}");
                 }
                 if (path == "/get-file-info") return Json("{\"result\":{\"downloadInfo\":{\"quality\":\"lossless\",\"codec\":\"mp3\",\"bitrate\":320,\"transport\":\"raw\",\"url\":\"https://s1.vlx.yandex.net/track-wave-fixture.mp3\"}}}");
                 if (path.EndsWith("/lyrics", StringComparison.Ordinal) || path.EndsWith("/supplement", StringComparison.Ordinal)) return LyricsUiYandex(request, "Локальная проверка волны");

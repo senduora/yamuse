@@ -5,13 +5,14 @@ using System.Windows.Threading;
 
 namespace YMusic.Native;
 
-// Own on the WPF dispatcher, like MediaPlayer itself. Each slot owns only the
-// temporary file it downloaded; opening a user/offline URI never transfers ownership.
+// Own on the WPF dispatcher, like MediaPlayer itself. A slot can own a temporary
+// download or a read lease. It never deletes a user/offline file.
 internal sealed partial class NativePlayer : IDisposable
 {
     private Slot? _current, _prepared, _fading;
     private readonly AudioBuffer _buffer;
     private CancellationTokenSource? _opening, _preparing;
+    private readonly List<(string Path, Task Released)> _closedLocalSources = [];
     private readonly DispatcherTimer _fadeTimer;
     private readonly Stopwatch _fadeClock = new();
     private TimeSpan _fadeElapsed, _fadeDuration;
@@ -28,6 +29,7 @@ internal sealed partial class NativePlayer : IDisposable
     public bool IsPlaying { get; private set; }
     public bool HasSource => _current?.HasSource == true;
     public bool HasPrepared => _prepared?.Ready == true;
+    internal TimeSpan PreparedDuration => _prepared?.Duration ?? TimeSpan.Zero;
     public string? SourceLocalPath => LocalPath(_current);
     public string? PreparedLocalPath => LocalPath(_prepared);
     public string? FadingLocalPath => LocalPath(_fading);
@@ -36,6 +38,9 @@ internal sealed partial class NativePlayer : IDisposable
     public double CrossfadeSeconds { get; private set; } = 3;
     public TimeSpan Position => _current?.Position ?? TimeSpan.Zero;
     public TimeSpan Duration => _current?.Duration ?? TimeSpan.Zero;
+    internal bool IsCurrentAudioAdvancing => IsPlaying && _current?.IsAudioAdvancing == true;
+    internal bool IsFadingAudioAdvancing => IsPlaying && _fading?.IsAudioAdvancing == true;
+    internal event Action? PlaybackActivityChanged;
     public event EventHandler? Ended;
     public event EventHandler? Failed;
     // true: the overlap ended naturally; false: stop, seek, replacement or failure.
@@ -50,13 +55,17 @@ internal sealed partial class NativePlayer : IDisposable
         => OpenCoreAsync(uri, null, cancellationToken, progress, false);
     internal Task OpenPausedAsync(AudioDescriptor audio, CancellationToken cancellationToken, IProgress<AudioProgress>? progress = null)
         => OpenCoreAsync(audio.Uri, audio, cancellationToken, progress, false);
-    private async Task OpenCoreAsync(Uri uri, AudioDescriptor? audio, CancellationToken cancellationToken, IProgress<AudioProgress>? progress, bool play = true)
+    internal Task OpenLocalPausedAsync(LocalAudioSource source, CancellationToken cancellationToken)
+        => OpenCoreAsync(new Uri(source.Path), null, cancellationToken, null, play: false, localSource: source);
+    private async Task OpenCoreAsync(Uri uri, AudioDescriptor? audio, CancellationToken cancellationToken, IProgress<AudioProgress>? progress,
+        bool play = true, LocalAudioSource? localSource = null)
     {
         ValidateSource(uri); ObjectDisposedException.ThrowIf(_disposed, this);
         Stop();
         var operation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _opening = operation;
         Slot? slot = null; PlaybackInput? input = null;
+        LocalAudioLease? lease = null;
         try
         {
             var local = uri;
@@ -67,7 +76,8 @@ internal sealed partial class NativePlayer : IDisposable
             }
             operation.Token.ThrowIfCancellationRequested();
             if (!ReferenceEquals(_opening, operation)) throw new OperationCanceledException(operation.Token);
-            slot = new Slot(this, uri, input, Volume, SpeedRatio); input = null;
+            lease = localSource?.Hold();
+            slot = new Slot(this, uri, input, lease, Volume, SpeedRatio); input = null; lease = null;
             _current = slot; LastNativeError = null;
             slot.Open(local);
             await slot.Opened.Task.WaitAsync(TimeSpan.FromSeconds(30), operation.Token);
@@ -85,6 +95,7 @@ internal sealed partial class NativePlayer : IDisposable
         finally
         {
             input?.Dispose();
+            lease?.Dispose();
             if (ReferenceEquals(_opening, operation)) _opening = null;
             operation.Dispose();
         }
@@ -94,13 +105,16 @@ internal sealed partial class NativePlayer : IDisposable
         => PrepareCoreAsync(uri, null, cancellationToken);
     public Task PrepareNextAsync(AudioDescriptor audio, CancellationToken cancellationToken)
         => PrepareCoreAsync(audio.Uri, audio, cancellationToken);
-    private async Task PrepareCoreAsync(Uri uri, AudioDescriptor? audio, CancellationToken cancellationToken)
+    internal Task PrepareLocalNextAsync(LocalAudioSource source, CancellationToken cancellationToken)
+        => PrepareCoreAsync(new Uri(source.Path), null, cancellationToken, source);
+    private async Task PrepareCoreAsync(Uri uri, AudioDescriptor? audio, CancellationToken cancellationToken, LocalAudioSource? localSource = null)
     {
         ValidateSource(uri); ObjectDisposedException.ThrowIf(_disposed, this);
         DiscardPrepared();
         var operation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _preparing = operation;
         Slot? slot = null; PlaybackInput? input = null;
+        LocalAudioLease? lease = null;
         try
         {
             var local = uri;
@@ -111,7 +125,8 @@ internal sealed partial class NativePlayer : IDisposable
             }
             operation.Token.ThrowIfCancellationRequested();
             if (!ReferenceEquals(_preparing, operation)) throw new OperationCanceledException(operation.Token);
-            slot = new Slot(this, uri, input, 0, SpeedRatio); input = null;
+            lease = localSource?.Hold();
+            slot = new Slot(this, uri, input, lease, 0, SpeedRatio); input = null; lease = null;
             _prepared = slot;
             slot.Open(local); // Decode/open only. Never Play before promotion.
             await slot.Opened.Task.WaitAsync(TimeSpan.FromSeconds(30), operation.Token);
@@ -131,6 +146,7 @@ internal sealed partial class NativePlayer : IDisposable
         finally
         {
             input?.Dispose();
+            lease?.Dispose();
             if (ReferenceEquals(_preparing, operation)) _preparing = null;
             operation.Dispose();
         }
@@ -141,20 +157,30 @@ internal sealed partial class NativePlayer : IDisposable
         ValidateSource(source); ObjectDisposedException.ThrowIf(_disposed, this);
         if (crossfade < TimeSpan.Zero || crossfade > TimeSpan.FromSeconds(10)) throw new ArgumentOutOfRangeException(nameof(crossfade));
         if (_prepared is not { Ready: true } next || !string.Equals(next.RequestedSource.AbsoluteUri, source.AbsoluteUri, StringComparison.Ordinal)) return false;
+        var previous = _current;
+        var overlap = IsPlaying && previous?.Ready == true && crossfade > TimeSpan.Zero;
+        try
+        {
+            next.Volume = overlap ? 0 : Volume * _sleepGain * next.Gain;
+            next.Speed = SpeedRatio;
+            next.Play();
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException)
+        {
+            DiscardPrepared();
+            return false;
+        }
         FinishTransition(); // A second promotion can never leave three players playing.
         var opening = _opening; _opening = null; opening?.Cancel();
         _prepared = null; _preparing = null;
-        var previous = _current;
-        var overlap = IsPlaying && previous?.Ready == true && crossfade > TimeSpan.Zero;
         _current = next; LastNativeError = null;
         if (overlap)
         {
             _fading = previous; _fadeDuration = crossfade; _fadeElapsed = TimeSpan.Zero;
-            _fadeClock.Restart(); _fadeTimer.Start(); next.Volume = 0;
+            _fadeClock.Restart(); _fadeTimer.Start();
         }
-        else { previous?.Close(); next.Volume = Volume * _sleepGain * next.Gain; }
-        next.Speed = SpeedRatio;
-        next.Play(); IsPlaying = true;
+        else previous?.Close();
+        IsPlaying = true;
         StartGainTimer(); // A prepared slot may still be ramping when it becomes audible.
         return true;
     }
@@ -243,8 +269,12 @@ internal sealed partial class NativePlayer : IDisposable
     private void OnMediaEnded(Slot slot)
     {
         if (ReferenceEquals(slot, _fading)) { CompleteTransition(natural: true); return; }
-        if (!ReferenceEquals(slot, _current)) return;
+        if (!ReferenceEquals(slot, _current) || !IsPlaying) return;
         IsPlaying = false; FinishTransition(); Ended?.Invoke(this, EventArgs.Empty);
+    }
+    private void OnPlaybackActivityChanged(Slot slot)
+    {
+        if (ReferenceEquals(slot, _current) || ReferenceEquals(slot, _fading)) PlaybackActivityChanged?.Invoke();
     }
     public void Stop()
     {
@@ -261,20 +291,48 @@ internal sealed partial class NativePlayer : IDisposable
         _disposed = true;
         try { Stop(); } finally { _buffer.Dispose(); }
     }
-    private static string? LocalPath(Slot? slot) => slot?.Input?.Path ?? (slot?.OpenedSource is { IsFile: true } source ? source.LocalPath : null);
+    internal Task WaitForClosedLocalSourcesAsync(IReadOnlySet<string> paths)
+    {
+        _closedLocalSources.RemoveAll(source => source.Released.IsCompleted);
+        return Task.WhenAll(_closedLocalSources.Where(source => paths.Contains(source.Path)).Select(source => source.Released));
+    }
+
+    private void ReleaseLocalSource(LocalAudioLease lease, IEnumerable<Task> routing, Task? normalization)
+    {
+        var readers = routing.Where(task => !task.IsCompleted).ToList();
+        if (normalization is { IsCompleted: false }) readers.Add(normalization);
+        if (readers.Count == 0) { lease.Dispose(); return; }
+        var released = Task.WhenAll(readers).ContinueWith(reading =>
+        {
+            _ = reading.Exception;
+            lease.Dispose();
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        _closedLocalSources.RemoveAll(source => source.Released.IsCompleted);
+        _closedLocalSources.Add((lease.Path, released));
+    }
+
+    private static string? LocalPath(Slot? slot)
+        => slot?.LocalAudioPath ?? slot?.Input?.Path ?? (slot?.OpenedSource is { IsFile: true } source ? source.LocalPath : null);
     private static void ValidateSource(Uri source)
     { ArgumentNullException.ThrowIfNull(source); if (!source.IsAbsoluteUri) throw new ArgumentException("Требуется абсолютный адрес аудио.", nameof(source)); }
 
     private sealed class Slot
     {
         private readonly NativePlayer _owner;
+        private readonly LocalAudioLease? _localAudio;
+        private readonly List<Task> _routingReads = [];
+        internal string? LocalAudioPath => _localAudio?.Path;
         internal PlaybackInput? Input { get; }
         private Windows.Media.Playback.MediaPlayer? _network;
         private Windows.Media.Core.MediaSource? _networkSource;
         private readonly Dispatcher _dispatcher = Dispatcher.CurrentDispatcher;
+        private bool _wpfBuffering;
         internal Uri? OpenedSource { get; private set; }
         private int _routeRevision;
         internal bool HasSource => _networkSource is not null || Player.Source is not null;
+        internal bool IsAudioAdvancing => _network is { } network
+            ? network.PlaybackSession.PlaybackState == Windows.Media.Playback.MediaPlaybackState.Playing
+            : Ready && !_wpfBuffering;
         internal TimeSpan Position { get => _network?.PlaybackSession.Position ?? Player.Position; set { if (_network is not null) _network.PlaybackSession.Position = value; else Player.Position = value; } }
         internal TimeSpan Duration => _network?.PlaybackSession.NaturalDuration ?? (Player.NaturalDuration.HasTimeSpan ? Player.NaturalDuration.TimeSpan : TimeSpan.Zero);
         internal double Volume { set { if (_network is not null) _network.Volume = value; else Player.Volume = value; } }
@@ -297,6 +355,10 @@ internal sealed partial class NativePlayer : IDisposable
                 player.CommandManager.IsEnabled = false;
                 player.PlaybackSession.PlaybackRate = _owner.SpeedRatio;
                 route.Apply(player);
+                player.PlaybackSession.PlaybackStateChanged += (_, _) => Post(() =>
+                {
+                    if (ReferenceEquals(player, _network)) _owner.OnPlaybackActivityChanged(this);
+                });
                 player.MediaOpened += (_, _) => Post(() =>
                 {
                     routingOpened?.TrySetResult();
@@ -313,7 +375,17 @@ internal sealed partial class NativePlayer : IDisposable
             }
             catch { player.Dispose(); throw; }
         }
-        internal async Task RouteAsync(IAudioOutputRoute route)
+        internal Task RouteAsync(IAudioOutputRoute route)
+        {
+            var routing = RouteCoreAsync(route);
+            if (_localAudio is not null && !routing.IsCompleted)
+            {
+                _routingReads.RemoveAll(task => task.IsCompleted);
+                _routingReads.Add(routing);
+            }
+            return routing;
+        }
+        private async Task RouteCoreAsync(IAudioOutputRoute route)
         {
             var revision = ++_routeRevision;
             if (_closed) return;
@@ -339,6 +411,7 @@ internal sealed partial class NativePlayer : IDisposable
                 replacement = null; source = null;
                 Player.Close();
                 _owner.ApplyGains();
+                _owner.OnPlaybackActivityChanged(this);
                 if (_owner.IsPlaying && (ReferenceEquals(_owner._current, this) || ReferenceEquals(_owner._fading, this))) _network.Play();
             }
             catch (OperationCanceledException) when (_closed) { }
@@ -363,11 +436,20 @@ internal sealed partial class NativePlayer : IDisposable
         public Uri RequestedSource { get; }
         public TaskCompletionSource Opened { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool Ready { get; private set; }
-        public Slot(NativePlayer owner, Uri source, PlaybackInput? input, double volume, double speed)
+        public Slot(NativePlayer owner, Uri source, PlaybackInput? input, LocalAudioLease? localAudio, double volume, double speed)
         {
-            _owner = owner; RequestedSource = source; Input = input;
+            _owner = owner; RequestedSource = source; Input = input; _localAudio = localAudio;
             Player = new MediaPlayer { Volume = volume, SpeedRatio = speed };
             Player.MediaOpened += MediaOpened; Player.MediaFailed += MediaFailed; Player.MediaEnded += MediaEnded;
+            Player.BufferingStarted += BufferingStarted; Player.BufferingEnded += BufferingEnded;
+        }
+        private void BufferingStarted(object? sender, EventArgs e) => SetWpfBuffering(true);
+        private void BufferingEnded(object? sender, EventArgs e) => SetWpfBuffering(false);
+        private void SetWpfBuffering(bool buffering)
+        {
+            if (_closed || _network is not null) return;
+            _wpfBuffering = buffering;
+            _owner.OnPlaybackActivityChanged(this);
         }
         private void MediaOpened(object? sender, EventArgs e) { if (!_closed) { Ready = true; _owner.BeginNormalization(this); Opened.TrySetResult(); } }
         private void MediaFailed(object? sender, ExceptionEventArgs e) { if (!_closed) _owner.OnMediaFailed(this, e.ErrorException); }
@@ -382,9 +464,14 @@ internal sealed partial class NativePlayer : IDisposable
                 _ = task.ContinueWith(_ => NormalizationCancellation.Dispose(), TaskScheduler.Default);
             else NormalizationCancellation.Dispose();
             Player.MediaOpened -= MediaOpened; Player.MediaFailed -= MediaFailed; Player.MediaEnded -= MediaEnded;
+            Player.BufferingStarted -= BufferingStarted; Player.BufferingEnded -= BufferingEnded;
             Opened.TrySetCanceled();
             try { Player.Close(); _network?.Dispose(); _networkSource?.Dispose(); }
-            finally { Input?.Dispose(); }
+            finally
+            {
+                if (_localAudio is not null) _owner.ReleaseLocalSource(_localAudio, _routingReads, NormalizationTask);
+                Input?.Dispose();
+            }
         }
     }
 }

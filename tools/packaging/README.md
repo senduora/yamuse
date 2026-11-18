@@ -1,26 +1,40 @@
 # Локальная упаковка Windows x64
 
-Приложение использует **Velopack 1.2.161**, стабильный NuGet/vpk от 29.09.2026, лицензия MIT. Прямая зависимость закреплена точным диапазоном `[1.2.161]`, `src/YMusic.Native/packages.lock.json` содержит contentHash. `dotnet-tools.json` фиксирует ту же версию CLI. Для self-contained сборки закреплены .NET Core и Windows Desktop **10.0.14**; SDK **10.0.403** закреплён в global.json, Windows projection — **10.0.19041.57**.
+Приложение использует **Velopack 1.2.161**, стабильный NuGet/vpk от 29.09.2026, лицензия MIT. Прямая зависимость закреплена точным диапазоном `[1.2.161]`, `src/YMusic.Native/packages.lock.json` содержит contentHash. `dotnet-tools.json` фиксирует ту же версию CLI. Для self-contained сборки закреплены .NET Core и Windows Desktop **10.0.15**, для SDK в global.json — **10.0.404**, для Windows projection — **10.0.19041.57**.
 
-Публичный источник настроен на [senduora/yamuse](https://github.com/senduora/yamuse). `update-feed.json` копируется в выход сборки и publish через csproj; PAT, секретов, фонового процесса и собственного механизма замены exe нет. Проверка публичного выпуска и загрузка его пакета сверяются с опубликованными Release assets и SHA-256.
+Файл `update-feed.json` входит в сборку и указывает на публичный репозиторий. Yamuse запрашивает последний стабильный выпуск и сверяет пакет с его опубликованным SHA-256. При явном применении клиент готовит проверенный `Update.exe` из пакета и передаёт установку Velopack. [Официальный репозиторий](https://github.com/senduora/yamuse)
 
 ## Сборка
 
-Новые версии следуют [политике `X.Y.Z`](../../docs/VERSIONING.md): `X` — крупное обновление, `Y` — новые небольшие возможности, `Z` — исправления. Стабильная версия для сборки — `0.5.0`. Полная `InformationalVersion` обязательна при проверке пакета: числовая `AssemblyVersion` равна `0.5.0.0` и не отличает preview от стабильной версии. Скрипт принимает только стабильную `X.Y.Z`; до создания рабочих папок и получения инструментов он отклоняет preview-исходники либо несовпадение полной версии готовой DLL. Упаковка preview пока не поддерживается.
+Номер выпуска выбирается и согласуется по [политике `X.Y.Z`](../../docs/VERSIONING.md). Для упаковки нужна стабильная версия. До подготовки пакета скрипт сверяет `-Version` с `Version` и `AssemblyVersion` исходного проекта или с `InformationalVersion` и `AssemblyVersion` готовой DLL.
 
-Нужны Windows x64, PowerShell и .NET SDK 10.0.403. Для локально распакованного SDK передайте `-DotnetPath <полный путь к dotnet.exe>`. Для окончательного пакета используйте уже проверенный self-contained publish и хеш DLL, прошедшего общие проверки. Указывайте новые пустые папки:
+Нужны Windows x64, PowerShell и .NET SDK 10.0.404. Выполняйте пример из корня репозитория для согласованного пакета. Укажите `RunName` уже пройденной полной проверки `tools/Verify-Project.ps1 -Full`. Номер и SHA-256 берутся из её квитанции, где записаны `InformationalVersion` и хеш проверенной DLL.
 
 ```powershell
-& .\tools\packaging\Pack-Installer.ps1 `
-  -Version 0.5.0 `
-  -OutputFolder (Join-Path $PWD 'artifacts\setup-0.5.0') `
-  -WorkFolder (Join-Path $PWD 'work\package-0.5.0') `
-  -PackageCache (Join-Path $PWD 'work\verified-packages') `
-  -PublishedFolder $checkedSelfContainedPublish `
-  -ExpectedProductSha256 $checkedProductHash
+$runName = Read-Host 'RunName пройденной полной проверки'
+$verifiedRun = Join-Path (Join-Path $PWD 'work') $runName
+$receipt = Get-Content -LiteralPath (Join-Path $verifiedRun 'verification.json') -Raw | ConvertFrom-Json
+if ($receipt.status -cne 'PASS' -or !$receipt.full) { throw 'Требуется квитанция полной проверки.' }
+
+$version = ([string]$receipt.productVersion).Split('+')[0]
+if ($version -cnotmatch '^\d+\.\d+\.\d+$') { throw 'Требуется стабильная версия X.Y.Z.' }
+
+$attempt = "package-$version-" + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmssfff')
+$outputFolder = Join-Path $PWD "artifacts\$attempt"
+$packageWork = Join-Path $PWD "work\$attempt"
+$pack = @{
+    Version = $version
+    OutputFolder = $outputFolder
+    WorkFolder = $packageWork
+    PublishedFolder = Join-Path $verifiedRun 'publish'
+    ExpectedProductSha256 = $receipt.productDllSha256
+}
+# Для локального SDK добавьте $pack.DotnetPath с полным путём к dotnet.exe.
+# При наличии локального кэша добавьте $pack.PackageCache с путём к папке с nupkg.
+& .\tools\packaging\Pack-Installer.ps1 @pack
 ```
 
-Без `PublishedFolder` скрипт копирует исходники и global.json в отдельный staging, не трогает активный `app`, публикует self-contained WPF `win-x64`, затем вызывает закреплённый `vpk pack`. В staging создаётся RID-specific lock; основная блокировка зависимостей не переписывается. `PinnedRuntime.targets` задаёт WindowsSdkPackageVersion отдельно: глобальная RuntimeFrameworkVersion несовместима с Windows profile references SDK 10. Transitive framework downloads не отключаются. Итоговые Core и WPF runtime 10.0.14 обязательно сверяются в runtimeconfig; ASP.NET может быть загружен SDK в build cache, но не поставляется WPF-приложением.
+Без `PublishedFolder` скрипт копирует исходники и global.json в отдельный staging, не трогает активный `app`, публикует self-contained WPF `win-x64`, затем вызывает закреплённый `vpk pack`. В staging создаётся RID-specific lock; основная блокировка зависимостей не переписывается. `PinnedRuntime.targets` задаёт WindowsSdkPackageVersion отдельно: глобальная RuntimeFrameworkVersion несовместима с Windows profile references SDK 10. Transitive framework downloads не отключаются. Итоговые Core и WPF runtime 10.0.15 обязательно сверяются в runtimeconfig; ASP.NET может быть загружен SDK в build cache, но не поставляется WPF-приложением.
 
 `-PublishedFolder <проверенная папка>` упаковывает копию без пересборки. Проверяются assembly version, наличие WPF/CoreCLR и точная версия bundled runtime. `-ExpectedProductSha256` связывает пакет с проверенным DLL; тот же хеш затем сравнивается с DLL внутри full.nupkg. В обеих ветках кладутся согласованный публичный `update-feed.json` и `Legal` notices, без подмены DLL.
 
@@ -34,13 +48,13 @@
 
 Стандартный Setup.exe Velopack — per-user, с `%LOCALAPPDATA%\YMusic.Native` и уровнем `asInvoker`, без `--msi` и без загрузки prerequisites. Создаются ярлыки Desktop/StartMenuRoot и штатная запись удаления. Эти действия подтверждены контрактом Velopack и метаданными пакета; установка/удаление в живом профиле в этой работе не выполнялись.
 
-Идентификатор пакета **YMusic.Native** сохраняется для совместимости с уже установленными выпусками. Данные Yamuse находятся в `%LOCALAPPDATA%\Yamuse`, музыка — в `Документы\Yamuse\Music`. При первом старте новая версия безопасно переносит прежние папки без повторного скачивания музыки; пользовательский `--installto` в папку данных использовать нельзя.
+Идентификатор пакета **YMusic.Native** сохраняется для совместимости с уже установленными выпусками. Данные Yamuse находятся в `%LOCALAPPDATA%\Yamuse`, музыка — в `Документы\Yamuse\Music`. При первом старте приложение переносит локальный профиль и музыку из доступной локальной папки. Сетевые и недоступные «Документы» оно оставляет без изменений. Пользовательский `--installto` в папку данных использовать нельзя.
 
 Полное удаление запускается кнопкой в настройках установленного приложения. После явного подтверждения приложение завершает загрузки и воспроизведение, выходит, а отдельный этап очищает фиксированные пользовательские папки и вызывает штатный `Update.exe --uninstall`. Музыка удаляется по собственному индексу с проверкой размера и SHA-256. Посторонние и изменённые файлы сохраняются с сообщением; при занятом файле индекс остаётся для повторной попытки. Переходы через внешние junction/symlink запрещены, удаление файлов выполняется через проверенные handles.
 
 При обычном запуске и после обновления `UninstallSupport` заменяет только известную штатную команду в существующей HKCU-записи удаления Yamuse на `current\YMusic.Native.exe --uninstall`. Поэтому удаление через параметры Windows после запуска приложения использует такое же подтверждение и очистку. Portable не регистрирует удаление. Прямой вызов нативного `Update.exe --uninstall` по контракту Velopack удаляет только установленный пакет; интерактивную очистку данных нужно запускать через Yamuse.
 
-Bootstrap расположен в `Program.Main`, выбран через StartupObject, и выполняет `VelopackApp.Build().SetArgs(args).SetAutoApplyOnStartup(false)` с регистрацией after-update callback и `Run()` до создания `App`, `InitializeComponent` и `Run`. Fast hooks завершаются до открытия WPF/данных. Команды полного удаления обрабатываются до старта приложения; защитный marker не позволяет заново создавать данные во время передачи управления штатному деинсталлятору. Auto-apply при запуске явно выключен: скачанное обновление ожидает отдельного действия пользователя. При упаковке CLI проверяет наличие `VelopackApp.Run` в entry point.
+`Program.Main` выбран через `StartupObject`. При обычном запуске он захватывает общий mutex и проверяет маркер удаления перед инициализацией Velopack и WPF. Velopack получает параметры запуска и обрабатывает fast hooks до создания окна. Обычный SDK-запуск не перечисляет и не очищает кэш пакетов. Скачанное обновление ожидает явного применения. Команды полного удаления обрабатываются отдельной веткой, а демо открывается без инициализации Velopack. При упаковке CLI проверяет вызов `VelopackApp.Run` в точке входа.
 
 ## API для настроек
 
@@ -50,17 +64,27 @@ Bootstrap расположен в `Program.Main`, выбран через Startu
 - `DownloadAsync(IProgress<int>? = null, CancellationToken = default)` скачивает выбранное обновление. Повторный вызов после готовности не скачивает его заново. Операции сериализуются.
 - `ApplyAndRestart()` разрешён только после `Downloaded`; вызывается отдельной кнопкой после сохранения состояния и остановки плеера. Только этот метод вызывает официальный SDK apply/restart.
 
-Сам service не ставит таймер и не делает автоматических сетевых вызовов. Отсутствующий файл либо `update-feed.template.json` с null дают немедленный `NotConfigured` без создания update backend. Переносимая версия проверяет публичные метаданные через `CheckPortableReleaseAsync` и предлагает официальный установщик или архив; backend установки Velopack для неё не создаётся. Конфиг допускает только канонический HTTPS URL публичного `github.com/owner/repo`; credentials/query/token/неизвестные поля отклоняются. В состояние/сообщения не попадают raw URL и exception text.
+Сам service не ставит таймер и не делает автоматических сетевых вызовов. Отсутствующий файл либо `update-feed.template.json` с null дают немедленный `NotConfigured` без создания update backend. Переносимая версия проверяет публичные метаданные через `CheckPortableReleaseAsync` и предлагает официальный установщик или архив; backend установки Velopack для неё не создаётся. Единственный источник обновлений для установленной и переносимой версий — официальный публичный репозиторий `https://github.com/senduora/yamuse`. В состояние/сообщения не попадают raw URL и exception text.
 
-CheckForUpdatesAsync в закреплённом SDK не принимает CancellationToken: начатый запрос не бросается в фоне при отмене, операция остаётся сериализованной до завершения. Download поддерживает отмену SDK. Нет проверки private Releases, серверной авторизации или встроенного PAT.
+Проверка выпуска и скачивание пакета поддерживают отмену. Если пакет уже сохранён и проверен, последующая отмена сохраняет его готовность к установке. Клиент обращается к публичным выпускам GitHub без авторизации.
 
 ## Проверка пакетов
 
 `Pack-Installer.ps1` получает только фиксированные файлы NuGet по официальным HTTPS URL, сравнивает встроенные SHA-256 и запускает `dotnet nuget verify --all`. Затем CLI ставится из проверенного локального пакета, restore staging использует локальный feed. Источники/версии/хеши сохраняются в `build-provenance.json`; runtime/host Microsoft проверены по author+repository signature, Velopack/vpk — по repository signature NuGet.
 
-`Inspect-Package.ps1` читает nupkg/nuspec, сравнивает package id/version, размер/SHA-256 Release assets и читает манифест Setup как PE DATAFILE. Дополнительно сверяются product DLL и все шесть license/notice по SHA-256 внутри nupkg, включая `Third-Party-Notices.txt` и собственную MIT-лицензию `Yamuse-LICENSE.txt`. Встроенный полный nupkg внутри unsigned Setup подтверждается его SHA-256. Новый обязательный аргумент `-ReferencePublishedFolder` указывает на тот же проверенный publish: apphost сравнивается побайтово, его ProductName/FileDescription и native icon resources, а также иконка Setup должны соответствовать Yamuse. `Pack-Installer.ps1` передаёт reference и ожидаемые SHA автоматически. Setup не выполняется. Результат — `package-evidence.json`, `package.nuspec.xml`, `setup.manifest.xml`.
+`Pack-Installer.ps1` проверяет состав `.deps.json` для win-x64 и SHA-256 всего закреплённого runtime, включая Velopack, Windows projection и локализованные сборки WPF. `Inspect-Package.ps1` сверяет полную запись в `releases.win.json` по ID пакета, версии, имени, размеру и хешам. Он также сверяет три записи в `assets.win.json` и строку полного пакета в `RELEASES` по имени, размеру и SHA-1. Файлы nupkg и Portable ZIP сверяются побайтно с `-ReferencePublishedFolder`. Velopack может пропустить `createdump.exe` и добавляет известные служебные файлы. Три общих служебных файла дополнительно сверяются между архивами. Манифест и иконка Setup читаются как PE DATAFILE, а SHA-256 подтверждает соответствие встроенного nupkg. Скрипт пишет `package-evidence.json`, `package.nuspec.xml` и `setup.manifest.xml`.
 
-`Legal/Velopack-LICENSE.txt` — точный first-party [LICENSE](https://github.com/velopack/velopack/blob/92d6a1c91716729d449034df5c50307dcce39493/LICENSE) commit из nuspec Velopack 1.2.161, с copyright Caelan Sayler/Velopack Ltd. Также поставляются точные NETCore LICENSE/THIRD-PARTY-NOTICES и WindowsDesktop LICENSE из подписанных runtime nupkg 10.0.14. Csproj копирует их в output/publish, packscript — в staging. Эти лицензии относятся к зависимостям; собственный код Yamuse распространяется по лицензии MIT (см. LICENSE). Vendor notices сохраняются побайтно; Git не нормализует их line endings или upstream whitespace. Инспектор сверяет SHA-256.
+При упаковке `Pack-Installer.ps1` сам передаёт инспектору обязательный `-ReferencePublishedFolder`. Для отдельной повторной проверки сохраните и укажите папку `<WorkFolder>\publish`. В ней лежит точная копия файлов, переданных Velopack, включая подготовленные `update-feed.json` и `Legal`. С переменными из примера упаковки команда выглядит так.
+
+```powershell
+& .\tools\packaging\Inspect-Package.ps1 `
+    -OutputFolder $outputFolder `
+    -ExpectedVersion $version `
+    -ReferencePublishedFolder (Join-Path $packageWork 'publish') `
+    -ExpectedProductSha256 $receipt.productDllSha256
+```
+
+`Legal/Velopack-LICENSE.txt` — точный first-party [LICENSE](https://github.com/velopack/velopack/blob/92d6a1c91716729d449034df5c50307dcce39493/LICENSE) commit из nuspec Velopack 1.2.161, с copyright Caelan Sayler/Velopack Ltd. Также поставляются точные NETCore LICENSE/THIRD-PARTY-NOTICES и WindowsDesktop LICENSE из подписанных runtime nupkg 10.0.15. Csproj копирует их в output/publish, packscript — в staging. Эти лицензии относятся к зависимостям; собственный код Yamuse распространяется по лицензии MIT (см. LICENSE). Vendor notices сохраняются побайтно; Git не нормализует их line endings или upstream whitespace. Инспектор сверяет SHA-256.
 
 Установщик smoke не подписан Authenticode (`NotSigned`); NuGet repository signature исходных инструментов не является подписью нашего Setup. Signing certificate не предоставлен и не придумывается. Реальную установку/обновление/удаление и сохранение данных после них нужно проверять отдельно в разрешённом изолированном профиле/VM. Живой профиль и старый открытый клиент в этой работе не менялись.
 

@@ -15,11 +15,11 @@ internal static partial class Program
     };
 
     private static string LrclibRecord(string? artist = null, string? title = null, double duration = 180.125,
-        string? lrc = "[offset:250]\n[00:01.50][00:03.000]Synthetic fixture line", bool instrumental = false)
+        string? lrc = "[offset:250]\n[00:01.50][00:03.000]Synthetic fixture line", bool instrumental = false, string album = "Альбом / 2026")
         => JsonSerializer.Serialize(new
         {
             trackName = title ?? "песня (live remix)", artistName = artist ?? "  исполнитель   & гость  ",
-            albumName = "Альбом / 2026", duration, instrumental, plainLyrics = "Synthetic plain fixture", syncedLyrics = lrc
+            albumName = album, duration, instrumental, plainLyrics = "Synthetic plain fixture", syncedLyrics = lrc
         });
 
     private static async Task CheckLrclib()
@@ -43,7 +43,7 @@ internal static partial class Program
                 return Task.FromResult(Json(LrclibRecord(duration: 182.125)));
             }));
             using var client = new LrclibLyricsClient(http);
-            var result = await client.FindSynchronizedAsync(LrclibTrack(), default);
+            var result = (await client.FindSynchronizedAsync(LrclibTrack(), default)).Lyrics;
             Assert(calls == 1 && result is { Synchronized: true, Lines.Count: 2 }
                 && Math.Abs(result.Lines[0].TimeSeconds - 1.25) < .001 && Math.Abs(result.Lines[1].TimeSeconds - 2.75) < .001,
                 "matched LRC did not retain parser offset/multiple-stamp semantics or the inclusive two-second boundary");
@@ -58,6 +58,8 @@ internal static partial class Program
                 LrclibRecord(artist: "Исполнитель"),
                 LrclibRecord(title: "Песня"),
                 LrclibRecord(title: "Песня (Studio Remix)"),
+                LrclibRecord(album: "Другой альбом"),
+                LrclibRecord(album: ""),
                 LrclibRecord(duration: 182.126),
                 LrclibRecord(lrc: null),
                 LrclibRecord(lrc: ""),
@@ -67,6 +69,7 @@ internal static partial class Program
                 LrclibRecord(lrc: "[ar:Synthetic fixture]"),
                 "{malformed",
                 "[]",
+                LrclibRecord().Replace("\"syncedLyrics\":", "\"syncedLyrics\":\"\\uD800\",\"unused\":", StringComparison.Ordinal),
                 LrclibRecord().Replace("\"instrumental\":false", "\"instrumental\":\"false\"", StringComparison.Ordinal),
                 "{\"trackName\":\"Песня (Live Remix)\",\"artistName\":\"Исполнитель & Гость\",\"duration\":\"180.125\",\"syncedLyrics\":\"[00:01]Fixture\"}"
             };
@@ -74,7 +77,7 @@ internal static partial class Program
             {
                 using var http = new HttpClient(new LrclibHandler((_, _) => Task.FromResult(Json(rejected[index]))));
                 using var client = new LrclibLyricsClient(http);
-                Assert(await client.FindSynchronizedAsync(LrclibTrack(), default) is null, "rejected recording/body case accepted: " + index);
+                Assert((await client.FindSynchronizedAsync(LrclibTrack(), default)).Lyrics is null, "rejected recording/body case accepted: " + index);
             }
             foreach (var announcedLength in new[] { true, false })
             {
@@ -87,14 +90,39 @@ internal static partial class Program
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
                 }));
                 using var sizeClient = new LrclibLyricsClient(sizeHttp);
-                Assert(await sizeClient.FindSynchronizedAsync(LrclibTrack(), default) is null, "oversized LRCLIB body was accepted");
+                Assert((await sizeClient.FindSynchronizedAsync(LrclibTrack(), default)).Lyrics is null, "oversized LRCLIB body was accepted");
             }
             var unexpectedCalls = 0;
             using var emptyHttp = new HttpClient(new LrclibHandler((_, _) => { unexpectedCalls++; throw new InvalidOperationException("invalid input reached HTTP"); }));
             using var emptyClient = new LrclibLyricsClient(emptyHttp);
-            Assert(await emptyClient.FindSynchronizedAsync(LrclibTrack(0), default) is null
-                && await emptyClient.FindSynchronizedAsync(LrclibTrack(3600001), default) is null && unexpectedCalls == 0,
+            Assert((await emptyClient.FindSynchronizedAsync(LrclibTrack(0), default)).Lyrics is null
+                && (await emptyClient.FindSynchronizedAsync(LrclibTrack(3600001), default)).Lyrics is null && unexpectedCalls == 0,
                 "unknown/out-of-range duration was sent to LRCLIB");
+
+            using var shortHttp = new HttpClient(new LrclibHandler((_, _) =>
+            {
+                var reply = Json(LrclibRecord());
+                reply.Content.Headers.ContentLength = reply.Content.Headers.ContentLength!.Value + 1;
+                return Task.FromResult(reply);
+            }));
+            using var shortClient = new LrclibLyricsClient(shortHttp);
+            Assert((await shortClient.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics: null, TemporarilyUnavailable: true },
+                "a valid prefix of an incomplete LRCLIB body was accepted");
+
+            using var malformedHttp = new HttpClient(new LrclibHandler((_, _) => Task.FromResult(Json("{}"))));
+            using var malformedClient = new LrclibLyricsClient(malformedHttp);
+            Assert((await malformedClient.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics: null, TemporarilyUnavailable: true },
+                "a malformed LRCLIB record was treated as a confirmed miss");
+
+            using var rangeHttp = new HttpClient(new LrclibHandler((_, _) =>
+            {
+                var reply = Json(LrclibRecord());
+                Assert(reply.Content.Headers.TryAddWithoutValidation("Content-Range", "invalid fixture range"), "raw range fixture was rejected by the header collection");
+                return Task.FromResult(reply);
+            }));
+            using var rangeClient = new LrclibLyricsClient(rangeHttp);
+            Assert((await rangeClient.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics: null, TemporarilyUnavailable: true },
+                "LRCLIB ignored a nonempty malformed Content-Range");
         });
 
         await Run("LRCLIB: cancellation, HTTP errors and redirects never turn into cached success", async () =>
@@ -111,9 +139,12 @@ internal static partial class Program
                     return Task.FromResult(response);
                 }));
                 using var client = new LrclibLyricsClient(http);
-                Assert(await client.FindSynchronizedAsync(LrclibTrack(), default) is null && calls == 1, "HTTP failure/redirect was treated as lyrics: " + status);
+                var lookup = await client.FindSynchronizedAsync(LrclibTrack(), default);
+                Assert(lookup.Lyrics is null && lookup.TemporarilyUnavailable == (status != 404) && calls == 1,
+                    "HTTP failure/redirect was treated as lyrics or absence: " + status);
                 if (status == 429)
-                    Assert(await client.FindSynchronizedAsync(LrclibTrack(), default) is null && calls == 1, "Retry-After was ignored");
+                    Assert((await client.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics: null, TemporarilyUnavailable: true }
+                        && calls == 1, "Retry-After was ignored or turned into an absence");
             }
             var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             using var cancelHttp = new HttpClient(new LrclibHandler(async (_, token) =>
@@ -136,9 +167,9 @@ internal static partial class Program
                 _ => Json(LrclibRecord(), HttpStatusCode.ServiceUnavailable)
             })));
             using var retryClient = new LrclibLyricsClient(retryHttp);
-            Assert(await retryClient.FindSynchronizedAsync(LrclibTrack(), default) is null
-                && await retryClient.FindSynchronizedAsync(LrclibTrack(), default) is { Synchronized: true }
-                && await retryClient.FindSynchronizedAsync(LrclibTrack(), default) is null && sequence == 3,
+            Assert((await retryClient.FindSynchronizedAsync(LrclibTrack(), default)).TemporarilyUnavailable
+                && (await retryClient.FindSynchronizedAsync(LrclibTrack(), default)).Lyrics is { Synchronized: true }
+                && (await retryClient.FindSynchronizedAsync(LrclibTrack(), default)).TemporarilyUnavailable && sequence == 3,
                 "forbidden response blocked recovery or a server failure reused a previous success");
 
             using var timeoutHttp = new HttpClient(new LrclibHandler(async (_, token) =>
@@ -147,7 +178,8 @@ internal static partial class Program
                 throw new InvalidOperationException("timeout handler continued");
             })) { Timeout = TimeSpan.FromMilliseconds(50) };
             using var timeoutClient = new LrclibLyricsClient(timeoutHttp);
-            Assert(await timeoutClient.FindSynchronizedAsync(LrclibTrack(), default) is null, "request timeout became lyrics or an uncaught user cancellation");
+            Assert((await timeoutClient.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics: null, TemporarilyUnavailable: true },
+                "request timeout became lyrics, an absence, or an uncaught user cancellation");
 
             var authCalls = 0;
             using var authHttp = new HttpClient(new LrclibHandler((_, _) => { authCalls++; throw new InvalidOperationException("credentialed HTTP sent"); }));

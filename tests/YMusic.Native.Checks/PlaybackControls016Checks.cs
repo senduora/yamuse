@@ -3,11 +3,14 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Automation.Peers;
+using System.Windows.Automation.Provider;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Threading;
 using YMusic.Native;
+using Ellipse = System.Windows.Shapes.Ellipse;
 
 internal static partial class Program
 {
@@ -17,6 +20,8 @@ internal static partial class Program
         await Run("Playback016: held pointer and keyboard previews survive progress and commit or cancel safely", Pc016Gestures);
         await Run("Playback016: rail point replaces animation before commit and old gestures cannot seek a new track", Pc016RailAndReplacement);
         await Run("Playback016: all volume gestures update native gain immediately and persist only after release", Pc016Volume);
+        await Run("Playback016: UI Automation range writes seek in all views and progress remains display only", Pc016AutomationSeek);
+        await Run("Playback016: keyboard focus appears on the thumb and clears on pointer input", Pc016ThumbFocus);
     }
 
     private static async Task Pc016Smooth()
@@ -188,6 +193,56 @@ internal static partial class Program
         Assert(!SliderGesture.HasActiveGesture && !MediaField<DispatcherTimer>(f.Window, "_volumeSaveTimer").IsEnabled,
             "closed views retained gesture state or a persistence timer");
         Pc016Readback("volume", new { readback, allAudioPausedBeforeVolumeChecks = true });
+    }
+
+    private static async Task Pc016AutomationSeek()
+    {
+        using var f = new Pc016Fixture("automation-seek"); await f.Play(); f.Views();
+        await Call(f.Window, "TogglePlaybackAsync");
+        var sliders = f.Seeks();
+        foreach (var slider in sliders) PlaybackTimeline.Update(slider, 5, 30, false);
+        Assert(MediaField<double?>(f.Window, "_pendingSeek") is null && f.Player.Position.TotalSeconds < 2,
+            "an application-driven playhead update sought the audio source");
+        var target = 7d;
+        foreach (var slider in sliders)
+        {
+            var peer = UIElementAutomationPeer.CreatePeerForElement(slider);
+            var provider = (IRangeValueProvider)peer.GetPattern(PatternInterface.RangeValue);
+            Assert(!provider.IsReadOnly && provider.Minimum == 0 && provider.Maximum > target, "timeline lost its native UI Automation range");
+            provider.SetValue(target);
+            Assert(MediaField<double?>(f.Window, "_pendingSeek") == target && sliders.All(view => Math.Abs(view.Value - target) < .01),
+                "UI Automation range write did not issue a shared seek");
+            await Until(() => Math.Abs(f.Player.Position.TotalSeconds - target) < .4);
+            target += 7;
+        }
+        Assert(!f.Player.IsPlaying, "UI Automation seek resumed paused audio");
+    }
+
+    private static async Task Pc016ThumbFocus()
+    {
+        using var f = new Pc016Fixture("thumb-focus"); await f.Play(); f.Views();
+        var keyboard = new Pk040Keyboard(ModifierKeys.None);
+        var previousFocus = Keyboard.FocusedElement as DependencyObject;
+        var setFocus = typeof(KeyboardDevice).GetMethod("ChangeFocus", BindingFlags.Instance | BindingFlags.NonPublic,
+            null, [typeof(DependencyObject), typeof(int)], null) ?? throw new InvalidOperationException("WPF local keyboard focus hook unavailable");
+        try
+        {
+            foreach (var slider in f.Seeks().Concat([Control<Slider>(f.Window, "VolumeSlider"), f.Mini!.VolumeSlider]))
+            {
+                slider.ApplyTemplate(); slider.UpdateLayout();
+                var thumb = ((Track)slider.Template.FindName("PART_Track", slider)).Thumb;
+                thumb.ApplyTemplate();
+                var ring = (Ellipse)thumb.Template.FindName("ThumbKeyboardFocus", thumb);
+                slider.RaiseEvent(new KeyEventArgs(keyboard, new Pk040Source(slider), Environment.TickCount, Key.Tab) { RoutedEvent = Keyboard.PreviewKeyDownEvent });
+                setFocus.Invoke(Keyboard.PrimaryDevice, [slider, Environment.TickCount]);
+                slider.UpdateLayout();
+                Assert(ring.Opacity == 1 && ring.ActualWidth <= thumb.ActualWidth && slider.FocusVisualStyle is null,
+                    "keyboard focus is missing or extends beyond the thumb");
+                slider.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Right) { RoutedEvent = Mouse.PreviewMouseDownEvent });
+                Assert(ring.Opacity == 0, "pointer interaction left the keyboard focus ring visible");
+            }
+        }
+        finally { setFocus.Invoke(Keyboard.PrimaryDevice, [previousFocus, Environment.TickCount]); }
     }
 
     private static bool Pc016Animated(Slider slider) => DependencyPropertyHelper.GetValueSource(slider, RangeBase.ValueProperty).IsAnimated;

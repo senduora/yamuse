@@ -1,6 +1,8 @@
 using System.IO;
 using System.Net.Http;
 using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -17,6 +19,145 @@ internal static partial class Program
         await Run("ThemeSettings040: absent legacy malformed and roundtrip preferences preserve System and the gold default", Ts040Preferences);
         await Run("ThemeSettings040: theme changes reuse the cover palette and keep five second readable accent transitions", Ts040Palette);
         await Run("ThemeSettings040: settings apply and persist theme immediately without showing a window or resetting other preferences", Ts040Settings);
+        await Run("ThemeSettings040: settings locked during startup survive edits and shutdown and can be saved after restart", Ts040LockedPreferences);
+        await Run("ThemeSettings040: recovering malformed settings archives the exact original", Ts040MalformedPreferencesBackup);
+        await Run("ThemeSettings040: oversized corrupt settings retain one exact archive across a blocked replacement", Ts040OversizedPreferencesBackup);
+        await Run("ThemeSettings040: encrypted metadata disallows a plaintext replacement before staging", Ts040EncryptedSettingsPolicy);
+        await Run("ThemeSettings040: guarded writers cannot publish during another settings transaction", Ts040ConcurrentPreferences);
+    }
+
+    private static Task Ts040MalformedPreferencesBackup()
+    {
+        var directory = Path.Combine(_directory, "theme040-preferences-backup");
+        var store = new PreferencesStore(directory);
+        Directory.CreateDirectory(directory);
+        var original = "{\r\n  \"volume\": 0.31,\r\n"u8.ToArray();
+        File.WriteAllBytes(store.FilePath, original);
+        File.SetLastWriteTimeUtc(store.FilePath, new DateTime(2025, 5, 12, 12, 0, 0, DateTimeKind.Utc));
+        File.SetAttributes(store.FilePath, FileAttributes.Hidden);
+        var archivedWriteTime = File.GetLastWriteTimeUtc(store.FilePath);
+        using var identity = WindowsIdentity.GetCurrent();
+        var security = new FileSecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(identity.User!, FileSystemRights.FullControl, AccessControlType.Allow));
+        new FileInfo(store.FilePath).SetAccessControl(security);
+        static string ReadDacl(string path) => new FileInfo(path).GetAccessControl(AccessControlSections.Access)
+            .GetSecurityDescriptorSddlForm(AccessControlSections.Access);
+        var originalDacl = ReadDacl(store.FilePath);
+
+        var recovered = store.Load();
+        Assert(store.LastLoadRecovered && recovered == new PlayerPreferences() && store.CorruptBackupPath is null
+            && File.ReadAllBytes(store.FilePath).SequenceEqual(original), "recovering settings changed the original file before save");
+
+        var valid = recovered with { Volume = .31, Theme = "Dark" };
+        // Share reads so the backup can be staged, but prevent the final rename.
+        var saveFailed = false;
+        using (File.OpenRead(store.FilePath))
+        {
+            try { store.Save(valid); }
+            catch (IOException) { saveFailed = true; }
+        }
+        Assert(saveFailed && store.CorruptBackupPath is null && File.ReadAllBytes(store.FilePath).SequenceEqual(original)
+            && Directory.GetFiles(directory).SequenceEqual(new[] { store.FilePath }),
+            "a failed replacement changed the original or left a staged file or backup behind");
+
+        store.Save(valid);
+        Assert(store.CorruptBackupPath is { } backup && Path.GetDirectoryName(backup) == directory
+            && File.ReadAllBytes(backup).SequenceEqual(original) && ReadDacl(backup) == originalDacl
+            && File.GetLastWriteTimeUtc(backup) == archivedWriteTime && File.GetAttributes(backup).HasFlag(FileAttributes.Hidden),
+            "save did not preserve the exact malformed original and its file metadata in a sibling backup");
+        Assert(store.Load() == valid && !store.LastLoadRecovered, "replacement did not produce valid settings");
+        Assert(ReadDacl(store.FilePath) == originalDacl && File.GetAttributes(store.FilePath).HasFlag(FileAttributes.Hidden),
+            "recovery changed the settings permissions or attributes");
+        store.Save(valid with { Theme = "Light" });
+        Assert(ReadDacl(store.FilePath) == originalDacl, "replacing a valid file changed the settings permissions");
+        return Task.CompletedTask;
+    }
+
+    private static Task Ts040OversizedPreferencesBackup()
+    {
+        var directory = Path.Combine(_directory, "theme040-oversized-preferences");
+        var store = new PreferencesStore(directory);
+        Directory.CreateDirectory(directory);
+        var original = new byte[3 * 64 * 1024 + 17];
+        new Random(42).NextBytes(original);
+        File.WriteAllBytes(store.FilePath, original);
+
+        var recovered = store.Load();
+        Assert(store.LastLoadRecovered && recovered == new PlayerPreferences(), "oversized settings were accepted as a preference snapshot");
+        var valid = recovered with { Volume = .37, Theme = "Dark" };
+        using (File.OpenRead(store.FilePath))
+        {
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                var failed = false;
+                try { store.Save(valid); }
+                catch (IOException) { failed = true; }
+                Assert(failed && store.CorruptBackupPath is null && File.ReadAllBytes(store.FilePath).SequenceEqual(original),
+                    "a blocked replacement changed the oversized original or reported success");
+            }
+        }
+        var archives = Directory.GetFiles(directory, "settings.corrupt-*.json");
+        Assert(archives.Length <= 1, "blocked replacements accumulated oversized archives");
+
+        store.Save(valid);
+        Assert(store.CorruptBackupPath is { } backup && File.ReadAllBytes(backup).SequenceEqual(original)
+            && (archives.Length == 0 || backup == archives[0]) && Directory.GetFiles(directory).Length == 2,
+            "recovery did not keep one exact oversized archive and clean stages");
+        Assert(store.Load() == valid && !store.LastLoadRecovered, "recovery did not publish valid settings");
+        return Task.CompletedTask;
+    }
+
+    private static Task Ts040EncryptedSettingsPolicy()
+    {
+        FileSecurityPreservation.ValidateReplacementAttributes(FileAttributes.Archive);
+        var refused = false;
+        try { FileSecurityPreservation.ValidateReplacementAttributes(FileAttributes.Archive | FileAttributes.Encrypted); }
+        catch (IOException) { refused = true; }
+        Assert(refused, "encrypted settings were admitted to a plaintext stage");
+        return Task.CompletedTask;
+    }
+
+    private static async Task Ts040ConcurrentPreferences()
+    {
+        var directory = Path.Combine(_directory, "theme040-concurrent-preferences");
+        var store = new PreferencesStore(directory);
+        store.Save(new PlayerPreferences { Volume = .31 });
+        var original = File.ReadAllBytes(store.FilePath);
+        var expected = new PlayerPreferences { Volume = .73 };
+
+        var holding = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var holder = Task.Run(() =>
+        {
+            using var transaction = GuardedStoreFile.BeginWrite(store.FilePath);
+            holding.TrySetResult();
+            release.Task.GetAwaiter().GetResult();
+        });
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<bool> competing;
+        try
+        {
+            await holding.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            competing = Task.Run(() =>
+            {
+                started.TrySetResult();
+                try { new PreferencesStore(directory).Save(expected); return true; }
+                catch (IOException) { return false; }
+            });
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            if (await Task.WhenAny(competing, Task.Delay(200)) == competing)
+                Assert(!await competing, "a competing writer published while the transaction was active");
+            Assert(File.ReadAllBytes(store.FilePath).SequenceEqual(original), "a competing writer changed guarded settings");
+        }
+        finally
+        {
+            release.TrySetResult();
+            await holder.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        if (!await competing.WaitAsync(TimeSpan.FromSeconds(5))) store.Save(expected);
+        Assert(store.Load() == expected, "settings were not writable after the guarded transaction ended");
     }
 
     private static Task Ts040Preferences()
@@ -51,6 +192,63 @@ internal static partial class Program
         store.Save(legacy with { Theme = "invalid", StaticAccentColor = "invalid" });
         Assert(store.Load().Theme == "System" && store.Load().StaticAccentColor == "#E7BB59", "invalid saved values lost safe defaults");
         Assert(CoverPalette.Fallback == Color.FromRgb(231, 187, 89), "palette fallback is not the new gold");
+        return Task.CompletedTask;
+    }
+
+    private static Task Ts040LockedPreferences()
+    {
+        var previousMode = ThemeManager.Mode;
+        var directory = Path.Combine(_directory, "theme040-locked-preferences");
+        var store = new PreferencesStore(directory);
+        var saved = new PlayerPreferences { Theme = "Light", Volume = .31, PlaybackSpeed = 1.25,
+            CrossfadeSeconds = 6.5, ConcurrentDownloads = 7, UpdateCheckFrequency = UpdateCheckFrequency.Off };
+        store.Save(saved);
+        var originalBytes = File.ReadAllBytes(store.FilePath);
+
+        MainWindow OpenWindow() => new(api: new MusicApi(new FakeHandler((_, _) => throw new InvalidOperationException("settings fixture attempted network access"))),
+            restore: false, diagnosticsDirectory: directory, preferences: new PreferencesStore(directory));
+
+        FileStream LockSettings() => new(store.FilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+
+        void SetSpeed(MainWindow window, double speed)
+        {
+            SaClick(Control<Button>(window, "SettingsButton"));
+            Control<ComboBox>(window, "SettingsSpeed").SelectedItem = speed;
+            Assert(SaField<NativePlayer>(window, "_player").SpeedRatio == speed, "playback speed did not change in the window");
+        }
+
+        try
+        {
+            foreach (var edit in new[] { false, true })
+            {
+                MainWindow window;
+                using (LockSettings()) window = OpenWindow();
+                try
+                {
+                    Assert(SaField<Diagnostics>(window, "_diagnostics").LastErrorType == "PreferencesLoad:IOException", "startup did not observe the sharing failure");
+                    if (edit)
+                    {
+                        SetSpeed(window, 1.5);
+                        Assert(File.ReadAllBytes(store.FilePath).SequenceEqual(originalBytes), "live save overwrote settings that were unreadable at startup");
+                    }
+                }
+                finally { window.Close(); }
+                Assert(File.ReadAllBytes(store.FilePath).SequenceEqual(originalBytes), "shutdown overwrote settings that were unreadable at startup");
+            }
+
+            var restarted = OpenWindow();
+            try
+            {
+                Assert(ThemeManager.Mode == saved.Theme && Control<Slider>(restarted, "VolumeSlider").Value == 31
+                    && SaField<NativePlayer>(restarted, "_player").SpeedRatio == saved.PlaybackSpeed, "restart did not restore saved settings");
+                using (LockSettings()) SetSpeed(restarted, 1.5);
+                Assert(SaField<Diagnostics>(restarted, "_diagnostics").LastErrorType == "PreferencesSave:IOException", "the save did not observe the sharing failure");
+                Assert(File.ReadAllBytes(store.FilePath).SequenceEqual(originalBytes), "a sharing failure during save damaged the file");
+            }
+            finally { restarted.Close(); }
+            Assert(store.Load() == (saved with { PlaybackSpeed = 1.5 }), "shutdown retry lost the change or an unrelated setting after a successful startup load");
+        }
+        finally { ThemeManager.SetMode(previousMode); }
         return Task.CompletedTask;
     }
 

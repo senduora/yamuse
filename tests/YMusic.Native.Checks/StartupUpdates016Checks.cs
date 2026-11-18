@@ -109,7 +109,7 @@ internal static partial class Program
         using var f = new SaFixture("startup016-pending"); var w = f.Window;
         var backend = new Su016Backend { PendingVersion = "9.1.0" }; var updates = Su016Service(w, "pending", backend);
         await Call(w, "CheckForAppUpdatesAsync");
-        Assert(updates.State.Status == AppUpdateStatus.Downloaded && backend.Checks == 0 && backend.Downloads == 0 && backend.Applies == 0,
+        Assert(updates.State.Status == AppUpdateStatus.Downloaded && backend.Checks == 1 && backend.Downloads == 0 && backend.Applies == 0,
             "pending update was downloaded/applied during startup");
         SaClick(Su016Find<Button>(w, "StartupUpdateButton")!);
         await Until(() => backend.Applies == 1 && !SaField<bool>(w, "_appUpdateActionInProgress"));
@@ -150,7 +150,7 @@ internal static partial class Program
             await Call(w, "CheckForAppUpdatesAsync"); SaClick(Su016Find<Button>(w, "StartupUpdateButton")!); await backend.DownloadEntered.Task;
             w.Close(); backend.DownloadRelease.TrySetResult();
             await Until(() => !SaField<bool>(w, "_appUpdateActionInProgress"));
-            Assert(backend.Canceled && backend.Applies == 0 && updates.State.Status != AppUpdateStatus.Downloaded,
+            Assert(backend.Canceled && backend.Applies == 0 && backend.PendingVersion is null && updates.State.Status != AppUpdateStatus.Downloaded,
                 "download ignored lifetime cancellation and restarted after close");
         }
     }
@@ -173,7 +173,7 @@ internal static partial class Program
     {
         var directory = Path.Combine(_directory, "startup016-" + name); Directory.CreateDirectory(directory);
         var path = Path.Combine(directory, "feed.json");
-        File.WriteAllText(path, configured ? "{\"githubRepository\":\"https://github.com/example/startup-fixture\"}" : "{}");
+        File.WriteAllText(path, configured ? "{\"githubRepository\":\"https://github.com/senduora/yamuse\"}" : "{}");
         var service = new UpdateSupport(path, installed, _ => backend);
         typeof(MainWindow).GetField("_appUpdatesOverride", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(window, service);
         return service;
@@ -193,19 +193,21 @@ internal static partial class Program
         internal TaskCompletionSource DownloadEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource DownloadRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public string? PendingVersion { get; set; }
-        public async Task<string?> CheckAsync()
+        public async Task<string?> CheckAsync(CancellationToken token)
         {
             Checks++; CheckEntered.TrySetResult(); if (HoldCheck) await CheckRelease.Task;
+            token.ThrowIfCancellationRequested();
             if (CheckFailures-- > 0) throw new IOException("fixture-private-check-failure");
-            return Version;
+            return PendingVersion ?? Version;
         }
         public async Task DownloadAsync(Action<int> progress, CancellationToken token)
         {
             Downloads++; LastProgress = progress; progress(42); DownloadEntered.TrySetResult();
             using var registration = token.Register(() => Canceled = true);
-            // Deliberately complete a late callback even after cancellation, to
-            // verify the service and UI do not turn it into a restart.
             if (HoldDownload) await DownloadRelease.Task;
+            // Emit a stale progress callback, then honor cancellation before publication.
+            if (token.IsCancellationRequested) progress(100);
+            token.ThrowIfCancellationRequested();
             if (DownloadFailures-- > 0) throw new IOException("fixture-private-download-failure");
             PendingVersion = Version; progress(100);
         }

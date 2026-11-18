@@ -72,7 +72,7 @@ internal static partial class Program
             try
             {
                 offlineWindow.Show(); Control<Slider>(offlineWindow, "VolumeSlider").Value = 0;
-                typeof(MainWindow).GetMethod("ShowOfflinePlaylist", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(offlineWindow, [new CatalogItem("42", "offline-playlist", "Fixture", "", "12345", "42")]);
+                await Call(offlineWindow, "ShowOfflinePlaylist", new CatalogItem("42", "offline-playlist", "Fixture", "", "12345", "42"));
                 var list = Control<ListView>(offlineWindow, "TracksList");
                 Assert(list.Items.Count == 2 && reopened.GetPlaylistStatus("12345", "42").Complete, "playlist status not persisted");
                 await offlineWindow.PlayTrackAsync((TrackRow)list.Items[0]);
@@ -158,10 +158,11 @@ internal static partial class Program
                 await Call(window, "StartWaveViewAsync", false);
                 Assert(Control<TextBlock>(window, "TrackTitle").Text == "Wave fixture 501", "Wave did not play server track");
                 Assert(native.IsPlaying && native.Duration.TotalSeconds >= 9, "Wave native audio did not open");
-                Assert(Control<Button>(window, "NextButton").IsEnabled, "last Wave Next disabled");
                 await Task.Delay(100); await Call(window, "TogglePlaybackAsync"); await Task.Delay(300);
+                await Until(() => native.HasPrepared);
+                Assert(Control<Button>(window, "NextButton").IsEnabled, "last Wave Next disabled");
                 var prefetchedBatches = more;
-                Assert(prefetchedBatches is >= 1 and <= 2, "Wave tail was not prepared, or fetched without a bounded lookahead");
+                Assert(prefetchedBatches == 1, "first Wave track did not prepare exactly one continuation");
                 await Call(window, "AdvanceAsync", 1, false);
                 Assert(more >= prefetchedBatches && more <= prefetchedBatches + 1 && Control<TextBlock>(window, "TrackTitle").Text == "Wave fixture 502", "Wave extension/advance failed");
                 await Until(() => feedback.Count >= 4);

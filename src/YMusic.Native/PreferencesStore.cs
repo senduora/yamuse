@@ -1,7 +1,11 @@
 ﻿using System.IO;
 using System.Collections.Concurrent;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Win32.SafeHandles;
 
 namespace YMusic.Native;
 
@@ -53,10 +57,14 @@ internal sealed class PreferencesStore
         lock (_gate)
         {
             LastLoadRecovered = false;
-            if (!File.Exists(FilePath)) return new();
-            if (TryRead(FilePath, out var preferences)) return Normalize(preferences!);
-            // Keep the original untouched. Save() moves the exact original to a
-            // unique backup atomically before replacing a malformed settings file.
+            using var parents = HoldSettingsDirectory();
+            if (!parents.Complete) return new();
+            using var handle = TryOpenSettingsFile();
+            if (handle is null) return new();
+            using var stream = new FileStream(handle, FileAccess.Read);
+            if (TryReadSettings(stream, out var preferences)) return Normalize(preferences!);
+
+            // Save archives the original before publishing new settings.
             LastLoadRecovered = true;
             return new();
         }
@@ -67,37 +75,166 @@ internal sealed class PreferencesStore
         ArgumentNullException.ThrowIfNull(preferences);
         lock (_gate)
         {
-            var directory = Path.GetDirectoryName(FilePath)!;
-            Directory.CreateDirectory(directory);
-            var temporary = Path.Combine(directory, $".settings-{Guid.NewGuid():N}.tmp");
-            try
-            {
-                var bytes = JsonSerializer.SerializeToUtf8Bytes(Normalize(preferences), JsonOptions);
-                using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write,
-                    FileShare.None, 4096, FileOptions.WriteThrough))
-                {
-                    stream.Write(bytes);
-                    stream.Flush(flushToDisk: true);
-                }
-                if (File.Exists(FilePath))
-                {
-                    var backup = TryRead(FilePath, out _) ? null
-                        : Path.Combine(directory, $"settings.corrupt-{DateTime.UtcNow:yyyyMMddTHHmmssfffffffZ}-{Guid.NewGuid():N}.json");
-                    // Windows ReplaceFile preserves the destination on failure;
-                    // recovery also retains the exact malformed original. Stores
-                    // sharing this path serialize their opens with the same gate.
-                    File.Replace(temporary, FilePath, backup);
-                    if (backup is not null) CorruptBackupPath = backup;
-                }
-                else File.Move(temporary, FilePath);
-            }
-            finally
-            {
-                try { File.Delete(temporary); }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
-            }
+            try { WriteSettings(preferences); }
+            catch (Win32Exception error) { throw new IOException("Не удалось сохранить настройки.", error); }
         }
     }
+
+    private void WriteSettings(PlayerPreferences preferences)
+    {
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(Normalize(preferences), JsonOptions);
+        var directory = Path.GetDirectoryName(FilePath)!;
+        var id = Guid.NewGuid().ToString("N");
+        using var storage = GuardedStoreFile.BeginWrite(FilePath);
+        SafeFileHandle? staged = null;
+        SafeFileHandle? backup = null;
+        var published = false;
+        try
+        {
+            string? backupPath = null;
+            using (var existing = storage.OpenExisting())
+            {
+                if (existing is not null)
+                {
+                    using var original = new FileStream(existing, FileAccess.Read);
+                    if (original.Length > MaximumFileBytes)
+                    {
+                        backupPath = ArchiveOversizedOriginal(existing, directory);
+                    }
+                    else if (!TryReadSettings(original, out _))
+                    {
+                        backup = storage.CreateStage(Path.Combine(directory, $".settings-{id}-backup.tmp"));
+                        WriteBackup(original, backup);
+                        backupPath = Path.Combine(directory, $"settings.corrupt-{DateTime.UtcNow:yyyyMMddTHHmmssfffffffZ}-{id}.json");
+                        ManagedCacheCleanup.RenameByHandle(backup, backupPath);
+                    }
+                }
+            }
+
+            // Creating the oversized archive can update the original's metadata.
+            // Stage records the original for commit after that operation.
+            staged = storage.Stage(bytes);
+            storage.Commit(staged);
+            published = true;
+            if (backupPath is not null) CorruptBackupPath = backupPath;
+        }
+        finally
+        {
+            if (!published)
+            {
+                if (staged is not null) UninstallPathGuard.DiscardStagedFile(staged);
+                if (backup is not null) UninstallPathGuard.DiscardStagedFile(backup);
+            }
+            staged?.Dispose();
+            backup?.Dispose();
+        }
+    }
+
+    private static void WriteBackup(FileStream original, SafeFileHandle backup)
+    {
+        original.Position = 0;
+        var buffer = new byte[64 * 1024];
+        long offset = 0;
+        int read;
+        while ((read = original.Read(buffer)) > 0)
+        {
+            RandomAccess.Write(backup, buffer.AsSpan(0, read), offset);
+            offset += read;
+        }
+        FileSecurityPreservation.PreserveBasicInformation(original.SafeFileHandle, backup);
+        File.SetLastWriteTimeUtc(backup, File.GetLastWriteTimeUtc(original.SafeFileHandle));
+        RandomAccess.FlushToDisk(backup);
+    }
+
+    private string ArchiveOversizedOriginal(SafeFileHandle original, string directory)
+    {
+        try
+        {
+            var identity = GetFileIdentity(original);
+            // Reuse the complete archive if an earlier publication was interrupted.
+            var name = $"settings.corrupt-large-{identity.Volume:x16}-{identity.High:x16}{identity.Low:x16}.json";
+            var archivePath = Path.Combine(directory, name);
+            // Link the checked source identity directly within the pinned directory.
+            using var parent = UninstallPathGuard.HoldDirectory(directory);
+            CreateArchiveLink(original, parent, name);
+            using var archive = UninstallPathGuard.OpenOwnedFile(archivePath, read: false, deleteAccess: false);
+            if (!GetFileIdentity(archive).Equals(identity)) throw new IOException("Резервная копия настроек занята другим файлом.");
+            return archivePath;
+        }
+        catch (Exception error) when (error is IOException or Win32Exception or UnauthorizedAccessException)
+        {
+            throw new OversizedSettingsArchiveException(error);
+        }
+    }
+
+    private static void CreateArchiveLink(SafeFileHandle original, SafeFileHandle parent, string name)
+    {
+        const int fileLinkInformation = 11;
+        var filename = Encoding.Unicode.GetBytes(name + '\0');
+        var nameOffset = Marshal.OffsetOf<LinkInformation>(nameof(LinkInformation.Name)).ToInt32();
+        var size = nameOffset + filename.Length;
+        var buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            // ReplaceIfExists stays zero. A retry verifies the existing link's ID.
+            for (var i = 0; i < nameOffset; ++i) Marshal.WriteByte(buffer, i, 0);
+            Marshal.WriteIntPtr(buffer, Marshal.OffsetOf<LinkInformation>(nameof(LinkInformation.RootDirectory)).ToInt32(),
+                parent.DangerousGetHandle());
+            Marshal.WriteInt32(buffer, Marshal.OffsetOf<LinkInformation>(nameof(LinkInformation.NameLength)).ToInt32(),
+                filename.Length - sizeof(char));
+            Marshal.Copy(filename, 0, buffer + nameOffset, filename.Length);
+            var status = NtSetInformationFile(original, out _, buffer, (uint)size, fileLinkInformation);
+            GC.KeepAlive(parent);
+            if (status < 0)
+            {
+                var error = (int)RtlNtStatusToDosError(status);
+                if (error is not (80 or 183)) throw new Win32Exception(error);
+            }
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    private static FileIdentity GetFileIdentity(SafeFileHandle handle)
+    {
+        const int fileIdInfo = 18;
+        if (!GetFileInformationByHandleEx(handle, fileIdInfo, out var identity, (uint)Marshal.SizeOf<FileIdentity>()))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return identity;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileIdentity
+    {
+        internal ulong Volume;
+        internal ulong Low;
+        internal ulong High;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct LinkInformation
+    {
+        internal byte ReplaceIfExists;
+        internal IntPtr RootDirectory;
+        internal uint NameLength;
+        internal char Name;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoStatusBlock
+    {
+        internal IntPtr Status;
+        internal UIntPtr Information;
+    }
+
+    [DllImport("ntdll.dll", ExactSpelling = true)]
+    private static extern int NtSetInformationFile(SafeFileHandle handle, out IoStatusBlock status, IntPtr information, uint size, int infoClass);
+
+    [DllImport("ntdll.dll", ExactSpelling = true)]
+    private static extern uint RtlNtStatusToDosError(int status);
+
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, out FileIdentity identity, uint size);
 
     public static PlayerPreferences Normalize(PlayerPreferences preferences)
     {
@@ -125,9 +262,21 @@ internal sealed class PreferencesStore
     internal static string NormalizeTheme(string? value) => string.Equals(value, "Light", StringComparison.OrdinalIgnoreCase) ? "Light"
         : string.Equals(value, "Dark", StringComparison.OrdinalIgnoreCase) ? "Dark" : "System";
 
-    private static bool TryRead(string path, out PlayerPreferences? preferences)
+    private UninstallPathGuard.AncestorLease HoldSettingsDirectory()
     {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        try { return UninstallPathGuard.HoldAncestors(FilePath); }
+        catch (Win32Exception error) { throw new IOException("Не удалось открыть папку настроек.", error); }
+    }
+
+    private SafeFileHandle? TryOpenSettingsFile()
+    {
+        try { return UninstallPathGuard.OpenOwnedFile(FilePath, read: true, deleteAccess: false); }
+        catch (Win32Exception error) when (error.NativeErrorCode == 2) { return null; }
+        catch (Win32Exception error) { throw new IOException("Не удалось открыть файл настроек.", error); }
+    }
+
+    private static bool TryReadSettings(FileStream stream, out PlayerPreferences? preferences)
+    {
         preferences = null;
         if (stream.Length > MaximumFileBytes) return false;
         try
@@ -138,6 +287,9 @@ internal sealed class PreferencesStore
         catch (JsonException) { return false; }
     }
 }
+
+internal sealed class OversizedSettingsArchiveException(Exception inner)
+    : IOException("Не удалось архивировать большой файл настроек. Переименуйте settings.json в папке данных Yamuse и перезапустите приложение.", inner);
 
 internal sealed class ThemeModeConverter : JsonConverter<string>
 {

@@ -3,7 +3,6 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
-using System.Security.Cryptography;
 using System.Text.Json;
 using System.Windows.Controls;
 using YMusic.Native;
@@ -171,16 +170,8 @@ internal static partial class Program
                 return new TrackRow { Id = "synthetic-" + i, RequestId = "synthetic-" + i, Title = "Synthetic " + i, Artist = "Fixture",
                     Available = true, DurationMs = 2000, LocalPath = path, LocalQuality = "Generated local WAV" };
             }).ToArray();
+            WriteFixtureAudioIndex(music, Rows, bitrate);
             if (repeated) Rows[2] = Rows[0];
-            if (bitrate is not null)
-            {
-                // Logical service-quality metadata drives policy independently of
-                // the owned generated WAV container used by the native decoder.
-                var items = Rows.Select((row, i) => new OfflineItem(row.Id, row.RequestId, row.Title, row.Artist, "Fixture", 2000,
-                    Path.GetFileName(row.LocalPath!), "mp3", bitrate(i), new FileInfo(row.LocalPath!).Length,
-                    Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(row.LocalPath!))), DateTimeOffset.UtcNow)).ToArray();
-                File.WriteAllText(Path.Combine(music, "library.index.json"), JsonSerializer.Serialize(items));
-            }
             Player = new NativePlayer(new AudioBuffer(Path.Combine(directory, "audio"), Handler));
             Window = new MainWindow(api: new MusicApi(Handler), store: new SessionStore(Path.Combine(directory, "session")), restore: false,
                 diagnosticsDirectory: Path.Combine(directory, "diagnostics"),

@@ -25,6 +25,7 @@ internal static partial class Program
         await Run("Library017: saved track cover plays without an account and unavailable covers cannot play", Library017OfflinePlay);
         await Run("Library017: cover click retains repeated occurrence and virtualization in a 3900-track queue", Library017LargeQueueCover);
         await Run("Library017: search and artist track covers reuse exact one-click playback", Library017OtherTrackCovers);
+        await Run("Library017: offline reads before or during removals use fresh rows", Library017OfflineReadMaintenance);
     }
 
     private static async Task Library017LikeMarks()
@@ -118,7 +119,7 @@ internal static partial class Program
             Title = $"Трек {119 - index:000} с длинным названием для проверки расположения отметок",
             Artist = "Исполнитель", Album = "Альбом", DurationMs = 4000, Available = true
         }).ToArray();
-        SaField<List<TrackRow>>(window, "_favoritesCache").AddRange(rows);
+        f.SeedWarmFavorites(rows);
         SaInvoke(window, "ShowRows", (object)rows); window.UpdateLayout(); await Task.Delay(80);
         string[] Fields() => grid.Columns.Select(column => (string)((GridViewColumnHeader)column.Header).Tag).ToArray();
         Assert(SaField<string>(window, "_section") == "favorites"
@@ -341,15 +342,75 @@ internal static partial class Program
         SaInvoke(f.Window, "SetSection", "search", "Поиск");
         SaInvoke(f.Window, "ShowCatalogItems", new[] { new CatalogItem(first.Id, "track", "Первый", "", Track: first), new CatalogItem(second.Id, "track", "Второй", "", Track: second) }, false);
         f.Window.UpdateLayout();
-        var searchCover = SaVisuals<Button>(Control<ListBox>(f.Window, "CatalogList")).Single(button => button.Name == "TrackCoverPlayButton" && ReferenceEquals(button.DataContext, second));
+        var catalog = Control<ListBox>(f.Window, "CatalogList");
+        var searchCover = SaVisuals<Button>(catalog).Single(button => button.Name == "TrackCoverPlayButton" && ReferenceEquals(button.DataContext, second));
         SaClick(searchCover); await Until(() => f.Player.IsPlaying && !SaField<bool>(f.Window, "_loadingStream"));
-        Assert(ReferenceEquals(SaField<PlaybackQueue>(f.Window, "_playbackQueue").Current, second), "search cover selected another track");
+        var queue = SaField<PlaybackQueue>(f.Window, "_playbackQueue");
+        Assert(ReferenceEquals(queue.Current, second) && queue.Items.SequenceEqual([first, second])
+            && SaField<string>(f.Window, "_section") == "search", "search cover selected another track, changed the results queue or navigated");
         var artistTrack = f.Row("artist-top", "1");
-        Control<Grid>(f.Window, "ArtistPanel").Visibility = Visibility.Visible;
+        SaInvoke(f.Window, "SetSection", "artist-detail", "Исполнитель");
         SaInvoke(f.Window, "ShowArtistDetails", new ArtistDetails("a", "Исполнитель", null, null, [artistTrack], [], [], "")); f.Window.UpdateLayout();
+        Assert(Control<Grid>(f.Window, "ArtistPanel").IsVisible && !catalog.IsVisible, "the fixture did not navigate to the artist card");
         var artistCover = SaVisuals<Button>(Control<ListBox>(f.Window, "ArtistTopTracks")).Single(button => button.Name == "TrackCoverPlayButton");
         SaClick(artistCover); await Until(() => ReferenceEquals(SaField<TrackRow?>(f.Window, "_current"), artistTrack) && f.Player.IsPlaying && !SaField<bool>(f.Window, "_loadingStream"));
-        Assert(SaField<PlaybackQueue>(f.Window, "_playbackQueue").Items.SequenceEqual(new[] { artistTrack }), "artist cover kept another view's queue");
+        Assert(ReferenceEquals(queue.Current, artistTrack) && queue.Items.SequenceEqual([artistTrack])
+            && SaField<string>(f.Window, "_section") == "artist-detail" && f.Paths.All(path => !path.StartsWith("/albums/", StringComparison.Ordinal)),
+            "artist cover selected another track, kept another view's queue or opened an album");
+    }
+
+    private static async Task Library017OfflineReadMaintenance()
+    {
+        foreach (var clear in new[] { false, true })
+        foreach (var during in new[] { false, true })
+        {
+            using var f = new Library017Fixture("offline-read-" + clear + "-" + during);
+            await f.SaveShared();
+            var row = f.Row("shared", "1");
+            var w = f.Window;
+            var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var reads = 0;
+            Task Remove() => clear ? Call(w, "ClearOfflineAfterConfirmationAsync") : Call(w, "DeleteOfflineTrackAsync", row);
+            try
+            {
+                if (during)
+                {
+                    await f.Library.RememberPlaylistAsync(new("12345", "77", "Локальный список", "", 1, [row]), AudioQuality.Optimal, default);
+                    Library017Set(w, "_downloadTask", release.Task);
+                    var removal = Remove();
+                    Assert(SaField<bool>(w, "_offlineMaintenance"), "fixture did not pause deletion");
+                    w.OfflineViewAfterRead = _ => { reads++; return Task.CompletedTask; };
+                    var open = Call(w, "ShowOfflinePlaylist", new CatalogItem("77", "offline-playlist", "Локальный список", "", "12345", "77"));
+                    Assert(!open.IsCompleted && reads == 0, "the view read files while removal was preparing");
+                    release.TrySetResult();
+                    await removal;
+                    await open;
+                    var rows = Control<ListView>(w, "TracksList").Items.Cast<TrackRow>().ToArray();
+                    Assert(SaField<string>(w, "_section") == "offline-playlist-detail" && reads == 1
+                        && rows.Length == (clear ? 0 : 1) && rows.All(item => item.LocalPath is null && !item.CanPlay),
+                        "an offline playlist opened with removed audio or stale completion");
+                }
+                else
+                {
+                    w.OfflineViewAfterRead = _ =>
+                    {
+                        if (++reads != 1) return Task.CompletedTask;
+                        entered.TrySetResult();
+                        return release.Task;
+                    };
+                    var open = Call(w, "ShowOffline");
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                    await Remove();
+                    release.TrySetResult();
+                    await open;
+                    Assert(SaField<string>(w, "_section") == "offline" && reads == 2 && Control<ListView>(w, "TracksList").Items.Count == 0,
+                        "a held result republished removed audio instead of retrying");
+                }
+                Assert(f.Library.Read().Count == 0 && !f.Player.HasSource, "fixture left removed audio indexed or started playback");
+            }
+            finally { release.TrySetResult(); w.OfflineViewAfterRead = null; }
+        }
     }
 
     private static Button Library017Cover(MainWindow window, TrackRow row) => SaVisuals<Button>(Control<ListView>(window, "TracksList"))
@@ -384,6 +445,7 @@ internal static partial class Program
         internal bool FailMutation;
         internal int ApiRequests, MediaRequests;
         private readonly HashSet<string> _likes = new(StringComparer.Ordinal) { "shared" };
+        private IReadOnlyList<LikedId>? _favoritesReadback;
         private readonly FakeHandler _handler, _media;
         private readonly string _directoryPath;
         internal Library017Fixture(string name)
@@ -402,13 +464,26 @@ internal static partial class Program
         }
         internal TrackRow Row(string id, string album) => new() { Id = id, RequestId = id + ":" + album, AlbumId = album, Number = 1,
             Title = "Одинаковое название", Artist = "Исполнитель", Album = "Альбом", DurationMs = 4000, Available = true };
+        internal void SeedWarmFavorites(IReadOnlyList<TrackRow> rows)
+        {
+            _favoritesReadback = rows.Select(row => new LikedId(row.Id, row.AlbumId)).ToArray();
+            SaField<List<TrackRow>>(Window, "_favoritesCache").AddRange(rows);
+            SaField<HashSet<string>>(Window, "_favoriteTrackIds").UnionWith(rows.Select(row => row.Id));
+            Library017Set(Window, "_favoritesCacheRead", true);
+            Library017Set(Window, "_favoritesCacheComplete", true);
+            Library017Set(Window, "_favoritesMetadataSavedUtc", DateTimeOffset.UtcNow);
+        }
         internal Task<OfflineItem> SaveShared() => Library.SaveAsync(Row("shared", "album-a"), new AudioDescriptor(new Uri("https://s1.vlx.yandex.net/audio.mp3"), "mp3", 320), default);
         private async Task<HttpResponseMessage> Respond(HttpRequestMessage request, CancellationToken token)
         {
             ApiRequests++; var path = request.RequestUri!.AbsolutePath; Paths.Add(path);
             Assert(request.RequestUri.Host == "api.music.yandex.net", "library fixture left the API host");
             if (path == "/account/status") return Json(Profile);
-            if (path == "/users/12345/likes/tracks") return Json(JsonSerializer.Serialize(new { result = new { library = new { tracks = _likes.Select(id => new { id, albumId = "album-a" }).ToArray() } } }));
+            if (path == "/users/12345/likes/tracks")
+            {
+                var likes = _favoritesReadback ?? _likes.Select(id => new LikedId(id, "album-a")).ToArray();
+                return Json(JsonSerializer.Serialize(new { result = new { library = new { tracks = likes.Select(item => new { id = item.Id, albumId = item.AlbumId }).ToArray() } } }));
+            }
             if (path.StartsWith("/users/12345/likes/tracks/", StringComparison.Ordinal))
             {
                 var body = Uri.UnescapeDataString(await request.Content!.ReadAsStringAsync(token));

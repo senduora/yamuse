@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Media;
 
@@ -16,12 +17,16 @@ internal sealed class DesktopShell : IDisposable
 {
     private const uint TrayCallback = 0x8000 + 51;
     private const uint TrayId = 1;
-    private const uint NifMessage = 0x1, NifIcon = 0x2, NifTip = 0x4, NifGuid = 0x20;
+    private const uint NifMessage = 0x1, NifIcon = 0x2, NifTip = 0x4, NifGuid = 0x20, NifShowTip = 0x80;
+    private const uint NimSetFocus = 3;
     private readonly Window _owner;
     private readonly HwndSource _source;
     private readonly Guid _iconGuid = TrayIdentity(Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "Yamuse.exe"));
     private readonly uint _taskbarCreated;
     private readonly AppBranding.OwnedIcon _icon;
+    private readonly Func<uint, bool>? _notifyIconForChecks;
+    internal Func<Guid, (int X, int Y)?>? TrayMenuAnchorForChecks { get; init; }
+    internal Func<int, int, uint>? TrackTrayMenuForChecks { get; init; }
     private bool _minimizeToTray;
     private bool _version4;
     private bool _exitRequested;
@@ -35,6 +40,7 @@ internal sealed class DesktopShell : IDisposable
     private bool _canNext;
     private bool _canPrevious;
     private ImageSource? _cover;
+    private string? _coverUri;
     private double _positionSeconds, _durationSeconds, _volumePercent = 70, _speedRatio = 1;
     private bool _canSeek, _isLiked, _canLike;
     private string? _trackKey;
@@ -43,6 +49,7 @@ internal sealed class DesktopShell : IDisposable
     public event Action<ShellAction>? Command;
     public event Action<double>? SeekRequested;
     public event Action<double>? VolumeRequested;
+    internal event Action<Image?>? MiniCoverChanged;
     public bool IsAvailable { get; private set; }
     public string? FailureReason { get; private set; }
     internal nint WindowHandle { get; }
@@ -67,25 +74,25 @@ internal sealed class DesktopShell : IDisposable
         {
             _owner.Dispatcher.VerifyAccess();
             if (Volatile.Read(ref _disposed) != 0 || _minimizeToTray == value) return;
+            _minimizeToTray = value;
             if (value)
             {
-                if (!TryAddTray()) return; // Never hide without a working restore path.
-                _minimizeToTray = true;
+                TryAddTray();
             }
             else
             {
-                _minimizeToTray = false;
                 RemoveTray();
                 if (!_owner.IsVisible) ShowMainWindow();
             }
         }
     }
 
-    public DesktopShell(Window owner)
+    public DesktopShell(Window owner, Func<uint, bool>? notifyIconForChecks = null)
     {
         ArgumentNullException.ThrowIfNull(owner);
         owner.Dispatcher.VerifyAccess();
         _owner = owner;
+        _notifyIconForChecks = notifyIconForChecks;
         _restoreState = owner.WindowState == WindowState.Minimized ? WindowState.Normal : owner.WindowState;
         WindowHandle = new WindowInteropHelper(owner).EnsureHandle();
         _ = GetWindowThreadProcessId(WindowHandle, out var processId);
@@ -118,7 +125,7 @@ internal sealed class DesktopShell : IDisposable
             if (IsAvailable && tipChanged)
             {
                 var data = CreateIconData();
-                if (!Shell_NotifyIcon(1, ref data)) DisableUnavailableTray();
+                if (!NotifyIcon(1, ref data)) MarkTrayUnavailable();
             }
         });
     }
@@ -130,6 +137,7 @@ internal sealed class DesktopShell : IDisposable
             if (_ownerClosed) return;
             if (!_owner.IsVisible) _owner.Show();
             if (_owner.WindowState == WindowState.Minimized) _owner.WindowState = _restoreState;
+            _mini?.ClearCommandError();
             if (_owner.ShowActivated) _owner.Activate();
         });
     }
@@ -140,18 +148,21 @@ internal sealed class DesktopShell : IDisposable
     {
         OnWindowThread(() =>
         {
-            if (_ownerClosed) return;
+            if (_ownerClosed || _exitRequested) return;
             _exitRequested = true;
-            _owner.Close();
+            try { _owner.Close(); }
+            finally { _exitRequested = false; }
         });
     }
 
     public void UpdateDetails(ImageSource? cover, double positionSeconds, double durationSeconds,
-        bool canSeek, bool isLiked, bool canLike, double volumePercent, string? trackKey = null, double speedRatio = 1, bool advancePlayhead = true)
+        bool canSeek, bool isLiked, bool canLike, double volumePercent, string? trackKey = null, double speedRatio = 1,
+        bool advancePlayhead = true, string? coverUri = null)
     {
         OnWindowThread(() =>
         {
             _cover = cover;
+            _coverUri = coverUri;
             _durationSeconds = double.IsFinite(durationSeconds) ? Math.Max(0, durationSeconds) : 0;
             _positionSeconds = double.IsFinite(positionSeconds) ? Math.Clamp(positionSeconds, 0, _durationSeconds) : 0;
             _canSeek = canSeek && _durationSeconds > 0;
@@ -181,6 +192,7 @@ internal sealed class DesktopShell : IDisposable
             UpdateMiniPlayer();
             UpdateMiniPlayerDetails();
             WindowAppearance.Apply(window);
+            MiniCoverChanged?.Invoke(window.CoverImage);
             window.Show();
         });
     }
@@ -205,18 +217,25 @@ internal sealed class DesktopShell : IDisposable
         window.VolumeRequested -= MiniVolumeRequested;
         window.ShowMainRequested -= ShowMainWindow;
         window.Closed -= MiniClosed;
-        if (ReferenceEquals(_mini, window)) _mini = null;
+        if (ReferenceEquals(_mini, window))
+        {
+            _mini = null;
+            MiniCoverChanged?.Invoke(null);
+        }
     }
 
     private void UpdateMiniPlayer() => _mini?.Update(_title, _artist, _isPlaying, _canNext, _canPrevious);
+    internal void ShowMiniCommandError(string text)
+        => OnWindowThread(() => { if (_mini is { IsVisible: true } mini) mini.ShowCommandError(text); });
+
     private void UpdateMiniPlayerDetails() => _mini?.UpdateDetails(_cover, _positionSeconds, _durationSeconds,
-        _canSeek, _isLiked, _canLike, _volumePercent, _trackKey, _speedRatio, _advancePlayhead);
+        _canSeek, _isLiked, _canLike, _volumePercent, _trackKey, _speedRatio, _advancePlayhead, _coverUri);
 
     private bool TryAddTray()
     {
         if (IsAvailable) return true;
         var data = CreateIconData();
-        if (_icon.IsInvalid || _icon.IsClosed || !Shell_NotifyIcon(0, ref data))
+        if (_icon.IsInvalid || _icon.IsClosed || !NotifyIcon(0, ref data))
         {
             FailureReason = "Область уведомлений Windows недоступна. Окно остаётся доступным.";
             return false;
@@ -224,7 +243,7 @@ internal sealed class DesktopShell : IDisposable
         IsAvailable = true;
         FailureReason = null;
         data.TimeoutOrVersion = 4;
-        _version4 = Shell_NotifyIcon(4, ref data);
+        _version4 = NotifyIcon(4, ref data);
         return true;
     }
 
@@ -232,15 +251,17 @@ internal sealed class DesktopShell : IDisposable
     {
         if (!IsAvailable) return;
         var data = CreateIconData();
-        _ = Shell_NotifyIcon(2, ref data);
+        _ = NotifyIcon(2, ref data);
         IsAvailable = false;
         _version4 = false;
     }
 
-    private void DisableUnavailableTray()
+    private bool NotifyIcon(uint message, ref NotifyIconData data)
+        => _notifyIconForChecks?.Invoke(message) ?? Shell_NotifyIcon(message, ref data);
+
+    private void MarkTrayUnavailable()
     {
         RemoveTray();
-        _minimizeToTray = false;
         FailureReason = "Область уведомлений Windows недоступна. Окно остаётся доступным.";
         if (!_owner.IsVisible) ShowMainWindow();
     }
@@ -252,7 +273,7 @@ internal sealed class DesktopShell : IDisposable
         return new()
         {
             Size = (uint)Marshal.SizeOf<NotifyIconData>(), Window = WindowHandle, Id = TrayId,
-            Flags = NifMessage | NifIcon | NifTip | NifGuid, CallbackMessage = TrayCallback,
+            Flags = NifMessage | NifIcon | NifTip | NifGuid | NifShowTip, CallbackMessage = TrayCallback,
             Icon = _icon.DangerousGetHandle(), Tip = tip, Info = "", InfoTitle = "", Guid = _iconGuid
         };
     }
@@ -263,7 +284,7 @@ internal sealed class DesktopShell : IDisposable
         if (_taskbarCreated != 0 && (uint)message == _taskbarCreated && _minimizeToTray)
         {
             IsAvailable = false;
-            if (!TryAddTray()) DisableUnavailableTray();
+            if (!TryAddTray()) MarkTrayUnavailable();
             return 0;
         }
         if ((uint)message != TrayCallback || !IsAvailable) return 0;
@@ -272,14 +293,49 @@ internal sealed class DesktopShell : IDisposable
         if (id != TrayId) return 0;
         handled = true;
         if (notification is 0x400 or 0x401 or 0x203) ShowMainWindow(); // NIN_SELECT / KEYSELECT / double-click
-        else if (notification is 0x7b or 0x205) ShowTrayMenu(); // context menu / legacy right-button-up
+        else if (_version4 ? notification == 0x7b : notification == 0x205) ShowTrayMenu();
         return 0;
     }
 
     private void ShowTrayMenu()
     {
+        var point = TrayMenuAnchor();
+        var selected = point is { } anchor
+            ? TrackTrayMenuForChecks?.Invoke(anchor.X, anchor.Y) ?? TrackNativeTrayMenu(anchor.X, anchor.Y)
+            : 0;
+        switch (selected)
+        {
+            case 0:
+                if (IsAvailable && Volatile.Read(ref _disposed) == 0)
+                {
+                    var data = CreateIconData();
+                    _ = NotifyIcon(NimSetFocus, ref data);
+                }
+                break;
+            case 1: ShowMainWindow(); break;
+            case 2: ShowMiniPlayer(); break;
+            case 3: Dispatch(ShellAction.PlayPause); break;
+            case 4: Dispatch(ShellAction.Next); break;
+            case 5: Dispatch(ShellAction.Previous); break;
+            case 6: Dispatch(ShellAction.Exit); break;
+        }
+    }
+
+    private (int X, int Y)? TrayMenuAnchor()
+    {
+        if (!_version4)
+            return GetCursorPos(out var pointer) ? (pointer.X, pointer.Y) : null;
+        if (TrayMenuAnchorForChecks is { } getAnchor) return getAnchor(_iconGuid);
+
+        // The version 4 callback leaves wParam undefined for WM_CONTEXTMENU.
+        var icon = new NotifyIconIdentifier { Size = (uint)Marshal.SizeOf<NotifyIconIdentifier>(), Window = WindowHandle, Id = TrayId, Guid = _iconGuid };
+        return Shell_NotifyIconGetRect(in icon, out var bounds) == 0 ? (bounds.Left, bounds.Top) : null;
+    }
+
+    private uint TrackNativeTrayMenu(int x, int y)
+    {
         var menu = CreatePopupMenu();
-        if (menu == 0) return;
+        if (menu == 0) return 0;
         try
         {
             _ = AppendMenu(menu, 0, 1, "Открыть " + AppBranding.Name);
@@ -290,19 +346,10 @@ internal sealed class DesktopShell : IDisposable
             _ = AppendMenu(menu, _canPrevious ? 0u : 0x1u, 5, "Предыдущий трек");
             _ = AppendMenu(menu, 0x800, 0, null);
             _ = AppendMenu(menu, 0, 6, "Выход");
-            _ = GetCursorPos(out var point);
             _ = SetForegroundWindow(WindowHandle);
-            var selected = TrackPopupMenuEx(menu, 0x100 | 0x2, point.X, point.Y, WindowHandle, 0);
+            var selected = TrackPopupMenuEx(menu, 0x100 | 0x2, x, y, WindowHandle, 0);
             _ = PostMessage(WindowHandle, 0, 0, 0);
-            switch (selected)
-            {
-                case 1: ShowMainWindow(); break;
-                case 2: ShowMiniPlayer(); break;
-                case 3: Dispatch(ShellAction.PlayPause); break;
-                case 4: Dispatch(ShellAction.Next); break;
-                case 5: Dispatch(ShellAction.Previous); break;
-                case 6: Dispatch(ShellAction.Exit); break;
-            }
+            return selected;
         }
         finally { _ = DestroyMenu(menu); }
     }
@@ -314,9 +361,8 @@ internal sealed class DesktopShell : IDisposable
             || action == ShellAction.Next && !_canNext
             || action == ShellAction.Previous && !_canPrevious
             || action == ShellAction.ToggleLike && (!_canLike || string.IsNullOrWhiteSpace(_title))) return;
-        if (action == ShellAction.Exit) _exitRequested = true;
+        if (action == ShellAction.Exit) { RequestExit(); return; }
         Command?.Invoke(action);
-        if (action == ShellAction.Exit && !_ownerClosed) RequestExit();
     }
 
     private void OwnerStateChanged(object? sender, EventArgs e)
@@ -362,6 +408,7 @@ internal sealed class DesktopShell : IDisposable
             Command = null;
             SeekRequested = null;
             VolumeRequested = null;
+            MiniCoverChanged = null;
         }
         if (_owner.Dispatcher.CheckAccess()) DisposeCore();
         else if (!_owner.Dispatcher.HasShutdownStarted && !_owner.Dispatcher.HasShutdownFinished) _owner.Dispatcher.Invoke(DisposeCore);
@@ -385,8 +432,12 @@ internal sealed class DesktopShell : IDisposable
         public nint BalloonIcon;
     }
     [StructLayout(LayoutKind.Sequential)] private struct NativePoint { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] private struct NativeRect { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NotifyIconIdentifier { public uint Size; public nint Window; public uint Id; public Guid Guid; }
     [DllImport("shell32.dll", EntryPoint = "Shell_NotifyIconW", CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)] private static extern bool Shell_NotifyIcon(uint message, ref NotifyIconData data);
+    [DllImport("shell32.dll")] private static extern int Shell_NotifyIconGetRect(in NotifyIconIdentifier identifier, out NativeRect location);
     [DllImport("user32.dll", EntryPoint = "RegisterWindowMessageW", CharSet = CharSet.Unicode)] private static extern uint RegisterWindowMessage(string message);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(nint hwnd, out int processId);
     [DllImport("user32.dll")] private static extern nint CreatePopupMenu();

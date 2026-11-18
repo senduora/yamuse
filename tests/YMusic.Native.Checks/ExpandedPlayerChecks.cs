@@ -33,6 +33,8 @@ internal static partial class Program
             await Run("Expanded player: large artwork and complete inline controls fit both supported window sizes", () => EpAppearance(() => artworkCalls));
             await Run("Expanded player: actual transport, exact seek, canceled drag, shared volume and confirmed like", EpTransport);
             await Run("Expanded player: lyrics slide left, share native timed lines, seek, follow and return to center", EpLyrics);
+            await Run("Expanded player: reused cover retries after a temporary failure in fullscreen and ordinary lyrics", EpSameCoverRetry);
+            await Run("Expanded player: refreshed timed lyrics reveal the same paused line and preserve manual scrolling", EpLyricsRefreshFollow);
             await Run("Expanded player: lyrics loading, errors, plain fallback and late account response stay isolated", EpLyricsStates);
             await Run("Expanded player: album navigation, Escape and signout preserve or clear the shared queue", EpLifecycle);
             await Run("Expanded player: fullscreen placement restores normal and maximized state without showing a window", EpPlacement);
@@ -174,6 +176,108 @@ internal static partial class Program
             && f.Lrclib.Seen.Count == 2, "current-track change retained old expanded metadata or started another lyrics pipeline");
     }
 
+    private static async Task EpSameCoverRetry()
+    {
+        var previous = Artwork.Cache;
+        try
+        {
+            foreach (var expanded in new[] { true, false })
+            {
+                var name = expanded ? "same-cover-fullscreen" : "same-cover-lyrics";
+                var rendition = expanded ? "1000x1000" : "400x400";
+                var requests = 0;
+                var png = expanded ? EpArtwork() : HomeArtworkPng(Colors.Red);
+                using var cache = new ArtworkCache(Path.Combine(_directory, name + "-cache"), new FakeHandler((request, _) =>
+                {
+                    HomeArtworkAnonymous(request);
+                    if (!request.RequestUri!.AbsolutePath.EndsWith('/' + rendition, StringComparison.Ordinal))
+                        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+                    return Task.FromResult(Interlocked.Increment(ref requests) == 1
+                        ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) : HomeArtworkResponse(png));
+                }));
+                Artwork.Cache = cache;
+                using var f = new ExpandedFixture(name, sharedCover: $"https://avatars.yandex.net/get-music-content/1/{name}/%%");
+                Control<Image>(f.Window, "PlayerCover").Visibility = Visibility.Collapsed;
+                await f.Play();
+                if (expanded) EpOpen(f.Window);
+                else EpClick(Control<Button>(f.Window, "PlayerLyricsButton"));
+                var cover = expanded ? EpField<Image>(f.Window, "_expandedPlayerCover") : Control<Image>(f.Window, "LyricsCover");
+                await Until(() => Artwork.GetLoadStatus(cover) == ArtworkLoadStatus.Unavailable);
+                Assert(requests == 1, "the original temporary failure did not reach the visible artwork");
+
+                await f.Window.PlayTrackAsync(f.Second);
+                await Until(() => Artwork.GetLoadStatus(cover) == ArtworkLoadStatus.Ready);
+                Assert(Artwork.GetSourceUri(cover) == f.Second.CoverUri && requests == 2
+                    && cover.Source is BitmapSource { IsFrozen: true } bitmap && (!expanded || bitmap.PixelWidth > 256),
+                    "the next track did not retry and render the same cover in its intended rendition");
+            }
+        }
+        finally { Artwork.Cache = previous; }
+    }
+
+    private static async Task EpLyricsRefreshFollow()
+    {
+        using var f = new ExpandedFixture("lyrics-refresh-follow");
+        await f.Play();
+        var window = f.Window;
+        window.Width = 1280; window.Height = 860;
+        EpOpen(window);
+        window.UpdateLayout();
+        EpInvoke(window, "SetExpandedLyricsVisible", true, false);
+        var list = EpField<ListBox>(window, "_expandedLyricsList");
+        ScrollViewer? realizedViewer = null;
+        await Until(() =>
+        {
+            window.UpdateLayout();
+            realizedViewer = EpVisuals<ScrollViewer>(list).FirstOrDefault();
+            return list.Items.Count == 50 && realizedViewer is { IsVisible: true, ViewportHeight: > 0 };
+        });
+        var viewer = realizedViewer!;
+        EpClick(EpElement<Button>(window, "ExpandedPlayerPlayPause"));
+        await Until(() => !f.Player.IsPlaying);
+        const int lateIndex = 42;
+        EpInvoke(window, "CommitSeek", 42.25d);
+        bool LateIsVisible()
+        {
+            window.UpdateLayout();
+            if (list.ItemContainerGenerator.ContainerFromIndex(lateIndex) is not FrameworkElement row) return false;
+            var top = row.TranslatePoint(new Point(), viewer).Y;
+            return top >= 0 && top < viewer.ViewportHeight;
+        }
+        await Until(() => list.SelectedIndex == lateIndex && LateIsVisible());
+        var retry = EpVisuals<Button>(EpField<Grid>(window, "_expandedLyricsPanel")).Single(button => Equals(button.Content, "Обновить текст"));
+
+        async Task RefreshThroughEmptyViewport()
+        {
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            f.BeforeTimedLyrics = token => { entered.TrySetResult(); return release.Task.WaitAsync(token); };
+            try
+            {
+                EpClick(retry);
+                await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                await Until(() => { window.UpdateLayout(); return list.Items.Count == 0 && viewer.VerticalOffset < 1; });
+                Assert(EpField<int>(window, "_expandedLyricsFollowIndex") == -1 && !SmoothScroll.IsAnimating(viewer),
+                    "refresh retained the previous list's follow index or automatic scroll");
+            }
+            finally { release.TrySetResult(); }
+            await Until(() => list.Items.Count == 50 && list.SelectedIndex == lateIndex);
+        }
+
+        SmoothScroll.ScrollTo(viewer, 0);
+        await RefreshThroughEmptyViewport();
+        await Until(LateIsVisible);
+        Assert(!f.Player.IsPlaying, "refresh resumed playback to reveal the active line");
+
+        list.RaiseEvent(new DragStartedEventArgs(0, 0) { RoutedEvent = Thumb.DragStartedEvent });
+        var manualUntil = EpField<DateTimeOffset>(window, "_expandedLyricsFollowUntil");
+        await RefreshThroughEmptyViewport();
+        Assert(!LateIsVisible() && EpField<bool>(window, "_expandedLyricsManualDragging")
+            && EpField<DateTimeOffset>(window, "_expandedLyricsFollowUntil") == manualUntil,
+            "refreshed lyrics scrolled over an active manual gesture or reset its guard");
+        list.RaiseEvent(new DragCompletedEventArgs(0, 0, false) { RoutedEvent = Thumb.DragCompletedEvent });
+    }
+
     private static async Task EpLyricsStates()
     {
         using (var f = new ExpandedFixture("lyrics-plain", synchronized: false))
@@ -212,7 +316,7 @@ internal static partial class Program
             Assert(old.IsCancellationRequested && Control<TextBlock>(f.Window, "LyricsHeading").Text == f.Second.Title, "track change did not cancel the previous shared lyrics request");
             f.ReleaseLyrics.TrySetResult(); await Task.Delay(180);
             Assert(EpField<TextBlock>(f.Window, "_expandedPlayerTitle").Text == f.Second.Title && Control<TextBlock>(f.Window, "LyricsHeading").Text == f.Second.Title
-                && !EpField<System.Collections.IDictionary>(f.Window, "_lyricsCache").Contains(f.First.Id), "late previous-track lyrics overwrote or entered the expanded current-track state");
+                && !LyricsUiCached(f.Window, f.First), "late previous-track lyrics overwrote or entered the expanded current-track state");
         }
     }
 
@@ -299,15 +403,16 @@ internal static partial class Program
         public PreferencesStore Preferences { get; }
         public TaskCompletionSource LyricsEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource ReleaseLyrics { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Func<CancellationToken, Task>? BeforeTimedLyrics { get; set; }
         public int MediaCalls;
         private readonly HttpClient _lyricsHttp;
         private bool _liked = true;
-        public ExpandedFixture(string suffix, bool synchronized = true, bool failure = false, bool hold = false, bool show = true)
+        public ExpandedFixture(string suffix, bool synchronized = true, bool failure = false, bool hold = false, bool show = true, string? sharedCover = null)
         {
             var directory = Path.Combine(_directory, "expanded-" + suffix); Directory.CreateDirectory(directory);
             var wav = WriteWave("expanded-" + suffix + ".wav", 50);
-            First = new() { Id = "70101", RequestId = "70101:ep-album", Title = "Огни большого города", Artist = "Тестовый исполнитель", Album = "Коллекция звука", AlbumId = "ep-album", CoverUri = "avatars.yandex.net/get-music-content/expanded/first/%%", LocalPath = wav, LocalQuality = "Fixture WAV", DurationMs = 50000, Available = true };
-            Second = new() { Id = "70102", RequestId = "70102:ep-album", Title = "После полуночи", Artist = "Тестовый исполнитель · Другой участник", Album = "Коллекция звука", AlbumId = "ep-album", CoverUri = "avatars.yandex.net/get-music-content/expanded/second/%%", LocalPath = wav, LocalQuality = "Fixture WAV", DurationMs = 50000, Available = true };
+            First = new() { Id = "70101", RequestId = "70101:ep-album", Title = "Огни большого города", Artist = "Тестовый исполнитель", Album = "Коллекция звука", AlbumId = "ep-album", CoverUri = sharedCover ?? "avatars.yandex.net/get-music-content/expanded/first/%%", LocalPath = wav, LocalQuality = "Fixture WAV", DurationMs = 50000, Available = true };
+            Second = new() { Id = "70102", RequestId = "70102:ep-album", Title = "После полуночи", Artist = "Тестовый исполнитель · Другой участник", Album = "Коллекция звука", AlbumId = "ep-album", CoverUri = sharedCover ?? "avatars.yandex.net/get-music-content/expanded/second/%%", LocalPath = wav, LocalQuality = "Fixture WAV", DurationMs = 50000, Available = true };
             Handler = new FakeHandler(async (request, token) =>
             {
                 Assert(request.RequestUri!.Host == "api.music.yandex.net", "expanded fixture API left its host");
@@ -324,12 +429,13 @@ internal static partial class Program
                 if (path.EndsWith("/supplement", StringComparison.Ordinal)) return failure ? Json("{\"result\":{\"lyrics\":null}}") : Json("{\"result\":{\"lyrics\":{\"hasRights\":true,\"fullLyrics\":\"Первая тестовая строка\\nВторая тестовая строка\"}}}");
                 throw new InvalidOperationException("Unexpected expanded fixture route " + path);
             });
-            Lrclib = new FakeHandler((request, _) =>
+            Lrclib = new FakeHandler(async (request, token) =>
             {
                 Assert(request.RequestUri!.Host == "lrclib.net" && request.Headers.Authorization is null && !request.Headers.Contains("Cookie"), "expanded LRCLIB left anonymous fixture transport");
+                if (BeforeTimedLyrics is { } before) await before(token);
                 var text = string.Join('\n', Enumerable.Range(0, 50).Select(index => "[" + TimeSpan.FromSeconds(index).ToString(@"mm\:ss\.fff") + "]Строка " + index + ": огни города отражаются в воде"));
                 var track = LyricsFollowQuery(request.RequestUri)["track_name"] == Second.Title ? Second : First;
-                return Task.FromResult(synchronized ? LyricsFollowRecord(track, text) : Json("{}", HttpStatusCode.NotFound));
+                return synchronized ? LyricsFollowRecord(track, text) : Json("{}", HttpStatusCode.NotFound);
             });
             Genius = new FakeHandler((_, _) => throw new InvalidOperationException("expanded fixture unexpectedly contacted Genius"));
             Player = new NativePlayer(new AudioBuffer(Path.Combine(directory, "audio"), new FakeHandler((_, _) => { Interlocked.Increment(ref MediaCalls); throw new InvalidOperationException("expanded local fixture contacted media network"); })));

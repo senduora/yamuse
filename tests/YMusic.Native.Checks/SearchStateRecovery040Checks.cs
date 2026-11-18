@@ -17,7 +17,9 @@ internal static partial class Program
         await Run("SearchRecovery040: history restores the exhausted second page without re-enabling More", Search040ExhaustedPage);
         await Run("SearchRecovery040: collections and albums restore separate categories and continuation requests", Search040Collections);
         await Run("SearchRecovery040: a late search response cannot overwrite mouse Back or a signed-out view", Search040LateHistory);
+        await Run("SearchRecovery040: superseded search failure cannot overwrite the active section status", Search040LateFailure);
         await Run("SearchRecovery040: choosing an empty category cancels the previous query and clears its cursor", Search040EmptyCategory);
+        await Run("SearchRecovery040: submitting an empty query abandons the pending search", Search040EmptySubmit);
         await Run("QaFixes061: search distinguishes initial and completed empty results before a new successful query", Search061EmptyResultCopy);
     }
 
@@ -113,6 +115,7 @@ internal static partial class Program
         var signedOutSection = SaField<string>(w, "_section");
         f.Release.TrySetResult(); await Search040Idle(w);
         Assert(SaField<Session?>(w, "_session") is null && Control<ListBox>(w, "CatalogList").Items.Count == 0
+            && Control<TextBox>(w, "CatalogQuery").Text.Length == 0
             && SaField<string>(w, "_section") == signedOutSection && NavHistoryCount(w, "_browseHistory") == signedOutHistory,
             "a late search changed the signed-out view or its history");
         Assert(f.CancellationObserved && !f.Player.HasSource, "signout failed to cancel search or started audio");
@@ -133,6 +136,40 @@ internal static partial class Program
         Control<TextBox>(w, "CatalogQuery").Text = "next album"; SaClick(Search040Find(w)); await Search040Idle(w);
         Search040Assert(w, "album", "album", false, "next album", 0, false, ["album-0"]);
         Search040Facts(f, "empty-category");
+    }
+
+    private static async Task Search040LateFailure()
+    {
+        using var f = new Search040Fixture("late-failure"); await f.Activate(); var w = f.Window;
+        SaClick(Control<Button>(w, "SearchNav"));
+        Control<TextBox>(w, "CatalogQuery").Text = "late search";
+        f.Hold("late search", new MusicException("Fixture late search failure."));
+        var request = Call(w, "SearchCatalogViewAsync", false);
+        await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        SaClick(Control<Button>(w, "FavoritesNav"));
+        var currentStatus = Control<TextBlock>(w, "StatusText").Text;
+        f.Release.TrySetResult();
+        await request;
+        Assert(f.CancellationObserved && SaField<string>(w, "_section") == "favorites"
+            && Control<TextBlock>(w, "StatusText").Text == currentStatus,
+            "an obsolete non-cancellation exception replaced the active section status");
+    }
+
+    private static async Task Search040EmptySubmit()
+    {
+        using var f = new Search040Fixture("empty-submit"); await f.Activate(); var w = f.Window;
+        SaClick(Control<Button>(w, "SearchNav"));
+        var query = Control<TextBox>(w, "CatalogQuery");
+        query.Text = "held explicit lookup";
+        f.Hold(query.Text);
+        var pending = Call(w, "SearchCatalogViewAsync", false);
+        await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        query.Clear();
+        await Call(w, "SearchCatalogViewAsync", false);
+        f.Release.TrySetResult();
+        await pending;
+        Search040Assert(w, "all", "all", false, "", 0, false, []);
+        Assert(f.CancellationObserved && f.Searches.Length == 1, "explicitly submitting the empty query left prior results alive");
     }
 
     private static async Task Search061EmptyResultCopy()
@@ -222,6 +259,7 @@ internal static partial class Program
         private readonly List<Search040Request> _searches = [];
         internal Search040Request[] Searches { get { lock (_searches) return _searches.ToArray(); } }
         private string? _holdQuery;
+        private Exception? _heldFailure;
         internal TaskCompletionSource Entered { get; private set; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource Release { get; private set; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal bool CancellationObserved { get; private set; }
@@ -241,9 +279,9 @@ internal static partial class Program
             Window.Show();
         }
         internal Task Activate() => Call(Window, "ActivateAsync", FakeSession, CancellationToken.None);
-        internal void Hold(string query)
+        internal void Hold(string query, Exception? failure = null)
         {
-            _holdQuery = query; CancellationObserved = false;
+            _holdQuery = query; _heldFailure = failure; CancellationObserved = false;
             Entered = new(TaskCreationOptions.RunContinuationsAsynchronously); Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
         private async Task<HttpResponseMessage> Respond(HttpRequestMessage request, CancellationToken token)
@@ -251,6 +289,7 @@ internal static partial class Program
             var uri = request.RequestUri!; var path = uri.AbsolutePath;
             Assert(uri.Host == "api.music.yandex.net", "search fixture left its fake API host");
             if (path == "/account/status") return Json(Profile);
+            if (request.Method == HttpMethod.Get && path == "/account/about") return Json(ProfileAboutWithoutAvatar);
             if (path == "/users/12345/likes/tracks") return Json("""{"result":{"library":{"tracks":[]}}}""");
             if (path == "/users/12345/likes/artists") return Json("""{"result":[]}""");
             if (path == "/search")
@@ -259,7 +298,12 @@ internal static partial class Program
                     .ToDictionary(part => part[0], part => Uri.UnescapeDataString(part[1]));
                 var search = new Search040Request(query["type"], int.Parse(query["page"], CultureInfo.InvariantCulture), query["text"]);
                 lock (_searches) _searches.Add(search);
-                if (search.Text == _holdQuery) { Entered.TrySetResult(); await Release.Task; CancellationObserved |= token.IsCancellationRequested; }
+                if (search.Text == _holdQuery)
+                {
+                    var failure = _heldFailure;
+                    Entered.TrySetResult(); await Release.Task; CancellationObserved |= token.IsCancellationRequested;
+                    if (failure is not null) throw failure;
+                }
                 return Json(Search040Json(search));
             }
             if (path == "/artists/artist-42/brief-info") return Json(SaArtistJson("artist-42"));

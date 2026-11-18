@@ -117,6 +117,13 @@ internal static partial class Program
                 SmoothScroll.ScrollTo(viewer, 500);
                 viewer.ScrollToVerticalOffset(200.25); await Task.Delay(60);
                 Assert(!SmoothScroll.IsAnimating(viewer) && Math.Abs(viewer.VerticalOffset - 200.25) <= .1, "external scrolling failed to cancel an animated target");
+                var visibleOffset = viewer.VerticalOffset;
+                SmoothScroll.ScrollTo(viewer, 500);
+                Assert(SmoothScroll.IsAnimating(viewer), "fixture did not start programmatic scrolling");
+                SmoothScroll.ScrollTo(viewer, visibleOffset);
+                Assert(!SmoothScroll.IsAnimating(viewer), "a new target at the visible offset kept the previous animation");
+                await Task.Delay(40);
+                Assert(Math.Abs(viewer.VerticalOffset - visibleOffset) <= .1, "previous target moved the viewport after cancellation");
                 SmoothScroll.ScrollTo(viewer, viewer.ScrollableHeight);
                 body.Height = 300.25; window.UpdateLayout(); await Task.Delay(60);
                 Assert(!SmoothScroll.IsAnimating(viewer) && viewer.VerticalOffset >= 0 && viewer.VerticalOffset <= viewer.ScrollableHeight,

@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -14,13 +16,71 @@ internal static partial class Program
     {
         await Run("Updates0317: all intervals calendar month restart and future checkpoints are bounded", U317Calendar);
         await Run("Updates0317: missing invalid preferences and corrupt checkpoint preserve safe defaults", U317Storage);
+        await Run("Updates0317: legacy UTF-8 checkpoint and busy replacement preserve the previous attempt", U317GuardedCheckpoint);
+        await Run("Updates0317: named NTFS metadata prevents a lossy checkpoint replacement", U317CheckpointMetadata);
+        await Run("Updates0317: replacement preserves explicit and inherited NTFS compression", U317CompressedCheckpoint);
         await Run("Updates0317: Startup Off and periodic checks remain serialized and stop on close", U317Scheduler);
         await Run("Updates0317: persisted attempt survives restart and a failed request waits the selected interval", U317Restart);
         await Run("Updates0317: immediate frequency persistence and automatic status preserve current edits", U317SettingsDraft);
         await Run("Updates0317: first bind live apply invalid HEX debounce close and centered settings have no save footer", U317InstantSettings);
         await Run("Updates0317: portable check and explicit official links never create installer backend", U317Portable);
         await Run("Updates0317: portable HTTP metadata rejects redirects oversized malformed and canceled responses", U317PortableTrust);
+        await Run("Updates0317: only the project feed can create an update backend", U317Repository);
+        await Run("Updates0317: an internal timeout clears a stale available release", U317Timeout);
+        await Run("Updates0317: pending settings can check manually without downloading or applying an update", U317PendingManualCheck);
         await Run("Updates0317: footer status and links fit the compact footer at both window sizes", U317Footer);
+    }
+
+    private static async Task U317Repository()
+    {
+        var path = Path.Combine(_directory, "updates0317-alternate-feed.json");
+        File.WriteAllText(path, """{"githubRepository":"https://github.com/example/demo"}""");
+        foreach (var installed in new[] { true, false })
+        {
+            var calls = 0;
+            var service = new UpdateSupport(path, installed, _ => { calls++; return new Su016Backend(); },
+                _ => { calls++; return Task.FromResult<string?>(null); });
+            var state = await service.CheckAsync();
+            await service.DownloadAsync();
+            Assert(state.Status == AppUpdateStatus.Error && !state.FeedConfigured && calls == 0,
+                "alternate repository reached an update backend");
+        }
+    }
+
+    private static async Task U317Timeout()
+    {
+        var path = Path.Combine(_directory, "updates0317-timeout.json");
+        File.WriteAllText(path, """{"githubRepository":"https://github.com/senduora/yamuse"}""");
+        var checks = 0;
+        var service = new UpdateSupport(path, false, portableCheck: _ => ++checks == 1
+            ? Task.FromResult<string?>("9.1.0")
+            : Task.FromException<string?>(new TaskCanceledException("fixture timeout")));
+        Assert((await service.CheckAsync()).Status == AppUpdateStatus.Available, "fixture update offer missing");
+        var state = await service.CheckAsync();
+        Assert(state.Status == AppUpdateStatus.Error && state.AvailableVersion is null,
+            "a timed out check reported the old update as current");
+    }
+
+    private static async Task U317PendingManualCheck()
+    {
+        using var fixture = new SaFixture("updates0317-pending-manual");
+        var window = fixture.Window;
+        var backend = new Su016Backend { PendingVersion = "9.1.0" };
+        var updates = Su016Service(window, "u317-pending-manual", backend);
+        Assert((await updates.CheckAsync()).Status == AppUpdateStatus.Downloaded, "pending fixture was not confirmed");
+        SaClick(Control<Button>(window, "SettingsButton"));
+        var panel = (StackPanel)Control<ContentControl>(window, "SettingsUpdates").Content;
+        var apply = panel.Children.OfType<Button>().Single();
+        var check = panel.Children.OfType<StackPanel>().Single().Children.OfType<Button>().Single();
+        Assert(Equals(apply.Content, "Обновить и перезапустить") && Equals(check.Content, "Проверить обновления") && check.IsEnabled,
+            "pending settings did not preserve explicit apply and separate manual check");
+
+        backend.PendingVersion = null;
+        backend.Version = "9.2.0";
+        SaClick(check);
+        await Until(() => updates.State.Status == AppUpdateStatus.Available && !SaField<bool>(window, "_updateCheckInProgress"));
+        Assert(updates.State.AvailableVersion == "9.2.0" && backend.Checks == 2 && backend.Downloads == 0 && backend.Applies == 0,
+            "manual recheck did not refresh the offer independently of download or apply");
     }
 
     private static Task U317Calendar()
@@ -65,6 +125,87 @@ internal static partial class Program
         Assert(Directory.GetFiles(directory, "*.tmp").Length == 0, "checkpoint write left temporary files");
         return Task.CompletedTask;
     }
+
+    private static async Task U317GuardedCheckpoint()
+    {
+        var directory = Path.Combine(_directory, "updates0317-checkpoint-guarded", "data");
+        var store = new UpdateScheduleStore(directory);
+        var now = new DateTimeOffset(2028, 3, 1, 12, 0, 0, TimeSpan.Zero);
+        Assert(store.Load(now) == new UpdateScheduleCheckpoint() && !Directory.Exists(directory), "checkpoint read created missing parents");
+        store.Save(new(now.AddHours(-1)));
+        var original = File.ReadAllText(store.FilePath);
+        File.WriteAllText(store.FilePath, original, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+        var bytes = File.ReadAllBytes(store.FilePath);
+        Assert(store.Load(now) == new UpdateScheduleCheckpoint(now.AddHours(-1)), "legacy UTF-8 checkpoint with BOM failed to load");
+        using (File.Open(store.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            await Throws<IOException>(() => { store.Save(new(now)); return Task.CompletedTask; });
+            Assert(bytes.SequenceEqual(File.ReadAllBytes(store.FilePath)) && !Directory.EnumerateFiles(directory, "*.tmp").Any(),
+                "busy checkpoint lost the previous attempt or left a staging file");
+        }
+        store.Save(new(now));
+        Assert(store.Load(now) == new UpdateScheduleCheckpoint(now), "checkpoint could not retry after the file became writable");
+    }
+
+    private static async Task U317CheckpointMetadata()
+    {
+        var directory = Path.Combine(_directory, "updates0317-checkpoint-metadata");
+        var store = new UpdateScheduleStore(directory);
+        if (new DriveInfo(Path.GetPathRoot(store.FilePath)!).DriveFormat != "NTFS") return;
+        var now = new DateTimeOffset(2028, 3, 1, 12, 0, 0, TimeSpan.Zero);
+        var previous = new UpdateScheduleCheckpoint(now.AddHours(-1));
+        store.Save(previous);
+        var stream = store.FilePath + ":yamuse-fixture";
+        File.WriteAllText(stream, "synthetic metadata");
+        var original = File.ReadAllBytes(store.FilePath);
+        await Throws<IOException>(() => { store.Save(new(now)); return Task.CompletedTask; });
+        Assert(store.Load(now) == previous && original.SequenceEqual(File.ReadAllBytes(store.FilePath))
+            && File.ReadAllText(stream) == "synthetic metadata" && !Directory.EnumerateFiles(directory, "*.tmp").Any(),
+            "replacement changed the checkpoint or its named stream");
+    }
+
+    private static Task U317CompressedCheckpoint()
+    {
+        const uint fileCompression = 0x00000010;
+        var drive = Path.GetPathRoot(_directory)!;
+        if (new DriveInfo(drive).DriveFormat != "NTFS") return Task.CompletedTask;
+        Assert(U317GetVolumeInformation(drive, IntPtr.Zero, 0, out _, out _, out var flags, IntPtr.Zero, 0),
+            "could not read fixture volume capabilities");
+        if ((flags & fileCompression) == 0) return Task.CompletedTask;
+
+        var now = DateTimeOffset.UtcNow;
+        foreach (var (compressedDirectory, compressedFile) in new[] { (false, true), (true, true), (true, false) })
+        {
+            var directory = Path.Combine(_directory, $"updates0317-compressed-{compressedDirectory}-{compressedFile}");
+            Directory.CreateDirectory(directory);
+            SetCompression(directory, compressedDirectory);
+            var store = new UpdateScheduleStore(directory);
+            store.Save(new(now.AddHours(-1)));
+            SetCompression(store.FilePath, compressedFile);
+            store.Save(new(now));
+            Assert(store.Load(now) == new UpdateScheduleCheckpoint(now)
+                && File.GetAttributes(store.FilePath).HasFlag(FileAttributes.Compressed) == compressedFile
+                && !Directory.EnumerateFiles(directory, "*.tmp").Any(), "replacement lost compression state or the checkpoint");
+        }
+        return Task.CompletedTask;
+
+        static void SetCompression(string path, bool compressed)
+        {
+            var start = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "compact.exe"))
+                { UseShellExecute = false, CreateNoWindow = true };
+            start.ArgumentList.Add(compressed ? "/C" : "/U");
+            start.ArgumentList.Add("/Q");
+            start.ArgumentList.Add(path);
+            using var process = Process.Start(start) ?? throw new IOException("Could not start the fixture compression tool.");
+            Assert(process.WaitForExit(5000) && process.ExitCode == 0
+                && File.GetAttributes(path).HasFlag(FileAttributes.Compressed) == compressed, "could not set fixture compression mode");
+        }
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "GetVolumeInformationW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool U317GetVolumeInformation(string root, IntPtr volumeName, uint volumeNameSize, out uint serial,
+        out uint maxName, out uint flags, IntPtr fileSystemName, uint fileSystemNameSize);
 
     private static async Task U317Scheduler()
     {

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Net.Http;
 using System.Text.Json;
 using YMusic.Native;
@@ -159,6 +160,80 @@ internal static partial class Program
             Assert(fixture.Revision == 1 && fixture.PlaylistReads == 1 && fixture.Tracks.Count == 1,
                 "non-advancing change response was accepted or followed by misleading readback");
         });
+
+        await Run("CatalogPlaylistWrites: create and rename reject reads older than their acknowledgement", async () =>
+        {
+            using var created = new PlaylistWritesFixture(exists: false) { ReadbackRevision = 1, Revision = 2 };
+            var error = await Throws<MusicException>(() => created.Api.CreatePlaylistAsync(FakeSession, PlaylistWritesFixture.Title, default));
+            Assert(error.Message.Contains("итог не подтверждён", StringComparison.Ordinal) && created.Writes.SequenceEqual(["create"])
+                && created.PlaylistReads == 1, "creation accepted an older read or retried the write");
+
+            using var renamed = new PlaylistWritesFixture { Revision = 5, ReadbackRevision = 4 };
+            error = await Throws<MusicException>(() => renamed.Api.RenamePlaylistAsync(FakeSession, renamed.Snapshot(), "Renamed", default));
+            Assert(error.Message.Contains("итог не подтверждён", StringComparison.Ordinal) && renamed.Writes.SequenceEqual(["rename"])
+                && renamed.PlaylistReads == 2, "rename accepted an older read with the same title or retried the write");
+        });
+
+        await Run("CatalogPlaylistWrites: incomplete write responses are reconciled by reads without replay", async () =>
+        {
+            foreach (var fault in new[] { PlaylistWriteAckFault.Partial, PlaylistWriteAckFault.InvalidJson, PlaylistWriteAckFault.NoResult })
+            {
+                using var change = new PlaylistWritesFixture { AckFault = fault };
+                var inserted = await change.Api.InsertPlaylistTracksAsync(FakeSession, change.Snapshot(), [new("track-one", "album-one")], 0, default);
+                Assert(inserted.Revision == 2 && inserted.Tracks.Single().RequestId == "track-one:album-one"
+                    && change.Writes.SequenceEqual(["change"]) && change.PlaylistReads == 2, "an interrupted change was replayed or checked without authoritative readback");
+            }
+
+            using var wrongRead = new PlaylistWritesFixture { AckFault = PlaylistWriteAckFault.Partial, ReadbackFault = PlaylistWritesReadbackFault.TrackId };
+            var error = await Throws<MusicException>(() => wrongRead.Api.InsertPlaylistTracksAsync(FakeSession, wrongRead.Snapshot(), [new("track-one", "album-one")], 0, default));
+            PlaylistWritesAssertUnconfirmed(wrongRead, error);
+
+            using var rename = new PlaylistWritesFixture { AckFault = PlaylistWriteAckFault.NoResult };
+            var renamed = await rename.Api.RenamePlaylistAsync(FakeSession, rename.Snapshot(), "Renamed", default);
+            Assert(renamed.Revision == 2 && renamed.Title == "Renamed" && rename.Writes.SequenceEqual(["rename"]) && rename.PlaylistReads == 2,
+                "interrupted rename did not reconcile the exact playlist by readback");
+
+            using var create = new PlaylistWritesFixture(exists: false) { AckFault = PlaylistWriteAckFault.NoResult };
+            error = await Throws<MusicException>(() => create.Api.CreatePlaylistAsync(FakeSession, PlaylistWritesFixture.Title, default));
+            Assert(error.Message.Contains("итог не подтверждён", StringComparison.Ordinal) && create.Exists && create.Writes.SequenceEqual(["create"])
+                && create.PlaylistReads == 0, "creation retried a lost acknowledgement or guessed the new playlist identity");
+        });
+
+        await Run("CatalogPlaylistWrites: explicit authorization conflict and JSON rejections never reconcile as committed", async () =>
+        {
+            foreach (var fault in new[] { PlaylistWriteAckFault.Forbidden, PlaylistWriteAckFault.Conflict, PlaylistWriteAckFault.ExplicitError })
+            {
+                using var fixture = new PlaylistWritesFixture { AckFault = fault };
+                var error = await Throws<MusicException>(() => fixture.Api.InsertPlaylistTracksAsync(FakeSession, fixture.Snapshot(), [new("track-one", "album-one")], 0, default));
+                Assert(fixture.Writes.SequenceEqual(["change"]) && fixture.PlaylistReads == 1 && fixture.Revision == 2
+                    && !error.Message.Contains("fixture-error-secret", StringComparison.Ordinal)
+                    && !error.Message.Contains("итог не подтверждён", StringComparison.Ordinal),
+                    "a rejected POST was replayed, reconciled, or displayed its untrusted response");
+            }
+        });
+
+        await Run("CatalogPlaylistWrites: revision-only acknowledgements confirm a known playlist once by readback", async () =>
+        {
+            using var change = new PlaylistWritesFixture { AckFault = PlaylistWriteAckFault.RevisionOnly };
+            var inserted = await change.Api.InsertPlaylistTracksAsync(FakeSession, change.Snapshot(), [new("track-one", "album-one")], 0, default);
+            Assert(inserted.Revision == 2 && inserted.Tracks.Single().RequestId == "track-one:album-one"
+                && change.Writes.SequenceEqual(["change"]) && change.PlaylistReads == 2, "revision-only change did not reconcile the exact playlist once");
+
+            using var rename = new PlaylistWritesFixture { AckFault = PlaylistWriteAckFault.RevisionOnly };
+            var renamed = await rename.Api.RenamePlaylistAsync(FakeSession, rename.Snapshot(), "Renamed", default);
+            Assert(renamed.Revision == 2 && renamed.Title == "Renamed" && rename.Writes.SequenceEqual(["rename"]) && rename.PlaylistReads == 2,
+                "revision-only rename did not reconcile the exact playlist once");
+
+            foreach (var fault in new[] { PlaylistWriteAckFault.RevisionWrongOwner, PlaylistWriteAckFault.RevisionWrongKind,
+                PlaylistWriteAckFault.RevisionInvalid, PlaylistWriteAckFault.RevisionAhead })
+            {
+                using var contradiction = new PlaylistWritesFixture { AckFault = fault };
+                var error = await Throws<MusicException>(() => contradiction.Api.InsertPlaylistTracksAsync(FakeSession, contradiction.Snapshot(), [new("track-one", "album-one")], 0, default));
+                PlaylistWritesAssertUnconfirmed(contradiction, error);
+                Assert(contradiction.PlaylistReads == (fault == PlaylistWriteAckFault.RevisionAhead ? 2 : 1),
+                    "contradictory identity or revision was accepted or retried");
+            }
+        });
     }
 
     private static void PlaylistWritesAssertUnconfirmed(PlaylistWritesFixture fixture, MusicException error)
@@ -168,6 +243,11 @@ internal static partial class Program
         .ToDictionary(pair => Uri.UnescapeDataString(pair[0].Replace('+', ' ')), pair => Uri.UnescapeDataString(pair[1].Replace('+', ' ')), StringComparer.Ordinal);
     private enum PlaylistWritesReadbackFault { None, TrackId, MissingAlbumId, WrongAlbumId }
     private enum PlaylistWritesEmbeddedTrackShape { None, ExactSingleton, WrongTrackId, MissingTrackId, AbsentAlbums, MultipleAlbums }
+    private enum PlaylistWriteAckFault
+    {
+        None, Partial, InvalidJson, NoResult, Forbidden, Conflict, ExplicitError,
+        RevisionOnly, RevisionWrongOwner, RevisionWrongKind, RevisionInvalid, RevisionAhead
+    }
     private sealed class PlaylistWritesFixture : IDisposable
     {
         internal const string Title = "Playlist writes fixture";
@@ -177,6 +257,8 @@ internal static partial class Program
         internal int Revision { get; set; } = 1;
         internal string AccountUid { get; init; } = "12345";
         internal bool AdvanceRevision { get; init; } = true;
+        internal int? ReadbackRevision { get; init; }
+        internal PlaylistWriteAckFault AckFault { get; init; }
         internal PlaylistWritesReadbackFault ReadbackFault { get; init; }
         internal PlaylistWritesEmbeddedTrackShape EmbeddedTrackShape { get; init; }
         internal string EmbeddedAlbumId { get; init; } = "album-one";
@@ -184,8 +266,9 @@ internal static partial class Program
         internal List<(int Revision, string Diff)> Changes { get; } = [];
         internal List<string> Writes { get; } = [];
         internal int PlaylistReads { get; private set; }
+        private string _title = Title;
         internal PlaylistWritesFixture(bool exists = true) { Exists = exists; Http = new FakeHandler(Respond); Api = new MusicApi(Http); }
-        internal PlaylistDetails Snapshot() => new("12345", "17", Title, "", Revision,
+        internal PlaylistDetails Snapshot() => new("12345", "17", _title, "", Revision,
             Tracks.Select(reference => new TrackRow { Id = reference.Id, RequestId = reference.RequestId, AlbumId = reference.AlbumId }).ToArray(), Visibility: "private");
         private async Task<HttpResponseMessage> Respond(HttpRequestMessage request, CancellationToken cancellationToken)
         {
@@ -205,7 +288,7 @@ internal static partial class Program
             if (path == "/users/12345/playlists/17")
             {
                 Assert(request.Method == HttpMethod.Get && Exists, "playlist detail preflight/readback differs");
-                PlaylistReads++; return Json(JsonSerializer.Serialize(new { result = Header(readback: Changes.Count > 0) }));
+                PlaylistReads++; return Json(JsonSerializer.Serialize(new { result = Header(readback: Writes.Count > 0) }));
             }
             if (path == "/tracks")
             {
@@ -226,7 +309,13 @@ internal static partial class Program
             {
                 var form = PlaylistWritesForm(await request.Content!.ReadAsStringAsync(cancellationToken));
                 Assert(!Exists && form["title"] == Title && form["visibility"] == "private", "unexpected playlist creation");
-                Exists = true; Writes.Add("create"); return Json(JsonSerializer.Serialize(new { result = Header() }));
+                Exists = true; Writes.Add("create"); return Acknowledge();
+            }
+            if (path == "/users/12345/playlists/17/name")
+            {
+                var form = PlaylistWritesForm(await request.Content!.ReadAsStringAsync(cancellationToken));
+                Assert(Exists && form.Count == 1, "unexpected playlist rename");
+                _title = form["value"]; Revision++; Writes.Add("rename"); return Acknowledge();
             }
             if (path == "/users/12345/playlists/17/change")
             {
@@ -256,7 +345,7 @@ internal static partial class Program
                     Tracks.RemoveRange(from, to - from);
                 }
                 if (AdvanceRevision) Revision++;
-                return Json(JsonSerializer.Serialize(new { result = Header() }));
+                return Acknowledge();
             }
             if (path == "/users/12345/playlists/17/delete")
             {
@@ -264,10 +353,33 @@ internal static partial class Program
             }
             throw new InvalidOperationException("Unexpected playlist write fixture endpoint " + path);
         }
+        private HttpResponseMessage Acknowledge()
+        {
+            var response = Json(AckFault switch
+            {
+                PlaylistWriteAckFault.InvalidJson => "{",
+                PlaylistWriteAckFault.NoResult => "{}",
+                PlaylistWriteAckFault.ExplicitError => """{"error":{"message":"fixture-error-secret"}}""",
+                PlaylistWriteAckFault.RevisionOnly => JsonSerializer.Serialize(new { result = new { revision = Revision } }),
+                PlaylistWriteAckFault.RevisionWrongOwner => JsonSerializer.Serialize(new { result = new { revision = Revision, owner = new { uid = "67890" } } }),
+                PlaylistWriteAckFault.RevisionWrongKind => JsonSerializer.Serialize(new { result = new { revision = Revision, kind = "18" } }),
+                PlaylistWriteAckFault.RevisionInvalid => """{"result":{"revision":-1}}""",
+                PlaylistWriteAckFault.RevisionAhead => JsonSerializer.Serialize(new { result = new { revision = Revision + 1 } }),
+                _ => JsonSerializer.Serialize(new { result = Header() })
+            });
+            response.StatusCode = AckFault switch
+            {
+                PlaylistWriteAckFault.Partial => HttpStatusCode.PartialContent,
+                PlaylistWriteAckFault.Forbidden => HttpStatusCode.Forbidden,
+                PlaylistWriteAckFault.Conflict => HttpStatusCode.Conflict,
+                _ => HttpStatusCode.OK
+            };
+            return response;
+        }
         private Dictionary<string, object?> Header(bool readback = false) => new()
         {
-            ["kind"] = "17", ["owner"] = new { uid = "12345" }, ["title"] = Title, ["description"] = "",
-            ["revision"] = Revision, ["visibility"] = "private", ["trackCount"] = Tracks.Count,
+            ["kind"] = "17", ["owner"] = new { uid = "12345" }, ["title"] = _title, ["description"] = "",
+            ["revision"] = readback ? ReadbackRevision ?? Revision : Revision, ["visibility"] = "private", ["trackCount"] = Tracks.Count,
             ["tracks"] = Tracks.Select(reference =>
             {
                 var entry = new Dictionary<string, object?> { ["id"] = readback && ReadbackFault == PlaylistWritesReadbackFault.TrackId ? "wrong-track" : reference.Id };

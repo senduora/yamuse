@@ -52,7 +52,15 @@ public static class SmoothScroll
     {
         if (index < 0 || index >= list.Items.Count || !isCurrent()) return;
         if (States.TryGetValue(viewer, out var state)) state.DeferBringIntoView(list, index, isCurrent);
-        else { list.ScrollIntoView(list.Items[index]); list.UpdateLayout(); }
+        else { BringItemIntoView(viewer, list, index); list.UpdateLayout(); }
+    }
+
+    private static void BringItemIntoView(ScrollViewer viewer, ListBox list, int index)
+    {
+        // A repeated lyric can be equal to an earlier row even at a different timestamp.
+        if (ScrollInfo(viewer.Content as DependencyObject) is VirtualizingPanel panel && ReferenceEquals(ItemsControl.GetItemsOwner(panel), list))
+            panel.BringIndexIntoViewPublic(index);
+        else list.ScrollIntoView(list.Items[index]);
     }
 
     // Hermite interpolation preserves the visible velocity when another wheel
@@ -279,14 +287,22 @@ public static class SmoothScroll
 
         internal void AnimateTo(double target)
         {
+            var current = _precisionPending ? TargetOffset : _viewer.VerticalOffset;
+            if (Math.Abs(target - current) <= Epsilon)
+            {
+                if (IsAnimating || _bringIntoView is not null)
+                {
+                    Cancel();
+                    _viewer.ScrollToVerticalOffset(target);
+                }
+                return;
+            }
             if (_bringIntoView is not null)
             {
                 _bringGeneration++;
                 _bringIntoView.Abort();
                 _bringIntoView = null;
             }
-            var current = _precisionPending ? TargetOffset : _viewer.VerticalOffset;
-            if (Math.Abs(target - current) <= Epsilon) return;
             _programmatic = true;
             if (_precisionPending)
             {
@@ -324,7 +340,7 @@ public static class SmoothScroll
                 // No native BringIntoView has been queued until this cancellable
                 // callback owns the dispatcher. Finish its layout synchronously
                 // before a later manual event can acquire the viewport.
-                list.ScrollIntoView(item);
+                BringItemIntoView(_viewer, list, index);
                 list.UpdateLayout();
                 _viewer.UpdateLayout();
                 if (generation == _bringGeneration) _programmatic = false;

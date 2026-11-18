@@ -11,31 +11,62 @@ internal sealed class BrandPaths
 {
     internal const string LegacyInstanceMutex = @"Local\YMusic.Native.Prototype";
     internal const string LegacyPackageId = "YMusic.Native";
-    private static readonly Lazy<BrandPaths> CurrentPaths = new(() => FromKnownFolders(
+    internal const string OfflineUnavailableMessage = "Офлайн-библиотека недоступна. Проверьте локальное расположение папки «Документы» в Windows и перезапустите Yamuse.";
+    private static readonly Lazy<BrandPaths> CurrentPaths = new(() => FromStartupKnownFolders(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)));
+        Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments, Environment.SpecialFolderOption.DoNotVerify)));
     internal static BrandPaths Current => CurrentPaths.Value;
 
     internal string LocalData { get; }
-    internal string Documents { get; }
+    private readonly string? _documents;
+    internal string Documents => _documents ?? throw new IOException(OfflineUnavailableMessage);
     internal string DataDirectory { get; }
-    internal string MusicDirectory { get; }
+    internal string? AvailableMusicDirectory { get; }
+    internal string MusicDirectory => AvailableMusicDirectory ?? throw new IOException(OfflineUnavailableMessage);
     internal string LegacyDataDirectory { get; }
-    internal string LegacyMusicDirectory { get; }
+    private readonly string? _legacyMusicDirectory;
+    internal string LegacyMusicDirectory => _legacyMusicDirectory ?? throw new IOException(OfflineUnavailableMessage);
 
-    private BrandPaths(string localData, string documents)
+    private BrandPaths(string localData, string? documents)
     {
         LocalData = UninstallPathGuard.Canonical(localData);
-        Documents = UninstallPathGuard.Canonical(documents);
-        if (UninstallPathGuard.Contains(LocalData, Documents) || UninstallPathGuard.Contains(Documents, LocalData))
-            throw new IOException("Системные папки пересекаются. Перенос данных остановлен.");
         DataDirectory = FixedChild(LocalData, "Yamuse");
-        MusicDirectory = FixedChild(Documents, "Yamuse", "Music");
         LegacyDataDirectory = FixedChild(LocalData, "YMusic.Native.Prototype");
-        LegacyMusicDirectory = FixedChild(Documents, "YMusic Native", "Music");
+        if (documents is null) return;
+        _documents = UninstallPathGuard.Canonical(documents);
+        if (UninstallPathGuard.Contains(LocalData, _documents) || UninstallPathGuard.Contains(_documents, LocalData))
+            throw new IOException("Системные папки пересекаются. Перенос данных остановлен.");
+        AvailableMusicDirectory = FixedChild(_documents, "Yamuse", "Music");
+        _legacyMusicDirectory = FixedChild(_documents, "YMusic Native", "Music");
     }
 
     internal static BrandPaths FromKnownFolders(string localData, string documents) => new(localData, documents);
+
+    internal static BrandPaths FromStartupKnownFolders(string localData, string documents)
+    {
+        var local = UninstallPathGuard.Canonical(localData);
+        try
+        {
+            var paths = FromKnownFolders(local, documents);
+            var volume = new DriveInfo(Path.GetPathRoot(paths.Documents)!);
+            if (volume.DriveType is DriveType.Network or DriveType.NoRootDirectory or DriveType.Unknown)
+                return new BrandPaths(local, documents: null);
+            using var documentsAnchor = UninstallPathGuard.HoldAncestors(Path.Combine(paths.Documents, ".yamuse-documents"));
+            if (!documentsAnchor.Complete) return new BrandPaths(local, documents: null);
+            CheckOfflineRoot(paths.MusicDirectory);
+            CheckOfflineRoot(paths.LegacyMusicDirectory);
+            return paths;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception or ArgumentException)
+        { return new BrandPaths(local, documents: null); }
+
+        static void CheckOfflineRoot(string path)
+        {
+            using var parents = UninstallPathGuard.HoldAncestors(path);
+            if (!parents.Complete || !UninstallPathGuard.EntryExists(path)) return;
+            using var root = UninstallPathGuard.HoldDirectory(path);
+        }
+    }
 
     private static string FixedChild(string root, params string[] parts)
     {
@@ -53,14 +84,15 @@ internal sealed class BrandPaths
     internal void MigrateLegacyData(Action<string>? beforeMove = null)
     {
         using (var data = MigrationPlan.Prepare(LegacyDataDirectory, DataDirectory))
-        using (var music = MigrationPlan.Prepare(LegacyMusicDirectory, MusicDirectory))
+        using (var music = _legacyMusicDirectory is { } legacy ? MigrationPlan.Prepare(legacy, MusicDirectory) : null)
         {
             data.Move(beforeMove);
-            music.Move(beforeMove);
+            music?.Move(beforeMove);
         }
         // The old Documents parent may also contain files unrelated to Music.
         // Remove it only when empty; failure here never invalidates a completed
         // data rename and is safe to retry on the next launch.
+        if (_legacyMusicDirectory is null) return;
         try
         {
             var parent = Path.GetDirectoryName(LegacyMusicDirectory)!;
@@ -142,9 +174,7 @@ internal sealed class BrandPaths
         {
             if (_sourceHandle is null) return;
             beforeMove?.Invoke(_source);
-            var parent = Path.GetDirectoryName(_target)!;
-            Directory.CreateDirectory(parent);
-            using var targetParents = UninstallPathGuard.HoldExistingAncestors(_target);
+            using var targetParents = UninstallPathGuard.HoldAncestors(_target, create: true);
             if (_emptyTarget is not null)
             {
                 // Delete only the checked, empty directory by handle. A file
@@ -170,7 +200,7 @@ internal sealed class BrandPaths
     // an unexpected existing destination is never replaced or merged.
     private static SafeFileHandle OpenMigrationDirectory(string path)
     {
-        var handle = CreateFile(path, 0x10000 | 0x80 | 1, 1 | 2, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero);
+        var handle = CreateFile(UninstallPathGuard.ToWin32Path(path), 0x10000 | 0x80 | 1, 1 | 2, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero);
         if (handle.IsInvalid) { var error = Marshal.GetLastWin32Error(); handle.Dispose(); throw new Win32Exception(error); }
         try
         {
@@ -187,7 +217,7 @@ internal sealed class BrandPaths
     {
         // Win32 normalizes an absolute FileName as a NUL-terminated path even
         // though FileNameLength excludes the terminator. Reserve it explicitly.
-        var name = Encoding.Unicode.GetBytes(target + '\0');
+        var name = Encoding.Unicode.GetBytes(UninstallPathGuard.ToWin32Path(target) + '\0');
         var rootOffset = IntPtr.Size;
         var lengthOffset = rootOffset + IntPtr.Size;
         var nameOffset = lengthOffset + sizeof(uint);

@@ -149,6 +149,41 @@ internal static partial class Program
                 Assert(Control<Button>(w, "AlbumWaveButton").Visibility == Visibility.Collapsed, "playlist showed the album-only action");
             }
         });
+        await Run("InfiniteMix060: queue edits preserve the album station and exact source occurrences", async () =>
+        {
+            using var f = new TwFixture("mix-edited-album-origin"); var w = f.Window;
+            var album = Mix060Album("12345"); var repeated = album.Tracks[^1];
+            album = album with { Tracks = [album.Tracks[0], repeated, repeated] };
+            Mix060ShowAlbum(w, album);
+            var list = Control<ListView>(w, "TracksList"); var queue = SaField<PlaybackQueue>(w, "_playbackQueue");
+            list.SelectedItem = album.Tracks[0]; await Call(w, "PlaySelectedAsync");
+            Assert(queue.SelectAt(2), "fixture could not select the second original occurrence");
+            await w.PlayTrackAsync(repeated);
+            SaInvoke(w, "ShowQueueCore", false); w.MoveQueueSelection([2], 0);
+
+            var source = new PlaybackAlbumState(album.Id, album.Title, album.Artists);
+            bool HasAlbum() => (PlaybackAlbumState?)Pc0317Invoke(w, "PlaybackSourceAlbum") == source;
+            Assert(HasAlbum(), "moving an occurrence dropped the original album");
+            SaInvoke(w, "PlaybackContext_Click", null!, null!);
+            Assert(list.SelectedIndex == 2, "return after a move selected the wrong occurrence in the original album");
+
+            queue.RemoveMany([0]);
+            Assert(HasAlbum(), "removing a track dropped the original album");
+            Assert(queue.UndoRemoval() && HasAlbum(), "undo did not retain the original album");
+            Assert(queue.SelectAt(0), "fixture could not select the restored occurrence");
+            SaInvoke(w, "PlaybackContext_Click", null!, null!);
+            Assert(list.SelectedIndex == 2, "undo lost the exact source occurrence");
+
+            queue.Enqueue(repeated);
+            Assert(HasAlbum() && queue.SelectAt(queue.Items.Count - 1), "adding a duplicate dropped the original album");
+            SaInvoke(w, "PlaybackContext_Click", null!, null!);
+            Assert(list.SelectedIndex == -1, "an enqueued duplicate was mistaken for an original album occurrence");
+
+            var tail = TwSeed("9999", "Добавленный трек", true);
+            queue.Append([tail]); Assert(queue.SelectAt(queue.Items.Count - 1), "fixture could not select the appended tail");
+            await w.PlayTrackAsync(tail); f.Player.Stop(); await Call(w, "AdvanceAsync", 1, true);
+            Assert(f.Seeds.Single() == "album:12345", "automatic continuation used the appended track instead of the original album");
+        });
         await Run("InfiniteMix060: repeat modes, after-track sleep, manual Next, missing login and invalid seed do not start autoplay", async () =>
         {
             foreach (var mode in new[] { "all", "one", "sleep", "manual", "offline", "invalid" })
@@ -208,6 +243,49 @@ internal static partial class Program
                     "autoplay ignored " + action);
             }
         });
+        await Run("InfiniteMix060: SMTC Play preserves a pending station while Pause and Stop cancel it", async () =>
+        {
+            foreach (var action in new[] { DesktopMediaAction.Pause, DesktopMediaAction.Stop })
+            {
+                using var f = new TwFixture("mix-smtc-" + action);
+                var w = f.Window;
+                var shell = SaField<DesktopShell>(w, "_shell");
+                var mini = new MiniPlayerWindow();
+                const System.Reflection.BindingFlags shellFields = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+                typeof(DesktopShell).GetField("_mini", shellFields)!.SetValue(shell, mini);
+                var last = TwSeed("1234", "Последний трек", true);
+                await w.PlayTrackAsync(last);
+                f.Player.Pause();
+                f.HoldNext = true;
+                var pending = Call(w, "AdvanceAsync", 1, true);
+                await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                var request = SaField<CancellationTokenSource>(w, "_automaticWaveCts");
+                Assert(f.Player.HasSource && !f.Player.IsPlaying && Equals(Control<Button>(w, "PlayPauseButton").Content, "\uE769"),
+                    "fixture lost its logically active transition");
+                Assert(System.Windows.Automation.AutomationProperties.GetName(mini.PlayButton) == "Пауза"
+                    && (bool)typeof(DesktopShell).GetField("_isPlaying", shellFields)!.GetValue(shell)!
+                    && !(bool)typeof(DesktopShell).GetField("_advancePlayhead", shellFields)!.GetValue(shell)!,
+                    "mini and tray did not show Pause without advancing the inactive player timeline");
+                await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+                await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+                Assert(ReferenceEquals(SaField<CancellationTokenSource>(w, "_automaticWaveCts"), request) && !request.IsCancellationRequested,
+                    "SMTC Play canceled the pending station");
+                await w.HandleDesktopMediaCommandAsync(action);
+                Assert(request.IsCancellationRequested && SaField<CancellationTokenSource?>(w, "_automaticWaveCts") is null
+                    && !f.Player.HasSource && Equals(Control<Button>(w, "PlayPauseButton").Content, "\uE768"),
+                    "SMTC cancellation left a pending station or Play state");
+                if (action == DesktopMediaAction.Pause) await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Pause);
+                else
+                {
+                    await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+                    Assert(f.Player.IsPlaying, "first Play after Stop canceled the old station instead of playing");
+                }
+                f.Release.TrySetResult();
+                await pending;
+                Assert(f.Seeds.Count == 1 && ReferenceEquals(SaField<PlaybackQueue>(w, "_playbackQueue").Current, last)
+                    && f.Player.IsPlaying == (action == DesktopMediaAction.Stop), "delayed station overrode the transport command");
+            }
+        });
         await Run("InfiniteMix060: autoplay failure stops safely, does not retry and preserves a newer Settings view", async () =>
         {
             using var f = new TwFixture("mix-failure"); var w = f.Window; var last = TwSeed("1234", "Последний трек", true);
@@ -236,12 +314,22 @@ internal static partial class Program
                 UlSet(w, "_account", new Account("12345", "Fixture", true)); SaInvoke(w, "RestorePlaybackState", "12345");
                 Assert((PlaybackAlbumState?)Pc0317Invoke(w, "PlaybackSourceAlbum") == source && !SaField<NativePlayer>(w, "_player").HasSource && requests == 0,
                     "restoring the album source opened audio or lost exact origin");
-                SaField<PlaybackQueue>(w, "_playbackQueue").SetItems([TwSeed("9999", "Новая очередь", true)]);
+                var liveQueue = SaField<PlaybackQueue>(w, "_playbackQueue"); var restoredTrack = liveQueue.Current!;
+                liveQueue.MoveMany([1], 0);
+                liveQueue.Enqueue(TwSeed("9999", "Добавленный трек", true));
+                liveQueue.RemoveMany([1]);
+                SaInvoke(w, "SavePlaybackState");
+                Assert(store.Load("12345") is { } edited && edited.SourceAlbum == source && edited.Tracks.Count == 2
+                    && edited.CurrentIndex == 0 && edited.PositionSeconds == 12 && !SaField<NativePlayer>(w, "_player").HasSource && requests == 0,
+                    "saving an edited restored queue lost its origin, position, or paused state");
+                liveQueue.SetItems([restoredTrack], restoredTrack);
                 Assert(Pc0317Invoke(w, "PlaybackSourceAlbum") is null, "restored source leaked into a replacement queue");
                 Mix060ShowAlbum(w, album);
-                SaField<PlaybackQueue>(w, "_playbackQueue").SetItems(album.Tracks, album.Tracks[^1]);
+                liveQueue.SetItems(album.Tracks, album.Tracks[^1]);
                 UlSet(w, "_current", album.Tracks[^1]); SaInvoke(w, "CapturePlaybackContext"); SaInvoke(w, "SavePlaybackState");
                 Assert(store.Load("12345")?.SourceAlbum == source, "window save omitted the actual album playback source");
+                liveQueue.RestoreItems(liveQueue.Items, liveQueue.CurrentIndex, liveQueue.Shuffle, liveQueue.Repeat);
+                Assert(Pc0317Invoke(w, "PlaybackSourceAlbum") is null, "a new restored queue inherited a former playback context");
             }
             finally { w.Close(); }
             store.Save(PlaybackStateStore.Capture("12345", queue, 12));

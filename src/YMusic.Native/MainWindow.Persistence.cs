@@ -6,11 +6,12 @@ public partial class MainWindow
 {
     private PlaybackStateStore? _playbackStateStore;
     private string? _playbackStateAccountUid;
-    private TrackRow? _restoredPlaybackTrack;
+    private long? _restoredPlaybackOccurrence;
     private double? _restoredPlaybackSeconds;
     private DateTimeOffset _lastPlaybackStateSave;
     private bool _playbackStateInvalidated;
     private bool _playbackStateWriteBlocked;
+    private bool _playbackStateRestoreUnavailable;
     private Task? _playbackStateWriteTask;
 
     private bool PlaybackPersistenceEnabled => _restore && !_demo;
@@ -25,21 +26,33 @@ public partial class MainWindow
         if (!PlaybackPersistenceEnabled || _playbackStateStore is null || _closed) return;
         // Restoring an already activated account must not rewind a user's queue
         // when the service profile/library is refreshed in the same window.
-        if (_playbackStateAccountUid == accountUid && !_playbackStateInvalidated) return;
+        var hasLivePlayback = _player.HasSource || _loadingStream || _queue.Count > 0;
+        if (_playbackStateAccountUid == accountUid && !_playbackStateInvalidated
+            && (!_playbackStateRestoreUnavailable || hasLivePlayback)) return;
         _playbackStateAccountUid = accountUid;
         _playbackStateInvalidated = false;
         _playbackStateWriteBlocked = false;
-        if (_player.HasSource || _loadingStream || _queue.Count > 0) return;
+        _playbackStateRestoreUnavailable = false;
+        if (hasLivePlayback) return;
         var snapshot = _playbackStateStore.Load(accountUid);
-        if (snapshot is null) return;
+        if (snapshot is null)
+        {
+            if (_playbackStateStore.LastReadStatus is PlaybackStateReadStatus.Invalid or PlaybackStateReadStatus.Unavailable)
+            {
+                _playbackStateWriteBlocked = true;
+                _playbackStateRestoreUnavailable = _playbackStateStore.LastReadStatus == PlaybackStateReadStatus.Unavailable;
+                _diagnostics.LastErrorType = "PlaybackRestore:" + _playbackStateStore.LastReadStatus;
+            }
+            return;
+        }
         try
         {
             var restored = PlaybackStateStore.RestoreQueue(snapshot, _offline);
             _playbackQueue.RestoreItems(restored.Tracks, restored.CurrentIndex, snapshot.Shuffle, snapshot.Repeat);
-            _restoredSourceAlbum = snapshot.SourceAlbum;
-            _restoredSourceAlbumQueue = _playbackQueue.Items;
+            _restoredSourceAlbum = snapshot.SourceAlbum is { } album
+                ? (album, _playbackQueue.ReplacementVersion, _accountGeneration, accountUid) : null;
             _current = _playbackQueue.Current;
-            _restoredPlaybackTrack = _current;
+            _restoredPlaybackOccurrence = _playbackQueue.CurrentOccurrenceToken;
             _restoredPlaybackSeconds = _current is null ? null : restored.PositionSeconds;
             _progressTimer.Stop();
             if (_current is { } current)
@@ -47,7 +60,7 @@ public partial class MainWindow
                 current.IsPlaying = false;
                 TrackTitle.Text = current.Title; TrackArtist.Text = current.Artist;
                 QualityText.Text = "";
-                Artwork.SetSourceUri(PlayerCover, current.CoverUri);
+                SetPlayerArtwork(current);
                 _diagnostics.Stage = "restored_paused";
                 SetStatus("Очередь восстановлена · нажмите «Воспроизвести»");
             }
@@ -65,25 +78,41 @@ public partial class MainWindow
         }
     }
 
-    private void SavePlaybackState()
+    private bool TrySavePlaybackStateForExit()
     {
-        if (!PlaybackPersistenceEnabled || _playbackStateStore is null || _playbackStateInvalidated || _playbackStateWriteBlocked
-            || _account is null || _playbackStateAccountUid != _account.Uid) return;
+        if (_playbackStateRestoreUnavailable && _account is { } account) RestorePlaybackState(account.Uid);
+        return SavePlaybackState();
+    }
+
+    private bool SavePlaybackState()
+    {
+        if (!PlaybackPersistenceEnabled || _account is null) return true;
+        if (_playbackStateStore is null || _playbackStateInvalidated || _playbackStateWriteBlocked
+            || _playbackStateAccountUid != _account.Uid) return false;
         try
         {
-            var seconds = ReferenceEquals(_current, _playbackQueue.Current)
-                ? RestoredPlaybackPosition?.TotalSeconds ?? DisplayPosition(_player.Position).TotalSeconds : 0;
-            _playbackStateStore.Save(PlaybackStateStore.Capture(_account.Uid, _playbackQueue, seconds, PlaybackSourceAlbum()));
+            _playbackStateStore.Save(CapturePlaybackState(_account.Uid));
             _lastPlaybackStateSave = DateTimeOffset.UtcNow;
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
-        { _diagnostics.LastErrorType = "PlaybackSave:" + ex.GetType().Name; }
+        {
+            _diagnostics.LastErrorType = "PlaybackSave:" + ex.GetType().Name;
+            return false;
+        }
+    }
+
+    private PlaybackSnapshot CapturePlaybackState(string accountUid)
+    {
+        var seconds = ReferenceEquals(_current, _playbackQueue.Current)
+            ? RestoredPlaybackPosition?.TotalSeconds ?? DisplayPosition(_player.Position).TotalSeconds : 0;
+        return PlaybackStateStore.Capture(accountUid, _playbackQueue, seconds, PlaybackSourceAlbum());
     }
 
     // Called by the normal progress timer; close/pause/seek save immediately.
     private void PersistPlaybackStateIfDue()
     {
-        if (DateTimeOffset.UtcNow - _lastPlaybackStateSave < TimeSpan.FromSeconds(5) || _playbackStateWriteTask is { IsCompleted: false }
+        if (_closeCommitInProgress || DateTimeOffset.UtcNow - _lastPlaybackStateSave < TimeSpan.FromSeconds(5) || _playbackStateWriteTask is { IsCompleted: false }
             || !PlaybackPersistenceEnabled || _playbackStateStore is null || _playbackStateInvalidated || _playbackStateWriteBlocked
             || _account is null || _playbackStateAccountUid != _account.Uid) return;
         // Validation can fail synchronously before the background write starts.
@@ -91,9 +120,7 @@ public partial class MainWindow
         _lastPlaybackStateSave = DateTimeOffset.UtcNow;
         try
         {
-            var seconds = RestoredPlaybackPosition?.TotalSeconds ?? DisplayPosition(_player.Position).TotalSeconds;
-            var snapshot = PlaybackStateStore.Capture(_account.Uid, _playbackQueue, seconds, PlaybackSourceAlbum());
-            _playbackStateWriteTask = SaveAsync(snapshot);
+            _playbackStateWriteTask = SaveAsync(CapturePlaybackState(_account.Uid));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         { _diagnostics.LastErrorType = "PlaybackSave:" + ex.GetType().Name; }
@@ -109,8 +136,9 @@ public partial class MainWindow
     {
         _playbackStateInvalidated = true;
         _playbackStateWriteBlocked = false;
+        _playbackStateRestoreUnavailable = false;
         _playbackStateAccountUid = null;
-        _restoredPlaybackTrack = null; _restoredPlaybackSeconds = null;
+        ClearRestoredPosition();
         if (!PlaybackPersistenceEnabled || _playbackStateStore is null) return true;
         try { _playbackStateStore.Clear(); return true; }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -124,7 +152,8 @@ public partial class MainWindow
     private bool TryGetRestoredPosition(TrackRow track, out double seconds)
     {
         seconds = 0;
-        if (!ReferenceEquals(track, _restoredPlaybackTrack) || _restoredPlaybackSeconds is not { } saved) return false;
+        if (!ReferenceEquals(track, _playbackQueue.Current) || _restoredPlaybackSeconds is not { } saved
+            || _restoredPlaybackOccurrence != _playbackQueue.CurrentOccurrenceToken) return false;
         seconds = PlaybackStateStore.ClampPosition(saved, track.DurationMs);
         return true;
     }
@@ -137,17 +166,25 @@ public partial class MainWindow
         var target = Math.Clamp(seconds, 0, Math.Max(0, _player.Duration.TotalSeconds));
         _player.Seek(TimeSpan.FromSeconds(target));
         _pendingSeek = target; _seekClock.Restart();
-        _restoredPlaybackTrack = null; _restoredPlaybackSeconds = null;
+        ClearRestoredPosition();
     }
 
     private void ForgetRestoredPositionFor(TrackRow track, bool restart = false)
     {
         _playbackStateWriteBlocked = false; // An explicit new playback can replace an unrestorable queue.
-        if (!restart && ReferenceEquals(track, _restoredPlaybackTrack)) return;
-        _restoredPlaybackTrack = null; _restoredPlaybackSeconds = null;
+        _playbackStateRestoreUnavailable = false;
+        if (!restart && TryGetRestoredPosition(track, out _)) return;
+        ClearRestoredPosition();
     }
 
-    private TimeSpan? RestoredPlaybackPosition => !_player.HasSource && _current is { } track && TryGetRestoredPosition(track, out var seconds)
+    private void ClearRestoredPosition()
+    {
+        _restoredPlaybackOccurrence = null;
+        _restoredPlaybackSeconds = null;
+    }
+
+    // Native source assignment can precede media readiness and the resume seek.
+    private TimeSpan? RestoredPlaybackPosition => _current is { } track && TryGetRestoredPosition(track, out var seconds)
         ? TimeSpan.FromSeconds(seconds) : null;
     private TimeSpan? RestoredPlaybackDuration => RestoredPlaybackPosition.HasValue && _current is { } track
         ? TimeSpan.FromMilliseconds(track.DurationMs) : null;

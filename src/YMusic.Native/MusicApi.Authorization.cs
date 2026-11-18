@@ -1,5 +1,6 @@
 using System.Net.Http;
 using System.Text.Json;
+using System.Diagnostics.CodeAnalysis;
 
 namespace YMusic.Native;
 
@@ -22,14 +23,17 @@ internal sealed partial class MusicApi
     private static void RequirePlayerScopes(Session session)
     {
         if (!HasPlayerScopes(session)) throw ScopeFailure();
+        if (!IsOAuthValue(session.AccessToken)) throw new MusicException("Сохранённый токен входа повреждён. Войдите заново.", true);
     }
+
+    internal static bool IsOAuthValue([NotNullWhen(true)] string? value) =>
+        !string.IsNullOrEmpty(value) && !value.Any(character => char.IsWhiteSpace(character) || char.IsControl(character));
 
     private static string GrantedPlayerScope(JsonElement root)
     {
         // Yandex documents scope as optional when the requested rights were granted.
         // A reported grant must contain exactly our requested music permissions.
-        if (root.TryGetProperty("scope", out var scope)
-            && (scope.ValueKind != JsonValueKind.String || !IsPlayerScope(scope.GetString())))
+        if (root.TryGetProperty("scope", out var scope) && !IsPlayerScope(JsonString(scope)))
             throw ScopeFailure();
         return RequiredScopes;
     }
@@ -38,22 +42,27 @@ internal sealed partial class MusicApi
         "Нужен новый вход с доступом только к музыке. Прежний или неподходящий набор разрешений не используется.", true);
 
     private static MusicException RevokeFailure() => new(
-        "Не удалось отозвать прежний доступ. Повторите вход позже или отзовите доступ устройства Yamuse в Яндекс ID.", true);
+        "Не удалось отозвать прежний доступ. Повторите вход позже. После ручного отзыва доступа устройства Yamuse в Яндекс ID закройте приложение, удалите session.dpapi из папки данных и войдите заново.", true);
 
     internal async Task RevokeSessionAsync(Session session, CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(session.AccessToken) || session.AccessToken.Any(char.IsWhiteSpace))
+        if (!IsOAuthValue(session.AccessToken))
             throw RevokeFailure();
+        using var timeout = RequestTimeout(cancellationToken);
         using var request = new HttpRequestMessage(HttpMethod.Post, "https://oauth.yandex.ru/revoke_token")
         {
             Content = Form(("access_token", session.AccessToken), ("client_id", ClientId), ("client_secret", PublicClientSecret))
         };
-        using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
         try
         {
-            using var json = await ReadJsonAsync(response, cancellationToken).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode || Text(json.RootElement, "status") != "ok") throw RevokeFailure();
+            using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode) throw RevokeFailure();
+            using var json = await ReadJsonAsync(response, timeout.Token).ConfigureAwait(false);
+            if (JsonString(json.RootElement, "status") != "ok" || json.RootElement.TryGetProperty("error", out _))
+                throw RevokeFailure();
         }
         catch (MusicException error) when (!error.Authentication) { throw RevokeFailure(); }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { throw RevokeFailure(); }
+        catch (Exception error) when (error is HttpRequestException or IOException) { throw RevokeFailure(); }
     }
 }

@@ -63,6 +63,20 @@ internal static partial class Program
                 "owner identity was silently normalized");
         });
 
+        await Run("FavoritesCacheStore: missing metadata can be retried after restoring old and current snapshots", async () =>
+        {
+            const string uid = "fixture-account-A";
+            var store = new FavoritesCacheStore(FcDirectory("missing-metadata"));
+            var oldPlaceholder = new TrackRow { Id = "202", RequestId = "202:201" };
+            var omittedWithDescription = new TrackRow { Id = "303", RequestId = "303:201", Title = "Cached title", HasTrackMetadata = false };
+            await store.SaveInBackgroundAsync(FavoritesCacheStore.Capture(uid, [FcTrack("101"), oldPlaceholder, omittedWithDescription], DateTimeOffset.UtcNow));
+            var snapshot = store.Load(uid)!;
+            var rows = FavoritesCacheStore.Restore(snapshot);
+            Assert(!snapshot.Tracks[1].MissingMetadata && snapshot.Tracks[2].MissingMetadata
+                && rows[0].HasTrackMetadata && !rows[1].HasTrackMetadata && !rows[2].HasTrackMetadata
+                && rows[2].Title == "Cached title", "missing metadata was lost on restore or downgraded a populated row");
+        });
+
         await Run("FavoritesCacheStore: malformed unknown and unsafe metadata is a read-only miss", async () =>
         {
             var store = new FavoritesCacheStore(FcDirectory("invalid"));
@@ -148,6 +162,43 @@ internal static partial class Program
             var loaded = store.Load("fixture-account-A")!;
             Assert(loaded.Tracks[0].Title == "Original title" && loaded.Tracks[0].Artists[0] == new ArtistReference("301", "Original artist"),
                 "caller mutation changed an admitted snapshot");
+        });
+
+        await Run("FavoritesCacheStore: a held commit does not block admission or another owner", async () =>
+        {
+            var pending = new FcPendingWriters(); var directory = FcDirectory("held-commit");
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var release = new ManualResetEventSlim();
+            var timeout = TimeSpan.FromSeconds(10);
+            var baseline = new FavoritesCacheStore(directory);
+            await baseline.SaveInBackgroundAsync(FcSnapshot());
+            var commits = 0;
+            var store = new FavoritesCacheStore(directory, pending.Schedule, () =>
+            {
+                if (Interlocked.Increment(ref commits) != 1) return;
+                entered.SetResult();
+                if (!release.Wait(TimeSpan.FromSeconds(30))) throw new TimeoutException("Favorites commit gate timed out.");
+            });
+            var first = store.SaveInBackgroundAsync(FcSnapshot(id: "202"));
+            var writer = Task.Run(() => pending.Execute(0));
+            Task latest = Task.CompletedTask;
+            try
+            {
+                await entered.Task.WaitAsync(timeout);
+                await Task.Run(() => { latest = store.SaveInBackgroundAsync(FcSnapshot(id: "303")); }).WaitAsync(timeout);
+                await baseline.SaveInBackgroundAsync(FcSnapshot(uid: "fixture-account-B", id: "404")).WaitAsync(timeout);
+                Assert(baseline.Load("fixture-account-B")!.Tracks.Single().Id == "404", "held commit blocked another account");
+            }
+            finally
+            {
+                release.Set();
+                await writer.WaitAsync(timeout);
+            }
+            await first.WaitAsync(timeout);
+            Assert(store.Load("fixture-account-A")!.Tracks.Single().Id == "101", "superseded worker published its flushed snapshot");
+            pending.Execute(1);
+            await latest.WaitAsync(timeout);
+            Assert(store.Load("fixture-account-A")!.Tracks.Single().Id == "303", "newest admitted snapshot was not published");
         });
 
         await Run("FavoritesCacheStore: redirected directories files and hard links never expose outside metadata", async () =>

@@ -14,7 +14,7 @@ Yamuse — неофициальный клиент Яндекс Музыки д�
 
 ## Среда и структура
 
-Нужны Windows 10/11 x64, Git и .NET 8 SDK с поддержкой сборки WPF.
+Нужны Windows 10/11 x64, Git и .NET SDK для сборки WPF. Точная версия SDK закреплена в [global.json](global.json).
 
 - `src/YMusic.Native` — приложение.
 - `tests/YMusic.Native.Checks` — исполняемый набор проверок.

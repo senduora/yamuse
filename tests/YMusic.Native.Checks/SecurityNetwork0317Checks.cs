@@ -16,10 +16,10 @@ internal static partial class Program
             Assert(lrc.Length < 8192, "amplification fixture exceeded its input cap");
             await Throws<MusicException>(() => Task.FromResult(MusicApi.ParseSynchronizedLyrics(lrc)));
             var track = new TrackRow { Title = "Fixture Song", Artist = "Fixture Artist", Album = "Fixture Album", DurationMs = 180000 };
-            var body = JsonSerializer.Serialize(new { trackName = track.Title, artistName = track.Artist, duration = 180, instrumental = false, syncedLyrics = lrc });
+            var body = JsonSerializer.Serialize(new { trackName = track.Title, artistName = track.Artist, albumName = track.Album, duration = 180, instrumental = false, syncedLyrics = lrc });
             using var http = new HttpClient(new SecurityNetwork0317Handler((_, _) => Task.FromResult(Json(body))));
             using var client = new LrclibLyricsClient(http);
-            Assert(await client.FindSynchronizedAsync(track, default) is null, "LRCLIB accepted an amplified LRC result");
+            Assert((await client.FindSynchronizedAsync(track, default)).Lyrics is null, "LRCLIB accepted an amplified LRC result");
         });
 
         await Run("Security network 0317: expanded LRC boundary includes newline separators", async () =>
@@ -50,6 +50,53 @@ internal static partial class Program
             var delayed = MusicApi.ParseSynchronizedLyrics("[offset:-250]\n[00:01]Line");
             Assert(Math.Abs(delayed.Lines.Single().TimeSeconds - 1.25) < .001, "negative LRC offset changed");
             return Task.CompletedTask;
+        });
+
+        await Run("Security network 0317: LRC preserves lyric brackets and literal hearts with repeated and word timestamps", () =>
+        {
+            var lyrics = MusicApi.ParseSynchronizedLyrics("[offset:0]\n[00:01.50][00:03.000]<00:01.50>[Chorus] I <3 you: always\n[00:04]Open [bracket");
+            Assert(lyrics.Synchronized && lyrics.Lines.Select(line => line.TimeSeconds).SequenceEqual([1.5, 3, 4])
+                && lyrics.Lines.Select(line => line.Text).SequenceEqual(["[Chorus] I <3 you: always", "[Chorus] I <3 you: always", "Open [bracket"]),
+                "word timestamps or bracketed lyrics disrupted the timed text");
+            return Task.CompletedTask;
+        });
+
+        await Run("Security network 0317: Yandex TEXT rejects documents and keeps bounded plain lyrics", async () =>
+        {
+            const string plain = "[Verse]\nI <3 you: always";
+            foreach (var (mime, payload, accepted) in new (string?, string, bool)[]
+            {
+                ("text/plain", plain, true), (null, plain, true),
+                ("text/html", "Fixture HTML error", false), ("application/problem+json", "Fixture JSON error", false),
+                (null, "  <!DOCTYPE html><html><title>Fixture error</title></html>", false),
+                ("text/plain", """{"error":"Temporary fixture message"}""", false),
+                (null, new string('x', 1024 * 1024 + 1), false)
+            })
+            {
+                var supplement = 0;
+                using var api = new MusicApi(new FakeHandler((request, _) =>
+                {
+                    var uri = request.RequestUri!;
+                    if (uri.AbsolutePath == "/fixture-text")
+                    {
+                        Assert(request.Headers.Authorization is null, "lyrics CDN request carried account credentials");
+                        var content = new StringContent(payload);
+                        content.Headers.ContentType = mime is null ? null : new(mime);
+                        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+                    }
+                    if (uri.AbsolutePath == "/tracks/42/supplement")
+                    {
+                        supplement++;
+                        return Task.FromResult(Json("""{"result":{"lyrics":{"hasRights":true,"fullLyrics":"Supplement fixture"}}}"""));
+                    }
+                    return Task.FromResult(uri.Query.Contains("format=TEXT", StringComparison.Ordinal)
+                        ? Json("""{"result":{"downloadUrl":"https://fixture.yandex.net/fixture-text"}}""")
+                        : Json("{}", HttpStatusCode.NotFound));
+                }));
+                var lyrics = await api.GetLyricsAsync(FakeSession, "42", default);
+                Assert(!lyrics.Synchronized && lyrics.PlainText == (accepted ? plain : "Supplement fixture")
+                    && supplement == (accepted ? 0 : 1), "unexpected document MIME/body was displayed or plaintext was dropped");
+            }
         });
 
         await Run("Security network 0317: artwork body deadlines release four workers for a healthy fifth URL", async () =>
@@ -128,6 +175,160 @@ internal static partial class Program
                     return Task.CompletedTask;
                 });
             }
+        });
+
+        await Run("Security network 0317: partial image responses never populate artwork caches", async () =>
+        {
+            var png = SecurityNetwork0317Png();
+            var directory = SecurityNetwork0317Directory("partial");
+            var attempted = 0;
+            using var cache = new ArtworkCache(directory, new SecurityNetwork0317Handler((_, _) =>
+            {
+                var response = SecurityNetwork0317Image(new ByteArrayContent(png));
+                switch (++attempted)
+                {
+                    case 1: response.StatusCode = HttpStatusCode.PartialContent; break;
+                    case 2: response.Content.Headers.ContentLength = png.Length + 10; break;
+                }
+                return Task.FromResult(response);
+            }));
+            const string image = "https://avatars.yandex.net/complete/%%";
+            Assert(await cache.GetAsync(image, 128, default) is null && await cache.GetAsync(image, 128, default) is null
+                && !Directory.Exists(directory), "a partial response became memory or disk artwork");
+            Assert(await cache.GetAsync(image, 128, default) is not null && attempted == 3,
+                "complete artwork could not replace failed partial downloads");
+        });
+
+        await Run("Security network 0317: favorite snapshots must match their account and include every reference", async () =>
+        {
+            const string valid = """{"result":{"library":{"uid":12345,"tracks":[{"id":7,"albumId":"fixture-album"},{"id":"fixture-track","albumId":null},{"id":9}]}}}""";
+            using (var api = new MusicApi(new FakeHandler((_, _) => Task.FromResult(Json(valid)))))
+            {
+                var ids = await api.GetLikedIdsAsync(FakeSession, "12345", default);
+                Assert(ids.Select(id => id.RequestId).SequenceEqual(["7:fixture-album", "fixture-track", "9"]),
+                    "positive favorite response lost an opaque or unavailable track reference");
+            }
+            var bad = new[]
+            {
+                (valid.Replace("12345", "67890", StringComparison.Ordinal), HttpStatusCode.OK),
+                (valid.Replace("12345", "{}", StringComparison.Ordinal), HttpStatusCode.OK),
+                (valid.Replace("\"id\":9", "\"id\":null", StringComparison.Ordinal), HttpStatusCode.OK),
+                (valid.Replace("\"id\":9", "\"id\":9.25", StringComparison.Ordinal), HttpStatusCode.OK),
+                (valid.Replace("\"fixture-track\"", "\"   \"", StringComparison.Ordinal), HttpStatusCode.OK),
+                (valid.Replace("\"fixture-album\"", "[]", StringComparison.Ordinal), HttpStatusCode.OK),
+                ("{\"result\":{\"library\":[]}}", HttpStatusCode.OK), (valid, HttpStatusCode.PartialContent)
+            };
+            foreach (var (data, status) in bad)
+            {
+                using var api = new MusicApi(new FakeHandler((_, _) => Task.FromResult(Json(data, status))));
+                await Throws<MusicException>(() => api.GetLikedIdsAsync(FakeSession, "12345", default));
+            }
+        });
+
+        await Run("Security network 0317: track metadata distinguishes omitted references aliases and invalid responses", async () =>
+        {
+            LikedId[] requested = [new("1", "7"), new("1", "8"), new("2", null), new("3", "9")];
+            const string valid = """{"result":[{"id":1,"title":"Edition seven","albums":[{"id":7}]},{"id":1,"title":"Edition eight","albums":[{"id":8}]},{"id":20,"realId":2,"title":"Confirmed alias","available":true}]}""";
+            using (var api = new MusicApi(new FakeHandler((_, _) => Task.FromResult(Json(valid)))))
+            {
+                var rows = await api.GetTracksAsync(FakeSession, requested, 5, default);
+                Assert(rows.Count == 4 && rows.Select(row => row.RequestId).SequenceEqual(["1:7", "1:8", "2", "3:9"])
+                    && rows.Select(row => row.Number).SequenceEqual([6, 7, 8, 9])
+                    && rows.Take(3).All(row => row.HasTrackMetadata) && !rows[3].HasTrackMetadata && !rows[3].Available
+                    && rows[0].Title == "Edition seven" && rows[1].Title == "Edition eight" && rows[2].Title == "Confirmed alias",
+                    "metadata did not preserve exact requested editions, recognized alias, or omitted slot");
+            }
+            foreach (var malformed in new[]
+            {
+                "{\"result\":[null]}", "{\"result\":[{}]}", "{\"result\":[{\"id\":999}]}",
+                "{\"result\":[{\"id\":1,\"artists\":[false]}]}", "{\"result\":[{\"id\":1,\"albums\":17}]}",
+                "{\"result\":[{\"id\":1,\"albums\":[{\"id\":7}],\"title\":\"A\"},{\"id\":1,\"albums\":[{\"id\":7}],\"title\":\"B\"}]}"
+            })
+            {
+                using var api = new MusicApi(new FakeHandler((_, _) => Task.FromResult(Json(malformed))));
+                await Throws<MusicException>(() => api.GetTracksAsync(FakeSession, requested, 0, default));
+            }
+        });
+
+        await Run("Security network 0317: network track durations safely preserve bounds in bulk album and wave", async () =>
+        {
+            const string tracks = """[{"id":1,"title":"Fixture\u0001track","durationMs":-1},{"id":2,"title":"Fixture track","durationMs":604800001},{"id":3,"title":"Fixture track","durationMs":9223372036854775808},{"id":4,"title":"Fixture track","durationMs":604800000},{"id":5,"title":"Fixture track","durationMs":0}]""";
+            using var decoded = JsonDocument.Parse(tracks);
+            var waveBody = JsonSerializer.Serialize(new { result = new { radioSessionId = "fixture-session", batchId = "fixture-batch",
+                sequence = decoded.RootElement.EnumerateArray().Select(track => new { track }).ToArray() } });
+            using var api = new MusicApi(new FakeHandler((request, _) => Task.FromResult(Json(request.RequestUri!.AbsolutePath switch
+            {
+                "/tracks" => "{\"result\":" + tracks + "}",
+                "/albums/7/with-tracks" => "{\"result\":{\"id\":7,\"volumes\":[" + tracks + "]}}",
+                "/rotor/session/new" => waveBody,
+                _ => throw new InvalidOperationException("unexpected network duration fixture route")
+            }))));
+            var bulk = await api.GetTracksAsync(FakeSession, [new("1", null), new("2", null), new("3", null), new("4", null), new("5", null)], 0, default);
+            var album = await api.GetAlbumTracksAsync(FakeSession, "7", default);
+            var wave = await api.StartWaveAsync(FakeSession, default);
+            foreach (var rows in new[] { bulk, album, wave.Tracks })
+                Assert(rows.Select(row => row.DurationMs).SequenceEqual([0, 0, 0, PlaybackStateStore.MaximumDurationMs, 0])
+                    && rows[0].Title == "Fixture track", "network metadata escaped the supported duration or text range");
+        });
+
+        await Run("Security network 0317: Genius handles malformed status and ignores raw script text", async () =>
+        {
+            var http = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath switch
+            {
+                "/api/search/multi" => Json("""{"meta":{"status":"200"},"response":{"sections":[{"type":"song","hits":[{"result":{"title":"Fixture song","primary_artist":{"name":"Fixture artist"},"path":"/Fixture-song-lyrics"}}]}]}}"""),
+                "/Fixture-song-lyrics" => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(
+                    "<div data-lyrics-container='true'>Test line<br><script>fixture text </script-label> ignored fixture text</script>Second line</div>") },
+                _ => throw new InvalidOperationException("Unexpected Genius fixture route")
+            }));
+            using var genius = new GeniusLyricsClient(http);
+            var lyrics = await genius.FindAsync("Fixture song", "Fixture artist", default);
+            Assert(lyrics?.PlainText == "Test line\nSecond line" && http.Seen.Count == 2
+                && http.Seen.All(sent => sent.Authorization is null), "Genius incorrectly read search metadata or included script data in lyrics");
+        });
+
+        await Run("Security network 0317: Genius retries an unreadable song page and caches explicit misses", async () =>
+        {
+            const string match = """{"response":{"sections":[{"type":"song","hits":[{"result":{"title":"Fixture song","primary_artist":{"name":"Fixture artist"},"path":"/Fixture-song-lyrics"}}]}]}}""";
+            var pages = 0;
+            var http = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath switch
+            {
+                "/api/search/multi" => Json(match),
+                "/Fixture-song-lyrics" => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(++pages == 1
+                    ? "<main>Temporary fixture page</main>" : "<div data-lyrics-container='true'>Fixture lyric</div>") },
+                _ => throw new InvalidOperationException("Unexpected Genius fixture route")
+            }));
+            using var genius = new GeniusLyricsClient(http);
+            await Throws<MusicException>(() => genius.FindAsync("Fixture song", "Fixture artist", default));
+            Assert((await genius.FindAsync("Fixture song", "Fixture artist", default))?.PlainText == "Fixture lyric" && pages == 2,
+                "Genius cached the unreadable page as an absent text");
+
+            var emptySearch = new FakeHandler((_, _) => Task.FromResult(Json("""{"response":{"sections":[{"type":"song","hits":[]}]}}""")));
+            using var missing = new GeniusLyricsClient(emptySearch);
+            Assert(await missing.FindAsync("Unknown song", "Fixture artist", default) is null
+                && await missing.FindAsync("Unknown song", "Fixture artist", default) is null && emptySearch.Seen.Count == 1,
+                "a genuine search miss stopped using the existing negative cache");
+            Assert(await missing.FindAsync("Unknown song", "Fixture artist", default, refresh: true) is null && emptySearch.Seen.Count == 2,
+                "an explicit refresh reused the Genius negative cache");
+
+            foreach (var (status, body) in new[] { (HttpStatusCode.NotFound, ""), (HttpStatusCode.OK, ""),
+                (HttpStatusCode.OK, "<div class='lyrics'><br></div>") })
+            {
+                var emptyPage = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath == "/api/search/multi"
+                    ? Json(match) : new HttpResponseMessage(status) { Content = new StringContent(body) }));
+                using var empty = new GeniusLyricsClient(emptyPage);
+                Assert(await empty.FindAsync("Fixture song", "Fixture artist", default) is null && emptyPage.Seen.Count == 2,
+                    "an explicitly absent lyric was reported as broken markup");
+            }
+
+            var range = new FakeHandler((_, _) =>
+            {
+                var reply = Json(match);
+                Assert(reply.Content.Headers.TryAddWithoutValidation("Content-Range", "invalid fixture range"), "raw range fixture was rejected by the header collection");
+                return Task.FromResult(reply);
+            });
+            using var partial = new GeniusLyricsClient(range);
+            await Throws<MusicException>(() => partial.FindAsync("Fixture song", "Fixture artist", default));
+            Assert(range.Seen.Count == 1, "Genius accepted a search response with malformed Content-Range");
         });
     }
 

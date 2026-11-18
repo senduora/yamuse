@@ -21,8 +21,15 @@ public partial class MainWindow
     private BatchSelectionListView? _downloadEntriesList;
     private string? _downloadQueueAccountUid;
     private int _downloadQueueAccountGeneration;
+    private bool DownloadQueueBelongsToActiveAccount => _session is not null && _account is { } account
+        && _downloadQueueAccountUid == account.Uid && _downloadQueueAccountGeneration == _accountGeneration;
+    private bool HasActiveOwnedDownload => DownloadQueueBelongsToActiveAccount && _downloadQueue.Running
+        && _downloadCts is { IsCancellationRequested: false };
+    private bool CanPauseActiveDownload => !_closed && !_offlineMaintenance && !_closeCommitInProgress
+        && !_appUpdatePreparingRestart && HasActiveOwnedDownload;
     private bool _downloadsAutoSuspended;
     private PlaylistDetails? _downloadQueuePlaylist;
+    private bool _downloadQueuePlaylistHistoryOnly;
     private AudioQuality _downloadQueueQuality;
     private bool _downloadQueueAutomatic;
     internal FrameworkElement DownloadCenterView { get { InitializeDownloadCenter(); return _downloadCenterView!; } }
@@ -62,7 +69,7 @@ public partial class MainWindow
         actions.Children.Add(_downloadSelectionText);
         _downloadCenterNotice = new TextBlock { Name = "DownloadCenterNotice", TextWrapping = TextWrapping.Wrap, FontSize = 12, Foreground = (Brush)FindResource("MutedBrush"), Margin = new(0, 0, 0, 14) };
         Grid.SetRow(_downloadCenterNotice, 2); grid.Children.Add(_downloadCenterNotice);
-        var list = new BatchSelectionListView { Name = "DownloadEntriesList", ItemsSource = _downloadQueue.Entries, HorizontalContentAlignment = HorizontalAlignment.Stretch,
+        var list = new BatchSelectionListView { Name = "DownloadEntriesList", HorizontalContentAlignment = HorizontalAlignment.Stretch,
             Background = Brushes.Transparent, Foreground = Foreground, BorderThickness = new(0), ItemContainerStyle = DownloadRowStyle() };
         list.SetResourceReference(StyleProperty, typeof(ListView));
         _downloadEntriesList = list; list.SelectionMode = SelectionMode.Extended;
@@ -150,13 +157,32 @@ public partial class MainWindow
     }
     private void RefreshDownloadCenter()
     {
+        RefreshTrackDownloadButton();
         RefreshTransferProgress();
         if (_downloadCenterSummary is null) return;
-        _downloadCenterSummary.Text = _downloadQueue.Summary;
-        _downloadCenterNotice!.Text = _downloadQueue.Notice;
+        var visible = DownloadQueueBelongsToActiveAccount;
+        var entries = visible ? _downloadQueue.Entries : null;
+        if (!ReferenceEquals(_downloadEntriesList!.ItemsSource, entries)) _downloadEntriesList.ItemsSource = entries;
+        _downloadCenterSummary.Text = visible ? _downloadQueue.Summary : DownloadQueueState.EmptyLabel;
+        _downloadCenterNotice!.Text = visible ? _downloadQueue.Notice : DownloadQueueState.EmptyNotice;
         RefreshDownloadUnlikeAction();
         RefreshDownloadSort(force: !_downloadQueue.Running);
-        _downloadPauseButton!.IsEnabled = _downloadCts is not null && !_downloadCts.IsCancellationRequested;
+        _downloadPauseButton!.IsEnabled = CanPauseActiveDownload;
+    }
+    private void RefreshTrackDownloadButton()
+    {
+        if (DownloadButton is null) return;
+        DownloadButton.Content = _downloadCts is not null ? "✕" : "↓";
+        if (!_offline.IsAvailable)
+        {
+            DownloadButton.ToolTip = BrandPaths.OfflineUnavailableMessage;
+            DownloadButton.IsEnabled = false;
+            return;
+        }
+        DownloadButton.ToolTip = _downloadCts is not null ? "Отменить загрузку" : "Скачать выбранные треки";
+        DownloadButton.IsEnabled = _downloadCts is not null ? CanPauseActiveDownload
+            : !_offlineMaintenance && !_catalogShowing && _session is not null
+                && TracksList.SelectedItems.Cast<TrackRow>().Any(track => track is { Available: true, LocalPath: null });
     }
     private void RefreshDownloadStorage()
     {
@@ -185,37 +211,82 @@ public partial class MainWindow
     }
     private void PauseDownloadQueue()
     {
-        if (_downloadCts is null) return;
+        if (CanPauseActiveDownload) PauseDownloadQueueCore();
+    }
+    private void PauseDownloadQueueCore()
+    {
         ++_downloadQueueAdmissionRevision;
         _downloadsAutoSuspended = true; ClearPendingAutoFavorites();
-        _downloadQueue.Pause(); _downloadCts.Cancel(); RefreshDownloadCenter();
+        _downloadQueue.Pause(); _downloadCts!.Cancel();
+        RemoveUnstartedAutomaticFavorites();
+        RefreshDownloadCenter();
         _ = PersistDownloadQueueAsync(force: true);
     }
     private Task ResumeDownloadQueue() => ContinueDownloadQueue(retryFailed: false);
     private Task RetryFailedDownloads() => ContinueDownloadQueue(retryFailed: true);
-    private void PauseDownloadQueueForAppUpdate()
+    private long PauseDownloadQueueForAppUpdate()
     {
-        // Updating is a pause in the same account, not account invalidation.
-        // Reject a held restore, but retain entries and their resumable snapshot.
-        ++_downloadQueueAdmissionRevision;
-        _downloadsAutoSuspended = true; ClearPendingAutoFavorites();
-        _downloadQueue.Pause(); _downloadCts?.Cancel(); RefreshDownloadCenter();
+        // Even an idle queue can have a single-removal restart waiting for refresh.
+        var admissionRevision = ++_downloadQueueAdmissionRevision;
+        if (_autoFavoritesEnabled && DownloadQueueBelongsToActiveAccount && _pendingConfirmedFavorites.Count > 0)
+            _downloadQueue.AppendAutomaticFavorites(_pendingConfirmedFavorites.Values, SelectedQuality);
+        if (_downloadQueue.Running || _downloadQueue.CanResume || _downloadCts is not null)
+        {
+            _downloadsAutoSuspended = true;
+            ClearPendingAutoFavorites();
+            _downloadQueue.Pause(); _downloadCts?.Cancel(); RefreshDownloadCenter();
+        }
+        return admissionRevision;
     }
     private Task ContinueDownloadQueue(bool retryFailed)
     {
-        if (_downloadCts is not null || _offlineMaintenance || _session is null || _closed || _catalogWriting || _downloadQueue.Suspended) return Task.CompletedTask;
-        if (_downloadQueueAccountGeneration != _accountGeneration) { SuspendDownloadQueueForAccountChange(); return Task.CompletedTask; }
+        if (_downloadCts is not null || _offlineMaintenance || _session is null || _closed || _closeCommitInProgress || DownloadQueueRestorePending
+            || _catalogWriting || _downloadQueue.Suspended) return Task.CompletedTask;
+        if (!DownloadQueueBelongsToActiveAccount) return Task.CompletedTask;
         return RunDownloadQueueAsync(retryFailed);
     }
-    private void SuspendDownloadQueueForAccountChange()
+    private bool SuspendDownloadQueueForAccountChange(bool keepQueueVisible = false)
     {
-        ClearPersistedDownloadQueue();
+        var checkpointCleared = ClearPersistedDownloadQueue(invalidateOnFailure: !keepQueueVisible);
+        if (!checkpointCleared && keepQueueVisible) return false;
         _compactDownloadOperation?.Dispose();
+        if (!keepQueueVisible) _downloadQueueAccountUid = null;
         _downloadsAutoSuspended = true; ClearPendingAutoFavorites();
         _downloadQueue.Suspend(); _downloadCts?.Cancel(); RefreshDownloadCenter();
+        return checkpointCleared;
     }
-    private void DownloadCenter_Click(object sender, RoutedEventArgs e)
-    { SetSection("download-center", "Центр загрузок"); DownloadCenterNav.BringIntoView(); RefreshDownloadCenter(); RefreshDownloadStorage(); }
+    private void DiscardUnstartedAutomaticFavorites()
+    {
+        if (!RemoveUnstartedAutomaticFavorites()) return;
+        RefreshDownloadCenter();
+        _ = PersistDownloadQueueAsync(force: true);
+    }
+    private bool RemoveUnstartedAutomaticFavorites()
+    {
+        if (!_downloadQueue.DiscardUnstartedAutomaticFavorites()) return false;
+        if (_downloadQueuePlaylist is { } playlist)
+        {
+            var retainedIds = _downloadQueue.Entries.Select(entry => entry.Track.Id).ToHashSet(StringComparer.Ordinal);
+            var retainedTracks = playlist.Tracks.Where(track => retainedIds.Contains(track.Id)).ToArray();
+            if (retainedTracks.Length != playlist.Tracks.Count)
+            {
+                _downloadQueuePlaylist = playlist with { Tracks = retainedTracks };
+                _downloadQueuePlaylistHistoryOnly = true;
+            }
+        }
+        return true;
+    }
+    private void ReconcileDownloadQueueFavorites(string uid, IReadOnlySet<string> confirmedIds)
+    {
+        if (uid != _downloadQueueAccountUid || !DownloadQueueBelongsToActiveAccount || _downloadQueue.Suspended) return;
+        if (_downloadQueue.ReconcileFavorites(confirmedIds)) RefreshDownloadCenter();
+    }
+    private async void DownloadCenter_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_offline.IsAvailable) { SetStatus(BrandPaths.OfflineUnavailableMessage, true); return; }
+        SetSection("download-center", "Центр загрузок"); DownloadCenterNav.BringIntoView(); RefreshDownloadCenter(); RefreshDownloadStorage();
+        await RetryDownloadQueueRestoreAsync();
+    }
 
     private bool CanUnlikeDownload(DownloadEntry? entry) => entry is not null && !entry.Active && !_closed && !_demo && !_catalogWriting
         && _session is not null && _account is not null && _downloadQueueAccountUid == _account.Uid
@@ -237,7 +308,7 @@ public partial class MainWindow
         if (_downloadUnlikeMenu is not null) { _downloadUnlikeMenu.Header = count > 1 ? $"Убрать из «Мне нравится» · {count}" : "Убрать из «Мне нравится»"; _downloadUnlikeMenu.IsEnabled = enabled; _downloadUnlikeMenu.ToolTip = hint; }
         _downloadSelectUnavailableButton!.IsEnabled = _downloadQueue.Entries.Any(entry => IsUnavailableDownload(entry) && CanUnlikeDownload(entry));
         _downloadSelectionText!.Text = selected.Length == 0 ? "Ctrl / Shift — выбор" : $"Выбрано: {selected.Length}";
-        var sameAccount = _session is not null && _downloadQueueAccountGeneration == _accountGeneration;
+        var sameAccount = DownloadQueueBelongsToActiveAccount && _downloadCts is null;
         _downloadResumeButton!.IsEnabled = _downloadQueue.CanResume && sameAccount && !_offlineMaintenance && !_closed && !_catalogWriting;
         _downloadRetryButton!.IsEnabled = _downloadQueue.CanRetry && sameAccount && !_offlineMaintenance && !_closed && !_catalogWriting;
     }
@@ -264,6 +335,7 @@ public partial class MainWindow
         if (entries.Length == 0 || _account is null) return;
         var uid = _account.Uid; var generation = _accountGeneration;
         _downloadUnlikeTotal = entries.Length; _downloadUnlikeCompleted = 0;
+        var needsRefresh = false;
         try
         {
             await CatalogMutationAsync(async (session, token) =>
@@ -272,18 +344,24 @@ public partial class MainWindow
                 {
                     token.ThrowIfCancellationRequested();
                     if (_closed || generation != _accountGeneration || _account?.Uid != uid) throw new OperationCanceledException(token);
-                    try { await _api.SetTrackLikeAsync(session, uid, TrackReference(entry.Track), false, token); }
+                    IReadOnlyList<LikedId> readback;
+                    try { readback = await _api.SetTrackLikeAsync(session, uid, TrackReference(entry.Track), false, token); }
                     catch (Exception error) when (error is MusicException or HttpRequestException)
                     { throw new MusicException($"Снято лайков: {_downloadUnlikeCompleted} из {entries.Length}. Обработка остановлена. {error.Message}"); }
                     token.ThrowIfCancellationRequested();
                     if (_closed || generation != _accountGeneration || _account?.Uid != uid) throw new OperationCanceledException(token);
-                    ApplyConfirmedTrackLike(entry.Track, false, showStatus: false);
+                    needsRefresh = !ApplyConfirmedTrackLikeResult(entry.Track, false, readback, showStatus: false, refreshIncomplete: false);
                     _downloadUnlikeCompleted++;
                     RefreshDownloadUnlikeAction();
                 }
                 return _downloadUnlikeCompleted;
             }, count => SetStatus(count == 1 ? "Трек убран из избранного" : $"Из избранного убраны треки: {count}"), requireSameView: false);
         }
-        finally { _downloadUnlikeTotal = _downloadUnlikeCompleted = 0; RefreshDownloadUnlikeAction(); }
+        finally
+        {
+            _downloadUnlikeTotal = _downloadUnlikeCompleted = 0;
+            RefreshDownloadUnlikeAction();
+            if (needsRefresh && !_closed && generation == _accountGeneration && _account?.Uid == uid) _ = RefreshLibraryAsync();
+        }
     }
 }

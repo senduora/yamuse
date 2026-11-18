@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Http;
 using System.Reflection;
 using System.Text.Json;
+using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -14,7 +15,11 @@ internal static partial class Program
     {
         await Run("Home artwork: numeric cache versions preserve renditions and reject unsafe addresses", HomeArtworkAddresses);
         await Run("Home artwork: version changes invalidate memory and disk cache without losing old versions", HomeArtworkVersions);
+        await Run("Home artwork: damaged disk entries are replaced by verified artwork", HomeArtworkDamagedEntry);
+        await Run("Home artwork: a visible image recovers after cache clear while recycled images stay canceled", HomeArtworkClear);
+        await Run("Home artwork: clearing rejects results before the worker receives cancellation", HomeArtworkClearBeforeCancellation);
         await Run("Home artwork: versioned redirects stay on anonymous allowed CDN hosts", HomeArtworkRedirects);
+        await Run("Home artwork: raw Content-Range prevents caching even when the header cannot be parsed", HomeArtworkContentRange);
         await Run("Home artwork: personal landing playlists populate frozen images through real Home XAML", HomeArtworkCards);
     }
 
@@ -65,6 +70,156 @@ internal static partial class Program
             "disk cache mixed distinct image versions after restarting");
     }
 
+    private static async Task HomeArtworkDamagedEntry()
+    {
+        const string source = "https://avatars.yandex.net/get-music-content/1/damaged/200x200";
+        var directory = Path.Combine(_directory, "home-artwork-damaged");
+        var png = HomeArtworkPng(Colors.Coral);
+        using (var initial = new ArtworkCache(directory, new FakeHandler((_, _) => Task.FromResult(HomeArtworkResponse(png)))))
+            Assert(await initial.GetAsync(source, 128, default) is not null, "could not prime the artwork disk cache");
+
+        var path = Directory.EnumerateFiles(directory, "*.img").Single();
+        File.WriteAllBytes(path, []);
+        using (var cache = new ArtworkCache(directory, new FakeHandler((_, _) =>
+        {
+            Assert(new FileInfo(path).Length == 0, "a failed disk read removed the cache path before a replacement was ready");
+            return Task.FromResult(HomeArtworkResponse(png));
+        })))
+            Assert(await cache.GetAsync(source, 128, default) is not null, "an invalid disk entry prevented a healthy download");
+
+        Assert(File.ReadAllBytes(path).SequenceEqual(png) && Directory.EnumerateFiles(directory).Single() == path,
+            "a verified replacement was absent or left a staged file behind");
+    }
+
+    private static async Task HomeArtworkClear()
+    {
+        const string stableSource = "https://avatars.yandex.net/get-music-content/1/stable/200x200";
+        const string loadingSource = "https://avatars.yandex.net/get-music-content/1/loading/200x200";
+        var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstCanceled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var loadingRequests = 0;
+        var red = HomeArtworkPng(Colors.Red);
+        var blue = HomeArtworkPng(Colors.Blue);
+        using var cache = new ArtworkCache(Path.Combine(_directory, "home-artwork-clear"), new FakeHandler(async (request, token) =>
+        {
+            if (request.RequestUri!.AbsoluteUri == stableSource) return HomeArtworkResponse(red);
+            if (Interlocked.Increment(ref loadingRequests) == 1)
+            {
+                using var cancellation = token.Register(() => firstCanceled.TrySetResult());
+                firstEntered.SetResult();
+                await releaseFirst.Task;
+                token.ThrowIfCancellationRequested();
+            }
+            return HomeArtworkResponse(blue);
+        }));
+        var stable = new Image();
+        var current = new Image();
+        var recycled = new Image();
+        var arriving = new Image();
+        var window = new Window
+        {
+            Left = -16000, Width = 200, Height = 200, ShowActivated = false, ShowInTaskbar = false,
+            Content = new StackPanel { Children = { stable, current, recycled, arriving } }
+        };
+        var previous = Artwork.Cache;
+        Artwork.Cache = cache;
+        try
+        {
+            window.Show();
+            Artwork.SetSourceUri(stable, stableSource);
+            await Until(() => Artwork.GetLoadStatus(stable) == ArtworkLoadStatus.Ready);
+            var stableBitmap = stable.Source;
+            Artwork.SetSourceUri(current, loadingSource);
+            Artwork.SetSourceUri(recycled, loadingSource);
+            await firstEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var clear = cache.ClearAsync(default);
+            await firstCanceled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Artwork.SetSourceUri(recycled, null);
+            Artwork.SetSourceUri(arriving, loadingSource);
+            Assert(Artwork.GetLoadStatus(current) == ArtworkLoadStatus.Loading
+                && Artwork.GetLoadStatus(arriving) == ArtworkLoadStatus.Loading,
+                "clearing the cache marked a current or new visible request unavailable");
+            releaseFirst.SetResult();
+            await clear.WaitAsync(TimeSpan.FromSeconds(5));
+
+            await Until(() => Artwork.GetLoadStatus(current) == ArtworkLoadStatus.Ready
+                && Artwork.GetLoadStatus(arriving) == ArtworkLoadStatus.Ready);
+            Assert(ReferenceEquals(stableBitmap, stable.Source), "cache clear dropped an already displayed cover");
+            Assert(Artwork.GetLoadStatus(recycled) == ArtworkLoadStatus.None && recycled.Source is null,
+                "a recycled image published a completed request after clear");
+            Assert(loadingRequests == 2 && ReferenceEquals(current.Source, arriving.Source)
+                && HomeArtworkPixel((BitmapSource)current.Source)[0] == 255,
+                "visible requests did not share one fresh, valid cover after clear");
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+            window.Close();
+            Artwork.Cache = previous;
+        }
+    }
+
+    private static async Task HomeArtworkClearBeforeCancellation()
+    {
+        const string blockingSource = "https://avatars.yandex.net/get-music-content/1/blocked/200x200";
+        const string racingSource = "https://avatars.yandex.net/get-music-content/1/racing/200x200";
+        var blockerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var racingEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseBlocker = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRacing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCancellation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var requests = 0;
+        var red = HomeArtworkPng(Colors.Red);
+        var blue = HomeArtworkPng(Colors.Blue);
+        using var cache = new ArtworkCache(Path.Combine(_directory, "home-artwork-clear-publication"), new FakeHandler(async (request, token) =>
+        {
+            if (request.RequestUri!.AbsoluteUri == blockingSource)
+            {
+                using var registration = token.Register(() =>
+                {
+                    cancellationEntered.SetResult();
+                    releaseCancellation.Task.Wait(TimeSpan.FromSeconds(10));
+                });
+                blockerEntered.SetResult();
+                await releaseBlocker.Task;
+                token.ThrowIfCancellationRequested();
+            }
+            if (Interlocked.Increment(ref requests) > 1) return HomeArtworkResponse(blue);
+            racingEntered.SetResult();
+            await releaseRacing.Task;
+            return HomeArtworkResponse(red);
+        }));
+        var blocker = cache.GetAsync(blockingSource, 256, default);
+        try
+        {
+            await blockerEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var old = cache.GetAsync(racingSource, 256, default);
+            var visible = cache.GetAsync(racingSource, 256, default, retryAfterClear: true);
+            await racingEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var clear = cache.ClearAsync(default);
+            await cancellationEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            releaseRacing.SetResult();
+            await Throws<OperationCanceledException>(() => old.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert(!visible.IsCompleted && requests == 1, "artwork returned or retried while cache clear was still active");
+            releaseCancellation.SetResult();
+            releaseBlocker.SetResult();
+            await clear.WaitAsync(TimeSpan.FromSeconds(5));
+            await Throws<OperationCanceledException>(() => blocker.WaitAsync(TimeSpan.FromSeconds(5)));
+            var bitmap = await visible.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(bitmap is not null && requests == 2 && HomeArtworkPixel(bitmap)[0] == 255
+                && ReferenceEquals(bitmap, await cache.GetAsync(racingSource, 256, default)), "stale artwork survived the clear or replaced its fresh result");
+        }
+        finally
+        {
+            releaseRacing.TrySetResult();
+            releaseCancellation.TrySetResult();
+            releaseBlocker.TrySetResult();
+        }
+    }
+
     private static async Task HomeArtworkRedirects()
     {
         const string source = "https://avatars.yandex.net/get-music-user-playlist/1/fixture/%%?1";
@@ -86,6 +241,26 @@ internal static partial class Program
             var bitmap = await cache.GetAsync(source, 256, CancellationToken.None);
             Assert(allowed ? bitmap is not null && requests == 2 : bitmap is null && requests == 1, "versioned redirect followed an unsafe host or rejected the allowed CDN");
         }
+    }
+
+    private static async Task HomeArtworkContentRange()
+    {
+        const string source = "https://avatars.yandex.net/get-music-content/1/range/400x400";
+        var directory = Path.Combine(_directory, "home-artwork-content-range");
+        var png = HomeArtworkPng(Colors.Blue);
+        var requests = 0;
+        using var cache = new ArtworkCache(directory, new FakeHandler((request, _) =>
+        {
+            HomeArtworkAnonymous(request);
+            var response = HomeArtworkResponse(png);
+            if (Interlocked.Increment(ref requests) == 1)
+                Assert(response.Content.Headers.TryAddWithoutValidation("Content-Range", "invalid range"), "could not attach raw fixture header");
+            return Task.FromResult(response);
+        }));
+        Assert(await cache.GetAsync(source, 256, default) is null && !Directory.Exists(directory),
+            "an unparseable Content-Range reached the memory or disk artwork cache");
+        Assert(await cache.GetAsync(source, 256, default) is { IsFrozen: true } && requests == 2,
+            "rejecting the range prevented a later complete cover from loading");
     }
 
     private static async Task HomeArtworkCards()

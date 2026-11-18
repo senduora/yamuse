@@ -40,12 +40,11 @@ internal sealed partial class MusicApi
         try
         {
             await CatalogVerifyOwnerAsync(session, uid, cancellationToken).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
+            var result = await LibraryWriteResultAsync($"/users/{CatalogId(uid)}/likes/{plural}/{(liked ? "add-multiple" : "remove")}",
+                session, Form((bodyKey, reference)), cancellationToken).ConfigureAwait(false);
+            LibraryRequireOk(result);
             try
             {
-                using var json = await CatalogWriteAsync($"/users/{CatalogId(uid)}/likes/{plural}/{(liked ? "add-multiple" : "remove")}",
-                    session, Form((bodyKey, reference)), cancellationToken).ConfigureAwait(false);
-                LibraryRequireOk(CatalogResult(json));
                 IReadOnlyList<CatalogItem> current = item.Kind switch
                 {
                     "album" => await GetLikedAlbumsAsync(session, uid, cancellationToken).ConfigureAwait(false),
@@ -55,7 +54,7 @@ internal sealed partial class MusicApi
                 var present = current.Any(candidate => LibraryEntityReference(candidate).Reference == reference);
                 if (present != liked) throw CatalogUnconfirmedWrite();
             }
-            catch (Exception ex) when (LibraryUncertain(ex)) { throw CatalogUnconfirmedWrite(); }
+            catch (Exception ex) when (CatalogReadbackUncertain(ex)) { throw CatalogUnconfirmedWrite(); }
         }
         finally { _catalogMutationGate.Release(); }
     }
@@ -110,21 +109,19 @@ internal sealed partial class MusicApi
         try
         {
             await CatalogVerifyOwnerAsync(session, uid, cancellationToken).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
+            var result = await LibraryWriteResultAsync($"/users/{CatalogId(uid)}/dislikes/{plural}/{(disliked ? "add-multiple" : "remove")}",
+                session, Form((bodyKey, requestId)), cancellationToken).ConfigureAwait(false);
+            if (kind == "track") LibraryRequireRevision(result);
+            else LibraryRequireOk(result);
             try
             {
-                using var json = await CatalogWriteAsync($"/users/{CatalogId(uid)}/dislikes/{plural}/{(disliked ? "add-multiple" : "remove")}",
-                    session, Form((bodyKey, requestId)), cancellationToken).ConfigureAwait(false);
-                var result = CatalogResult(json);
-                if (kind == "track") _ = CatalogNonNegativeInt(result, "revision", "изменения отметки");
-                else LibraryRequireOk(result);
                 // A track's library membership is keyed by track id; albumId is request context.
                 var present = kind == "track"
                     ? (await LibraryDislikedIdsAsync(session, uid, cancellationToken).ConfigureAwait(false)).Any(t => t.Id == reference.Id)
                     : (await GetDislikedArtistsAsync(session, uid, cancellationToken).ConfigureAwait(false)).Any(a => a.Id == reference.Id);
                 if (present != disliked) throw CatalogUnconfirmedWrite();
             }
-            catch (Exception ex) when (LibraryUncertain(ex)) { throw CatalogUnconfirmedWrite(); }
+            catch (Exception ex) when (CatalogReadbackUncertain(ex)) { throw CatalogUnconfirmedWrite(); }
         }
         finally { _catalogMutationGate.Release(); }
     }
@@ -182,16 +179,36 @@ internal sealed partial class MusicApi
     {
         // The supported music entities have decimal server IDs. Never turn a local/generated
         // placeholder, delimiter or display name into a library mutation or a multi-ID body.
-        if (string.IsNullOrEmpty(id) || id.Length > 32 || id.Any(c => c < '0' || c > '9') || id.All(c => c == '0'))
+        if (!IsLibraryId(id))
             throw new MusicException("Нужен точный положительный числовой ID сервера; объект без него пока не поддерживается.");
     }
 
+    private static bool IsLibraryId(string? id) => id is { Length: > 0 and <= 32 }
+        && id.All(char.IsAsciiDigit) && id.Any(c => c != '0');
+
+    private static string LibraryTrackId(JsonElement row, string property)
+    {
+        var id = Text(row, property);
+        if (!IsTrackReferencePart(id) || row.GetProperty(property).ValueKind == JsonValueKind.Number && !id.All(char.IsAsciiDigit))
+            throw new MusicException("Сервис вернул некорректный идентификатор трека или альбома. Список не был загружен.");
+        return id;
+    }
+
+    private static bool IsTrackReferencePart(string id) => id.Length is > 0 and <= 512 && id is not ("." or "..")
+        && !id.Any(character => char.IsWhiteSpace(character) || char.IsControl(character) || character is ',' or ':');
+
     private static void LibraryRequireOk(JsonElement result)
     {
-        if (result.ValueKind != JsonValueKind.String || !string.Equals(result.GetString(), "ok", StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(JsonString(result), "ok", StringComparison.OrdinalIgnoreCase))
             throw CatalogUnconfirmedWrite();
     }
 
-    private static bool LibraryUncertain(Exception ex)
-        => ex is MusicException or HttpRequestException or IOException or OperationCanceledException or JsonException or InvalidOperationException;
+    private async Task<JsonElement> LibraryWriteResultAsync(string path, Session session, HttpContent content, CancellationToken cancellationToken)
+        => await CatalogWriteResultAsync(path, session, content, cancellationToken).ConfigureAwait(false) ?? throw CatalogUnconfirmedWrite();
+
+    private static void LibraryRequireRevision(JsonElement result)
+    {
+        try { _ = CatalogNonNegativeInt(result, "revision", "изменения отметки"); }
+        catch (MusicException) { throw CatalogUnconfirmedWrite(); }
+    }
 }

@@ -60,6 +60,218 @@ internal static partial class Program
             Assert(visited.Count == 4, "Undo lost unplayed shuffled occurrences");
             return Task.CompletedTask;
         });
+        await Run("QueueEditing: undo restores PlayNext priority between pending and newer requests", () =>
+        {
+            var queue = new PlaybackQueue(new Random(17));
+            queue.SetItems([Row("current"), Row("shuffled")]);
+            queue.Shuffle = true;
+            var tail = Row("priority-tail"); var keep = Row("priority-keep");
+            var head = Row("priority-head"); var consumed = Row("priority-consumed");
+            foreach (var track in new[] { tail, keep, head, consumed }) queue.Enqueue(track, playNext: true);
+            queue.RemoveMany([2, 4]);
+            Assert(ReferenceEquals(queue.Next(), consumed), "removal disturbed the surviving priority order");
+            var fresh = Row("priority-fresh");
+            queue.Enqueue(fresh, playNext: true);
+            var current = queue.CurrentOccurrenceToken;
+            Assert(queue.UndoRemoval() && queue.CurrentOccurrenceToken == current, "undo changed the active occurrence");
+            foreach (var track in new[] { fresh, head, keep, tail })
+            {
+                Assert(ReferenceEquals(queue.PeekNext(), track), "undo lost explicit priority or reordered pending requests");
+                Assert(ReferenceEquals(queue.Next(), track), "advance disagreed with the restored priority");
+            }
+            Assert(queue.Next()?.Id == "shuffled" && queue.Next() is null, "undo replayed an already consumed priority");
+            return Task.CompletedTask;
+        });
+        await Run("QueueEditing: Play falls back to the first visible available occurrence", async () =>
+        {
+            var path = WriteWave("queue-play-fallback.wav", 30);
+            foreach (var selectUnavailable in new[] { false, true })
+            {
+                using var fixture = new SaFixture(selectUnavailable ? "queue-play-unavailable" : "queue-play-unselected");
+                var window = fixture.Window;
+                var unavailable = new TrackRow { Id = "unavailable", RequestId = "unavailable", Title = "А" };
+                var chosen = new TrackRow { Id = "selected", RequestId = "selected", Title = "Б", Available = true, LocalPath = path, DurationMs = 30000 };
+                var later = new TrackRow { Id = "later", RequestId = "later", Title = "В", Available = true, LocalPath = path, DurationMs = 30000 };
+                var queue = EpField<PlaybackQueue>(window, "_playbackQueue");
+                queue.RestoreItems([later, chosen, unavailable, chosen], -1, false, RepeatMode.Off);
+                var token = queue.OccurrenceTokenAt(1);
+                SaInvoke(window, "ShowQueueCore", false);
+                SortChoose(window, ListSortField.Title);
+                var list = Control<ListView>(window, "TracksList");
+                list.SelectedIndex = selectUnavailable ? 0 : -1;
+                Assert(Control<Button>(window, "PlaySelectionButton").IsEnabled, "play button was disabled with a visible playable row");
+                await Call(window, "PlaySelectedAsync");
+                Assert(fixture.Player.IsPlaying && queue.CurrentOccurrenceToken == token && ReferenceEquals(queue.Current, chosen),
+                    "play ignored the sorted available row or opened another occurrence");
+            }
+        });
+        await Run("QueueEditing: move remove and undo retain the filter and exact surviving selection", async () =>
+        {
+            using var fixture = new SaFixture("queue-edits-filter");
+            await fixture.Activate();
+            var window = fixture.Window;
+            var queue = EpField<PlaybackQueue>(window, "_playbackQueue");
+            var outside = SortTrack("outside", "Другая песня", "", "", 100000);
+            var shared = SortTrack("repeat", "Видимая Б", "", "", 100000);
+            var middle = SortTrack("middle", "Видимая А", "", "", 100000);
+            queue.SetItems([outside, shared, middle, shared], outside);
+            var repeatedToken = queue.OccurrenceTokenAt(3);
+            var middleToken = queue.OccurrenceTokenAt(2);
+            SaInvoke(window, "ShowQueueCore", false);
+            SortChoose(window, ListSortField.Title);
+            var list = Control<ListView>(window, "TracksList");
+            var filter = Control<TextBox>(window, "FilterBox");
+            filter.Text = "Видимая";
+            await Until(() => list.Items.Count == 3);
+            list.SelectedIndex = 2;
+
+            SaInvoke(window, "MoveQueueUp_Click", null!, null!);
+            Assert(queue.OccurrenceTokenAt(2) == repeatedToken && list.SelectedIndex == 2 && filter.Text == "Видимая",
+                "move changed the filter or lost the selected duplicate token");
+            await Call(window, "RemoveSelectedQueueAsync");
+            Assert(filter.Text == "Видимая" && list.Items.Cast<TrackRow>().SequenceEqual([middle, shared]) && list.SelectedItems.Count == 0,
+                "remove cleared the filter or selected a different row");
+            list.SelectedIndex = 0;
+            SaInvoke(window, "UndoQueueRemoval_Click", null!, null!);
+            var selectedIndex = (int)SaInvokeResult(window, "SelectedQueueIndex")!;
+            Assert(filter.Text == "Видимая" && list.Items.Cast<TrackRow>().SequenceEqual([middle, shared, shared])
+                && queue.OccurrenceTokenAt(2) == repeatedToken && selectedIndex >= 0
+                && queue.OccurrenceTokenAt(selectedIndex) == middleToken && !fixture.Player.HasSource,
+                "undo cleared the filter, changed the selection, or opened playback");
+        });
+        await Run("QueueEditing: Back uses live history after replacing the playback source", async () =>
+        {
+            using var fixture = new SaFixture("queue-history-live-back");
+            await fixture.Activate();
+            var window = fixture.Window;
+            var queue = EpField<PlaybackQueue>(window, "_playbackQueue");
+            queue.SetItems([Row("old-first"), Row("old-second")]);
+            queue.Next();
+            SaInvoke(window, "History_Click", null!, null!);
+            var list = Control<ListView>(window, "TracksList");
+            Assert(list.Items.Count == 1, "fixture had no old history before leaving");
+            list.SelectedIndex = 0;
+            SaClick(Control<Button>(window, "SearchNav"));
+            var fresh = Row("fresh-first");
+            queue.SetItems([fresh, Row("fresh-second")]);
+            queue.Next();
+            var version = queue.Version;
+
+            SaInvoke(window, "BrowseBack_Click", null!, null!);
+            Assert(list.Items.Cast<TrackRow>().SequenceEqual([fresh]) && list.SelectedItems.Count == 0 && queue.Version == version,
+                "Back restored old history or selected its stale index in the replacement source");
+        });
+        await Run("QueueEditing: undo readmits restored tracks only when unvisited in the current shuffle cycle", () =>
+        {
+            var queue = new PlaybackQueue(new Random(13));
+            var a = Row("a"); var b = Row("b"); var c = Row("c");
+            queue.SetItems([a, b, c]);
+            queue.RemoveMany([1]);
+            queue.Shuffle = true;
+            Assert(queue.UndoRemoval(), "undo did not restore the removed track");
+            Assert(new[] { queue.Next(), queue.Next() }.ToHashSet().SetEquals([b, c]) && queue.Next() is null,
+                "enabling shuffle with a removed track lost or duplicated the restored occurrence");
+
+            queue.SetItems([a, b, c]);
+            queue.SelectAt(1); queue.SelectAt(0);
+            queue.RemoveMany([1]);
+            Assert(queue.UndoRemoval() && ReferenceEquals(queue.Next(), c) && queue.Next() is null,
+                "undo replayed an occurrence already visited in the same shuffle cycle");
+
+            queue.SetItems([a, b, c]);
+            queue.SelectAt(1); queue.SelectAt(0);
+            queue.RemoveMany([1]);
+            queue.Repeat = RepeatMode.All;
+            Assert(ReferenceEquals(queue.Next(), c) && ReferenceEquals(queue.Next(), a), "fixture failed to cross the repeat boundary");
+            queue.Repeat = RepeatMode.Off;
+            Assert(queue.UndoRemoval() && new[] { queue.Next(), queue.Next() }.ToHashSet().SetEquals([b, c]) && queue.Next() is null,
+                "undo treated a track visited in the old cycle as visited in the new cycle");
+            return Task.CompletedTask;
+        });
+        await Run("QueueEditing: deleting a paused or restored current track cues the exact successor until Play", async () =>
+        {
+            var path = WriteWave("queue-remove-paused.wav", 30);
+            foreach (var restored in new[] { false, true })
+            {
+                using var fixture = new SaFixture(restored ? "queue-remove-restored" : "queue-remove-paused");
+                var window = fixture.Window;
+                var old = new TrackRow { Id = "old", RequestId = "old", Title = "Первый", Available = true, LocalPath = path, DurationMs = 30000 };
+                var shared = new TrackRow { Id = "shared", RequestId = "shared", Title = "Следующий", Available = true, LocalPath = path, DurationMs = 30000 };
+                var queue = SaField<PlaybackQueue>(window, "_playbackQueue");
+                queue.RestoreItems([shared, old, shared], 1, false, RepeatMode.Off);
+                var targetToken = queue.OccurrenceTokenAt(2);
+                if (restored)
+                {
+                    UlSet(window, "_current", old);
+                    UlSet(window, "_restoredPlaybackOccurrence", queue.CurrentOccurrenceToken);
+                    UlSet(window, "_restoredPlaybackSeconds", 18d);
+                }
+                else
+                {
+                    await window.PlayTrackAsync(old);
+                    await Call(window, "TogglePlaybackAsync");
+                    Assert(fixture.Player.HasSource && !fixture.Player.IsPlaying, "fixture did not pause a live source");
+                }
+                SaInvoke(window, "ShowQueueCore", false);
+                await Call(window, "RemoveSelectedQueueAsync");
+                Assert(queue.CurrentOccurrenceToken == targetToken && ReferenceEquals(SaField<TrackRow>(window, "_current"), shared)
+                    && (int)SaInvokeResult(window, "SelectedQueueIndex")! == 1 && !fixture.Player.HasSource && !fixture.Player.IsPlaying,
+                    "deletion autoplayed or did not cue the exact surviving occurrence");
+                Assert(SaField<double?>(window, "_restoredPlaybackSeconds") is null && Control<Button>(window, "PlayPauseButton").IsEnabled,
+                    "the previous seek survived deletion or explicit Play was disabled");
+                await Call(window, "TogglePlaybackAsync");
+                Assert(fixture.Player.IsPlaying && queue.CurrentOccurrenceToken == targetToken && fixture.Player.Position.TotalSeconds < 2,
+                    "explicit Play did not start the cued occurrence at its beginning");
+            }
+        });
+        await Run("QueueEditing: transport Play starts a manually built queue from Home", async () =>
+        {
+            using var fixture = new SaFixture("queue-transport-from-home");
+            var window = fixture.Window;
+            var path = WriteWave("queue-transport-home.wav", 30);
+            var a = new TrackRow { Id = "a", RequestId = "a", Title = "A", Available = true, LocalPath = path, DurationMs = 30000 };
+            var b = new TrackRow { Id = "b", RequestId = "b", Title = "B", Available = true, LocalPath = path, DurationMs = 30000 };
+            SaInvoke(window, "ShowRows", (object)new[] { Row("hidden-unrelated") });
+            var queue = SaField<PlaybackQueue>(window, "_playbackQueue");
+            queue.Enqueue(a); queue.Enqueue(b);
+            var current = queue.CurrentOccurrenceToken;
+            var replacement = queue.ReplacementVersion;
+            SaInvoke(window, "SetSection", "home", "Главная");
+            SaInvoke(window, "UpdateControls");
+            Assert(Control<Button>(window, "PlayPauseButton").IsEnabled, "queued tracks did not enable the lower Play button");
+            await Call(window, "TogglePlaybackAsync");
+            Assert(queue.Items.SequenceEqual([a, b]) && queue.CurrentOccurrenceToken == current && queue.ReplacementVersion == replacement
+                && fixture.Player.IsPlaying && ReferenceEquals(SaField<TrackRow>(window, "_current"), a),
+                "lower Play used the hidden page instead of the explicit queue");
+        });
+        await Run("QueueEditing: ordinary queue highlights only the playing duplicate through a sort", async () =>
+        {
+            using var fixture = new SaFixture("queue-playing-duplicate-mark");
+            var window = fixture.Window;
+            var path = WriteWave("queue-playing-mark.wav", 30);
+            var a = new TrackRow { Id = "a", RequestId = "a", Title = "А", Available = true, LocalPath = path, DurationMs = 30000 };
+            var b = new TrackRow { Id = "b", RequestId = "b", Title = "Я", Available = true, LocalPath = path, DurationMs = 30000 };
+            var queue = SaField<PlaybackQueue>(window, "_playbackQueue");
+            queue.RestoreItems([a, b, a], 2, false, RepeatMode.Off);
+            var current = queue.CurrentOccurrenceToken;
+            await window.PlayTrackAsync(a);
+            SaInvoke(window, "ShowQueueCore", false);
+            var list = Control<ListView>(window, "TracksList");
+            bool[] Marks()
+            {
+                window.UpdateLayout();
+                return Enumerable.Range(0, list.Items.Count).Select(index =>
+                {
+                    var row = (ListViewItem)list.ItemContainerGenerator.ContainerFromIndex(index)!;
+                    return ((FrameworkElement)row.Template.FindName("PlayingMark", row)).Visibility == Visibility.Visible;
+                }).ToArray();
+            }
+            Assert(Marks().SequenceEqual([false, false, true]), "both duplicate rows received the active playback mark");
+            SortChoose(window, ListSortField.Title);
+            list.SelectedIndex = 0;
+            Assert(Marks().SequenceEqual([false, true, false]) && queue.CurrentOccurrenceToken == current,
+                "sort or independent selection transferred the marker to the wrong duplicate");
+        });
         await Run("QueueEditing: 3900-row recycled selection moves and removes exact offscreen duplicate occurrences", QueueEditingVirtualizedDuplicates);
         await Run("QaFixes061: queue idle text follows remaining empty and restored rows without autoplay", async () =>
         {

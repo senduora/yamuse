@@ -30,6 +30,8 @@ internal static partial class Program
                 () => Lr040Ownership(expanded, name));
             await Run("LyricsRecovery040: an unrealized active row cannot steal immediate wheel takeover in " + name,
                 () => Lr040UnrealizedFollow(expanded, name));
+            await Run("LyricsRecovery040: automatic follow reveals the active occurrence of a repeated line in " + name,
+                () => Lr040RepeatedLineFollow(expanded, name));
         }
     }
 
@@ -201,6 +203,25 @@ internal static partial class Program
         Assert(trace.MissingAnchors == 0 && Math.Abs(trace.Travelled - 8 * SystemParameters.WheelScrollLines * 16d) <= 1.1,
             "a pending unrealized-row BringIntoView stole the manual viewport");
         Assert(f.Player.IsPlaying && f.Requests == 0, "unrealized-row following changed playback or contacted a provider");
+    }
+
+    private static async Task Lr040RepeatedLineFollow(bool expanded, string name)
+    {
+        using var f = new Lr040Fixture(expanded, 1050, 680, "repeated-" + name);
+        await Dispatcher.Yield(DispatcherPriority.ContextIdle);
+        f.Window.UpdateLayout();
+        var viewer = LyricsUiVisuals<ScrollViewer>(f.List).First();
+        const int target = 300;
+        var first = f.List.Items.IndexOf(f.List.Items[target]);
+        Assert(first >= 0 && first < 30 && f.List.ItemContainerGenerator.ContainerFromIndex(target) is null,
+            "fixture needs an unrealized occurrence of an earlier line");
+
+        LyricsUiInvoke(f.Window, "UpdateLyrics", target * .25);
+        await Until(() => f.List.SelectedIndex == target &&
+            f.List.ItemContainerGenerator.ContainerFromIndex(target) is ListBoxItem row &&
+            row.TranslatePoint(new Point(0, row.ActualHeight), viewer).Y > 0 &&
+            row.TranslatePoint(new Point(), viewer).Y < viewer.ViewportHeight);
+        Assert(f.Requests == 0, "following a repeated lyric contacted its provider");
     }
 
     private sealed class Lr040Trace : IDisposable

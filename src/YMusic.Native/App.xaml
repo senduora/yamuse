@@ -102,9 +102,30 @@
     <!-- Native Track behavior, generous hit area, no third-party controls. -->
     <Style x:Key="SliderSegment" TargetType="RepeatButton"><Setter Property="Focusable" Value="False"/><Setter Property="IsTabStop" Value="False"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="RepeatButton"><Border Background="{TemplateBinding Background}" Height="4" CornerRadius="2" VerticalAlignment="Center"/></ControlTemplate></Setter.Value></Setter></Style>
     <Style x:Key="SliderHandle" TargetType="Thumb"><Setter Property="Width" Value="16"/><Setter Property="Height" Value="26"/><Setter Property="Focusable" Value="False"/>
-      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Thumb"><Grid Background="Transparent"><Ellipse x:Name="Handle" Width="10" Height="10" local:Motion.Fill="{DynamicResource AccentBrush}" RenderTransformOrigin="0.5,0.5"><Ellipse.RenderTransform><ScaleTransform x:Name="HandleScale"/></Ellipse.RenderTransform></Ellipse></Grid><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Handle" Property="local:Motion.Scale" Value="1.4"/></Trigger><Trigger Property="IsDragging" Value="True"><Setter TargetName="Handle" Property="local:Motion.Scale" Value="1.4"/><Setter TargetName="Handle" Property="local:Motion.Fill" Value="{DynamicResource AccentFocusBrush}"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Thumb">
+        <Grid Background="Transparent">
+          <Ellipse x:Name="Handle" Width="10" Height="10" local:Motion.Fill="{DynamicResource AccentBrush}" RenderTransformOrigin="0.5,0.5"><Ellipse.RenderTransform><ScaleTransform x:Name="HandleScale"/></Ellipse.RenderTransform></Ellipse>
+          <Ellipse x:Name="ThumbKeyboardFocus" Width="14" Height="14" Stroke="{DynamicResource ForegroundBrush}" StrokeThickness="1" Opacity="0" IsHitTestVisible="False"/>
+        </Grid>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Handle" Property="local:Motion.Scale" Value="1.4"/></Trigger>
+          <Trigger Property="IsDragging" Value="True"><Setter TargetName="Handle" Property="local:Motion.Scale" Value="1.4"/><Setter TargetName="Handle" Property="local:Motion.Fill" Value="{DynamicResource AccentFocusBrush}"/></Trigger>
+          <DataTrigger Binding="{Binding Path=(local:InputFeedback.KeyboardFocusVisible), RelativeSource={RelativeSource AncestorType=Slider}}" Value="True"><Setter TargetName="ThumbKeyboardFocus" Property="Opacity" Value="1"/></DataTrigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
     </Style>
-    <Style TargetType="Slider"><Setter Property="VerticalAlignment" Value="Center"/><Setter Property="Height" Value="26"/><Setter Property="IsMoveToPointEnabled" Value="True"/><Setter Property="SmallChange" Value="1"/><Setter Property="LargeChange" Value="10"/><Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Style x:Key="MiniSliderHandle" TargetType="Thumb">
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Thumb">
+        <Grid>
+          <Ellipse Fill="{DynamicResource AccentBrush}"/>
+          <Ellipse x:Name="ThumbKeyboardFocus" Stroke="{DynamicResource ForegroundBrush}" StrokeThickness="1.5" Opacity="0" IsHitTestVisible="False"/>
+        </Grid>
+        <ControlTemplate.Triggers>
+          <DataTrigger Binding="{Binding Path=(local:InputFeedback.KeyboardFocusVisible), RelativeSource={RelativeSource AncestorType=Slider}}" Value="True"><Setter TargetName="ThumbKeyboardFocus" Property="Opacity" Value="1"/></DataTrigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <Style TargetType="Slider"><Setter Property="VerticalAlignment" Value="Center"/><Setter Property="Height" Value="26"/><Setter Property="IsMoveToPointEnabled" Value="True"/><Setter Property="SmallChange" Value="1"/><Setter Property="LargeChange" Value="10"/><Setter Property="FocusVisualStyle" Value="{x:Null}"/><Setter Property="local:InputFeedback.Enabled" Value="True"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Slider"><Grid x:Name="SliderSurface" Background="Transparent"><Border x:Name="Rail" Height="4" Margin="8,0" CornerRadius="2" local:Motion.Background="{DynamicResource TrackBrush}"/><Track x:Name="PART_Track" IsDirectionReversed="{TemplateBinding IsDirectionReversed}" Orientation="{TemplateBinding Orientation}"><Track.DecreaseRepeatButton><RepeatButton Style="{StaticResource SliderSegment}" Background="{DynamicResource AccentBrush}" Command="{x:Static Slider.DecreaseLarge}" Margin="8,0,0,0"/></Track.DecreaseRepeatButton><Track.Thumb><Thumb Style="{StaticResource SliderHandle}"/></Track.Thumb><Track.IncreaseRepeatButton><RepeatButton Style="{StaticResource SliderSegment}" Background="Transparent" Command="{x:Static Slider.IncreaseLarge}" Margin="0,0,8,0"/></Track.IncreaseRepeatButton></Track></Grid><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Rail" Property="local:Motion.Background" Value="{DynamicResource StrongBorderBrush}"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter TargetName="SliderSurface" Property="Opacity" Value="0.35"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style x:Key="ScrollPage" TargetType="RepeatButton"><Setter Property="Focusable" Value="False"/><Setter Property="IsTabStop" Value="False"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="RepeatButton"><Border Background="Transparent"/></ControlTemplate></Setter.Value></Setter></Style>

@@ -56,6 +56,15 @@ public partial class MainWindow
         if (PlaylistTransferPanel is { } playlistPanel) playlistPanel.Visibility = Visibility.Collapsed;
         RefreshCompactDownloadAction();
         if (_queueOverallProgress is null) return;
+        if (!DownloadQueueBelongsToActiveAccount)
+        {
+            _queueProgressPanel!.Visibility = Visibility.Collapsed;
+            _queueOverallProgress.Value = 0;
+            _queueProgressDetails!.Text = "";
+            PlaylistTransferBar.Value = 0;
+            PlaylistTransferTitle.Text = PlaylistTransferDetails.Text = "";
+            return;
+        }
         var progress = PlaylistTransferProgress.Read(_downloadQueue.Entries);
         _queueProgressPanel!.Visibility = progress.Total > 0 ? Visibility.Visible : Visibility.Collapsed;
         _queueOverallProgress.Value = progress.Percent;
@@ -72,7 +81,7 @@ public partial class MainWindow
 
     private bool IsCurrentCompactDownload()
     {
-        if (_closed || _session is null || _compactDownloadOperation is not { Playlist: { } playlist } operation
+        if (_closed || !DownloadQueueBelongsToActiveAccount || _compactDownloadOperation is not { Playlist: { } playlist } operation
             || operation.AccountGeneration != _accountGeneration) return false;
         return _section == "favorites" ? playlist.Owner == LocalFavoritesOwner && playlist.Kind == LocalFavoritesKind
             : _section == "playlist-detail" && _activePlaylist is { } current && current.Owner == playlist.Owner && current.Kind == playlist.Kind;

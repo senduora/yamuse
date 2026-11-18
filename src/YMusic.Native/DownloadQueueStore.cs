@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -9,11 +10,13 @@ namespace YMusic.Native;
 internal sealed record DownloadEntrySnapshot(
     [property: JsonRequired] PlaybackTrackState Track, [property: JsonRequired] DownloadEntryState State,
     [property: JsonRequired] int Attempts, [property: JsonRequired] string Error,
-    [property: JsonRequired] bool RemovedFromCollection, [property: JsonRequired] bool SkipFavoritesDownload);
+    [property: JsonRequired] bool RemovedFromCollection, [property: JsonRequired] bool SkipFavoritesDownload,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] AudioQuality? AutomaticFavoriteQuality = null);
 internal sealed record DownloadPlaylistSnapshot(
     [property: JsonRequired] string Owner, [property: JsonRequired] string Kind,
     [property: JsonRequired] string Title, [property: JsonRequired] int Revision,
-    [property: JsonRequired] IReadOnlyList<string> TrackIds);
+    [property: JsonRequired] IReadOnlyList<string> TrackIds,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool HistoryOnly = false);
 internal sealed record DownloadQueueSnapshot(
     [property: JsonRequired] int Version, [property: JsonRequired] string AccountUid,
     [property: JsonRequired] DateTimeOffset SavedUtc, [property: JsonRequired] string Label,
@@ -21,27 +24,27 @@ internal sealed record DownloadQueueSnapshot(
     [property: JsonRequired] bool FavoritesBatch, [property: JsonRequired] IReadOnlyList<DownloadEntrySnapshot> Entries,
     DownloadPlaylistSnapshot? Playlist = null);
 internal sealed record RestoredDownloadEntry(TrackRow Track, DownloadEntryState State, long Bytes, int Attempts,
-    string Error, bool RemovedFromCollection, bool SkipFavoritesDownload);
+    string Error, bool RemovedFromCollection, bool SkipFavoritesDownload, AudioQuality? AutomaticFavoriteQuality = null);
 internal sealed record RestoredDownloadQueue(string Label, AudioQuality Quality, bool Automatic, bool FavoritesBatch,
-    IReadOnlyList<RestoredDownloadEntry> Entries, PlaylistDetails? Playlist);
+    IReadOnlyList<RestoredDownloadEntry> Entries, PlaylistDetails? Playlist, bool PlaylistHistoryOnly = false);
 internal enum DownloadQueueReadStatus { Missing, Disabled, Loaded, OtherAccount, Invalid, Unavailable }
 
 internal sealed class DownloadQueueStore
 {
     internal const string FileName = "download-queue.json";
     internal const int CurrentVersion = 1, MaximumEntries = 10_000, MaximumBytes = 8 * 1024 * 1024;
+    private static ReadOnlySpan<byte> ClearedQueue => "{\"version\":0}"u8;
     private static readonly ConcurrentDictionary<string, StoreState> States = new(StringComparer.OrdinalIgnoreCase);
     private static readonly JsonSerializerOptions Json = new()
     { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, MaxDepth = 16 };
-    private readonly string _directory, _path;
+    private readonly string _path;
     private readonly StoreState _state;
     public DownloadQueueReadStatus LastReadStatus { get; private set; }
 
     internal DownloadQueueStore(string directory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);
-        _directory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
-        _path = Path.Combine(_directory, FileName);
+        _path = Path.Combine(Path.GetFullPath(directory), FileName);
         _state = States.GetOrAdd(_path, _ => new());
     }
     internal DownloadQueueSnapshot? Load(string? accountUid)
@@ -51,18 +54,21 @@ internal sealed class DownloadQueueStore
         {
             try
             {
-                EnsureSafeLocation();
-                if (!File.Exists(_path)) { LastReadStatus = DownloadQueueReadStatus.Missing; return null; }
-                using var stream = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read);
-                if (stream.Length > MaximumBytes) throw new JsonException();
-                var bytes = new byte[checked((int)stream.Length)]; stream.ReadExactly(bytes);
+                using var parents = UninstallPathGuard.HoldAncestors(_path);
+                if (!parents.Complete || !QueueFileExists()) { LastReadStatus = DownloadQueueReadStatus.Missing; return null; }
+                using var handle = UninstallPathGuard.OpenOwnedFile(_path, read: true, deleteAccess: false);
+                using var stream = new FileStream(handle, FileAccess.Read);
+                var length = stream.Length;
+                if (length > MaximumBytes) throw new JsonException();
+                var bytes = new byte[(int)length]; stream.ReadExactly(bytes);
+                if (bytes.AsSpan().SequenceEqual(ClearedQueue)) { LastReadStatus = DownloadQueueReadStatus.Missing; return null; }
                 var snapshot = JsonSerializer.Deserialize<DownloadQueueSnapshot>(bytes, Json) ?? throw new JsonException();
                 Validate(snapshot);
                 if (snapshot.AccountUid != accountUid) { LastReadStatus = DownloadQueueReadStatus.OtherAccount; return null; }
                 LastReadStatus = DownloadQueueReadStatus.Loaded; return Copy(snapshot);
             }
             catch (JsonException) { LastReadStatus = DownloadQueueReadStatus.Invalid; return null; }
-            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception)
             { LastReadStatus = DownloadQueueReadStatus.Unavailable; return null; }
         }
     }
@@ -87,7 +93,7 @@ internal sealed class DownloadQueueStore
         lock (_state)
         {
             if (revision != _state.Revision) return;
-            WriteAtomic(bytes);
+            GuardedStoreFile.Write(_path, bytes);
         }
     }
     internal void Clear()
@@ -95,39 +101,23 @@ internal sealed class DownloadQueueStore
         lock (_state)
         {
             ++_state.Revision;
-            EnsureSafeLocation();
-            if (!File.Exists(_path)) return;
-            // If deletion fails, no previous account queue remains restorable.
-            WriteAtomic("{\"version\":0}"u8.ToArray()); File.Delete(_path);
-        }
-    }
-    private void WriteAtomic(byte[] bytes)
-    {
-        EnsureSafeLocation(); Directory.CreateDirectory(_directory); EnsureSafeLocation();
-        var temporary = Path.Combine(_directory, ".download-queue-" + Guid.NewGuid().ToString("N") + ".tmp");
-        try
-        {
-            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
-            { stream.Write(bytes); stream.Flush(flushToDisk: true); }
-            EnsureSafeLocation();
-            if (File.Exists(_path)) File.Replace(temporary, _path, null); else File.Move(temporary, _path);
-        }
-        finally
-        {
-            try { if (File.Exists(temporary)) File.Delete(temporary); }
-            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+            // A published tombstone prevents restoration even if deleting it fails.
+            using var storage = GuardedStoreFile.BeginWrite(_path, createParents: false);
+            storage.Write(ClearedQueue, clear: true, retainClearMarkerOnDeleteFailure: true);
         }
     }
     internal static DownloadQueueSnapshot Capture(string accountUid, DownloadQueueState queue, AudioQuality quality,
-        bool automatic, PlaylistDetails? playlist)
+        bool automatic, PlaylistDetails? playlist, bool playlistHistoryOnly = false)
     {
         queue.VerifyAccess();
         var entries = queue.Entries.Select(entry => new DownloadEntrySnapshot(
             new PlaybackTrackState(entry.Track.Id, entry.Track.RequestId, entry.Track.Title, entry.Track.Artist,
-                entry.Track.Album, entry.Track.DurationMs, entry.Track.Available, CopyArtists(entry.Track.Artists), entry.Track.AlbumId),
-            entry.State, entry.Attempts, DownloadFailure.RestorableReason(entry.Error), entry.RemovedFromCollection, entry.SkipFavoritesDownload)).ToArray();
+                entry.Track.Album, entry.Track.DurationMs, entry.Track.Available, CopyArtists(entry.Track.Artists), entry.Track.AlbumId,
+                PrimaryArtistName: entry.Track.PrimaryArtistNameToPersist),
+            entry.State, entry.Attempts, DownloadFailure.RestorableReason(entry.Error), entry.RemovedFromCollection,
+            entry.SkipFavoritesDownload, entry.AutomaticFavoriteQuality)).ToArray();
         var context = playlist is null ? null : new DownloadPlaylistSnapshot(playlist.Owner, playlist.Kind, playlist.Title,
-            playlist.Revision, Array.AsReadOnly(playlist.Tracks.Select(track => track.Id).ToArray()));
+            playlist.Revision, Array.AsReadOnly(playlist.Tracks.Select(track => track.Id).ToArray()), playlistHistoryOnly);
         var snapshot = new DownloadQueueSnapshot(CurrentVersion, accountUid, DateTimeOffset.UtcNow, queue.Label,
             quality, automatic, queue.FavoritesBatch, Array.AsReadOnly(entries), context);
         Validate(snapshot); return snapshot;
@@ -140,7 +130,7 @@ internal sealed class DownloadQueueStore
         {
             var t = saved.Track;
             var row = new TrackRow { Number = entries.Count + 1, Id = t.Id, RequestId = t.RequestId, Title = t.Title,
-                Artist = t.Artist, Artists = CopyArtists(t.Artists), Album = t.Album, AlbumId = t.AlbumId,
+                Artist = t.Artist, Artists = CopyArtists(t.Artists), PrimaryArtistName = t.PrimaryArtistName, Album = t.Album, AlbumId = t.AlbumId,
                 DurationMs = t.DurationMs, Available = t.Available };
             // Only a validated offline-index entry can prove a file is ready.
             // A crash after audio commit but before queue save is covered too.
@@ -154,17 +144,19 @@ internal sealed class DownloadQueueStore
             var state = saved.State is DownloadEntryState.Failed or DownloadEntryState.Unavailable or DownloadEntryState.Removed
                 ? saved.State : DownloadEntryState.Paused;
             if (local is not null && saved.State != DownloadEntryState.Removed && (saved.State == DownloadEntryState.Completed
-                || snapshot.Automatic || AudioQualityPolicy.IsSufficient(local.Codec, local.Bitrate, snapshot.Quality))) state = DownloadEntryState.Completed;
+                || snapshot.Automatic || saved.AutomaticFavoriteQuality is not null
+                || AudioQualityPolicy.IsSufficient(local.Codec, local.Bitrate, snapshot.Quality))) state = DownloadEntryState.Completed;
             // No partial-file claim survives a process restart. The existing
             // downloader restarts that one track after explicit continuation.
             entries.Add(new(row, state, state == DownloadEntryState.Completed ? local!.Bytes : 0, saved.Attempts,
                 state is DownloadEntryState.Failed or DownloadEntryState.Unavailable ? saved.Error : "",
-                saved.RemovedFromCollection, saved.SkipFavoritesDownload));
+                saved.RemovedFromCollection, saved.SkipFavoritesDownload, saved.AutomaticFavoriteQuality));
         }
         var byId = entries.ToDictionary(entry => entry.Track.Id, entry => entry.Track, StringComparer.Ordinal);
         var playlist = snapshot.Playlist is { } p ? new PlaylistDetails(p.Owner, p.Kind, p.Title, "", p.Revision,
             Array.AsReadOnly(p.TrackIds.Select(id => byId[id]).ToArray())) : null;
-        return new(snapshot.Label, snapshot.Quality, snapshot.Automatic, snapshot.FavoritesBatch, Array.AsReadOnly(entries.ToArray()), playlist);
+        return new(snapshot.Label, snapshot.Quality, snapshot.Automatic, snapshot.FavoritesBatch, Array.AsReadOnly(entries.ToArray()),
+            playlist, snapshot.Playlist?.HistoryOnly ?? false);
     }
     private static DownloadQueueSnapshot Freeze(DownloadQueueSnapshot snapshot)
     { ArgumentNullException.ThrowIfNull(snapshot); Validate(snapshot); var copy = Copy(snapshot); Validate(copy); return copy; }
@@ -190,10 +182,13 @@ internal sealed class DownloadQueueStore
                 || !ValidRequestId(track.RequestId, track.Id) || track.AlbumId is not null && !ValidId(track.AlbumId)
                 || track.CoverUri is not null // Download snapshots deliberately remain metadata-only.
                 || !ValidText(track.Title) || !ValidText(track.Artist) || !ValidText(track.Album)
+                || !TrackRow.ValidPrimaryArtistName(track.PrimaryArtistName)
                 || track.DurationMs < 0 || track.DurationMs > PlaybackStateStore.MaximumDurationMs
                 || track.Artists is null || track.Artists.Count > 100 || !Enum.IsDefined(entry.State)
                 || entry.Attempts < 0 || entry.Attempts > 1_000_000 || entry.Error is null || entry.Error != DownloadFailure.RestorableReason(entry.Error)
-                || entry.SkipFavoritesDownload && (!snapshot.FavoritesBatch || !entry.RemovedFromCollection)) throw new JsonException();
+                || entry.AutomaticFavoriteQuality is { } automaticQuality && !Enum.IsDefined(automaticQuality)
+                || entry.SkipFavoritesDownload && (!(snapshot.FavoritesBatch || entry.AutomaticFavoriteQuality is not null)
+                    || !entry.RemovedFromCollection)) throw new JsonException();
             foreach (var artist in track.Artists)
                 if (artist is null || !ValidId(artist.Id) || !ValidText(artist.Name)) throw new JsonException();
         }
@@ -211,11 +206,16 @@ internal sealed class DownloadQueueStore
     private static bool ValidRequestId(string? value, string id) => value == id || value is { Length: <= 1025 }
         && value.StartsWith(id + ":", StringComparison.Ordinal) && ValidId(value[(id.Length + 1)..]);
     private static bool ValidText(string? value) => value is { Length: <= 4096 } && !value.Any(char.IsControl);
-    private void EnsureSafeLocation()
+    private bool QueueFileExists()
     {
-        for (DirectoryInfo? part = new(_directory); part is not null; part = part.Parent)
-            if (part.Exists && (part.Attributes & FileAttributes.ReparsePoint) != 0) throw new IOException("Папка очереди содержит перенаправление.");
-        if (File.Exists(_path) && (File.GetAttributes(_path) & FileAttributes.ReparsePoint) != 0) throw new IOException("Файл очереди содержит перенаправление.");
+        try
+        {
+            if ((File.GetAttributes(_path) & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+                throw new IOException("Файл очереди содержит перенаправление или изменился.");
+            return true;
+        }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
     }
     private sealed class StoreState { internal long Revision; }
     private sealed class BoundedJsonStream : MemoryStream

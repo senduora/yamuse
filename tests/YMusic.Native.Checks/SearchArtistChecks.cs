@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Net.Http;
 using System.Reflection;
 using System.Text.Json;
@@ -17,10 +18,53 @@ internal static partial class Program
         await Run("Search/Artist: old playlist artist resolves exact ID, profile data and Back preserve browse and queue", SaPlaylistArtist);
         await Run("Search/Artist: Home retains server shelves, full All source and correct card navigation", SaHomeNavigation);
         await Run("Search/Artist: late canceled profile and signout cannot restore prior artist or Home data", SaCanceledArtist);
+        await Run("Search/Artist: a failed optional artist read keeps the exact brief and top tracks", SaOptionalArtistAbout);
         await Run("QaFixes061: artist confirmed add and remove stay current across duplicate Back and Forward snapshots", SaArtistMembershipHistory061);
         await Run("QaFixes061: delayed artist confirmation follows exact ID while denied writes leave history unchanged", SaArtistMembershipDelayed061);
         await Run("QaFixes061: late artist membership result cannot cross logout into another account history", SaArtistMembershipAccount061);
         await Run("QaFixes061: stale artist membership read cannot overwrite confirmed write or refreshed history", SaArtistMembershipReadRace061);
+        await Run("Search/Artist: confirmed membership reconciles both liked artists history and an older collection response", SaArtistCollectionRace);
+        await Run("Search/Artist: Back retries incomplete artist membership while later search keeps its own request", SaArtistIncompleteBack);
+    }
+
+    private static async Task SaOptionalArtistAbout()
+    {
+        const string validAbout = """{"artist":{"id":"artist-fixture"},"description":"Exact biography","stats":{"lastMonthListeners":272}}""";
+        foreach (var mode in new[] { "valid", "wrong-id", "missing", "timeout", "unavailable", "auth", "cancel" })
+        {
+            using var cancellation = new CancellationTokenSource();
+            var fixture = new FakeHandler((request, _) =>
+            {
+                if (request.RequestUri!.AbsolutePath.EndsWith("/brief-info", StringComparison.Ordinal))
+                    return Task.FromResult(Json(SaArtistJson("artist-fixture")));
+                if (!request.RequestUri.AbsolutePath.EndsWith("/about-artist", StringComparison.Ordinal))
+                    throw new InvalidOperationException("Unexpected artist fixture route");
+                if (mode == "cancel") cancellation.Cancel();
+                if (mode is "timeout" or "cancel") throw new OperationCanceledException();
+                return Task.FromResult(mode switch
+                {
+                    "valid" => Json(validAbout),
+                    "wrong-id" => Json(validAbout.Replace("artist-fixture", "other-artist", StringComparison.Ordinal)),
+                    "missing" => Json("{}", HttpStatusCode.NotFound),
+                    "unavailable" => Json("{}", HttpStatusCode.ServiceUnavailable),
+                    _ => Json("{}", HttpStatusCode.Unauthorized)
+                });
+            });
+            using var api = new MusicApi(fixture);
+            var lookup = api.GetArtistDetailsAsync(FakeSession, "artist-fixture", cancellation.Token);
+            if (mode == "cancel") await Throws<OperationCanceledException>(() => lookup);
+            else if (mode == "auth") Assert((await Throws<MusicException>(() => lookup)).Authentication, "optional lookup lost 401 classification");
+            else
+            {
+                var details = await lookup;
+                Assert(details.Id == "artist-fixture" && details.Name == "Исполнитель artist-fixture"
+                    && details.TopTracks.Select(track => track.Id).SequenceEqual(["top-z", "top-a", "top-m"])
+                    && details.MonthlyListeners == (mode == "valid" ? 272L : (long?)null)
+                    && details.Description == (mode == "valid" ? "Exact biography" : ""),
+                    "optional artist data replaced or discarded the confirmed brief");
+            }
+            Assert(fixture.Seen.Count == 2, "optional artist lookup retried or skipped its known route");
+        }
     }
 
     private static async Task SaSearchCategories()
@@ -289,6 +333,70 @@ internal static partial class Program
         }
     }
 
+    private static async Task SaArtistCollectionRace()
+    {
+        foreach (var initiallyLiked in new[] { false, true })
+        {
+            using var f = new SaMembershipFixture061("collection-race-" + initiallyLiked) { HoldWrite = true };
+            var window = f.Browse.Window; await f.Browse.Activate();
+            f.Members("12345").Add("84");
+            if (initiallyLiked) f.Members("12345").Add("42");
+            var nav = Control<Button>(window, "ArtistsNav");
+            SaClick(nav);
+            await Until(() => SaField<CancellationTokenSource?>(window, "_featureCts") is null);
+            var catalog = Control<ListBox>(window, "CatalogList");
+            catalog.SelectedItem = catalog.Items.Cast<CatalogItem>().FirstOrDefault(item => item.Id == "42");
+            await Call(window, "OpenArtistAsync", "42", "Исполнитель 42", true);
+            SaClick(Control<Button>(window, "ArtistLikeButton"));
+            await f.WriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            f.HoldNextMembershipRead = true;
+            SaClick(nav);
+            await f.ReadEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(f.HeldReadContains42 == initiallyLiked, "the held response did not capture the old membership");
+            f.WriteRelease.TrySetResult();
+            await Until(() => !SaField<bool>(window, "_catalogWriting"));
+            f.ReadRelease.TrySetResult();
+            await Until(() => SaField<CancellationTokenSource?>(window, "_featureCts") is null);
+            AssertList();
+            SaInvoke(window, "BrowseBack_Click", null!, null!);
+            SaAssertMembership061(window, "42", !initiallyLiked);
+            SaInvoke(window, "BrowseBack_Click", null!, null!);
+            AssertList();
+            Assert(f.Writes.Count == 1 && !f.Browse.Player.HasSource, "history repeated the mutation or opened audio");
+
+            void AssertList()
+            {
+                var ids = catalog.Items.Cast<CatalogItem>().Select(item => item.Id);
+                Assert(SaField<string>(window, "_section") == "artists"
+                    && ids.SequenceEqual(initiallyLiked ? new[] { "84" } : new[] { "42", "84" })
+                    && catalog.SelectedItem is null, "the saved artists list or older result lost the confirmed membership");
+            }
+        }
+    }
+
+    private static async Task SaArtistIncompleteBack()
+    {
+        using var f = new SaMembershipFixture061("incomplete-back") { HoldNextMembershipRead = true };
+        var window = f.Browse.Window; await f.Browse.Activate();
+        f.Members("12345").Add("42");
+        var opening = Call(window, "OpenArtistAsync", "42", "Исполнитель 42", true);
+        await f.ReadEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert(SaField<bool?>(window, "_artistLiked") is null, "the fixture returned membership before leaving the artist");
+        SaClick(Control<Button>(window, "ArtistAllTracksButton"));
+        await Until(() => SaField<string>(window, "_section") == "artist-tracks" && SaField<CancellationTokenSource?>(window, "_featureCts") is null);
+        SaInvoke(window, "BrowseBack_Click", null!, null!);
+        await Until(() => Control<Button>(window, "ArtistLikeButton").IsEnabled);
+        SaAssertMembership061(window, "42", true);
+        Assert(f.Reads == 2, "Back did not request only the unfinished membership");
+        SaClick(Control<Button>(window, "SearchNav"));
+        Control<TextBox>(window, "CatalogQuery").Text = "new request";
+        await Call(window, "SearchCatalogViewAsync", false);
+        f.ReadRelease.TrySetResult();
+        await opening;
+        Assert(SaField<string>(window, "_section") == "search" && SaField<string>(window, "_searchText") == "new request"
+            && f.Browse.Searches.Count == 1 && f.Writes.Count == 0, "a prior artist membership request disturbed search or produced a write");
+    }
+
     private static void SaAssertMembership061(MainWindow window, string id, bool liked)
     {
         Assert(SaField<string>(window, "_section") == "artist-detail" && SaField<ArtistDetails>(window, "_artistDetails").Id == id
@@ -339,6 +447,7 @@ internal static partial class Program
             Assert(uri.Host == "api.music.yandex.net", "browse fixture left the API host");
             if (RespondOverride is { } respond && await respond(request, token) is { } response) return response;
             if (path == "/account/status") return Json(Profile);
+            if (request.Method == HttpMethod.Get && path == "/account/about") return Json(ProfileAboutWithoutAvatar);
             if (path == "/users/12345/likes/tracks") return Json("""{"result":{"library":{"tracks":[]}}}""");
             if (path == "/users/12345/likes/artists") return Json("""{"result":[{"artist":{"id":"artist-42","name":"Исполнитель 42"}}]}""");
             if (path == "/search")
@@ -393,6 +502,9 @@ internal static partial class Program
             var path = request.RequestUri!.AbsolutePath;
             if (path == "/account/status") return Json(JsonSerializer.Serialize(new
             { result = new { account = new { uid = CurrentUid, displayName = "Membership fixture " + CurrentUid }, plus = new { hasPlus = true } } }));
+            if (request.Method == HttpMethod.Get && path == "/account/about")
+                return Json(JsonSerializer.Serialize(new { result = new { uid = CurrentUid } }));
+            if (path == "/artists/42/tracks") return Json("""{"result":{"tracks":[]}}""");
             var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length < 4 || parts[0] != "users" || parts[2] != "likes") return null;
             var members = Members(parts[1]);

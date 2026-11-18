@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
@@ -20,8 +21,10 @@ public partial class MainWindow
     private long? _sleepTrackOccurrence;
     private TrackRow? _sleepTrack;
     private bool _playbackOptionsInitializing, _audioOutputSwitching, _audioOutputUnavailable;
+    private bool IsAudioOutputUnavailable => _audioOutputUnavailable || !_player.OutputRouteIsValid;
     private bool _audioOutputFixture;
-    private int _audioOutputRefreshRevision;
+    private int _audioOutputReadRevision, _audioOutputListedRevision;
+    private IReadOnlyList<AudioOutputDevice>? _listedAudioOutputs;
     internal Func<TimeSpan>? SleepElapsedForChecks { get; set; }
 
     private void InitializePlaybackOptions(IAudioOutputDevices? audioOutputDevices = null)
@@ -35,10 +38,16 @@ public partial class MainWindow
         if (_restore && !_demo || _audioOutputFixture)
         {
             _audioOutputDevices.Changed += AudioOutputDevices_Changed;
-            try { _audioOutputDevices.Watch(); }
-            catch (Exception ex) { _diagnostics.LastErrorType = "AudioDevicesWatch:" + ex.GetType().Name; }
+            TryWatchAudioOutputs();
             _audioOutputReady = RestoreAudioOutputAsync();
         }
+    }
+
+    private void TryWatchAudioOutputs()
+    {
+        if (_closed) return;
+        try { _audioOutputDevices?.Watch(); }
+        catch (Exception ex) { _diagnostics.LastErrorType = "AudioDevicesWatch:" + ex.GetType().Name; }
     }
 
     private void CreatePlaybackOptionsView()
@@ -64,7 +73,11 @@ public partial class MainWindow
         panel.Children.Add(new TextBlock { Text = "Устройство вывода", Margin = new(0, 0, 0, 9) });
         var row = new DockPanel();
         _audioOutputRefresh = new Button { Name = "AudioOutputRefresh", Content = "Обновить", Margin = new(10, 0, 0, 0) };
-        _audioOutputRefresh.Click += async (_, _) => await RefreshAudioOutputsAsync();
+        _audioOutputRefresh.Click += async (_, _) =>
+        {
+            if (_restore && !_demo || _audioOutputFixture) TryWatchAudioOutputs();
+            await RefreshAudioOutputsAsync();
+        };
         DockPanel.SetDock(_audioOutputRefresh, Dock.Right); row.Children.Add(_audioOutputRefresh);
         _audioOutputCombo = new ComboBox { Name = "AudioOutputCombo", SelectedValuePath = nameof(AudioOutputDevice.Id), DisplayMemberPath = nameof(AudioOutputDevice.Name),
             ItemsSource = new[] { new AudioOutputDevice("", AudioOutputDevices.SystemDefaultLabel) }, SelectedValue = "" };
@@ -87,16 +100,23 @@ public partial class MainWindow
     internal void SetSleepTimer(SleepTimerMode mode)
     {
         if (_closed) return;
+        if (mode == SleepTimerMode.AfterCurrentTrack && !_player.IsPlaying && PlaybackTransportActive)
+        {
+            FinishSleepTimer();
+            return;
+        }
         if (mode == SleepTimerMode.AfterCurrentTrack && (!_player.HasSource || _current is null))
         {
             SetStatus("Сначала запустите трек, затем включите таймер."); mode = SleepTimerMode.Off;
         }
+        var canceledWaveStart = mode == SleepTimerMode.AfterCurrentTrack && CancelExplicitWaveStart();
         _sleepTimer.Start(mode); _sleepClock.Restart(); _player.SetSleepGain(1);
         _sleepTrackOccurrence = _playbackQueue.CurrentOccurrenceToken; _sleepTrack = _current;
         if (_sleepTimer.Active) _sleepTick?.Start(); else { _sleepTick?.Stop(); _sleepClock.Reset(); }
         if (_sleepTimer.AfterTrack) CancelNextPreparation();
         else RefreshNextPreparation();
         SyncSleepTimerView();
+        if (canceledWaveStart) UpdateControls();
     }
 
     private void SleepTimer_Tick(object? sender, EventArgs e)
@@ -108,7 +128,9 @@ public partial class MainWindow
         TimeSpan? remaining = _player.HasSource && _player.Duration > TimeSpan.Zero
             ? TimeSpan.FromSeconds(Math.Max(0, (_player.Duration - _player.Position).TotalSeconds / _player.SpeedRatio)) : null;
         var tick = _sleepTimer.Tick(elapsed, remaining);
-        if (tick.Completed) { FinishSleepTimer(); return; }
+        // Duration and position can reach the end before Windows delivers MediaEnded.
+        // Keep the after-track stop armed until that event consumes it.
+        if (tick.Completed && !_sleepTimer.AfterTrack) { FinishSleepTimer(); return; }
         _player.SetSleepGain(tick.Gain);
         SyncSleepTimerView(tick.Remaining);
     }
@@ -153,7 +175,9 @@ public partial class MainWindow
     private bool CanAutoAdvancePlaybackOptions() => !_sleepTimer.AfterTrack;
     private bool HandlePlaybackOptionsTrackEnded()
     {
-        if (!_sleepTimer.AfterTrack) return false;
+        if (!_sleepTimer.Active || !_sleepTimer.AfterTrack
+            && !_sleepTimer.Tick(SleepElapsedForChecks?.Invoke() ?? _sleepClock.Elapsed, null).Completed) return false;
+        ReportWaveEnd(true);
         FinishSleepTimer(); return true;
     }
 
@@ -165,28 +189,38 @@ public partial class MainWindow
     private async Task EnsureAudioOutputReadyAsync()
     {
         await _audioOutputReady;
-        if (_audioOutputUnavailable) throw new MusicException("Аудиоустройство недоступно. Выберите устройство в настройках воспроизведения.");
+        if (IsAudioOutputUnavailable) throw new MusicException("Аудиоустройство недоступно. Выберите устройство в настройках воспроизведения.");
     }
     private async Task ChangeAudioOutputAsync(string id, bool restoring = false)
     {
-        if (_audioOutputDevices is null || _closed || _audioOutputSwitching) return;
+        if (_audioOutputDevices is not { } outputs || _closed || _audioOutputSwitching) return;
         _audioOutputSwitching = true;
         if (_audioOutputCombo is not null) _audioOutputCombo.IsEnabled = false;
         try
         {
-            var route = await _audioOutputDevices.ResolveAsync(id);
+            var knownList = _audioOutputListedRevision;
+            var route = await outputs.ResolveAsync(id);
             if (_closed) return;
-            await _player.SetOutputDeviceAsync(route);
-            if (_closed) return;
-            _preferredOutputDeviceId = id; _audioOutputUnavailable = false;
-            if (_audioOutputText is not null) _audioOutputText.Text = "Используется для онлайн-музыки, скачанных треков и кроссфейда.";
-            if (!restoring) PersistSettingsImmediately();
+            if (_audioOutputListedRevision != knownList && !AudioOutputWasListed(id))
+                throw new MusicException("Выбранное аудиоустройство недоступно.");
+            await _player.SetOutputDeviceAsync(route, async () =>
+            {
+                if (id.Length > 0) await ReadAudioOutputListAsync(outputs);
+                if (_closed) return;
+                // Confirmation is part of route application so a disappeared endpoint
+                // rolls back the slots before the preference or Play becomes available.
+                if (!AudioOutputWasListed(id)) throw new MusicException("Выбранное аудиоустройство недоступно.");
+                _preferredOutputDeviceId = id;
+                _audioOutputUnavailable = false;
+                if (_audioOutputText is not null) _audioOutputText.Text = "Используется для онлайн-музыки, скачанных треков и кроссфейда.";
+                if (!restoring) PersistSettingsImmediately();
+            });
         }
         catch (Exception ex)
         {
             if (_closed) return;
             _diagnostics.LastErrorType = "AudioOutput:" + ex.GetType().Name;
-            if (restoring) _audioOutputUnavailable = true;
+            if (restoring || !_player.OutputRouteIsValid) _audioOutputUnavailable = true;
             if (_loadingStream) _playCts?.Cancel();
             _player.Pause(); SavePlaybackState(); SetWavePaused(true); _progressTimer.Stop();
             _diagnostics.Stage = "paused"; UpdateControls();
@@ -198,51 +232,65 @@ public partial class MainWindow
             _audioOutputSwitching = false;
             if (!_closed && _audioOutputCombo is not null)
             {
-                _playbackOptionsInitializing = true;
-                try { _audioOutputCombo.SelectedValue = _preferredOutputDeviceId; _audioOutputCombo.IsEnabled = true; }
-                finally { _playbackOptionsInitializing = false; }
+                UpdateAudioOutputChoices();
+                _audioOutputCombo.IsEnabled = true;
             }
         }
     }
 
     private async Task RefreshAudioOutputsAsync()
     {
-        if (_audioOutputDevices is null || _closed || (!_restore || _demo) && !_audioOutputFixture) return;
-        var revision = ++_audioOutputRefreshRevision;
+        if (_audioOutputDevices is not { } outputs || _closed || (!_restore || _demo) && !_audioOutputFixture) return;
+        var listing = ReadAudioOutputListAsync(outputs);
+        var revision = _audioOutputReadRevision;
         try
         {
-            var devices = await _audioOutputDevices.ListAsync();
-            if (_closed || revision != _audioOutputRefreshRevision) return;
-            var choices = new List<AudioOutputDevice> { new("", AudioOutputDevices.SystemDefaultLabel) };
-            choices.AddRange(devices);
-            if (_preferredOutputDeviceId.Length > 0 && !devices.Any(d => d.Id == _preferredOutputDeviceId))
-            {
-                choices.Add(new(_preferredOutputDeviceId, "Выбранное устройство недоступно"));
-                if (!_audioOutputUnavailable)
-                {
-                    if (_loadingStream) _playCts?.Cancel();
-                    _audioOutputUnavailable = true; _player.Pause(); SavePlaybackState(); SetWavePaused(true); _progressTimer.Stop();
-                    _diagnostics.Stage = "paused"; UpdateControls();
-                    if (_audioOutputText is not null) _audioOutputText.Text = "Устройство отключено. Музыка на паузе; выберите доступное устройство.";
-                    SetStatus("Аудиоустройство отключено. Музыка на паузе.");
-                }
-            }
-            else if (_audioOutputUnavailable && !_audioOutputSwitching)
-            {
-                // Reconnection restores the route but never resumes music by itself.
+            await listing;
+            if (_closed || revision != _audioOutputListedRevision) return;
+            UpdateAudioOutputChoices();
+            if (IsAudioOutputUnavailable && !_audioOutputSwitching && AudioOutputWasListed(_preferredOutputDeviceId))
                 await ChangeAudioOutputAsync(_preferredOutputDeviceId, restoring: true);
-            }
-            if (_audioOutputCombo is not null)
-            {
-                _playbackOptionsInitializing = true;
-                try { _audioOutputCombo.ItemsSource = choices; _audioOutputCombo.SelectedValue = _preferredOutputDeviceId; }
-                finally { _playbackOptionsInitializing = false; }
-            }
         }
         catch (Exception ex)
         {
-            if (!_closed) { _diagnostics.LastErrorType = "AudioDevices:" + ex.GetType().Name; if (_audioOutputText is not null) _audioOutputText.Text = "Не удалось получить список устройств. Нажмите «Обновить»."; }
+            if (!_closed && revision == _audioOutputReadRevision)
+            { _diagnostics.LastErrorType = "AudioDevices:" + ex.GetType().Name; if (_audioOutputText is not null) _audioOutputText.Text = "Не удалось получить список устройств. Нажмите «Обновить»."; }
         }
+    }
+
+    private async Task ReadAudioOutputListAsync(IAudioOutputDevices outputs)
+    {
+        var revision = ++_audioOutputReadRevision;
+        var devices = await outputs.ListAsync();
+        if (_closed || revision <= _audioOutputListedRevision) return;
+        _audioOutputListedRevision = revision;
+        _listedAudioOutputs = devices;
+    }
+
+    private bool AudioOutputWasListed(string id)
+        => id.Length == 0 || _listedAudioOutputs?.Any(device => device.Id == id) == true;
+
+    private void UpdateAudioOutputChoices()
+    {
+        if (_listedAudioOutputs is not { } devices) return;
+        var choices = new List<AudioOutputDevice> { new("", AudioOutputDevices.SystemDefaultLabel) };
+        choices.AddRange(devices);
+        if (!AudioOutputWasListed(_preferredOutputDeviceId))
+        {
+            choices.Add(new(_preferredOutputDeviceId, "Выбранное устройство недоступно"));
+            if (!_audioOutputUnavailable)
+            {
+                if (_loadingStream) _playCts?.Cancel();
+                _audioOutputUnavailable = true; _player.Pause(); SavePlaybackState(); SetWavePaused(true); _progressTimer.Stop();
+                _diagnostics.Stage = "paused"; UpdateControls();
+                if (_audioOutputText is not null) _audioOutputText.Text = "Устройство отключено. Музыка на паузе; выберите доступное устройство.";
+                SetStatus("Аудиоустройство отключено. Музыка на паузе.");
+            }
+        }
+        if (_audioOutputCombo is null) return;
+        _playbackOptionsInitializing = true;
+        try { _audioOutputCombo.ItemsSource = choices; _audioOutputCombo.SelectedValue = _preferredOutputDeviceId; }
+        finally { _playbackOptionsInitializing = false; }
     }
     private void AudioOutputDevices_Changed()
     {
@@ -262,9 +310,21 @@ public partial class MainWindow
     }
     private void DisposePlaybackOptions()
     {
-        ++_audioOutputRefreshRevision; _sleepTick?.Stop(); _audioOutputRefreshTimer?.Stop();
+        _sleepTick?.Stop(); _audioOutputRefreshTimer?.Stop();
         _sleepTimer.Cancel(); _sleepClock.Reset(); _player.Pause(); _player.SetSleepGain(1);
-        if (_audioOutputDevices is not null)
-        { _audioOutputDevices.Changed -= AudioOutputDevices_Changed; _audioOutputDevices.Dispose(); _audioOutputDevices = null; }
+        var audioOutputDevices = _audioOutputDevices;
+        _audioOutputDevices = null;
+        if (audioOutputDevices is not null)
+        {
+            try
+            {
+                audioOutputDevices.Changed -= AudioOutputDevices_Changed;
+                audioOutputDevices.Dispose();
+            }
+            catch (Exception ex) when (ex is COMException or InvalidOperationException)
+            {
+                _diagnostics.LastErrorType = "AudioDevicesDispose:" + ex.GetType().Name;
+            }
+        }
     }
 }

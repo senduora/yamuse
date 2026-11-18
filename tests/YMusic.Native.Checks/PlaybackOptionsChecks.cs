@@ -1,5 +1,6 @@
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -87,7 +88,63 @@ internal static partial class Program
             await player.OpenAsync(new Uri(PlaybackOptionsSilentWave("route-failure", 12)), CancellationToken.None);
             var a = new PlaybackOptionsFakeRoute("fake-working"); await player.SetOutputDeviceAsync(a);
             await Throws<MusicException>(() => player.SetOutputDeviceAsync(new PlaybackOptionsFakeRoute("fake-failed", fail: true)));
-            Assert(!player.IsPlaying && player.OutputDeviceId == "fake-working", "failed route left playback audible or changed preference");
+            Assert(!player.IsPlaying && player.OutputDeviceId == "fake-working" && player.OutputRouteIsValid,
+                "ordinary rollback did not restore a valid paused route");
+        });
+        await Run("PlaybackOptions: partial route and failed rollback block Play until all slots accept an output", async () =>
+        {
+            using var f = new PlaybackOptionsFixture("route-rollback");
+            await f.Play();
+            var previous = new PlaybackOptionsFakeRoute("fake-A");
+            await SelectRoute(previous);
+            var current = previous.Players.Single();
+            var next = new TrackRow { Id = "rollback-next", RequestId = "rollback-next", Title = "Silent prepared track",
+                Available = true, DurationMs = 30000, LocalPath = PlaybackOptionsSilentWave("rollback-next", 30) };
+            var queue = PlaybackOptionsField<PlaybackQueue>(f.Window, "_playbackQueue");
+            queue.SetItems([f.First, next], f.First);
+            PlaybackOptionsInvoke(f.Window, "RefreshNextPreparation");
+            await PreloadAwaitPrepared(f.Window);
+
+            var requested = new PlaybackOptionsFakeRoute("fake-B") { Reject = player => !ReferenceEquals(player, current) };
+            previous.Reject = player => ReferenceEquals(player, current);
+            f.Player.Seek(TimeSpan.FromSeconds(5));
+            await SelectRoute(requested);
+            var position = f.Player.Position;
+            Assert(requested.Players.SetEquals([current]) && !f.Player.OutputRouteIsValid && f.Player.OutputDeviceId == previous.Id,
+                "partial switch and failed rollback were treated as a valid route");
+            Assert(!f.Player.IsPlaying && f.Player.HasSource && !f.Player.HasPrepared && position.TotalSeconds >= 4,
+                "failed rollback lost the current position or left a playable prepared slot");
+            await f.Window.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+            await Throws<MusicException>(() => (Task)PlaybackOptionsInvoke(f.Window, "EnsureAudioOutputReadyAsync")!);
+            Assert(!f.Player.IsPlaying && Math.Abs((f.Player.Position - position).TotalSeconds) < .2, "Play bypassed the invalid route");
+
+            f.Outputs.HeldRoute = null;
+            await (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
+            Assert(f.Player.OutputRouteIsValid && f.Player.OutputDeviceId == previous.Id && !f.Player.IsPlaying,
+                "successful reapplication did not restore the route in pause");
+            await f.Window.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+            Assert(f.Player.IsPlaying && f.Player.Position.TotalSeconds >= position.TotalSeconds - .2,
+                "explicit Play did not resume on the recovered route");
+
+            Task SelectRoute(PlaybackOptionsFakeRoute route)
+            {
+                var resolved = new TaskCompletionSource<IAudioOutputRoute>(TaskCreationOptions.RunContinuationsAsynchronously);
+                resolved.SetResult(route);
+                f.Outputs.HeldRoute = resolved;
+                return (Task)PlaybackOptionsInvoke(f.Window, "ChangeAudioOutputAsync", route.Id, false)!;
+            }
+        });
+        await Run("PlaybackOptions: DeviceWatcher COM error cannot interrupt window cleanup", async () =>
+        {
+            using var f = new PlaybackOptionsFixture("watcher-disposal-error");
+            await f.Play();
+            var lifetime = PlaybackOptionsField<CancellationTokenSource>(f.Window, "_lifetime");
+            f.Outputs.DisposeFailure = new COMException("Synthetic watcher failure", unchecked((int)0x80004005));
+            f.Window.Close();
+            Assert(f.Outputs.DisposeCalls == 1 && PlaybackOptionsField<IAudioOutputDevices?>(f.Window, "_audioOutputDevices") is null,
+                "closed window retained its watcher");
+            Assert(PlaybackOptionsField<bool>(f.Window, "_closed") && lifetime.IsCancellationRequested && !f.Player.HasSource,
+                "watcher error interrupted window cleanup");
         });
         await Run("PlaybackOptions: UI after-track blocks next while minute timer fades pauses and restores position", async () =>
         {
@@ -133,6 +190,116 @@ internal static partial class Program
             await (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
             await (Task)PlaybackOptionsInvoke(f.Window, "EnsureAudioOutputReadyAsync")!;
             Assert(!f.Player.IsPlaying, "device reconnection resumed music automatically");
+        });
+        await Run("PlaybackOptions: a held reconnect cannot revive a removed endpoint or replace the newer list", async () =>
+        {
+            foreach (var superseded in new[] { false, true })
+            {
+                using var f = new PlaybackOptionsFixture(superseded ? "stale-reconnect" : "fresh-reconnect");
+                await f.Play();
+                await (Task)PlaybackOptionsInvoke(f.Window, "ChangeAudioOutputAsync", "fake-A", false)!;
+                f.Outputs.Available = false;
+                await (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
+                Assert(!f.Player.IsPlaying && PlaybackOptionsField<bool>(f.Window, "_audioOutputUnavailable"),
+                    "fixture did not pause the missing endpoint");
+
+                f.Outputs.Available = true;
+                f.Outputs.HeldRoute = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                var reconnect = (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
+                Assert(!reconnect.IsCompleted, "fixture did not suspend route resolution");
+                f.Outputs.Available = false;
+                if (superseded) await (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
+                var route = new PlaybackOptionsFakeRoute("fake-A");
+                f.Outputs.HeldRoute.SetResult(route);
+                await reconnect;
+                Assert(route.Players.Count == (superseded ? 0 : 1), "reconnect did not respect the latest refresh revision");
+                await Throws<MusicException>(() => (Task)PlaybackOptionsInvoke(f.Window, "EnsureAudioOutputReadyAsync")!);
+                await f.Window.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+                var choices = PlaybackOptionsField<ComboBox>(f.Window, "_audioOutputCombo").Items.Cast<AudioOutputDevice>();
+                Assert(!f.Player.IsPlaying && choices.Single(device => device.Id == "fake-A").Name == "Выбранное устройство недоступно",
+                    "late reconnect revived an unavailable endpoint or replaced the latest list");
+            }
+        });
+        await Run("PlaybackOptions: manual refresh restarts failed and aborted audio watchers without repeated attempts", async () =>
+        {
+            var outputs = new PlaybackOptionsFakeOutputs { WatchFailures = 1 };
+            using var f = new PlaybackOptionsFixture("watcher-recovery", outputs);
+            await f.Play();
+            Assert(outputs.WatchAttempts == 1 && !outputs.Watching, "initial watch failure was lost or retried automatically");
+            var refresh = PlaybackOptionsField<Button>(f.Window, "_audioOutputRefresh");
+            refresh.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Assert(outputs.WatchAttempts == 2 && outputs.Watching, "manual refresh did not renew a failed watch");
+            await (Task)PlaybackOptionsInvoke(f.Window, "ChangeAudioOutputAsync", "fake-A", false)!;
+            outputs.Watching = false; // Simulates a previously registered watcher entering Aborted.
+            refresh.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Assert(outputs.WatchAttempts == 3 && outputs.Watching, "manual refresh did not renew an aborted watch");
+            var listCount = outputs.ListRequests;
+            outputs.Available = false;
+            outputs.RaiseChanged();
+            outputs.RaiseChanged();
+            outputs.RaiseChanged();
+            await Until(() => !f.Player.IsPlaying && PlaybackOptionsField<bool>(f.Window, "_audioOutputUnavailable"));
+            Assert(outputs.WatchAttempts == 3 && outputs.ListRequests == listCount + 1,
+                "watcher burst did not coalesce or caused automatic registration retries");
+        });
+        await Run("PlaybackOptions: a stale explicit route leaves the previous preference and native slots paused", async () =>
+        {
+            foreach (var scenario in new[] { "before-apply", "fresh-confirmation", "superseded-confirmation" })
+            {
+                using var f = new PlaybackOptionsFixture("manual-route-" + scenario);
+                await f.Play();
+                await (Task)PlaybackOptionsInvoke(f.Window, "ChangeAudioOutputAsync", "fake-A", false)!;
+                f.Outputs.SecondAvailable = true;
+                await (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
+                var candidate = new PlaybackOptionsFakeRoute("fake-B");
+                f.Outputs.HeldRoute = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                TaskCompletionSource<IReadOnlyList<AudioOutputDevice>>? heldConfirmation = null;
+                if (scenario == "superseded-confirmation")
+                {
+                    heldConfirmation = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    f.Outputs.HeldList = heldConfirmation;
+                    f.Outputs.HeldRoute.SetResult(candidate);
+                }
+                var selection = (Task)PlaybackOptionsInvoke(f.Window, "ChangeAudioOutputAsync", "fake-B", false)!;
+                Assert(!selection.IsCompleted, "fixture did not hold the requested endpoint or its confirmation");
+                if (heldConfirmation is not null) await Until(() => f.Outputs.HeldList is null);
+                f.Outputs.SecondAvailable = false;
+                if (scenario != "fresh-confirmation") await (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
+                if (heldConfirmation is null) f.Outputs.HeldRoute.SetResult(candidate);
+                else heldConfirmation.SetResult([new("fake-A", "Fixture headphones"), new("fake-B", "Fixture speakers")]);
+                await selection;
+                var combo = PlaybackOptionsField<ComboBox>(f.Window, "_audioOutputCombo");
+                Assert(candidate.Players.Count == (scenario == "before-apply" ? 0 : 1) && f.Player.OutputDeviceId == "fake-A"
+                    && f.Player.OutputRouteIsValid && !f.Player.IsPlaying && f.Player.HasSource,
+                    "a removed manual endpoint changed the live route or resumed playback");
+                Assert(Equals(combo.SelectedValue, "fake-A") && !combo.Items.Cast<AudioOutputDevice>().Any(device => device.Id == "fake-B")
+                    && PlaybackOptionsField<PreferencesStore>(f, "_preferences").Load().OutputDeviceId == "fake-A",
+                    "a removed manual endpoint was persisted or survived in the list");
+                f.Outputs.HeldRoute = null;
+                await f.Window.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+                Assert(f.Player.IsPlaying && f.Player.OutputDeviceId == "fake-A", "the previous working route could not be resumed explicitly");
+            }
+        });
+        await Run("PlaybackOptions: newer available lists share a held reconnect and leave Play usable", async () =>
+        {
+            using var f = new PlaybackOptionsFixture("reconnect-newer-available");
+            await f.Play();
+            await (Task)PlaybackOptionsInvoke(f.Window, "ChangeAudioOutputAsync", "fake-A", false)!;
+            f.Outputs.Available = false;
+            await (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
+            f.Outputs.Available = true;
+            f.Outputs.HeldRoute = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            var resolutions = f.Outputs.ResolveRequests;
+            var reconnect = (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
+            await (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
+            await (Task)PlaybackOptionsInvoke(f.Window, "RefreshAudioOutputsAsync")!;
+            Assert(!reconnect.IsCompleted && f.Outputs.ResolveRequests == resolutions + 1, "refresh started overlapping reconnects");
+            f.Outputs.HeldRoute.SetResult(new PlaybackOptionsFakeRoute("fake-A"));
+            await reconnect;
+            await (Task)PlaybackOptionsInvoke(f.Window, "EnsureAudioOutputReadyAsync")!;
+            Assert(!f.Player.IsPlaying && f.Outputs.ResolveRequests == resolutions + 1, "reconnect revived Play or started a redundant route resolution");
+            await f.Window.HandleDesktopMediaCommandAsync(DesktopMediaAction.Play);
+            Assert(f.Player.IsPlaying && f.Player.OutputDeviceId == "fake-A", "surviving endpoint stayed blocked after reconnect");
         });
         await Run("QaFixes061: unavailable output blocks resume while normal pause and reconnect remain explicit", async () =>
         {
@@ -263,11 +430,45 @@ internal static partial class Program
                 && saved is not null && saved.CurrentIndex == 1 && saved.Tracks[saved.CurrentIndex].Id == next.Id,
                 "paused finalization skipped B quality, listening, sleep context or saved occurrence");
             await Call(f.Window, "TogglePlaybackAsync");
+            await Until(() => listeningClock.IsRunning);
             Assert(f.Player.IsPlaying && f.Player.SourceLocalPath == next.LocalPath && File.Exists(f.First.LocalPath!)
                 && ReferenceEquals(PlaybackOptionsField<object>(f.Window, "_waveListening"), listening) && listeningClock.IsRunning
                 && Control<TextBlock>(f.Window, "QualityText").Text == "Офлайн · QA prepared PCM B",
                 "new explicit resume lost B metadata/lifecycle or an offline file");
         });
+        await Run("QaFixes061: promoted short track completion owns the next occurrence before held output readiness", async () =>
+        {
+            using var f = new PlaybackOptionsFixture("promoted-short-ended");
+            var shortTrack = new TrackRow { Id = "promoted-short-b", RequestId = "promoted-short-b", Title = "Prepared short track",
+                Available = true, DurationMs = 1000, LocalPath = PlaybackOptionsSilentWave("promoted-short-b", 1) };
+            var last = new TrackRow { Id = "promoted-short-c", RequestId = "promoted-short-c", Title = "Following track",
+                Available = true, DurationMs = 30000, LocalPath = PlaybackOptionsSilentWave("promoted-short-c", 30) };
+            var queue = PlaybackOptionsField<PlaybackQueue>(f.Window, "_playbackQueue");
+            queue.SetItems([f.First, shortTrack, last], f.First);
+            await f.Play();
+            await PreloadAwaitPrepared(f.Window);
+            await f.Rendered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var shortOccurrence = queue.PeekNextOccurrenceToken(true);
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            PlaybackOptionsSet(f.Window, "_audioOutputReady", gate.Task);
+            var promotion = Call(f.Window, "AdvanceAsync", 1, false);
+            Assert(!promotion.IsCompleted && !gate.Task.IsCompleted && f.Player.IsPlaying
+                && queue.CurrentOccurrenceToken == shortOccurrence && f.Player.SourceLocalPath == shortTrack.LocalPath,
+                "fixture did not promote the short occurrence while output readiness was held");
+            var lastOccurrence = queue.PeekNextOccurrenceToken(true);
+
+            await Until(() => ReferenceEquals(queue.Current, last));
+            Assert(!gate.Task.IsCompleted && queue.CurrentOccurrenceToken == lastOccurrence && !f.Player.HasSource
+                && queue.History.SequenceEqual([f.First, shortTrack]),
+                "the short track completion was dropped or the following occurrence opened before readiness");
+            gate.TrySetResult();
+            await promotion.WaitAsync(TimeSpan.FromSeconds(5));
+            await Until(() => f.Player.IsPlaying && f.Player.SourceLocalPath == last.LocalPath
+                && !PlaybackOptionsField<bool>(f.Window, "_loadingStream"));
+            Assert(queue.CurrentOccurrenceToken == lastOccurrence && ReferenceEquals(queue.Current, last),
+                "the old promotion changed the occurrence after output became ready");
+        });
+
         await Run("QaFixes061: sleep and output pauses preserve promoted lifecycle while unopened and preview sources stay aborted", async () =>
         {
             foreach (var cause in new[] { "sleep", "removal", "failure", "expired-before-next" })
@@ -362,25 +563,38 @@ internal static partial class Program
                 var clock = (System.Diagnostics.Stopwatch)listening!.GetType().GetProperty("Clock")!.GetValue(listening)!;
                 Assert(!clock.IsRunning, name + ": paused listening clock still runs");
                 await Call(f.Window, "TogglePlaybackAsync");
+                await Until(() => clock.IsRunning);
                 Assert(f.Player.IsPlaying && clock.IsRunning && f.Player.SourceLocalPath == next.LocalPath
                     && ReferenceEquals(PlaybackOptionsField<object>(f.Window, "_waveListening"), listening),
                     name + ": explicit resume changed or failed to restore B lifecycle");
             }
 
-            using var preview = new PlaybackOptionsFixture("qa-promoted-preview");
-            var fragment = new TrackRow { Id = "qa-fragment", RequestId = "qa-fragment", Title = "Invalid short fixture", Available = true,
-                DurationMs = 120000, LocalPath = PlaybackOptionsSilentWave("qa-fragment", 30), LocalQuality = "Must not commit" };
-            var previewQueue = PlaybackOptionsField<PlaybackQueue>(preview.Window, "_playbackQueue");
-            previewQueue.SetItems([preview.First, fragment], preview.First);
-            await preview.Play(); await PreloadAwaitPrepared(preview.Window);
-            PlaybackOptionsField<Dictionary<TrackRow, (string SessionId, string BatchId, WaveMode Mode, string? TrackSeedId, string? AlbumSeedId)>>(preview.Window, "_waveSources")
-                [fragment] = ("qa-wave-session", "qa-wave-batch", WaveMode.Personal, null, null);
-            await Call(preview.Window, "AdvanceAsync", 1, false);
-            Assert(!preview.Player.IsPlaying && !preview.Player.HasSource && !fragment.IsPlaying
-                && PlaybackOptionsField<object?>(preview.Window, "_waveListening") is null
-                && Control<TextBlock>(preview.Window, "QualityText").Text == ""
-                && PlaybackOptionsField<Diagnostics>(preview.Window, "_diagnostics").Stage == "playback_error",
-                "preview-duration rejection happened after promoted metadata/listening commit");
+            foreach (var natural in new[] { false, true })
+            {
+                using var preview = new PlaybackOptionsFixture("qa-promoted-preview-" + natural);
+                var fragment = new TrackRow { Id = "qa-fragment", RequestId = "qa-fragment", Title = "Invalid short fixture", Available = true,
+                    DurationMs = 120000, LocalPath = PlaybackOptionsSilentWave("qa-fragment-" + natural, 30), LocalQuality = "Must not commit" };
+                var previewQueue = PlaybackOptionsField<PlaybackQueue>(preview.Window, "_playbackQueue");
+                previewQueue.SetItems([preview.First, fragment], preview.First);
+                await preview.Play(); await PreloadAwaitPrepared(preview.Window);
+                await preview.Rendered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                PlaybackOptionsField<Dictionary<TrackRow, (string SessionId, string BatchId, WaveMode Mode, string? TrackSeedId, string? AlbumSeedId)>>(preview.Window, "_waveSources")
+                    [fragment] = ("qa-wave-session", "qa-wave-batch", WaveMode.Personal, null, null);
+                var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                PlaybackOptionsSet(preview.Window, "_audioOutputReady", gate.Task);
+                if (natural) preview.Player.Pause(); // Native Ended reaches Advance with IsPlaying false.
+                var advance = Call(preview.Window, "AdvanceAsync", 1, natural);
+                Assert(!advance.IsCompleted && !preview.Player.HasSource && !fragment.IsPlaying
+                    && PlaybackOptionsField<object?>(preview.Window, "_waveListening") is null,
+                    "preview was promoted instead of waiting for readiness on the ordinary open path");
+                gate.TrySetResult();
+                await advance.WaitAsync(TimeSpan.FromSeconds(5));
+                Assert(!preview.Player.IsPlaying && !preview.Player.HasSource && !fragment.IsPlaying
+                    && PlaybackOptionsField<object?>(preview.Window, "_waveListening") is null
+                    && Control<TextBlock>(preview.Window, "QualityText").Text == ""
+                    && PlaybackOptionsField<Diagnostics>(preview.Window, "_diagnostics").Stage == "playback_error",
+                    "preview-duration rejection happened after promoted metadata/listening commit");
+            }
         });
         await Run("PlaybackOptions: settings render sleep and fake system output choices in Light Dark minimum and normal layouts", async () =>
         {
@@ -456,37 +670,78 @@ internal static partial class Program
     {
         public string Id => id;
         internal HashSet<Windows.Media.Playback.MediaPlayer> Players { get; } = [];
+        internal Func<Windows.Media.Playback.MediaPlayer, bool>? Reject { get; set; }
         public void Apply(Windows.Media.Playback.MediaPlayer player)
         {
-            if (fail) throw new InvalidOperationException("fake route failure");
+            if (fail || Reject?.Invoke(player) == true) throw new InvalidOperationException("fake route failure");
             Players.Add(player); // Deliberately does not access AudioDevice or a real endpoint.
         }
     }
     private sealed class PlaybackOptionsFakeOutputs : IAudioOutputDevices
     {
-        public event Action? Changed { add { } remove { } }
+        public event Action? Changed;
         internal bool Available { get; set; } = true;
+        internal bool SecondAvailable { get; set; }
         internal TaskCompletionSource<IAudioOutputRoute>? HeldRoute { get; set; }
-        public void Watch() { }
-        public void Dispose() { }
+        internal TaskCompletionSource<IReadOnlyList<AudioOutputDevice>>? HeldList { get; set; }
+        internal Exception? DisposeFailure { get; set; }
+        internal int DisposeCalls { get; private set; }
+        internal int WatchFailures { get; set; }
+        internal int WatchAttempts { get; private set; }
+        internal int ListRequests { get; private set; }
+        internal int ResolveRequests { get; private set; }
+        internal bool Watching { get; set; }
+        public void Watch()
+        {
+            if (Watching) return;
+            WatchAttempts++;
+            if (WatchFailures > 0)
+            {
+                WatchFailures--;
+                throw new COMException("Synthetic watcher start error", unchecked((int)0x80004005));
+            }
+            Watching = true;
+        }
+        internal void RaiseChanged()
+        {
+            if (Watching) Changed?.Invoke();
+        }
+        public void Dispose()
+        {
+            DisposeCalls++;
+            if (DisposeFailure is { } error) throw error;
+        }
         public Task<IReadOnlyList<AudioOutputDevice>> ListAsync()
-            => Task.FromResult<IReadOnlyList<AudioOutputDevice>>(Available ? [new("fake-A", "Fixture headphones")] : []);
+        {
+            ListRequests++;
+            if (HeldList is { } held)
+            {
+                HeldList = null;
+                return held.Task;
+            }
+            var devices = new List<AudioOutputDevice>();
+            if (Available) devices.Add(new("fake-A", "Fixture headphones"));
+            if (SecondAvailable) devices.Add(new("fake-B", "Fixture speakers"));
+            return Task.FromResult<IReadOnlyList<AudioOutputDevice>>(devices);
+        }
         public Task<IAudioOutputRoute> ResolveAsync(string id)
         {
+            ResolveRequests++;
             if (id.Length > 0 && !Available) throw new MusicException("Fixture device unavailable");
             return HeldRoute?.Task ?? Task.FromResult<IAudioOutputRoute>(new PlaybackOptionsFakeRoute(id));
         }
     }
     private sealed class PlaybackOptionsFixture : IDisposable
     {
-        internal readonly PlaybackOptionsFakeOutputs Outputs = new();
+        internal readonly PlaybackOptionsFakeOutputs Outputs;
         internal readonly NativePlayer Player;
         internal readonly MainWindow Window;
         internal readonly TrackRow First;
         internal readonly TaskCompletionSource Rendered = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly PreferencesStore _preferences;
-        internal PlaybackOptionsFixture(string name)
+        internal PlaybackOptionsFixture(string name, PlaybackOptionsFakeOutputs? outputs = null)
         {
+            Outputs = outputs ?? new();
             var directory = Path.Combine(_directory, "playback-options-" + name);
             _preferences = new PreferencesStore(directory); _preferences.Save(new() { Volume = 0 });
             Player = new NativePlayer(new AudioBuffer(Path.Combine(directory, "buffer"),

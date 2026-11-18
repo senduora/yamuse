@@ -28,7 +28,13 @@ internal sealed class TrackRow : INotifyPropertyChanged
     public string RequestId { get; init; } = "";
     public string Title { get; init; } = "Недоступный трек";
     public string Artist { get; init; } = "";
+    internal string? PrimaryArtistName { get; init; }
     public IReadOnlyList<ArtistReference> Artists { get; init; } = [];
+    // Older stores can already reconstruct a primary artist with a navigation ID.
+    internal string? PrimaryArtistNameToPersist => Artists is { Count: > 0 } && Artists[0].Name == PrimaryArtistName
+        ? null : PrimaryArtistName;
+    internal static bool ValidPrimaryArtistName(string? value) => value is null
+        || value.Length <= 4096 && !string.IsNullOrWhiteSpace(value) && !value.Any(char.IsControl);
     public string Album { get; init; } = "";
     public string? AlbumId { get; init; }
     private string? _coverUri;
@@ -43,8 +49,10 @@ internal sealed class TrackRow : INotifyPropertyChanged
     }
     public long DurationMs { get; init; }
     public bool Available { get; init; }
+    internal bool HasTrackMetadata { get; init; } = true;
     public string? LocalPath { get; init; }
     public string? LocalQuality { get; init; }
+    internal bool IsOfflineLibraryRow { get; init; }
     private bool _isLiked, _likeStateKnown, _canToggleLike;
     public bool IsLiked { get => _isLiked; set { if (_isLiked == value) return; _isLiked = value; Changed(); } }
     public bool LikeStateKnown { get => _likeStateKnown; set { if (_likeStateKnown == value) return; _likeStateKnown = value; Changed(); } }
@@ -54,7 +62,7 @@ internal sealed class TrackRow : INotifyPropertyChanged
     public string? DownloadedPath { get => _downloadedPath; set { if (_downloadedPath == value) return; _downloadedPath = value; Changed(); Changed(nameof(IsDownloaded)); Changed(nameof(DownloadBadge)); Changed(nameof(CanPlay)); Changed(nameof(RowOpacity)); } }
     public string? DownloadedQuality { get => _downloadedQuality; set { if (_downloadedQuality == value) return; _downloadedQuality = value; Changed(); } }
     public bool IsDownloaded => DownloadedPath is not null;
-    public bool CanPlay => Available || IsDownloaded;
+    public bool CanPlay => IsDownloaded || Available && !IsOfflineLibraryRow;
     public string DownloadBadge => IsDownloaded ? "✓" : "";
     public string Duration => DurationMs > 0 ? TimeSpan.FromMilliseconds(DurationMs).ToString(@"m\:ss") : "—";
     public double RowOpacity => CanPlay ? 1 : 0.45;
@@ -70,4 +78,5 @@ internal sealed class TrackRow : INotifyPropertyChanged
 internal sealed class MusicException(string message, bool authentication = false) : Exception(message)
 {
     public bool Authentication { get; } = authentication;
+    internal bool UntrustedMediaAddress { get; init; }
 }

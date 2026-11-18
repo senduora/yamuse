@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$OutputFolder,
-    [Parameter(Mandatory)][string]$ExpectedVersion,
+    [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$ExpectedVersion,
     [Parameter(Mandatory)][string]$ReferencePublishedFolder,
     [string]$ExpectedPackId = 'YMusic.Native',
     [string]$ExpectedProductSha256,
@@ -9,18 +9,88 @@ param([Parameter(Mandatory)][string]$OutputFolder,
     [string]$ExpectedIconSha256)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$outputPath = [IO.Path]::GetFullPath($OutputFolder)
+. (Join-Path $PSScriptRoot '..\ScriptPaths.ps1')
+. (Join-Path $PSScriptRoot 'PublishValidation.ps1')
+
+function Get-ZipEntrySha256($Entry) {
+    $entryStream = $Entry.Open()
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($algorithm.ComputeHash($entryStream)).Replace('-','') }
+    finally { $algorithm.Dispose(); $entryStream.Dispose() }
+}
+function Assert-FullReleaseAsset($Release, [string]$Version, [string]$PackageId, [IO.FileInfo]$Package, [string]$Sha256) {
+    if (@($Release.PSObject.Properties.Name).Count -ne 1 -or !$Release.PSObject.Properties['Assets'] -or
+        $Release.Assets -isnot [array] -or $Release.Assets.Count -ne 1) { throw 'Release feed must contain exactly one full asset.' }
+    $asset = $Release.Assets[0]
+    if ($asset.PackageId -cne $PackageId -or $asset.Version -cne $Version -or $asset.Type -cne 'Full' -or
+        $asset.FileName -cne $Package.Name -or $asset.FileName -cne "Yamuse-$Version-full.nupkg" -or
+        ($asset.Size -isnot [int] -and $asset.Size -isnot [long]) -or $asset.Size -ne $Package.Length -or
+        $asset.SHA256 -isnot [string] -or $asset.SHA256 -notmatch '^[A-Fa-f0-9]{64}$' -or $asset.SHA256 -ne $Sha256) {
+        throw 'Release feed does not describe the exact full Yamuse asset.'
+    }
+}
+function Assert-ReleaseIndexes([string]$Folder, [IO.FileInfo]$Package, $Release, [string]$Sha1) {
+    $entries = @(Get-Content -LiteralPath (Join-Path $Folder 'assets.win.json') -Raw | ConvertFrom-Json)
+    $expected = @{ Installer='Yamuse-win-Setup.exe'; Full=$Package.Name; Portable='Yamuse-win-Portable.zip' }
+    if ($entries.Count -ne $expected.Count) { throw 'assets.win.json must contain the Installer, Full and Portable entries.' }
+    foreach ($type in $expected.Keys) {
+        $matches = @($entries | Where-Object {
+            $keys = @($_.PSObject.Properties.Name)
+            $keys.Count -eq 2 -and 'Type' -cin $keys -and 'RelativeFileName' -cin $keys -and
+            $_.Type -is [string] -and $_.Type -ceq $type -and
+            $_.RelativeFileName -is [string] -and $_.RelativeFileName -ceq $expected[$type]
+        })
+        if ($matches.Count -ne 1) { throw "assets.win.json does not describe the exact $type asset." }
+    }
+    $sha1InRelease = $Release.Assets[0].SHA1
+    if ($sha1InRelease -isnot [string] -or $sha1InRelease -notmatch '^[A-Fa-f0-9]{40}$' -or $sha1InRelease -ne $Sha1) {
+        throw 'releases.win.json has the wrong Full asset SHA1.'
+    }
+    $length = $Package.Length.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $expectedLine = "$Sha1 $($Package.Name) $length"
+    $legacy = [IO.File]::ReadAllText((Join-Path $Folder 'RELEASES'))
+    if ($legacy -cnotin @($expectedLine, "$expectedLine`n", "$expectedLine`r`n")) {
+        throw 'RELEASES must contain exactly the Full package SHA1, filename and size.'
+    }
+}
+function Assert-ArchiveMatchesPublish($Archive, [string]$Prefix, $Files, [string[]]$GeneratedEntries) {
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $generated = [Collections.Generic.HashSet[string]]::new([string[]]$GeneratedEntries, [StringComparer]::Ordinal)
+    $matched = 0
+    foreach ($entry in $Archive.Entries) {
+        if (!$seen.Add($entry.FullName)) { throw "Duplicate archive entry: $($entry.FullName)" }
+        if ($generated.Remove($entry.FullName)) {
+            if (($entry.FullName -ceq '.portable') -ne ($entry.Length -eq 0)) { throw "Unexpected size for generated archive entry: $($entry.FullName)" }
+            continue
+        }
+        if (!$entry.FullName.StartsWith($Prefix, [StringComparison]::Ordinal)) { throw "Unexpected archive entry: $($entry.FullName)" }
+        $relative = $entry.FullName.Substring($Prefix.Length)
+        if (!$Files.ContainsKey($relative)) { throw "Unexpected packaged file: $relative" }
+        $source = $Files[$relative]
+        if ($entry.Length -ne $source.bytes -or (Get-ZipEntrySha256 $entry) -cne $source.sha256) { throw "Packaged file differs from the reference publish: $relative" }
+        $matched++
+    }
+    if ($generated.Count) { throw "Missing generated archive entries: $($generated -join ', ')" }
+    foreach ($relative in $Files.Keys) {
+        # Velopack 1.2.161 drops the runtime dump utility in both archives.
+        if ($relative -cne 'createdump.exe' -and !$Archive.GetEntry($Prefix + $relative)) { throw "Missing packaged file: $relative" }
+    }
+    return $matched
+}
+
+if ($ExpectedPackId -cne 'YMusic.Native') { throw 'Expected the official Yamuse package ID YMusic.Native.' }
+$outputPath = Resolve-YamuseFileSystemPath $OutputFolder
+$referencePath = Resolve-YamuseFileSystemPath $ReferencePublishedFolder
 foreach ($name in @('Yamuse-win-Setup.exe','Yamuse-win-Portable.zip',"Yamuse-$ExpectedVersion-full.nupkg")) {
     if (!(Test-Path -LiteralPath (Join-Path $outputPath $name) -PathType Leaf)) { throw 'Branded Yamuse download is missing.' }
 }
-$projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-$referencePath = [IO.Path]::GetFullPath($ReferencePublishedFolder)
+$projectRoot = Resolve-YamuseFileSystemPath (Join-Path $PSScriptRoot '..\..')
 $sourceIcon = Join-Path $projectRoot 'src\YMusic.Native\Assets\Yamuse.ico'
 if (!$ExpectedIconSha256) { $ExpectedIconSha256 = (Get-FileHash -LiteralPath $sourceIcon -Algorithm SHA256).Hash }
 if ((Get-FileHash -LiteralPath $sourceIcon -Algorithm SHA256).Hash -ne $ExpectedIconSha256) { throw 'Expected icon hash differs from the approved source.' }
 if (!$ExpectedProjectLicenseSha256) { $ExpectedProjectLicenseSha256 = (Get-FileHash -LiteralPath (Join-Path $projectRoot 'LICENSE') -Algorithm SHA256).Hash }
 if (!$ExpectedProjectNoticesSha256) {
-    $projectNoticesSource = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\THIRD-PARTY-NOTICES.txt'))
+    $projectNoticesSource = Join-Path $projectRoot 'THIRD-PARTY-NOTICES.txt'
     $ExpectedProjectNoticesSha256 = (Get-FileHash -LiteralPath $projectNoticesSource -Algorithm SHA256).Hash
 }
 $setups = @(Get-ChildItem -LiteralPath $outputPath -File -Filter '*Setup.exe')
@@ -31,6 +101,10 @@ $package = $packages[0]
 # Velopack 1.2.161's unsigned Setup appends the complete nupkg. Verify the
 # embedded payload too, so Legal notices/product DLL are proven in Setup.
 $packageHash = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash
+$release = Get-Content -LiteralPath (Join-Path $outputPath 'releases.win.json') -Raw | ConvertFrom-Json
+Assert-FullReleaseAsset $release $ExpectedVersion $ExpectedPackId $package $packageHash
+$packageSha1 = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA1).Hash
+Assert-ReleaseIndexes $outputPath $package $release $packageSha1
 $setupStream = [IO.File]::OpenRead($setup.FullName)
 $setupPayloadAlgorithm = [Security.Cryptography.SHA256]::Create()
 try {
@@ -41,56 +115,28 @@ try {
     if ($setupPayloadHash -ne $packageHash) { throw 'Setup does not embed the verified full package.' }
 } finally { $setupPayloadAlgorithm.Dispose(); $setupStream.Dispose() }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-function Get-ZipEntrySha256($Entry) {
-    $entryStream = $Entry.Open()
-    $algorithm = [Security.Cryptography.SHA256]::Create()
-    try { return [BitConverter]::ToString($algorithm.ComputeHash($entryStream)).Replace('-','') }
-    finally { $algorithm.Dispose(); $entryStream.Dispose() }
-}
-function Get-UniqueZipEntry($Archive, [string]$RelativePath) {
-    $entries = @($Archive.Entries | Where-Object { $_.FullName -cmatch ('(^|/)' + [regex]::Escape($RelativePath) + '$') })
-    if ($entries.Count -ne 1) { throw "Expected exactly one packaged file: $RelativePath" }
-    return $entries[0]
-}
-$runtimeVersion = '10.0.14'
-$runtimeConfig = Get-Content -LiteralPath (Join-Path $referencePath 'YMusic.Native.runtimeconfig.json') -Raw | ConvertFrom-Json
-if ($runtimeConfig.runtimeOptions.tfm -cne 'net10.0') { throw 'Reference publish must target .NET 10.' }
-foreach ($framework in @('Microsoft.NETCore.App','Microsoft.WindowsDesktop.App')) {
-    $included = @($runtimeConfig.runtimeOptions.includedFrameworks | Where-Object { $_.name -ceq $framework })
-    if ($included.Count -ne 1 -or $included[0].version -cne $runtimeVersion) { throw "Expected exactly one pinned $framework $runtimeVersion runtime." }
-}
-# Exact binary hashes from the signed 10.0.14 runtime nupkg entries. A changed
-# runtimeconfig alone must never relabel older runtime binaries as .NET 10.
-$runtimeProofHashes = @{
-    'coreclr.dll'='1BC65B8D45474B19ADF3CA85CE881087AFF599FFC72B2C1A323E878227757B65'
-    'PresentationFramework.dll'='15EC7AC7EAECDEABF3BFB378711F2C45BCD8A59D77BCD8254B9E90B776385189'
-    'YMusic.Native.runtimeconfig.json'=(Get-FileHash -LiteralPath (Join-Path $referencePath 'YMusic.Native.runtimeconfig.json') -Algorithm SHA256).Hash
-}
-foreach ($file in $runtimeProofHashes.Keys) {
-    if ((Get-FileHash -LiteralPath (Join-Path $referencePath $file) -Algorithm SHA256).Hash -ne $runtimeProofHashes[$file]) { throw "Reference publish differs from the pinned runtime: $file" }
+$referenceFiles = Get-PublishedFileInventory $referencePath
+$runtimeProof = Assert-PinnedPublishRuntime $referencePath $ExpectedVersion $referenceFiles
+$runtimeProofHashes = @{}
+foreach ($file in @('coreclr.dll','hostfxr.dll','hostpolicy.dll','PresentationFramework.dll','Velopack.dll','YMusic.Native.deps.json','YMusic.Native.runtimeconfig.json')) {
+    $runtimeProofHashes[$file] = $referenceFiles[$file].sha256
 }
 $archive = [IO.Compression.ZipFile]::OpenRead($package.FullName)
 try {
-    $nuspec = $archive.Entries | Where-Object { $_.FullName -like '*.nuspec' } | Select-Object -First 1
+    $fullGenerated = @('[Content_Types].xml','setup.ico','YMusic.Native.nuspec','_rels/.rels','lib/app/sq.version','lib/app/Squirrel.exe','lib/app/Yamuse_ExecutionStub.exe')
+    $fullMatchCount = Assert-ArchiveMatchesPublish $archive 'lib/app/' $referenceFiles $fullGenerated
+    $nuspec = $archive.GetEntry('YMusic.Native.nuspec')
     $reader = [IO.StreamReader]::new($nuspec.Open())
     try { [xml]$metadata = $reader.ReadToEnd() } finally { $reader.Dispose() }
     $id = $metadata.package.metadata.id
     $version = $metadata.package.metadata.version
-    if ($id -ne $ExpectedPackId -or $version -ne $ExpectedVersion) { throw 'Package id/version mismatch.' }
+    if ($id -isnot [string] -or $id -cne $ExpectedPackId -or $version -isnot [string] -or $version -cne $ExpectedVersion) { throw 'Package id/version mismatch.' }
     if ($metadata.package.metadata.title -ne 'Yamuse' -or $metadata.package.metadata.authors -ne 'senduora') { throw 'Package display title/authors must be Yamuse/senduora.' }
-    if ($ExpectedPackId -eq 'YMusic.Native.Prototype') { throw 'Install root must not be the existing user-data folder.' }
-    $mainExeEntry = $archive.Entries | Where-Object { $_.FullName -match 'YMusic\.Native\.exe$' } | Select-Object -First 1
-    if (!$mainExeEntry) { throw 'Main executable missing from full package.' }
     $mainExePath = Join-Path $referencePath 'YMusic.Native.exe'
-    $mainExeHash = (Get-FileHash -LiteralPath $mainExePath -Algorithm SHA256).Hash
-    if ((Get-ZipEntrySha256 $mainExeEntry) -ne $mainExeHash) { throw 'Packaged executable differs from the reference publish.' }
+    $mainExeHash = $referenceFiles['YMusic.Native.exe'].sha256
     $mainExeInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($mainExePath)
     if ($mainExeInfo.ProductName -ne 'Yamuse' -or $mainExeInfo.FileDescription -ne 'Yamuse') { throw 'Main executable ProductName/Title must be Yamuse.' }
-    $iconEntry = $archive.Entries | Where-Object { $_.FullName -match 'Assets/Yamuse\.ico$' } | Select-Object -First 1
-    if (!$iconEntry) { throw 'Required physical Yamuse icon is missing.' }
-    if ((Get-ZipEntrySha256 $iconEntry) -ne $ExpectedIconSha256) { throw 'Packaged Yamuse icon differs from the approved source.' }
-    $productEntry = $archive.Entries | Where-Object { $_.FullName -match 'YMusic\.Native\.dll$' } | Select-Object -First 1
-    if (!$productEntry) { throw 'Product DLL missing from full package.' }
+    if ($referenceFiles['Assets/Yamuse.ico'].sha256 -ne $ExpectedIconSha256 -or (Get-ZipEntrySha256 ($archive.GetEntry('setup.ico'))) -ne $ExpectedIconSha256) { throw 'Packaged Yamuse icon differs from the approved source.' }
     $noticeHashes = @{
         'Velopack-LICENSE.txt'='91845DB83551C877EBBB1118E0FB92E4E527290D23B995C55DCD438B3293943F'
         'Microsoft.NETCore-LICENSE.txt'='D7A68596AB69B06F51CA278A6545148E4269A9381C26D597C13DF5D88E08CF5B'
@@ -100,32 +146,25 @@ try {
         'Yamuse-LICENSE.txt'=$ExpectedProjectLicenseSha256
     }
     foreach ($notice in $noticeHashes.Keys) {
-        $noticeEntry = $archive.Entries | Where-Object { $_.FullName -match ('Legal/' + [regex]::Escape($notice) + '$') } | Select-Object -First 1
-        if (!$noticeEntry) { throw "Required third-party notice missing: $notice" }
-        if ((Get-ZipEntrySha256 $noticeEntry) -ne $noticeHashes[$notice]) { throw "Third-party notice differs from the verified source: $notice" }
+        if ($referenceFiles["Legal/$notice"].sha256 -ne $noticeHashes[$notice]) { throw "Third-party notice differs from the verified source: $notice" }
     }
-    foreach ($file in $runtimeProofHashes.Keys) {
-        $runtimeEntry = Get-UniqueZipEntry $archive $file
-        if ((Get-ZipEntrySha256 $runtimeEntry) -ne $runtimeProofHashes[$file]) { throw "Packaged runtime differs from the pinned publish: $file" }
-    }
-    $productHash = Get-ZipEntrySha256 $productEntry
+    $productHash = $referenceFiles['YMusic.Native.dll'].sha256
     if ($ExpectedProductSha256 -and $productHash -ne $ExpectedProductSha256) { throw 'Packaged product DLL differs from the checked publish SHA-256.' }
-    if ($productHash -ne (Get-FileHash -LiteralPath (Join-Path $referencePath 'YMusic.Native.dll') -Algorithm SHA256).Hash) { throw 'Packaged product DLL differs from the reference publish.' }
+    $generatedPortableHashes = @{
+        'Update.exe' = Get-ZipEntrySha256 ($archive.GetEntry('lib/app/Squirrel.exe'))
+        'Yamuse.exe' = Get-ZipEntrySha256 ($archive.GetEntry('lib/app/Yamuse_ExecutionStub.exe'))
+        'current/sq.version' = Get-ZipEntrySha256 ($archive.GetEntry('lib/app/sq.version'))
+    }
+    if ((Get-ZipEntrySha256 $nuspec) -cne $generatedPortableHashes['current/sq.version']) { throw 'Packaged Velopack sq.version differs from the nuspec.' }
     $nuspecText = $metadata.OuterXml
     $inventory = @($archive.Entries | ForEach-Object { [pscustomobject]@{name=$_.FullName;bytes=$_.Length} })
 } finally { $archive.Dispose() }
-$portableHashes = @{
-    'YMusic.Native.dll'=$productHash
-    'YMusic.Native.exe'=$mainExeHash
-    'Assets/Yamuse.ico'=$ExpectedIconSha256
-}
-foreach ($file in $runtimeProofHashes.Keys) { $portableHashes[$file] = $runtimeProofHashes[$file] }
-foreach ($notice in $noticeHashes.Keys) { $portableHashes[('Legal/' + $notice)] = $noticeHashes[$notice] }
 $portableArchive = [IO.Compression.ZipFile]::OpenRead((Join-Path $outputPath 'Yamuse-win-Portable.zip'))
 try {
-    foreach ($file in $portableHashes.Keys) {
-        $entry = Get-UniqueZipEntry $portableArchive $file
-        if ((Get-ZipEntrySha256 $entry) -ne $portableHashes[$file]) { throw "Portable file differs from the verified full package: $file" }
+    $portableGenerated = @('.portable','Update.exe','Yamuse.exe','current/sq.version')
+    $portableMatchCount = Assert-ArchiveMatchesPublish $portableArchive 'current/' $referenceFiles $portableGenerated
+    foreach ($file in $generatedPortableHashes.Keys) {
+        if ((Get-ZipEntrySha256 ($portableArchive.GetEntry($file))) -cne $generatedPortableHashes[$file]) { throw "Portable Velopack file differs from the full package: $file" }
     }
 } finally { $portableArchive.Dispose() }
 
@@ -236,21 +275,14 @@ if ($manifest -notmatch 'requestedExecutionLevel\s+level=["'']asInvoker["'']') {
 $manifest | Set-Content -LiteralPath (Join-Path $outputPath 'setup.manifest.xml') -Encoding utf8
 $nuspecText | Set-Content -LiteralPath (Join-Path $outputPath 'package.nuspec.xml') -Encoding utf8
 
-$releasePath = Join-Path $outputPath 'releases.win.json'
-$release = Get-Content -LiteralPath $releasePath -Raw | ConvertFrom-Json
-foreach ($asset in $release.Assets) {
-    if ($asset.FileName -ne [IO.Path]::GetFileName($asset.FileName)) { throw 'Unsafe release asset name.' }
-    $assetFile = Join-Path $outputPath $asset.FileName
-    if (!(Test-Path -LiteralPath $assetFile)) { throw 'Release asset missing.' }
-    if ((Get-Item -LiteralPath $assetFile).Length -ne $asset.Size) { throw 'Release asset size mismatch.' }
-    if ($asset.SHA256 -and (Get-FileHash -LiteralPath $assetFile -Algorithm SHA256).Hash -ne $asset.SHA256) { throw 'Release asset SHA-256 mismatch.' }
-}
 $evidence = [pscustomobject]@{
     inspectedAt=(Get-Date -Format o); packId=$id; version=$version; productDllSha256=$productHash; legalNoticesVerified=$true; projectNoticesSha256=$ExpectedProjectNoticesSha256;
     product='Yamuse'; authors='senduora'; projectLicenseSha256=$ExpectedProjectLicenseSha256; iconSha256=$ExpectedIconSha256;
     mainExecutableSha256=$mainExeHash; mainExecutableProduct=$mainExeInfo.ProductName; executableIconMatches=$executableIconMatches; setupIconMatches=$setupIconMatches; iconFrameSizes=[YamuseIconVerifier]::FrameSizes($sourceIcon);
     setupEmbedsVerifiedNupkg=$true; setupPackageOffset=$payloadOffset; setupEmbeddedNupkgSha256=$setupPayloadHash;
-    runtime=$runtimeVersion; runtimeFilesSha256=$runtimeProofHashes; portableMatchesVerifiedFiles=$true;
+    runtime=$runtimeProof.version; runtimeFilesSha256=$runtimeProofHashes; runtimeValidation=$runtimeProof;
+    fullMatchesVerifiedFiles=$true; fullMatchedFileCount=$fullMatchCount; portableMatchesVerifiedFiles=$true; portableMatchedFileCount=$portableMatchCount;
+    officialFullAssetVerified=$true; assetIndexVerified=$true; legacyReleaseIndexVerified=$true; fullPackageSha1=$packageSha1;
     setupFileVersion=$setup.VersionInfo.FileVersion; setupProduct=$setup.VersionInfo.ProductName;
     setupExecutionLevel='asInvoker'; setupExecuted=$false;
     setupSignature=(Get-AuthenticodeSignature -LiteralPath $setup.FullName).Status.ToString();

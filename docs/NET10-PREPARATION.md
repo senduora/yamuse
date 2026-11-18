@@ -2,7 +2,7 @@
 
 Начиная с Yamuse 0.5.0 основной проект, тесты и средства native QA используют
 .NET 10. Установщик и Portable включают runtime; отдельно ставить .NET для запуска
-готового клиента не требуется. Для сборки SDK **10.0.403** закреплён в global.json.
+готового клиента не требуется. Для сборки SDK **10.0.404** закреплён в global.json.
 
 ## Воспроизводимый сценарий
 
@@ -13,11 +13,11 @@
 
 TFM продукта и fixtures — `net10.0-windows10.0.19041.0`, Windows projection —
 `10.0.19041.57`. Выполняются locked restore, self-contained publish и build для
-win-x64. Фактические includedFrameworks должны быть `10.0.14`; publish и проверки
+win-x64. Фактические includedFrameworks должны быть `10.0.15`; publish и проверки
 используют одну product DLL. Velopack/vpk остаются **1.2.161**.
 
 ```powershell
-# Если SDK 10.0.403 установлен и доступен через dotnet.
+# Если SDK 10.0.404 установлен и доступен через dotnet.
 ./tools/Verify-Project.ps1 -RunName net10-check-001 -Full
 
 # Только restore/publish/build, без оконных проверок.

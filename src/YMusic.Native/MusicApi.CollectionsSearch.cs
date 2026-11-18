@@ -38,7 +38,7 @@ internal sealed partial class MusicApi
 
     private static bool IsEditorialPlaylist(JsonElement row)
     {
-        if (!row.TryGetProperty("owner", out var owner) || owner.ValueKind != JsonValueKind.Object
+        if (row.ValueKind != JsonValueKind.Object || !row.TryGetProperty("owner", out var owner) || owner.ValueKind != JsonValueKind.Object
             || !owner.TryGetProperty("verified", out var verified) || verified.ValueKind != JsonValueKind.True
             || Text(owner, "name") != "Яндекс Музыка") return false;
         // Exact public owner pairs verified from Yandex search responses on 2026-10-24.

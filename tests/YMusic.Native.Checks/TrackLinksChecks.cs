@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text.Json;
 using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
@@ -13,6 +14,7 @@ internal static partial class Program
         await Run("Track links037: player exposes exact individual artists and complete artist menu without changing queue", TlPlayerArtists);
         await Run("Track links037: album column opens exact album and Back preserves playlist selection and offset", TlAlbumNavigation);
         await Run("Track links037: legacy album resolves by exact track and portable updater stays inactive", TlLegacyAlbum);
+        await Run("Track links037: newer unresolved album link owns navigation before either response", TlLegacyAlbumLatestLookup);
         await Run("Track links037: update controls separate download and explicit restart and finish pending offline writes", TlUpdateControls);
     }
 
@@ -117,12 +119,53 @@ internal static partial class Program
         Assert(SaVisuals<Button>(panel).Single(button=>button.Name=="AppUpdateButton").IsEnabled==state.FeedConfigured,"portable manual check does not follow its configured feed");
     }
 
+    private static async Task TlLegacyAlbumLatestLookup()
+    {
+        using var f = new SaFixture("legacy-album-latest"); await f.Activate(); var window = f.Window;
+        var old = new TrackRow { Id = "older-link", RequestId = "older-link:earlier" };
+        var latest = new TrackRow { Id = "latest-link", RequestId = "latest-link:later" };
+        var enteredOld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var enteredLatest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseOld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseLatest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.RespondOverride = async (request, token) =>
+        {
+            if (request.RequestUri!.AbsolutePath != "/tracks") return null;
+            var body = Uri.UnescapeDataString(await request.Content!.ReadAsStringAsync(token));
+            var isOld = body.Contains(old.RequestId, StringComparison.Ordinal);
+            var row = isOld ? old : latest;
+            (isOld ? enteredOld : enteredLatest).TrySetResult();
+            await (isOld ? releaseOld : releaseLatest).Task;
+            return Json(JsonSerializer.Serialize(new
+            {
+                result = new[] { new { id = row.Id, title = row.Id,
+                    albums = new[] { new { id = isOld ? "earlier" : "later", title = "Альбом " + row.Id } } } }
+            }));
+        };
+        try
+        {
+            var pendingOld = Call(window, "OpenTrackAlbumAsync", old);
+            await enteredOld.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var pendingLatest = Call(window, "OpenTrackAlbumAsync", latest);
+            await enteredLatest.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            releaseOld.TrySetResult();
+            await pendingOld;
+            Assert(SaField<string>(window, "_section") == "favorites" && f.Handler.Seen.All(call => !call.Uri.AbsolutePath.StartsWith("/albums/", StringComparison.Ordinal)),
+                "the first response won after a newer link was clicked");
+            releaseLatest.TrySetResult();
+            await pendingLatest;
+            Assert(SaField<AlbumDetails?>(window, "_activeAlbumDetails")?.Id == "later" && !f.Player.HasSource,
+                "the newer exact album was never opened or changed playback");
+        }
+        finally { releaseOld.TrySetResult(); releaseLatest.TrySetResult(); }
+    }
+
     private static async Task TlUpdateControls()
     {
         using var fixture=new SaFixture("update-controls");
         var window=fixture.Window;await fixture.Activate();
         var directory=Path.Combine(_directory,"update-controls");Directory.CreateDirectory(directory);
-        var config=Path.Combine(directory,"feed.json");File.WriteAllText(config,"{\"githubRepository\":\"https://github.com/example/fixture\"}");
+        var config=Path.Combine(directory,"feed.json");File.WriteAllText(config,"{\"githubRepository\":\"https://github.com/senduora/yamuse\"}");
         var backend=new TlUpdateBackend();
         var service=new UpdateSupport(config,true,_=>backend);
         var panel=(FrameworkElement)typeof(MainWindow).GetMethod("CreateUpdateSettingsPanelCore",BindingFlags.NonPublic|BindingFlags.Instance)!.Invoke(window,[service])!;
@@ -136,9 +179,12 @@ internal static partial class Program
         var pending=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         typeof(MainWindow).GetField("_downloadTask",BindingFlags.NonPublic|BindingFlags.Instance)!.SetValue(window,pending.Task);
         typeof(MainWindow).GetField("_autoFavoritesEnabled",BindingFlags.NonPublic|BindingFlags.Instance)!.SetValue(window,true);
-        SaClick(button);await Task.Delay(30);
+        SaClick(button);await Until(()=>SaField<bool>(window,"_appUpdatePreparingRestart"));
         Assert(backend.Applies==0 && !button.IsEnabled,"restart did not wait for the pending offline write");
-        pending.TrySetResult();await Until(()=>backend.Applies==1 && button.IsEnabled);
+        pending.TrySetResult();await Until(()=>backend.Applies==1 && !SaField<bool>(window,"_appUpdateActionInProgress"));
+        SaClick(button);
+        Assert(backend.Checks==1 && backend.Downloads==1 && backend.Applies==1 && !button.IsEnabled
+            && SaField<bool>(window,"_startupUpdateRestartRequested"),"settings allowed a second action after explicit restart");
         Assert(SaField<bool>(window,"_autoFavoritesEnabled"),"restart changed the user's auto-download preference");
         Assert(!fixture.Player.HasSource,"update controls started or replaced media");
     }
@@ -147,7 +193,7 @@ internal static partial class Program
     {
         internal int Checks,Downloads,Applies;
         public string? PendingVersion{get;private set;}
-        public Task<string?> CheckAsync(){Checks++;return Task.FromResult<string?>("0.3.8");}
+        public Task<string?> CheckAsync(CancellationToken token){token.ThrowIfCancellationRequested();Checks++;return Task.FromResult<string?>("0.3.8");}
         public Task DownloadAsync(Action<int> progress,CancellationToken token)
         {token.ThrowIfCancellationRequested();Downloads++;progress(50);PendingVersion="0.3.8";progress(100);return Task.CompletedTask;}
         public void ApplyAndRestart(){Applies++;}

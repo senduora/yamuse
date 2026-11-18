@@ -13,9 +13,9 @@ internal sealed record CacheCleanupResult(int Removed, int Preserved, int Failed
 // caller keeps READ|DELETE access and denies writers/deleters until completion.
 internal static class ManagedCacheCleanup
 {
-    internal static void RenameByHandle(SafeFileHandle handle, string destination)
+    internal static void RenameByHandle(SafeFileHandle handle, string destination, bool replace = false, bool releaseDeleteDisposition = false)
     {
-        var name = Encoding.Unicode.GetBytes(Path.GetFullPath(destination));
+        var name = Encoding.Unicode.GetBytes(UninstallPathGuard.ToWin32Path(Path.GetFullPath(destination)));
         var nameOffset = Marshal.OffsetOf<RenameInformation>(nameof(RenameInformation.FileName)).ToInt32();
         // FILE_RENAME_INFO.FileName is a NUL-terminated WCHAR string even
         // though FileNameLength excludes that terminator.
@@ -27,8 +27,11 @@ internal static class ManagedCacheCleanup
             Marshal.WriteInt32(information, Marshal.OffsetOf<RenameInformation>(nameof(RenameInformation.FileNameLength)).ToInt32(), name.Length);
             Marshal.Copy(name, 0, information + nameOffset, name.Length);
             Marshal.WriteInt16(information, nameOffset + name.Length, 0);
-            // ReplaceIfExists is false: neither staging nor recovery overwrites
-            // a file created by somebody else.
+            // Only index commits opt into replacing the fixed destination entry.
+            if (replace) Marshal.WriteByte(information, 0, 1);
+            // Prepare the full rename first, then release a temporary file's
+            // delete-pending state immediately before the kernel publish.
+            if (releaseDeleteDisposition) UninstallPathGuard.SetDeleteDisposition(handle, delete: false);
             if (!SetFileInformationByHandle(handle, 3, information, (uint)size))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
         }

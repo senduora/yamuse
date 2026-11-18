@@ -46,20 +46,44 @@ internal sealed class AudioOutputDevices : IAudioOutputDevices
 
     public void Watch()
     {
-        if (_watcher is not null) return;
-        _watcher = DeviceInformation.CreateWatcher(MediaDevice.GetAudioRenderSelector());
-        _watcher.Added += OnAdded; _watcher.Removed += OnRemoved; _watcher.Updated += OnUpdated;
-        _watcher.Start();
+        if (_watcher is { } current)
+        {
+            if (current.Status is not (DeviceWatcherStatus.Aborted or DeviceWatcherStatus.Stopped)) return;
+            TryDisposeWatcher();
+        }
+        var watcher = DeviceInformation.CreateWatcher(MediaDevice.GetAudioRenderSelector());
+        _watcher = watcher;
+        try
+        {
+            watcher.Added += OnAdded; watcher.Removed += OnRemoved; watcher.Updated += OnUpdated;
+            watcher.Start();
+        }
+        catch
+        {
+            TryDisposeWatcher();
+            throw;
+        }
     }
     private void OnAdded(DeviceWatcher sender, DeviceInformation args) => Changed?.Invoke();
     private void OnRemoved(DeviceWatcher sender, DeviceInformationUpdate args) => Changed?.Invoke();
     private void OnUpdated(DeviceWatcher sender, DeviceInformationUpdate args) => Changed?.Invoke();
+    private void TryDisposeWatcher()
+    {
+        try { Dispose(); }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException) { }
+    }
     public void Dispose()
     {
         if (_watcher is not { } watcher) return;
         _watcher = null;
-        watcher.Added -= OnAdded; watcher.Removed -= OnRemoved; watcher.Updated -= OnUpdated;
-        if (watcher.Status is DeviceWatcherStatus.Started or DeviceWatcherStatus.EnumerationCompleted) watcher.Stop();
+        try
+        {
+            watcher.Added -= OnAdded; watcher.Removed -= OnRemoved; watcher.Updated -= OnUpdated;
+        }
+        finally
+        {
+            if (watcher.Status is DeviceWatcherStatus.Started or DeviceWatcherStatus.EnumerationCompleted) watcher.Stop();
+        }
     }
     private sealed class DeviceRoute(DeviceInformation device) : IAudioOutputRoute
     {

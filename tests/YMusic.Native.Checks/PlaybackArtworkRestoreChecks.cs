@@ -21,16 +21,21 @@ internal static partial class Program
         await Run("PlaybackArtwork: safe canonical artwork roundtrips every occurrence without audio locations", PaRoundtrip);
         await Run("PlaybackArtwork: shared track metadata retains playback covers and forbids them in download snapshots", PaDownloadContract);
         await Run("PlaybackArtwork: legacy version one and validated offline artwork fallback remain compatible", PaLegacyOffline);
+        await Run("PlaybackArtwork: offline audio from another edition leaves the exact cover for hydration", PaDifferentOfflineAlbum);
+        await Run("PlaybackArtwork: optional covers cannot crowd out a valid queue or resume position", PaArtworkBudget);
         await Run("PlaybackArtwork: untrusted persisted artwork is rejected and capture never saves signed locations", PaUnsafe);
         await Run("PlaybackArtwork: missing-only artwork updates notify existing row bindings once", PaNotifications);
         await Run("PlaybackArtwork: cold new windows render saved player and queue covers while paused", PaReopen);
         await Run("PlaybackArtwork: held legacy hydration batches exact composite IDs current first and preserves row selection", PaHydrate);
+        await Run("PlaybackArtwork: restored cover appears in open lyrics without loading text again", PaHydrateLyrics);
         await Run("PlaybackArtwork: metadata with wrong album or unsafe cover cannot fill restored artwork", PaMetadataGuards);
         await Run("PlaybackArtwork: bare legacy IDs use confirmed saved album hints without changing queue identity", PaLegacyAlbumHints);
         await Run("PlaybackArtwork: requested album alone supplies fallback artwork and direct track cover keeps precedence", PaPreferredAlbumCovers);
         await Run("PlaybackArtwork: repeated track IDs in distinct response album contexts retain exact composite covers", PaCompositeResponses);
         await Run("PlaybackArtwork: logout account change cancellation and replaced queue reject held metadata", PaStale);
-        await Run("PlaybackArtwork: closing the window cancels held artwork without republishing state", PaClosed);
+        await Run("PlaybackArtwork: closing during media open and held artwork retains the restored position", PaClosed);
+        await Run("PlaybackArtwork: an unreadable resume snapshot survives a later writable close", PaUnreadableOnRestore);
+        await Run("PlaybackArtwork: playback resumes from a saved seek even when metadata duration is unknown", PaUnknownDuration);
         await Run("PlaybackArtwork: optional metadata failure preserves restored queue position and paused state", PaFailure);
     }
 
@@ -132,6 +137,52 @@ internal static partial class Program
         Assert(invalidMedia.Tracks[0].CoverUri is null && invalidMedia.Tracks[1].CoverUri is null
             && invalidMedia.Tracks[0].DownloadedPath is null, "invalid indexed media supplied fallback artwork");
         return Task.CompletedTask;
+    }
+
+    private static async Task PaDifferentOfflineAlbum()
+    {
+        var directory = PaDirectory("cross-album-offline");
+        new PlaybackStateStore(directory).Save(PlaybackStateStore.Capture("12345", PaQueue([PaRow("101")], 0), 77.25));
+        var music = Path.Combine(directory, "offline"); Directory.CreateDirectory(music);
+        var alternate = PaOffline("101", "alternate.mp3", PaOtherCover) with { RequestId = "101:92", AlbumId = "92" };
+        var media = Path.Combine(music, alternate.FileName);
+        File.WriteAllBytes(media, [1, 2, 3, 4, 5]);
+        File.WriteAllText(Path.Combine(music, "library.index.json"), JsonSerializer.Serialize(new[] { alternate }));
+
+        using var fixture = new PaFixture(directory, "window", async (request, token) =>
+        {
+            var ids = await PaRequestedIds(request, token);
+            Assert(ids.SequenceEqual(["101:91"]), "hydration requested the cached audio edition");
+            return PaMetadata(ids);
+        });
+        await fixture.OpenAndRestore(); await fixture.WaitArtwork();
+        Assert(fixture.Queue.Current is { RequestId: "101:91", AlbumId: "91", CoverUri: PaCover } row && row.DownloadedPath == media,
+            "a shared audio file selected the wrong edition artwork or lost the download");
+        PaAssertPaused(fixture, 1, 0);
+    }
+
+    private static async Task PaArtworkBudget()
+    {
+        var directory = PaDirectory("fallback-budget"); var store = new PlaybackStateStore(directory);
+        var snapshot = PlaybackStateStore.Capture("12345", PaQueue([PaRow("102")], 0), 2);
+        var row = snapshot.Tracks[0] with { Title = new string('x', 4096) };
+        var options = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+        var rowBytes = JsonSerializer.SerializeToUtf8Bytes(row, options).Length + 1;
+        var count = (PlaybackStateStore.MaximumBytes - 512) / rowBytes;
+        var legacy = snapshot with { Tracks = Enumerable.Repeat(row, count).ToArray(), CurrentIndex = count - 1 };
+        store.Save(legacy);
+        var updated = legacy with
+        {
+            Tracks = Enumerable.Repeat(row with { CoverUri = PaCover }, count).ToArray(),
+            PositionSeconds = 77.25
+        };
+        Assert(JsonSerializer.SerializeToUtf8Bytes(updated, options).Length > PlaybackStateStore.MaximumBytes,
+            "fixture artwork did not exceed the serialization limit");
+        await store.SaveInBackgroundAsync(updated);
+        var saved = store.Load("12345");
+        Assert(saved is { PositionSeconds: 77.25 } && saved.CurrentIndex == legacy.CurrentIndex
+            && saved.Tracks.Count == count && saved.Tracks.All(track => track.RequestId == row.RequestId && track.CoverUri is null),
+            "dropping excess optional artwork lost the saved queue or position");
     }
 
     private static Task PaUnsafe()
@@ -238,6 +289,50 @@ internal static partial class Program
                 existingInstances = true, selectedIndex = list.SelectedIndex, currentIndex = queue.CurrentIndex, position = "1:17", fixture.MediaRequests }, new JsonSerializerOptions { WriteIndented = true }));
         }
         finally { release.TrySetResult(); }
+    }
+
+    private static async Task PaHydrateLyrics()
+    {
+        var directory = PaDirectory("hydrate-lyrics");
+        new PlaybackStateStore(directory).Save(PlaybackStateStore.Capture("12345", PaQueue([PaRow("8181")], 0), 77.25));
+        var metadataEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseMetadata = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var lyricsRequests = 0;
+        Task<HttpResponseMessage> NoLyrics(HttpRequestMessage _, CancellationToken __)
+        {
+            Interlocked.Increment(ref lyricsRequests);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        }
+        using var lyricsHttp = new HttpClient(new FakeHandler(NoLyrics));
+        using var fixture = new PaFixture(directory, "window", async (request, token) =>
+        {
+            var ids = await PaRequestedIds(request, token);
+            metadataEntered.SetResult();
+            await releaseMetadata.Task;
+            return PaMetadata(ids);
+        });
+        try
+        {
+            PaSet(fixture.Window, "_geniusLyrics", new GeniusLyricsClient(new FakeHandler(NoLyrics)));
+            PaField<LrclibLyricsClient?>(fixture.Window, "_lrclibLyrics")?.Dispose();
+            PaSet(fixture.Window, "_lrclibLyrics", new LrclibLyricsClient(lyricsHttp));
+            await fixture.OpenAndRestore();
+            await metadataEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            PaInvoke(fixture.Window, "SetLyricsVisible", true);
+            var lyrics = Control<ListBox>(fixture.Window, "LyricsList");
+            var cover = Control<Image>(fixture.Window, "LyricsCover");
+            var lines = new[] { new LyricLine(5, "Displayed fixture line") };
+            lyrics.ItemsSource = lines;
+            Assert(cover.IsVisible && cover.Source is null, "lyrics did not start visible and without restored artwork");
+
+            releaseMetadata.SetResult();
+            await fixture.WaitArtwork();
+            await Until(() => Artwork.GetLoadStatus(cover) == ArtworkLoadStatus.Ready);
+            Assert(Artwork.GetSourceUri(cover) == PaCover && ReferenceEquals(lyrics.ItemsSource, lines)
+                && fixture.ApiHandler.Seen.Count == 1 && lyricsRequests == 0,
+                "hydration changed the displayed lyrics or requested their providers again");
+        }
+        finally { releaseMetadata.TrySetResult(); }
     }
 
     private static async Task PaMetadataGuards()
@@ -388,8 +483,8 @@ internal static partial class Program
 
     private static async Task PaClosed()
     {
-        var directory = PaDirectory("closed");
-        new PlaybackStateStore(directory).Save(PlaybackStateStore.Capture("12345", PaQueue([PaRow("9101")], 0), 77.25));
+        var directory = PaDirectory("closed"); var store = new PlaybackStateStore(directory);
+        store.Save(PlaybackStateStore.Capture("12345", PaQueue([PaRow("9101"), PaRow("9101")], 1), 77.25));
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var fixture = new PaFixture(directory, "window", async (request, _) =>
@@ -397,14 +492,72 @@ internal static partial class Program
         try
         {
             await fixture.OpenAndRestore(); await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            var original = fixture.Queue.Items.Single(); var pending = PaField<Task?>(fixture.Window, "_restoredArtworkTask")!;
+            var original = fixture.Queue.Current!; var pending = PaField<Task?>(fixture.Window, "_restoredArtworkTask")!;
+            await fixture.Player.SetOutputDeviceAsync(new PlaybackOptionsFakeRoute("fixture-resume"));
+            var opening = fixture.Player.OpenPausedAsync(new Uri(PlaybackOptionsSilentWave("close-during-resume", 4)), default);
+            // MediaOpened posts to this dispatcher. Close in the same dispatcher turn as source assignment.
+            Assert(fixture.Player.HasSource && !opening.IsCompleted, "decoder did not begin opening synchronously");
             fixture.Close(); var afterClose = File.ReadAllBytes(Path.Combine(directory, PlaybackStateStore.FileName));
-            release.TrySetResult(); await pending.WaitAsync(TimeSpan.FromSeconds(5));
+            release.TrySetResult();
+            try { await opening.WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (OperationCanceledException) { }
+            await pending.WaitAsync(TimeSpan.FromSeconds(5));
             Assert(original.CoverUri is null && fixture.ArtworkRequests == 0
+                && store.Load("12345") is { CurrentIndex: 1, PositionSeconds: 77.25 }
                 && afterClose.SequenceEqual(File.ReadAllBytes(Path.Combine(directory, PlaybackStateStore.FileName))),
-                "late artwork mutated or saved state after window close");
+                "closing during open lost the saved duplicate position or late artwork changed the snapshot");
         }
         finally { release.TrySetResult(); }
+    }
+
+    private static async Task PaUnreadableOnRestore()
+    {
+        var directory = PaDirectory("unreadable-on-restore"); var store = new PlaybackStateStore(directory);
+        store.Save(PlaybackStateStore.Capture("12345", PaQueue([PaRow("9102", PaCover)], 0), 77.25));
+        var path = Path.Combine(directory, PlaybackStateStore.FileName);
+        var original = File.ReadAllBytes(path);
+        using (var fixture = new PaFixture(directory, "blocked"))
+        {
+            using (var held = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None))
+                await fixture.OpenAndRestore(session: false);
+            Assert(fixture.Queue.Items.Count == 0, "the held snapshot unexpectedly loaded");
+            fixture.Close();
+        }
+        Assert(original.SequenceEqual(File.ReadAllBytes(path)), "close overwrote a temporarily unavailable valid snapshot");
+        using var reopened = new PaFixture(directory, "reopened");
+        await reopened.OpenAndRestore(session: false);
+        PaAssertPaused(reopened, 1, 0);
+    }
+
+    private static async Task PaUnknownDuration()
+    {
+        var directory = PaDirectory("unknown-duration"); var store = new PlaybackStateStore(directory);
+        var music = Path.Combine(directory, "offline"); Directory.CreateDirectory(music);
+        var file = Path.Combine(music, "unknown.mp3");
+        File.Copy(PlaybackOptionsSilentWave("resume-unknown-duration", 6), file);
+        var bytes = File.ReadAllBytes(file);
+        var item = PaOffline("9103", "unknown.mp3", PaCover) with
+        {
+            DurationMs = 0, Bytes = bytes.Length, Sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes))
+        };
+        File.WriteAllText(Path.Combine(music, "library.index.json"), JsonSerializer.Serialize(new[] { item }));
+        store.Save(PlaybackStateStore.Capture("12345", PaQueue([PaRow("9103", PaCover, durationMs: 0)], 0), 0));
+        using (var fixture = new PaFixture(directory, "before"))
+        {
+            await fixture.OpenAndRestore(session: false);
+            await fixture.Window.PlayTrackAsync(fixture.Queue.Current!);
+            fixture.Player.Pause();
+            PaInvoke(fixture.Window, "CommitSeek", 2.25d);
+            fixture.Close();
+        }
+        Assert(store.Load("12345") is { PositionSeconds: > 2 and < 3 }, "metadata duration zero erased the native seek position");
+        using var reopened = new PaFixture(directory, "after");
+        await reopened.OpenAndRestore(session: false);
+        Assert(!reopened.Player.HasSource && Control<TextBlock>(reopened.Window, "PositionText").Text == "0:02",
+            "unknown-duration track did not restore its paused position");
+        await reopened.Window.PlayTrackAsync(reopened.Queue.Current!);
+        await Until(() => reopened.Player.Position.TotalSeconds > 2);
+        Assert(reopened.Player.IsPlaying && reopened.MediaRequests == 0, "explicit resume did not seek the indexed audio");
     }
 
     private static async Task PaFailure()
@@ -422,10 +575,10 @@ internal static partial class Program
 
     private static string PaDirectory(string name)
     { var path = Path.Combine(_directory, "playback-artwork", name); Directory.CreateDirectory(path); return path; }
-    private static TrackRow PaRow(string id, string? cover = null) => new()
+    private static TrackRow PaRow(string id, string? cover = null, long durationMs = 180000) => new()
     {
         Id = id, RequestId = id + ":91", AlbumId = "91", Title = "Saved " + id, Artist = "Saved artist", Album = "Saved album",
-        Artists = [new("301", "Saved artist")], Available = true, DurationMs = 180000, CoverUri = cover
+        Artists = [new("301", "Saved artist")], Available = true, DurationMs = durationMs, CoverUri = cover
     };
     private static PlaybackQueue PaQueue(IEnumerable<TrackRow> rows, int current)
     { var queue = new PlaybackQueue(); queue.RestoreItems(rows.ToArray(), current, true, RepeatMode.One); return queue; }

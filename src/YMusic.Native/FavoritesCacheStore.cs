@@ -15,7 +15,9 @@ internal sealed record FavoritesTrackMetadata(
     [property: JsonRequired] string Title, [property: JsonRequired] string Artist,
     [property: JsonRequired] string Album, [property: JsonRequired] long DurationMs,
     [property: JsonRequired] bool Available, [property: JsonRequired] IReadOnlyList<ArtistReference> Artists,
-    string? AlbumId = null, string? CoverUri = null);
+    string? AlbumId = null, string? CoverUri = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool MissingMetadata = false,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PrimaryArtistName = null);
 
 internal sealed record FavoritesCacheSnapshot(
     [property: JsonRequired] int Version, [property: JsonRequired] string AccountHash,
@@ -30,16 +32,18 @@ internal sealed class FavoritesCacheStore
     { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, MaxDepth = 16 };
     private readonly string _directory;
     private readonly Func<Action, Task> _schedule;
+    private readonly Action? _beforeCommit;
 
     internal FavoritesCacheStore(string directory) : this(directory, action => Task.Run(action)) { }
 
-    // The scheduler seam lets fixtures execute queued writers in reverse order.
-    internal FavoritesCacheStore(string directory, Func<Action, Task> schedule)
+    // Fixtures can reorder workers or hold a flushed write before replacement.
+    internal FavoritesCacheStore(string directory, Func<Action, Task> schedule, Action? beforeCommit = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);
         ArgumentNullException.ThrowIfNull(schedule);
         _directory = Path.Combine(Path.GetFullPath(directory), "favorites-cache");
         _schedule = schedule;
+        _beforeCommit = beforeCommit;
     }
 
     internal string FilePath(string accountUid) => Path.Combine(_directory, AccountHash(accountUid) + ".json");
@@ -79,19 +83,20 @@ internal sealed class FavoritesCacheStore
         Validate(frozen);
         var path = Path.Combine(_directory, frozen.AccountHash + ".json");
         var state = States.GetOrAdd(path, _ => new());
+        // Admission and publication share only the final rename lock. Serialization
+        // and flushing must not hold up the caller's dispatcher.
         long revision;
-        // Admission order determines the winner, regardless of worker ordering.
-        lock (state) revision = ++state.Revision;
+        lock (state.RenameGate) revision = Interlocked.Increment(ref state.Revision);
         return _schedule(() =>
         {
-            lock (state) if (revision != state.Revision) return;
+            if (revision != Volatile.Read(ref state.Revision)) return;
             using var serialized = new BoundedJsonStream();
             JsonSerializer.Serialize(serialized, frozen, Json);
             var bytes = serialized.ToArray();
             lock (state)
             {
-                if (revision != state.Revision) return;
-                WriteAtomic(path, bytes);
+                if (revision != Volatile.Read(ref state.Revision)) return;
+                WriteAtomic(path, bytes, state, revision);
             }
         });
     }
@@ -101,7 +106,8 @@ internal sealed class FavoritesCacheStore
         ArgumentNullException.ThrowIfNull(rows);
         if (rows.Count > MaximumTracks) throw new JsonException("Коллекция слишком велика для кэша.");
         var tracks = rows.Select(row => new FavoritesTrackMetadata(row.Id, row.RequestId, row.Title, row.Artist,
-            row.Album, row.DurationMs, row.Available, CopyArtists(row.Artists), row.AlbumId, ArtworkUri.Metadata(row.CoverUri))).ToArray();
+            row.Album, row.DurationMs, row.Available, CopyArtists(row.Artists), row.AlbumId, ArtworkUri.Metadata(row.CoverUri),
+            MissingMetadata: !row.HasTrackMetadata, PrimaryArtistName: row.PrimaryArtistNameToPersist)).ToArray();
         var snapshot = new FavoritesCacheSnapshot(CurrentVersion, AccountHash(accountUid), savedUtc.ToUniversalTime(), Array.AsReadOnly(tracks));
         Validate(snapshot);
         return snapshot;
@@ -115,9 +121,16 @@ internal sealed class FavoritesCacheStore
         {
             Number = index + 1, Id = track.Id, RequestId = track.RequestId, Title = track.Title, Artist = track.Artist,
             Album = track.Album, DurationMs = track.DurationMs, Available = track.Available,
-            Artists = CopyArtists(track.Artists), AlbumId = track.AlbumId, CoverUri = track.CoverUri
+            Artists = CopyArtists(track.Artists), PrimaryArtistName = track.PrimaryArtistName,
+            AlbumId = track.AlbumId, CoverUri = track.CoverUri,
+            HasTrackMetadata = !track.MissingMetadata && !IsLegacyPlaceholder(track)
         }).ToArray();
     }
+
+    // Older snapshots stored an omitted track as the default unavailable row.
+    private static bool IsLegacyPlaceholder(FavoritesTrackMetadata track) => !track.Available
+        && track.Title == "Недоступный трек" && track.Artist.Length == 0 && track.Album.Length == 0
+        && track.DurationMs == 0 && track.Artists.Count == 0 && track.PrimaryArtistName is null && track.AlbumId is null && track.CoverUri is null;
 
     internal static string AccountHash(string uid)
     {
@@ -125,7 +138,7 @@ internal sealed class FavoritesCacheStore
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(uid)));
     }
 
-    private void WriteAtomic(string path, byte[] bytes)
+    private void WriteAtomic(string path, byte[] bytes, StoreState state, long revision)
     {
         using var location = SafeDirectoryScope.Acquire(_directory, create: true)!;
         // Check an existing destination without following a reparse point.
@@ -135,9 +148,14 @@ internal sealed class FavoritesCacheStore
         {
             using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
             { stream.Write(bytes); stream.Flush(flushToDisk: true); }
+            _beforeCommit?.Invoke();
             // Same-directory rename never exposes incomplete JSON. Replacing a
             // directory entry cannot write through a substituted destination link.
-            File.Move(temporary, path, overwrite: true);
+            lock (state.RenameGate)
+            {
+                if (revision != state.Revision) return;
+                File.Move(temporary, path, overwrite: true);
+            }
         }
         finally
         {
@@ -166,7 +184,9 @@ internal sealed class FavoritesCacheStore
             if (track is null || !ValidId(track.Id) || !ValidRequestId(track.RequestId, track.Id)
                 || track.AlbumId is not null && !ValidId(track.AlbumId)
                 || !ValidText(track.Title) || !ValidText(track.Artist) || !ValidText(track.Album)
+                || !TrackRow.ValidPrimaryArtistName(track.PrimaryArtistName)
                 || track.DurationMs < 0 || track.DurationMs > PlaybackStateStore.MaximumDurationMs
+                || track.Available && track.MissingMetadata
                 || track.Artists is null || track.Artists.Count > 100
                 || track.CoverUri is not null && track.CoverUri != ArtworkUri.Metadata(track.CoverUri)) throw new JsonException();
             foreach (var artist in track.Artists)
@@ -181,7 +201,11 @@ internal sealed class FavoritesCacheStore
         && value.StartsWith(id + ":", StringComparison.Ordinal) && ValidId(value[(id.Length + 1)..]);
     private static bool ValidText(string? value) => value is { Length: <= 4096 } && !value.Any(char.IsControl);
 
-    private sealed class StoreState { internal long Revision; }
+    private sealed class StoreState
+    {
+        internal readonly object RenameGate = new();
+        internal long Revision;
+    }
     private sealed class BoundedJsonStream : MemoryStream
     {
         public override void Write(byte[] buffer, int offset, int count) { Bound(count); base.Write(buffer, offset, count); }

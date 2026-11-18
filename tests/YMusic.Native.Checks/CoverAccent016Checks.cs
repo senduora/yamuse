@@ -18,6 +18,8 @@ internal static partial class Program
     {
         await Run("CoverAccent016: delayed forward and cached back keep the last palette and reject late artwork", Accent016Back);
         await Run("CoverAccent016: confirmed missing artwork fades to static over five seconds and recovers", Accent016Missing);
+        await Run("CoverAccent016: successive tracks with the same cover recover from a miss and complete their palette", Accent016SameCover);
+        await Run("CoverAccent016: visible mini player loads artwork and accent while the main window is hidden", Accent016HiddenMain);
         await Run("CoverAccent016: actual main mini and expanded play surfaces follow live colour without hovering", Accent016Surfaces);
         await Run("CoverAccent016: distinct soft clouds retain native motion and show colour changes", Accent016Clouds);
     }
@@ -32,7 +34,7 @@ internal static partial class Program
         internal CoverAccentController Controller => SaField<CoverAccentController>(Window, "_coverAccent");
         internal readonly TaskCompletionSource Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal readonly TaskCompletionSource Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        internal int HoldBlue, RedRequests;
+        internal int HoldBlue, RedRequests, GreenRequests, TemporaryRequests;
         internal Accent016Fixture(string name)
         {
             _cache = new ArtworkCache(System.IO.Path.Combine(_directory, name, "covers"), new FakeHandler(async (request, _) =>
@@ -41,19 +43,25 @@ internal static partial class Program
                 var path = request.RequestUri!.AbsolutePath;
                 if (path.Contains("blue") && Volatile.Read(ref HoldBlue) == 1) { Entered.TrySetResult(); await Release.Task; }
                 if (path.Contains("missing")) return new HttpResponseMessage(HttpStatusCode.NotFound);
+                if (path.Contains("temporary") && Interlocked.Increment(ref TemporaryRequests) == 1)
+                    return new HttpResponseMessage(HttpStatusCode.NotFound);
                 if (path.Contains("red")) Interlocked.Increment(ref RedRequests);
-                var color = path.Contains("blue") ? Colors.Blue : Colors.Red;
+                if (path.Contains("green")) Interlocked.Increment(ref GreenRequests);
+                var color = path.Contains("green") ? Colors.Green : path.Contains("blue") ? Colors.Blue : Colors.Red;
                 var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(Accent015Bitmap(32, 32, (_, _) => color)));
                 using var stream = new MemoryStream(); encoder.Save(stream);
                 return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(stream.ToArray()) };
             }));
             Artwork.Cache = _cache; Fixture = new SaFixture(name);
         }
-        internal void Select(string name)
+        internal void Select(string name, string? occurrence = null)
         {
-            typeof(MainWindow).GetField("_current", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(Window,
-                new TrackRow { Id = "accent016-" + name, RequestId = "accent016-" + name, Title = name, Available = true });
-            Artwork.SetSourceUri(Image, "https://avatars.yandex.net/get-music-content/1/accent016-" + name + "/%%");
+            var id = "accent016-" + (occurrence ?? name);
+            var track = new TrackRow { Id = id, RequestId = id, Title = name, Available = true,
+                CoverUri = "https://avatars.yandex.net/get-music-content/1/accent016-" + name + "/%%" };
+            typeof(MainWindow).GetField("_current", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(Window, track);
+            SaInvoke(Window, "SetPlayerArtwork", track);
+            SaInvoke(Window, "UpdateShellState");
         }
         internal async Task Ready()
         {
@@ -109,6 +117,61 @@ internal static partial class Program
         Assert(Artwork.GetLoadStatus(f.Image) == ArtworkLoadStatus.Loading && f.Controller.TargetColor == CoverPalette.Readable(Colors.Red), "hiding the player reset its palette");
         f.Window.Show(); await f.Ready();
         Assert(f.Controller.TargetColor == CoverPalette.Readable(Colors.Red), "showing the same cached artwork reset its palette");
+    }
+
+    private static async Task Accent016SameCover()
+    {
+        using var fixture = new Accent016Fixture("accent016-shared");
+        fixture.Select("temporary", "first");
+        await Until(() => Artwork.GetLoadStatus(fixture.Image) == ArtworkLoadStatus.Unavailable);
+        fixture.Select("temporary", "second");
+        await fixture.Ready();
+        Assert(fixture.TemporaryRequests == 2 && fixture.Controller.TargetColor == CoverPalette.Readable(Colors.Red),
+            "the next track with the same URI inherited a temporary failure");
+
+        var image = new Image();
+        var identity = new object();
+        var releaseOld = new TaskCompletionSource<Color?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var analyses = 0;
+        using var controller = new CoverAccentController(image, new ResourceDictionary(), () => identity,
+            (_, _) => ++analyses == 1 ? releaseOld.Task : Task.FromResult<Color?>(Colors.Blue));
+        image.Source = Accent015Bitmap(32, 32, (_, _) => Colors.Blue);
+        var old = controller.PendingAnalysis;
+        identity = new object();
+        controller.TrackChanged();
+        await controller.PendingAnalysis;
+        Assert(analyses == 2 && controller.TargetColor == CoverPalette.Readable(Colors.Blue),
+            "unchanged artwork did not start an analysis for the newly selected track");
+        releaseOld.SetResult(Colors.Red);
+        await old;
+        Assert(controller.TargetColor == CoverPalette.Readable(Colors.Blue), "the previous track published its late palette");
+    }
+
+    private static async Task Accent016HiddenMain()
+    {
+        using var fixture = new Accent016Fixture("accent016-hidden-main");
+        fixture.Select("red"); await fixture.Ready();
+        var cached = fixture.Image.Source;
+        var shell = SaField<DesktopShell>(fixture.Window, "_shell");
+        fixture.Window.Hide(); shell.ShowMiniPlayer();
+        var mini = MiniShellWindow(shell) ?? throw new InvalidOperationException("mini player did not open");
+        await Until(() => Artwork.GetLoadStatus(mini.CoverImage) == ArtworkLoadStatus.Ready);
+        Assert(fixture.Image.Source is null && ReferenceEquals(cached, mini.CoverImage.Source) && fixture.RedRequests == 1,
+            "mini player did not reuse the shared artwork cache while the main window was hidden");
+
+        fixture.Select("blue");
+        await Until(() => fixture.Controller.TargetColor == CoverPalette.Readable(Colors.Blue));
+        Assert(Artwork.GetLoadStatus(mini.CoverImage) == ArtworkLoadStatus.Ready && fixture.Image.Source is null,
+            "the shared accent did not follow the mini player's new cover");
+
+        MiniClick(mini.ArtworkButton);
+        fixture.Select("green");
+        Assert(!mini.IsArtworkVisible && fixture.GreenRequests == 0 && mini.CoverImage.Source is null,
+            "hidden mini artwork started a new request");
+        MiniClick(mini.ArtworkButton);
+        await Until(() => fixture.Controller.TargetColor == CoverPalette.Readable(Colors.Green));
+        Assert(Artwork.GetLoadStatus(mini.CoverImage) == ArtworkLoadStatus.Ready && fixture.GreenRequests == 1,
+            "showing mini artwork did not load and apply the current track's cover");
     }
 
     private static Brush Accent016Surface(Button button)

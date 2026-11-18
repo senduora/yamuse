@@ -15,9 +15,13 @@ internal static partial class Program
 {
     private static async Task CheckLyricsUi()
     {
+        await Run("Lyrics UI: primary artist without a link survives playback favorites and offline snapshots", CheckLyricsPrimaryArtistRoundTrip);
+
         await Run("Lyrics UI: Yandex supplement displays two lines without Genius", async () =>
         {
-            var yandex = new FakeHandler((request, _) => Task.FromResult(LyricsUiYandex(request, "Yandex fixture one\nYandex fixture two")));
+            var yandex = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath.EndsWith("/supplement", StringComparison.Ordinal)
+                ? Json("""{"result":{"lyrics":{"hasRights":false,"lyrics":"Yandex fixture one\nYandex fixture two"}}}""")
+                : LyricsUiYandex(request)));
             var genius = new FakeHandler((_, _) => throw new InvalidOperationException("Yandex lyrics unexpectedly contacted Genius"));
             var window = LyricsUiWindow("yandex", yandex, genius);
             try
@@ -26,7 +30,9 @@ internal static partial class Program
                 LyricsUiOpen(window);
                 await Until(() => LyricsUiLines(window).SequenceEqual(new[] { "Yandex fixture one", "Yandex fixture two" }));
                 Assert(Control<Grid>(window, "LyricsPanel").IsVisible && !Control<Grid>(window, "ContentGrid").IsVisible && window.OwnedWindows.Count == 0, "lyrics must open inside the main window only");
-                Assert(LyricsUiField<TextBlock>(window, "_lyricsNote")!.Text.Contains("Источник: Яндекс Музыка", StringComparison.Ordinal), "Yandex source label missing");
+                var note = LyricsUiField<TextBlock>(window, "_lyricsNote")!.Text;
+                Assert(note.Contains("Источник: Яндекс Музыка", StringComparison.Ordinal)
+                    && note.Contains("Полнота доступного обычного текста не подтверждена", StringComparison.Ordinal), "supplement lost its source or completeness warning");
                 Assert(LyricsUiField<Button>(window, "_lyricsSourceButton")!.Visibility == Visibility.Collapsed && LyricsUiField<Uri>(window, "_lyricsSource") is null, "Yandex text incorrectly points to Genius");
                 Assert(yandex.Seen.Count == 3 && genius.Seen.Count == 0, "expected LRC/TEXT/supplement only");
             }
@@ -59,6 +65,83 @@ internal static partial class Program
             finally { window.Close(); }
         });
 
+        await Run("Lyrics UI: manual refresh retries Genius, preserves artist commas and does not cache 403", async () =>
+        {
+            var yandex = new FakeHandler((request, _) => Task.FromResult(LyricsUiYandex(request)));
+            var searches = 0;
+            var genius = new FakeHandler((request, _) =>
+            {
+                var uri = request.RequestUri!;
+                if (uri.AbsolutePath == "/api/search/multi")
+                {
+                    Assert(Uri.UnescapeDataString(uri.Query).EndsWith("q=Fixture Artist, Ensemble Fixture Song", StringComparison.Ordinal),
+                        "Genius split a structured primary artist or included the guest");
+                    return Task.FromResult(++searches == 2 ? Json("{}", HttpStatusCode.Forbidden)
+                        : Json("""{"response":{"sections":[{"type":"song","hits":[{"result":{"title":"Fixture Song","path":"/Fixture-song-lyrics","primary_artist":{"name":"Fixture Artist, Ensemble"}}}]}]}}"""));
+                }
+                Assert(uri.AbsolutePath == "/Fixture-song-lyrics", "unexpected Genius fixture route");
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    { Content = new StringContent($"<div data-lyrics-container='true'>Lyric {searches}</div>") });
+            });
+            var window = LyricsUiWindow("genius-refresh", yandex, genius);
+            try
+            {
+                using var catalog = new MusicApi(new FakeHandler((_, _) => Task.FromResult(Json("""
+                    {"result":[{"id":41011,"title":"Fixture Song","available":true,"durationMs":180000,
+                    "artists":[{"name":"Fixture Artist, Ensemble"},{"id":42,"name":"Guest"}]}]}
+                    """))));
+                var track = (await catalog.GetTracksAsync(FakeSession, [new("41011", null)], 0, default)).Single();
+                Assert(track.Artists.Select(artist => artist.Name).SequenceEqual(["Guest"]), "fixture made a name-only artist navigable");
+                LyricsUiSet(window, "_current", track);
+                LyricsUiOpen(window);
+                await Until(() => LyricsUiLines(window).SequenceEqual(new[] { "Lyric 1" }));
+
+                LyricsUiInvoke(window, "LyricsRetry_Click", window, new RoutedEventArgs());
+                var note = LyricsUiField<TextBlock>(window, "_lyricsNote")!;
+                await Until(() => note.Text.Contains("HTTP 403", StringComparison.Ordinal));
+                Assert(LyricsUiLines(window).Length == 0 && !LyricsUiCached(window, track),
+                    "manual Genius failure left stale lyrics or a negative cache");
+
+                LyricsUiOpen(window); LyricsUiOpen(window);
+                await Until(() => LyricsUiLines(window).SequenceEqual(new[] { "Lyric 3" }));
+                Assert(searches == 3 && genius.Seen.Count == 5, "403 prevented a fresh Genius lookup on reopen");
+            }
+            finally { window.Close(); }
+        });
+
+        await Run("Lyrics UI: a visible guest track reloads lyrics when account activation keeps playback", async () =>
+        {
+            var yandex = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath switch
+            {
+                "/account/status" => Json(Profile),
+                "/account/about" => Json("""{"result":{"uid":"12345"}}"""),
+                "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                _ => LyricsUiYandex(request, "Account lyrics fixture")
+            }));
+            var genius = LyricsUiGenius();
+            var window = LyricsUiWindow("guest-activation", yandex, genius);
+            try
+            {
+                var track = LyricsUiTrack("41012");
+                LyricsUiSet(window, "_session", null!);
+                LyricsUiSet(window, "_account", null!);
+                LyricsUiSet(window, "_current", track);
+                var player = LyricsUiField<NativePlayer>(window, "_player")!;
+                await player.OpenPausedAsync(new Uri(WriteWave("lyrics-guest-activation.wav", 10)), default);
+                LyricsUiOpen(window);
+                await Until(() => LyricsUiLines(window).SequenceEqual(["Genius fixture one", "Genius fixture two"]));
+                Assert(LyricsUiCached(window, track) && yandex.Seen.Count == 0, "fixture did not reach cached guest lyrics");
+
+                await Call(window, "ActivateSessionAsync", FakeSession, default(CancellationToken), true);
+                await Until(() => LyricsUiLines(window).SequenceEqual(["Account lyrics fixture"]));
+                Assert(Control<Grid>(window, "LyricsPanel").IsVisible && player.SourceLocalPath is not null &&
+                    ReferenceEquals(track, LyricsUiField<TrackRow>(window, "_current")) && LyricsUiCached(window, track)
+                    && LyricsUiField<IDictionary>(window, "_lyricsCache")!.Count == 1,
+                    "account activation hid the occupied panel, replaced local playback, or kept the guest cache");
+            }
+            finally { window.Close(); }
+        });
+
         await Run("Lyrics UI: late canceled track response cannot replace the current text", async () =>
         {
             var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -82,11 +165,13 @@ internal static partial class Program
             var window = LyricsUiWindow("race", yandex, genius);
             try
             {
-                LyricsUiSet(window, "_current", LyricsUiTrack("41003", "Old fixture song"));
+                var oldTrack = LyricsUiTrack("41003", "Old fixture song");
+                var newTrack = LyricsUiTrack("41004", "Current fixture song");
+                LyricsUiSet(window, "_current", oldTrack);
                 LyricsUiOpen(window);
                 await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
                 var oldCancellation = LyricsUiField<CancellationTokenSource>(window, "_lyricsCts")!;
-                LyricsUiSet(window, "_current", LyricsUiTrack("41004", "Current fixture song"));
+                LyricsUiSet(window, "_current", newTrack);
                 LyricsUiInvoke(window, "RefreshLyrics");
                 await Until(() => LyricsUiLines(window).SequenceEqual(new[] { "Current fixture one", "Current fixture two" }));
                 Assert(cancellationObserved, "switching the track did not cancel its pending lyrics request");
@@ -95,8 +180,8 @@ internal static partial class Program
                 await Until(() => LyricsUiDisposed(oldCancellation));
                 Assert(LyricsUiLines(window).SequenceEqual(new[] { "Current fixture one", "Current fixture two" }), "old response overwrote the new text");
                 Assert(LyricsUiField<TextBlock>(window, "_lyricsHeading")!.Text == "Current fixture song", "old response overwrote the current heading");
-                var cache = LyricsUiField<IDictionary>(window, "_lyricsCache")!;
-                Assert(!cache.Contains("41003") && cache.Contains("41004") && genius.Seen.Count == 0, "canceled text entered the cache or started fallback");
+                Assert(!LyricsUiCached(window, oldTrack) && LyricsUiCached(window, newTrack) && genius.Seen.Count == 0,
+                    "canceled text entered the cache or started fallback");
             }
             finally { release.TrySetResult(); window.Close(); }
         });
@@ -116,7 +201,7 @@ internal static partial class Program
                     var note = LyricsUiField<TextBlock>(window, "_lyricsNote")!.Text;
                     Assert(note.Contains("Не удалось загрузить текст", StringComparison.Ordinal) && !note.Contains("Текст не найден", StringComparison.Ordinal), "provider error was presented as absent lyrics");
                     Assert(LyricsUiLines(window).Length == 0 && LyricsUiField<Button>(window, "_lyricsSourceButton")!.Visibility == Visibility.Collapsed, "provider error displayed cached/fallback text");
-                    Assert(genius.Seen.Count == 0 && !LyricsUiField<IDictionary>(window, "_lyricsCache")!.Contains(track.Id), "provider error was negatively cached or sent to Genius");
+                    Assert(genius.Seen.Count == 0 && !LyricsUiCached(window, track), "provider error was negatively cached or sent to Genius");
                     Assert(yandex.Seen.Count == 3, "expected independent TEXT/supplement fallback before reporting the error");
                 }
                 finally { window.Close(); }
@@ -160,6 +245,50 @@ internal static partial class Program
         });
     }
 
+    private static async Task CheckLyricsPrimaryArtistRoundTrip()
+    {
+        const string primary = "Fixture Artist, Ensemble";
+        var track = new TrackRow { Id = "71001", RequestId = "71001:17", AlbumId = "17", Title = "Fixture track",
+            Artist = primary + ", Guest", PrimaryArtistName = primary, Artists = [new("42", "Guest")], DurationMs = 1000, Available = true };
+        var legacyTrack = new TrackRow { Id = "71002", RequestId = "71002", Title = "Legacy fixture", Artist = "Legacy Artist, Guest",
+            Artists = [new("42", "Guest")], DurationMs = 1000, Available = true };
+        var directory = Path.Combine(_directory, "lyrics-primary-artist-checkpoints");
+        var media = File.ReadAllBytes(WriteWave("lyrics-primary-artist.wav", 1));
+        using var handler = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(media) }));
+        var music = Path.Combine(directory, "Music");
+        using (var writer = new OfflineLibrary(music, new AudioBuffer(Path.Combine(directory, "buffer"), handler)))
+        {
+            await writer.SaveAsync(track, new(new Uri("https://s1.vlx.yandex.net/primary-artist-fixture.wav"), "mp3", 192), default);
+            await writer.RememberPlaylistAsync(new("fixture", "17", "Offline fixture", "", 1, [track]), AudioQuality.Optimal, default);
+        }
+
+        using var offline = new OfflineLibrary(music);
+        var playback = new PlaybackQueue(); playback.SetItems([track, legacyTrack]);
+        var playbackStore = new PlaybackStateStore(directory);
+        var playbackSnapshot = PlaybackStateStore.Capture("fixture", playback, 0);
+        playbackStore.Save(playbackSnapshot);
+        var restored = PlaybackStateStore.RestoreQueue(playbackStore.Load("fixture")!, offline).Tracks;
+        Assert(restored[1].PrimaryArtistName is null && restored[1].Artist == legacyTrack.Artist,
+            "an old snapshot obtained a guessed artist identity");
+        await Throws<JsonException>(() =>
+        {
+            playbackStore.Save(playbackSnapshot with { Tracks = [playbackSnapshot.Tracks[0] with { PrimaryArtistName = new string('x', 4097) }] });
+            return Task.CompletedTask;
+        });
+
+        var favorites = new FavoritesCacheStore(directory);
+        await favorites.SaveInBackgroundAsync(FavoritesCacheStore.Capture("fixture", [track], DateTimeOffset.UtcNow));
+        var downloads = new DownloadQueueState(); downloads.Replace([track], "Download fixture");
+        var downloadStore = new DownloadQueueStore(directory);
+        downloadStore.Save(DownloadQueueStore.Capture("fixture", downloads, AudioQuality.Optimal, false, null));
+
+        var restoredRows = new[] { restored[0], FavoritesCacheStore.Restore(favorites.Load("fixture")!).Single(),
+            DownloadQueueStore.PrepareRestore(downloadStore.Load("fixture")!, offline).Entries.Single().Track,
+            offline.Tracks().Single(), offline.GetPlaylistTracks("fixture", "17").Single() };
+        Assert(restoredRows.All(row => row.PrimaryArtistName == primary && row.Artists.Single().Name == "Guest"),
+            "a saved track lost its structured primary name or exposed it as a navigation link");
+    }
+
     private static MainWindow LyricsUiWindow(string suffix, FakeHandler yandex, FakeHandler genius)
     {
         var directory = Path.Combine(_directory, "lyrics-ui-" + suffix);
@@ -177,6 +306,11 @@ internal static partial class Program
     private static T? LyricsUiField<T>(MainWindow window, string name) where T : class => (T?)typeof(MainWindow).GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(window);
     private static void LyricsUiSet(MainWindow window, string name, object value) => typeof(MainWindow).GetField(name, BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(window, value);
     private static void LyricsUiInvoke(MainWindow window, string name, params object[] arguments) => typeof(MainWindow).GetMethod(name, BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(window, arguments);
+    private static bool LyricsUiCached(MainWindow window, TrackRow track)
+    {
+        var key = typeof(MainWindow).GetMethod("LyricsCacheIdentity", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(window, [track]);
+        return LyricsUiField<IDictionary>(window, "_lyricsCache")!.Contains(key!);
+    }
     private static string[] LyricsUiLines(MainWindow window) => LyricsUiField<ListBox>(window, "_lyricsList")?.Items.Cast<object>().Select(value => value.ToString() ?? "").ToArray() ?? [];
     private static bool LyricsUiDisposed(CancellationTokenSource cancellation)
     {

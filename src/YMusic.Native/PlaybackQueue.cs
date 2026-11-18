@@ -34,6 +34,8 @@ internal sealed partial class PlaybackQueue
     public long? CurrentOccurrenceToken => _current?.Token;
     public int CurrentIndex => _current is null ? -1 : _entries.IndexOf(_current);
     public long Version { get; private set; }
+    // A queue replacement starts a new source; edits keep the existing source.
+    public long ReplacementVersion { get; private set; }
     public bool CanPrevious => Current is not null || _past.Any(IsPlayable);
     public bool CanNext => _future.Any(IsPlayable)
         || (_shuffle ? _playNext.Any(IsPlayable) || _shuffleBag.Any(IsPlayable) || _repeat == RepeatMode.All && _entries.Any(IsPlayable)
@@ -48,6 +50,7 @@ internal sealed partial class PlaybackQueue
             _shuffle = value;
             _shuffleBag.Clear();
             _playNext.Clear();
+            _shuffleCycle++;
             _cycleVisited.Clear();
             if (_current is not null) _cycleVisited.Add(_current.Token);
             if (value) BuildShuffleBag();
@@ -73,6 +76,18 @@ internal sealed partial class PlaybackQueue
         var selectedIndex = selected is null ? 0 : Array.FindIndex(rows, row => ReferenceEquals(row, selected));
         if (selected is not null && selectedIndex < 0)
             throw new ArgumentException("Выбранного экземпляра трека нет в новой очереди.", nameof(selected));
+        ReplaceItems(rows, selectedIndex);
+    }
+
+    internal void SetItemsAt(TrackRow[] rows, int selectedIndex)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(selectedIndex);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(selectedIndex, rows.Length);
+        ReplaceItems(rows, selectedIndex);
+    }
+
+    private void ReplaceItems(TrackRow[] rows, int selectedIndex)
+    {
         _removalUndo = null;
         _entries.Clear();
         _presentTokens.Clear();
@@ -87,6 +102,7 @@ internal sealed partial class PlaybackQueue
         _current = FindSequential(selectedIndex, wrap: true);
         MarkVisited(_current);
         if (_shuffle) BuildShuffleBag();
+        ReplacementVersion++;
         Touch(itemsChanged: true);
     }
 
@@ -105,6 +121,7 @@ internal sealed partial class PlaybackQueue
         _shuffle = shuffle; _repeat = repeat;
         MarkVisited(_current);
         if (_shuffle) BuildShuffleBag();
+        ReplacementVersion++;
         Touch(itemsChanged: true);
     }
 
@@ -325,6 +342,7 @@ internal sealed partial class PlaybackQueue
     {
         var next = ShiftPlayable(_playNext) ?? ShiftPlayable(_shuffleBag);
         if (next is not null || !allowNewCycle) return next;
+        _shuffleCycle++;
         _cycleVisited.Clear();
         _shuffleBag.Clear();
         _shuffleBag.AddRange(ReservedShuffleCycle(avoidFirst));

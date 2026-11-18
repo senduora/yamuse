@@ -25,6 +25,7 @@ public partial class MainWindow
         };
         _seekGesture = new SliderGesture(SeekSlider, () =>
         { _seekDragging = true; _seekIgnoreKeyUp = false; _seekKeyboardGesture = _seekGesture?.IsKeyboardActive == true; }, FinishSeek, registerPointer: false);
+        SeekSlider.AutomationSeekRequested += seconds => { _seekGesture.Cancel(); CommitSeek(seconds); };
         _volumeGesture = new SliderGesture(VolumeSlider, () => { }, _ => FlushVolumePreferences());
         _volumeSaveTimer.Tick += (_, _) => FlushVolumePreferences();
         Deactivated += (_, _) => { _seekGesture.Cancel(); _expandedSeekGesture?.Cancel(); };
@@ -89,8 +90,13 @@ public partial class MainWindow
 
     private void CommitSeek(double seconds)
     {
-        CancelAutomaticWave();
-        if (!_player.HasSource || !double.IsFinite(seconds)) return;
+        var canceledAdvance = !_player.IsPlaying && PlaybackTransportActive || _waveStartCts is { IsCancellationRequested: false };
+        CancelPendingWavePlayback();
+        if (!_player.HasSource || !double.IsFinite(seconds))
+        {
+            if (canceledAdvance) UpdateControls();
+            return;
+        }
         var target = Math.Clamp(seconds, 0, _player.Duration.TotalSeconds);
         PlaybackTimeline.Stop(SeekSlider);
         if (_expandedPlayerSeek is not null) PlaybackTimeline.Stop(_expandedPlayerSeek);
@@ -103,7 +109,11 @@ public partial class MainWindow
             PositionText.Text = FormatTime(TimeSpan.FromSeconds(target));
             UpdateLyrics(target); RefreshExpandedPlayer(); UpdateShellState(); SavePlaybackState();
         }
-        finally { _committingSeek = false; }
+        finally
+        {
+            _committingSeek = false;
+            if (canceledAdvance) UpdateControls();
+        }
     }
 
     private void FlushVolumePreferences()

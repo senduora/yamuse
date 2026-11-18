@@ -11,6 +11,14 @@ public partial class MainWindow
 {
     private CoverAccentController? _coverAccent;
 
+    private void SetPlayerArtwork(TrackRow? track)
+    {
+        var uri = track?.CoverUri;
+        var sameCover = Artwork.GetSourceUri(PlayerCover) == uri;
+        Artwork.SetTrackSource(PlayerCover, uri, trackChanged: true);
+        if (sameCover) _coverAccent?.TrackChanged();
+    }
+
     private void InitializeDynamicAccent()
     {
         _coverAccent = new CoverAccentController(PlayerCover, Application.Current.Resources, () => _current);
@@ -29,6 +37,7 @@ internal sealed class CoverAccentController : IDisposable
 {
     internal static readonly TimeSpan TransitionDuration = TimeSpan.FromSeconds(5);
     private readonly Image _cover;
+    private Image? _miniCover;
     private readonly Func<object?> _identity;
     private readonly Func<BitmapSource, CancellationToken, Task<Color?>> _analyze;
     private readonly DependencyPropertyDescriptor _sourceChanged;
@@ -76,41 +85,82 @@ internal sealed class CoverAccentController : IDisposable
         _sourceChanged = DependencyPropertyDescriptor.FromProperty(Image.SourceProperty, typeof(Image));
         _uriChanged = DependencyPropertyDescriptor.FromProperty(Artwork.SourceUriProperty, typeof(Image));
         _loadStatusChanged = DependencyPropertyDescriptor.FromProperty(Artwork.LoadStatusProperty, typeof(Image));
-        _sourceChanged.AddValueChanged(cover, OnCoverChanged);
-        _uriChanged.AddValueChanged(cover, OnCoverChanged);
-        _loadStatusChanged.AddValueChanged(cover, OnCoverChanged);
+        Observe(cover, true);
         ThemeManager.Changed += OnThemeChanged;
         OnCoverChanged(cover, EventArgs.Empty);
     }
 
+    internal void SetMiniCover(Image? cover)
+    {
+        _cover.VerifyAccess();
+        if (_disposed || ReferenceEquals(_miniCover, cover)) return;
+        if (_miniCover is not null) Observe(_miniCover, false);
+        _miniCover = cover;
+        if (cover is not null) Observe(cover, true);
+        OnCoverChanged(null, EventArgs.Empty);
+    }
+
+    internal void TrackChanged()
+    {
+        if (_pending is not null) OnCoverChanged(null, EventArgs.Empty);
+    }
+
+    private void Observe(Image image, bool add)
+    {
+        if (add)
+        {
+            _sourceChanged.AddValueChanged(image, OnCoverChanged);
+            _uriChanged.AddValueChanged(image, OnCoverChanged);
+            _loadStatusChanged.AddValueChanged(image, OnCoverChanged);
+            image.IsVisibleChanged += OnCoverVisibilityChanged;
+        }
+        else
+        {
+            _sourceChanged.RemoveValueChanged(image, OnCoverChanged);
+            _uriChanged.RemoveValueChanged(image, OnCoverChanged);
+            _loadStatusChanged.RemoveValueChanged(image, OnCoverChanged);
+            image.IsVisibleChanged -= OnCoverVisibilityChanged;
+        }
+    }
+
+    private Image CoverForAccent() => !_cover.IsVisible && _miniCover is { IsVisible: true } mini
+        && Artwork.GetSourceUri(mini) == Artwork.GetSourceUri(_cover) ? mini : _cover;
+
+    private void OnCoverVisibilityChanged(object sender, DependencyPropertyChangedEventArgs args)
+        => OnCoverChanged(sender, EventArgs.Empty);
+
     private void OnCoverChanged(object? sender, EventArgs args)
     {
         if (_disposed) return;
+        var cover = CoverForAccent();
+        if (sender is Image changed && ReferenceEquals(changed, _miniCover) && !ReferenceEquals(changed, cover)) return;
         _generation++; _pending?.Cancel(); _pending = null;
-        var source = _cover.Source as BitmapSource;
+        var source = cover.Source as BitmapSource;
         // Artwork clears Source while the next cover loads (including a cached
         // previous track). Keep the visible palette until that request finishes.
-        if (_fromCover && Artwork.GetLoadStatus(_cover) == ArtworkLoadStatus.Loading)
+        if (_fromCover && Artwork.GetLoadStatus(cover) == ArtworkLoadStatus.Loading)
         { PendingAnalysis = Task.CompletedTask; return; }
         // Real covers are already frozen and small. A non-frozen foreign image
         // is deliberately ignored rather than touching its dispatcher in a worker.
         if (!_fromCover || source is null || !source.IsFrozen) { Retarget(_staticColor); PendingAnalysis = Task.CompletedTask; return; }
         var cancellation = new CancellationTokenSource(); _pending = cancellation;
-        PendingAnalysis = AnalyzeAsync(source, _identity(), Artwork.GetSourceUri(_cover), _generation, cancellation);
+        PendingAnalysis = AnalyzeAsync(cover, source, _identity(), Artwork.GetSourceUri(cover), _generation, cancellation);
     }
 
-    private async Task AnalyzeAsync(BitmapSource source, object? identity, string? uri, long generation, CancellationTokenSource cancellation)
+    private async Task AnalyzeAsync(Image cover, BitmapSource source, object? identity, string? uri, long generation,
+        CancellationTokenSource cancellation)
     {
+        bool IsCurrent() => !_disposed && !cancellation.IsCancellationRequested && generation == _generation
+            && ReferenceEquals(CoverForAccent(), cover) && ReferenceEquals(cover.Source, source)
+            && ReferenceEquals(_identity(), identity) && Artwork.GetSourceUri(cover) == uri;
         try
         {
             var color = await _analyze(source, cancellation.Token);
-            if (!_disposed && !cancellation.IsCancellationRequested && generation == _generation
-                && ReferenceEquals(_cover.Source, source) && ReferenceEquals(_identity(), identity) && Artwork.GetSourceUri(_cover) == uri)
-                Retarget(color ?? _staticColor);
+            if (IsCurrent()) Retarget(color ?? _staticColor);
         }
         catch (Exception exception) when (exception is OperationCanceledException or InvalidOperationException or ArgumentException or NotSupportedException or System.IO.IOException)
         {
-            if (!_disposed && generation == _generation && ReferenceEquals(_cover.Source, source) && ReferenceEquals(_identity(), identity)) Retarget(_staticColor);
+            if (IsCurrent()) Retarget(_staticColor);
         }
         finally
         {
@@ -201,8 +251,8 @@ internal sealed class CoverAccentController : IDisposable
     {
         if (_disposed) return;
         _disposed = true; _generation++; _pending?.Cancel(); _pending = null;
-        _sourceChanged.RemoveValueChanged(_cover, OnCoverChanged); _uriChanged.RemoveValueChanged(_cover, OnCoverChanged);
-        _loadStatusChanged.RemoveValueChanged(_cover, OnCoverChanged);
+        Observe(_cover, false);
+        if (_miniCover is not null) Observe(_miniCover, false);
         ThemeManager.Changed -= OnThemeChanged;
         foreach (var brush in _brushes.Values)
         { var current = brush.Color; brush.Color = current; brush.ApplyAnimationClock(SolidColorBrush.ColorProperty, null); }

@@ -118,8 +118,14 @@ internal static partial class Program
         internal Button Unlike=>SaVisuals<Button>(Window.DownloadCenterView).Single(b=>b.Name=="DownloadUnlikeButton");
         internal Button Retry=>SaVisuals<Button>(Window.DownloadCenterView).Single(b=>b.Name=="DownloadRetryButton");
         internal MenuItem Menu=>List.ContextMenu.Items.OfType<MenuItem>().Single(item => item.Header?.ToString()?.StartsWith("Убрать из «Мне нравится»", StringComparison.Ordinal) == true);
-        internal UlFixture(string name)
+        internal UlFixture(string name, bool includeUnselectedFavorite = false)
         {
+            if (includeUnselectedFavorite)
+            {
+                var row = UlRow("ul-unselected", false);
+                Rows = [.. Rows, row];
+                _likes.Add(row.Id);
+            }
             DirectoryPath=Path.Combine(_directory,"unavailable-likes-"+name);Directory.CreateDirectory(DirectoryPath);
             var noAudio=new FakeHandler((_,_)=>{AudioRequests++;throw new InvalidOperationException("unlike requested audio");});
             Library=new OfflineLibrary(Path.Combine(DirectoryPath,"music"),new AudioBuffer(Path.Combine(DirectoryPath,"downloads"),noAudio));
@@ -135,6 +141,7 @@ internal static partial class Program
         internal async Task Start()
         {await Call(Window,"StartDownloadBatchAsync",Rows,"Мне нравится · тест",new PlaylistDetails("local:favorites","liked","Мне нравится","",0,Rows),false);SaInvoke(Window,"DownloadCenter_Click",null!,null!);Window.UpdateLayout();}
         internal bool IsLiked(string id){lock(_gate)return _likes.Contains(id);}
+        internal void RemoveServerLike(string id){lock(_gate)_likes.Remove(id);}
         internal string FileHashes()=>string.Join(";",Directory.EnumerateFiles(Library.DirectoryPath,"*",SearchOption.AllDirectories).Order().Select(p=>Path.GetRelativePath(Library.DirectoryPath,p)+":"+Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(p)))));
         private async Task<HttpResponseMessage> Respond(HttpRequestMessage request,CancellationToken token)
         {

@@ -56,35 +56,23 @@ internal static class UpdateSchedulePolicy
 // settings draft or rewrite playback preferences. It contains no account data.
 internal sealed class UpdateScheduleStore
 {
+    private const int MaximumFileBytes = 4096;
+    private static readonly JsonSerializerOptions Json = new() { MaxDepth = 4 };
     internal string FilePath { get; }
     internal UpdateScheduleStore(string directory) => FilePath = Path.Combine(Path.GetFullPath(directory), "update-schedule.json");
     internal UpdateScheduleCheckpoint Load(DateTimeOffset now)
     {
         try
         {
-            if (!File.Exists(FilePath)) return new();
-            using var stream = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-            if (stream.Length is <= 0 or > 4096) return new();
-            var value = JsonSerializer.Deserialize<UpdateScheduleCheckpoint>(stream, new JsonSerializerOptions { MaxDepth = 4 });
+            if (GuardedStoreFile.Read(FilePath, MaximumFileBytes) is not { } bytes) return new();
+            using var stream = new MemoryStream(bytes, writable: false);
+            var value = JsonSerializer.Deserialize<UpdateScheduleCheckpoint>(stream, Json);
             return UpdateSchedulePolicy.Normalize(value ?? new(), now);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return new(); }
     }
     internal void Save(UpdateScheduleCheckpoint checkpoint)
-    {
-        var directory = Path.GetDirectoryName(FilePath)!;
-        Directory.CreateDirectory(directory);
-        var temporary = Path.Combine(directory, $".update-schedule-{Guid.NewGuid():N}.tmp");
-        try
-        {
-            var bytes = JsonSerializer.SerializeToUtf8Bytes(checkpoint);
-            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
-            { stream.Write(bytes); stream.Flush(true); }
-            if (File.Exists(FilePath)) File.Replace(temporary, FilePath, null);
-            else File.Move(temporary, FilePath);
-        }
-        finally { try { File.Delete(temporary); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { } }
-    }
+        => GuardedStoreFile.Write(FilePath, JsonSerializer.SerializeToUtf8Bytes(checkpoint));
 }
 
 public partial class MainWindow
@@ -97,7 +85,7 @@ public partial class MainWindow
     private bool _updateScheduleInitialized, _updateCheckInProgress;
     private ComboBox? _updateFrequencyCombo;
     private Action<Uri>? _updateLinkLauncher = null;
-    private static readonly Uri ProjectUri = new("https://github.com/senduora/yamuse");
+    private static readonly Uri ProjectUri = UpdateSupport.OfficialRepository;
     private static readonly Uri ReleasesUri = new("https://github.com/senduora/yamuse/releases");
 
     private void InitializeUpdateSchedule()
@@ -129,7 +117,8 @@ public partial class MainWindow
     private void ArmUpdateSchedule()
     {
         _updateScheduleTimer?.Stop();
-        if (!_updateScheduleInitialized || _closed || _lifetime.IsCancellationRequested || !AppUpdates.State.FeedConfigured) return;
+        if (!_updateScheduleInitialized || _closed || _lifetime.IsCancellationRequested || _closeCommitInProgress
+            || _startupUpdateRestartRequested || !AppUpdates.State.FeedConfigured) return;
         var now = _updateClock();
         var normalized = UpdateSchedulePolicy.Normalize(_updateCheckpoint, now);
         if (normalized != _updateCheckpoint) { _updateCheckpoint = normalized; PersistUpdateCheckpoint(); }
@@ -156,7 +145,7 @@ public partial class MainWindow
 
     private async Task RunScheduledUpdateCheckAsync()
     {
-        if (_closed || _lifetime.IsCancellationRequested) return;
+        if (_closed || _lifetime.IsCancellationRequested || _closeCommitInProgress || _startupUpdateRestartRequested) return;
         var now = _updateClock();
         var next = UpdateSchedulePolicy.NextDue(_updateCheckFrequency, _updateCheckpoint, now);
         if (next is not null && next <= now && !_appUpdateActionInProgress && !_updateCheckInProgress)
@@ -166,19 +155,27 @@ public partial class MainWindow
 
     private async Task CheckAppUpdateNowAsync(UpdateSupport updates)
     {
-        if (_closed || _updateCheckInProgress || !updates.State.FeedConfigured || _lifetime.IsCancellationRequested) return;
+        if (_closed || _closeCommitInProgress || _updateCheckInProgress || !updates.State.FeedConfigured
+            || _lifetime.IsCancellationRequested || _startupUpdateRestartRequested) return;
         InitializeUpdateSchedule();
         _updateCheckInProgress = true;
+        var before = updates.State;
+        if (before.Status != AppUpdateStatus.Downloaded) _appUpdateFailure = null;
         _updateCheckpoint = UpdateSchedulePolicy.Normalize(_updateCheckpoint, _updateClock()) with { LastAttemptUtc = _updateClock() };
         PersistUpdateCheckpoint();
         try
         {
             var pending = updates.CheckAsync(_lifetime.Token);
             RefreshAppUpdateUi();
-            await pending;
+            var result = await pending;
             if (_closed || _lifetime.IsCancellationRequested) return;
-            if (updates.State.Status is AppUpdateStatus.NoUpdate or AppUpdateStatus.Available or AppUpdateStatus.Downloaded)
-            { _updateCheckpoint = _updateCheckpoint with { LastSuccessUtc = _updateClock() }; PersistUpdateCheckpoint(); }
+            if (result.Status != before.Status || !string.Equals(result.AvailableVersion, before.AvailableVersion, StringComparison.Ordinal))
+                _appUpdateFailure = null;
+            if (result.CheckSucceeded)
+            {
+                _updateCheckpoint = _updateCheckpoint with { LastSuccessUtc = _updateClock() };
+                PersistUpdateCheckpoint();
+            }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _diagnostics.LastErrorType = "Updates:" + ex.GetType().Name; }
@@ -191,7 +188,7 @@ public partial class MainWindow
 
     private async void FooterUpdate_Click(object sender, RoutedEventArgs e)
     {
-        if (_closed || _appUpdateActionInProgress || _updateCheckInProgress) return;
+        if (_closed || _closeCommitInProgress || _appUpdateActionInProgress || _updateCheckInProgress || _startupUpdateRestartRequested) return;
         if (AppUpdates.State.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded)
         {
             if (!AppUpdates.State.IsInstalled) OpenUpdateLink(ReleasesUri);

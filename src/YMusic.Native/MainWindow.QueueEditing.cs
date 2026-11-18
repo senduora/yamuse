@@ -61,52 +61,88 @@ public partial class MainWindow
             }
             return true;
         })) return []; // Never perform a partial destructive edit if layout is unavailable.
-        var occurrences = new Dictionary<TrackRow, Queue<int>>(ReferenceEqualityComparer.Instance);
-        for (var i = 0; i < _queue.Count; i++)
-        {
-            if (!occurrences.TryGetValue(_queue[i], out var positions)) occurrences[_queue[i]] = positions = new();
-            positions.Enqueue(i);
-        }
         var queueSelection = new bool[_queue.Count];
-        for (var i = 0; i < visible.Length; i++)
-            if (occurrences.TryGetValue(visible[i], out var positions) && positions.TryDequeue(out var index) && selected[i]) queueSelection[index] = true;
+        foreach (var occurrence in VisibleQueueOccurrences())
+            if (selected[occurrence.ViewIndex]) queueSelection[occurrence.QueueIndex] = true;
         return Enumerable.Range(0, queueSelection.Length).Where(index => queueSelection[index]).ToArray();
+    }
+
+    private IEnumerable<(int ViewIndex, int QueueIndex, TrackRow Row, bool Repeated)> VisibleQueueOccurrences()
+    {
+        var queue = _queue;
+        var positions = new Dictionary<TrackRow, Queue<int>>(ReferenceEqualityComparer.Instance);
+        var repeats = new HashSet<TrackRow>(ReferenceEqualityComparer.Instance);
+        for (var i = 0; i < queue.Count; i++)
+        {
+            var row = queue[i];
+            if (positions.TryGetValue(row, out var indices)) repeats.Add(row);
+            else positions[row] = indices = new();
+            indices.Enqueue(i);
+        }
+        var viewIndex = 0;
+        foreach (TrackRow row in _view)
+        {
+            if (positions.TryGetValue(row, out var indices) && indices.TryDequeue(out var queueIndex))
+                yield return (viewIndex, queueIndex, row, repeats.Contains(row));
+            viewIndex++;
+        }
+    }
+
+    private void RestoreQueueSelection(IReadOnlyCollection<long> tokens)
+    {
+        if (tokens.Count == 0) { TracksList.UnselectAll(); return; }
+        var wanted = tokens.ToHashSet();
+        if (tokens.Count == 1)
+        {
+            var index = Enumerable.Range(0, _queue.Count).FirstOrDefault(i => wanted.Contains(_playbackQueue.OccurrenceTokenAt(i)), -1);
+            SelectVisibleQueueOccurrence(index);
+            return;
+        }
+        var visible = VisibleQueueOccurrences().Select(item =>
+            (item.ViewIndex, item.QueueIndex, item.Row, item.Repeated, Selected: wanted.Contains(_playbackQueue.OccurrenceTokenAt(item.QueueIndex)))).ToArray();
+        if (visible.Length == TracksList.Items.Count && visible.All(item => item.Selected))
+        {
+            if (TracksList.SelectedItems.Count != visible.Length) TracksList.SelectAll();
+            return;
+        }
+        var current = SelectedQueueIndices().ToHashSet();
+        var repeatedChanges = new List<(int Index, bool Selected)>();
+        foreach (var item in visible)
+        {
+            if (item.Selected == current.Contains(item.QueueIndex)) continue;
+            if (item.Repeated) repeatedChanges.Add((item.ViewIndex, item.Selected));
+            else if (item.Selected) TracksList.SelectedItems.Add(item.Row);
+            else TracksList.SelectedItems.Remove(item.Row);
+        }
+        if (repeatedChanges.Count == 0) return;
+        WithQueueSelectionViewport(() =>
+        {
+            var panel = CurrentTrackItemsHost(TracksList);
+            foreach (var change in repeatedChanges)
+                if (QueueOccurrenceContainer(change.Index, panel) is { } container) container.IsSelected = change.Selected;
+            return true;
+        });
     }
 
     internal void MoveQueueSelection(int[] indices, int gap)
     {
-        var tokens = indices.Select(_playbackQueue.OccurrenceTokenAt).ToHashSet();
+        var tokens = indices.Select(_playbackQueue.OccurrenceTokenAt).ToArray();
         _playbackQueue.MoveMany(indices, gap);
         WithQueueSelectionViewport(() =>
         {
-            ShowQueueCore(revealCurrent: false);
-            TracksList.SelectedItems.Clear();
-            if (tokens.Count == 1)
-            {
-                var selected = Enumerable.Range(0, _queue.Count).Single(i => tokens.Contains(_playbackQueue.OccurrenceTokenAt(i)));
-                SelectVisibleQueueOccurrence(selected);
-                return true;
-            }
-            var occurrences = new Dictionary<TrackRow, Queue<bool>>(ReferenceEqualityComparer.Instance);
-            for (var i = 0; i < _queue.Count; i++)
-            {
-                if (!occurrences.TryGetValue(_queue[i], out var selected)) occurrences[_queue[i]] = selected = new();
-                selected.Enqueue(tokens.Contains(_playbackQueue.OccurrenceTokenAt(i)));
-            }
-            var duplicates = occurrences.Where(pair => pair.Value.Count > 1).Select(pair => pair.Key).ToHashSet(ReferenceEqualityComparer.Instance);
-            var panel = CurrentTrackItemsHost(TracksList); var index = 0;
-            foreach (TrackRow row in _view)
-            {
-                if (occurrences[row].Dequeue())
-                {
-                    if (!duplicates.Contains(row)) TracksList.SelectedItems.Add(row);
-                    else if (QueueOccurrenceContainer(index, panel) is { } container) container.IsSelected = true;
-                }
-                index++;
-            }
+            ShowEditedQueue(tokens);
             return true;
         });
         UpdateControls(); SavePlaybackState();
+    }
+
+    private void ShowEditedQueue(IReadOnlyCollection<long> selection)
+    {
+        _currentTrackRevealRequest++;
+        _filterTimer.Stop();
+        _query = FilterBox.Text.Trim();
+        ShowQueueRows();
+        RestoreQueueSelection(selection);
     }
 
     private T WithQueueSelectionViewport<T>(Func<T> action)
@@ -131,13 +167,16 @@ public partial class MainWindow
     }
     private void UndoQueueRemoval_Click(object sender, RoutedEventArgs e)
     {
-        if (_section != "queue" || !_playbackQueue.UndoRemoval()) return;
-        ShowQueueCore(revealCurrent: false);
-        if (_playbackQueue.Current is null)
+        if (_section != "queue" || !_playbackQueue.CanUndoRemoval) return;
+        var selection = CaptureQueueSelection();
+        if (!_playbackQueue.UndoRemoval()) return;
+        WithQueueSelectionViewport(() =>
         {
-            var firstPlayable = Enumerable.Range(0, _queue.Count).FirstOrDefault(i => _queue[i].CanPlay, -1);
-            if (firstPlayable >= 0) SelectVisibleQueueOccurrence(firstPlayable);
-        }
+            ShowEditedQueue(selection);
+            if (selection.Length == 0 && _playbackQueue.Current is null)
+                SelectVisibleQueueOccurrence(FirstVisiblePlayableQueueIndex());
+            return true;
+        });
         UpdateControls(); SavePlaybackState();
         SetStatus("Удалённые треки возвращены · воспроизведение сохранено");
     }

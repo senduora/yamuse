@@ -1,4 +1,5 @@
 using System.IO;
+using System.Net;
 using System.Net.Http;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -10,7 +11,6 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
-using System.Windows.Threading;
 using YMusic.Native;
 
 internal static partial class Program
@@ -100,6 +100,34 @@ internal static partial class Program
     {
         var directory=Path.Combine(_directory,"branding038-root-"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(directory);
         var liked=false;var writes=new List<string>();var unexpected=0;
+        var rejectLike = false;
+        var rejectedLikes = 0;
+        var aColor = Color.FromRgb(75, 65, 140);
+        var bColor = Color.FromRgb(145, 63, 72);
+        var aPng = HomeArtworkPng(aColor);
+        var bPng = HomeArtworkPng(bColor);
+        var releaseA = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseB = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var aRequests = 0;
+        var bRequests = 0;
+        var previousArtwork = Artwork.Cache;
+        using var artwork = new ArtworkCache(Path.Combine(directory, "artwork"), new FakeHandler(async (request, token) =>
+        {
+            HomeArtworkAnonymous(request);
+            switch (request.RequestUri!.AbsolutePath)
+            {
+                case "/get-music-content/1/branding-mini-a/400x400":
+                    Interlocked.Increment(ref aRequests);
+                    await releaseA.Task.WaitAsync(token);
+                    return HomeArtworkResponse(aPng);
+                case "/get-music-content/1/branding-mini-b/400x400":
+                    Interlocked.Increment(ref bRequests);
+                    await releaseB.Task.WaitAsync(token);
+                    return HomeArtworkResponse(bPng);
+                default:
+                    return new HttpResponseMessage(HttpStatusCode.NotFound);
+            }
+        }));
         var handler=new FakeHandler(async(request,token)=>
         {
             var path=request.RequestUri!.AbsolutePath;
@@ -112,6 +140,7 @@ internal static partial class Program
                 Assert(request.Method==HttpMethod.Post, "mini like did not invoke the existing write API");
                 var body=Uri.UnescapeDataString(await request.Content!.ReadAsStringAsync(token));
                 Assert(body.Contains("track-ids=branding-mini-a:1",StringComparison.Ordinal), "mini liked another playback reference");
+                if (rejectLike) { rejectedLikes++; return Json("{}", HttpStatusCode.ServiceUnavailable); }
                 liked=path.EndsWith("add-multiple",StringComparison.Ordinal);writes.Add(liked?"add":"remove");return Json("""{"result":{"revision":17}}""");
             }
             if(path=="/tracks")return Json("""{"result":[{"id":"branding-mini-a","title":"Первый fixture трек","available":true,"durationMs":30000,"artists":[{"id":"fixture-artist","name":"Fixture artist"}],"albums":[{"id":"1","title":"Fixture album"}]}]}""");
@@ -124,6 +153,7 @@ internal static partial class Program
         MiniPlayerWindow? mini=null; nint miniHandle=0;bool closed=false;
         try
         {
+            Artwork.Cache = artwork;
             window.Show();Control<Slider>(window,"VolumeSlider").Value=0;await Call(window,"ActivateAsync",FakeSession,CancellationToken.None);
             var a=BrandingLocalTrack("branding-mini-a","Первый fixture трек","branding038-a.wav");
             var b=BrandingLocalTrack("branding-mini-b","Второй fixture трек","branding038-b.wav");
@@ -136,9 +166,21 @@ internal static partial class Program
             mini!.ShowActivated=false;mini.WindowStartupLocation=WindowStartupLocation.Manual;mini.Left=-16000;mini.Top=0;miniHandle=new WindowInteropHelper(mini).Handle;
             await Until(()=>mini.TitleText.Text==a.Title&&mini.SeekSlider.IsEnabled&&mini.LikeButton.IsEnabled);
             Assert(mini.ArtistText.Text==a.Artist&&Math.Abs(mini.VolumeSlider.Value)<.01, "initial root mini metadata or muted volume differs");
-            var coverA=BrandingCover(Color.FromRgb(75,65,140));
-            await window.Dispatcher.InvokeAsync(()=>Control<Image>(window,"PlayerCover").Source=coverA,DispatcherPriority.Background);
-            await Until(()=>ReferenceEquals(mini.CoverImage.Source,coverA));
+            var mainCover = Control<Image>(window, "PlayerCover");
+            var miniCover = mini.CoverImage;
+            async Task CheckSharedCover(TrackRow track, Color color, TaskCompletionSource release)
+            {
+                Assert(Artwork.GetSourceUri(mainCover) == track.CoverUri && Artwork.GetSourceUri(miniCover) == track.CoverUri
+                    && Artwork.GetLoadStatus(mainCover) == ArtworkLoadStatus.Loading && Artwork.GetLoadStatus(miniCover) == ArtworkLoadStatus.Loading
+                    && mainCover.Source is null && miniCover.Source is null, "root and mini did not start the current artwork together");
+                release.SetResult();
+                await Until(() => Artwork.GetLoadStatus(mainCover) == ArtworkLoadStatus.Ready
+                    && Artwork.GetLoadStatus(miniCover) == ArtworkLoadStatus.Ready);
+                Assert(mainCover.Source is BitmapSource { IsFrozen: true } bitmap && ReferenceEquals(bitmap, miniCover.Source)
+                    && HomeArtworkPixel(bitmap).SequenceEqual(new byte[] { color.B, color.G, color.R, color.A }),
+                    "root and mini did not share the decoded current track artwork");
+            }
+            await CheckSharedCover(a, aColor, releaseA);
             Control<Slider>(window,"VolumeSlider").Value=23;
             await Until(()=>Math.Abs(mini.VolumeSlider.Value-23)<.01&&Math.Abs(player.Volume-.23)<.001);
             mini.VolumeSlider.Value=61;
@@ -148,6 +190,22 @@ internal static partial class Program
             await Until(()=>liked&&writes.Count==1&&mini.LikeButton.ToolTip?.ToString()=="Убрать из Мне нравится"&&!SaField<bool>(window,"_catalogWriting"));
             Control<Button>(window,"PlayerLikeButton").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
             await Until(()=>!liked&&writes.Count==2&&mini.LikeButton.ToolTip?.ToString()=="Добавить в Мне нравится"&&!SaField<bool>(window,"_catalogWriting"));
+            var notice = SaVisuals<TextBlock>(mini).Single(text => text.Name == "MiniCommandError");
+            rejectLike = true;
+            mini.LikeButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            await Until(() => rejectedLikes > 0 && !SaField<bool>(window, "_catalogWriting"));
+            Assert(notice.Visibility == Visibility.Collapsed, "visible main window duplicated the like error in the mini");
+            window.Hide();
+            var firstRejection = rejectedLikes;
+            mini.LikeButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            await Until(() => rejectedLikes > firstRejection && !SaField<bool>(window, "_catalogWriting"));
+            Assert(mini.IsVisible && !window.IsVisible && !liked && player.IsPlaying && mini.PlayButton.IsEnabled
+                && notice.IsVisible && notice.Text == Control<TextBlock>(window, "StatusText").Text
+                && !string.IsNullOrWhiteSpace(notice.Text) && Equals(notice.ToolTip, notice.Text)
+                && AutomationProperties.GetLiveSetting(notice) == AutomationLiveSetting.Polite,
+                "mini action error was lost while the owner was hidden or changed playback controls");
+            shell.ShowMainWindow();
+            Assert(window.IsVisible && notice.Visibility == Visibility.Collapsed, "return to the main window left a duplicate error");
             mini.PlayButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));await Until(()=>!player.IsPlaying&&AutomationProperties.GetName(mini.PlayButton)=="Играть");
             var source=PresentationSource.FromVisual(mini.SeekSlider);Assert(source is not null, "mini seek slider lacks a real presentation source");
             mini.SeekSlider.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice,source!,Environment.TickCount,Key.Right){RoutedEvent=Keyboard.PreviewKeyDownEvent});
@@ -159,9 +217,8 @@ internal static partial class Program
             mini.PlayButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));await Until(()=>player.IsPlaying&&AutomationProperties.GetName(mini.PlayButton)=="Пауза");
             SaVisuals<Button>(mini).Single(button=>AutomationProperties.GetName(button)=="Следующий трек").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
             await Until(()=>ReferenceEquals(SaField<TrackRow?>(window,"_current"),b)&&player.SourceLocalPath==b.LocalPath&&mini.TitleText.Text==b.Title&&!SaField<bool>(window,"_loadingStream"));
-            var coverB=BrandingCover(Color.FromRgb(145,63,72));
-            await window.Dispatcher.InvokeAsync(()=>Control<Image>(window,"PlayerCover").Source=coverB,DispatcherPriority.Background);
-            await Until(()=>ReferenceEquals(mini.CoverImage.Source,coverB));
+            await CheckSharedCover(b, bColor, releaseB);
+            Assert(aRequests == 1 && bRequests == 1, "root and mini made duplicate artwork requests");
             Assert(ReferenceEquals(SaField<NativePlayer>(window,"_player"),player)&&ReferenceEquals(SaField<PlaybackQueue>(window,"_playbackQueue"),queue)
                 &&queue.Items.Select(row=>row.RequestId).SequenceEqual(new[]{a.RequestId,b.RequestId}), "mini transport replaced the root player/queue or rewrote queue content");
             Assert(writes.SequenceEqual(new[]{"add","remove"})&&unexpected==0, "mini like callback sequence or fake API routing differs");
@@ -170,18 +227,22 @@ internal static partial class Program
             window.Close();closed=true;await Until(()=>!mini.IsVisible&&!BrandingIsWindow(miniHandle));
             Assert(!player.HasSource&&!player.IsPlaying, "owner teardown retained its audio source");
         }
-        finally{if(!closed)window.Close();player.Dispose();handler.Dispose();}
+        finally
+        {
+            releaseA.TrySetResult(); releaseB.TrySetResult();
+            if(!closed)window.Close();
+            Artwork.Cache = previousArtwork;
+            player.Dispose(); handler.Dispose();
+        }
     }
 
     private static TrackRow BrandingLocalTrack(string id,string title,string waveName)
     {
         var path=WriteWave(waveName,30);var bytes=File.ReadAllBytes(path);Array.Clear(bytes,44,bytes.Length-44);File.WriteAllBytes(path,bytes);
-        return new TrackRow{Id=id,RequestId=id+":1",Title=title,Artist="Fixture artist",Album="Fixture album",AlbumId="1",Available=true,DurationMs=30000,LocalPath=path,LocalQuality="Muted PCM WAV"};
+        return new TrackRow{Id=id,RequestId=id+":1",Title=title,Artist="Fixture artist",Album="Fixture album",AlbumId="1",Available=true,DurationMs=30000,LocalPath=path,LocalQuality="Muted PCM WAV",
+            CoverUri = $"https://avatars.yandex.net/get-music-content/1/{id}/%%"};
     }
     private static MiniPlayerWindow? BrandingMini(DesktopShell shell)=>(MiniPlayerWindow?)typeof(DesktopShell).GetField("_mini",BindingFlags.NonPublic|BindingFlags.Instance)!.GetValue(shell);
-    private static ImageSource BrandingCover(Color color)
-    {var drawing=new DrawingImage(new GeometryDrawing(new SolidColorBrush(color),null,new RectangleGeometry(new Rect(0,0,64,64))));drawing.Freeze();return drawing;}
-
     private sealed record BrandingCaptureFacts(bool Captured,string? Reason=null,int Width=0,int Height=0,
         bool NonClientGeometryIncluded=false,int CaptionBandX=0,int CaptionBandY=0,int CaptionBandWidth=0,int CaptionBandHeight=0,
         int CaptionBandSamples=0,double CaptionColorNearFraction=0,double CaptionDarkFraction=0,

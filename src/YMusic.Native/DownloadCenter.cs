@@ -7,10 +7,11 @@ namespace YMusic.Native;
 
 internal enum DownloadEntryState { Queued, Resolving, Downloading, Completed, Failed, Unavailable, Paused, Suspended, Removed }
 
-internal sealed class DownloadEntry(TrackRow track) : INotifyPropertyChanged
+internal sealed class DownloadEntry(TrackRow track, AudioQuality? automaticFavoriteQuality = null) : INotifyPropertyChanged
 {
     private readonly int _ownerThread = Environment.CurrentManagedThreadId;
     internal TrackRow Track { get; } = track;
+    internal AudioQuality? AutomaticFavoriteQuality { get; } = automaticFavoriteQuality;
     public string Title => Track.Title;
     public string Artist => Track.Artist;
     public DownloadEntryState State { get; private set; } = DownloadEntryState.Queued;
@@ -53,8 +54,15 @@ internal sealed class DownloadEntry(TrackRow track) : INotifyPropertyChanged
         Attempts = attempts; RemovedFromCollection = removedFromCollection; SkipFavoritesDownload = skipFavoritesDownload;
         SetState(state, DownloadFailure.RestorableReason(error));
     }
-    internal void SetCollectionLike(bool liked, bool favoritesBatch)
-    { VerifyAccess(); RemovedFromCollection = !liked; SkipFavoritesDownload = !liked && favoritesBatch; Changed(); }
+    internal bool SetCollectionLike(bool liked, bool favoritesBatch)
+    {
+        VerifyAccess();
+        var removed = !liked;
+        var skip = removed && favoritesBatch;
+        if (RemovedFromCollection == removed && SkipFavoritesDownload == skip) return false;
+        RemovedFromCollection = removed; SkipFavoritesDownload = skip; Changed();
+        return true;
+    }
     internal static string FormatBytes(long bytes) => bytes >= 1073741824 ? $"{bytes / 1073741824.0:F2} ГБ" : bytes >= 1048576 ? $"{bytes / 1048576.0:F1} МБ" : bytes >= 1024 ? $"{bytes / 1024.0:F1} КБ" : $"{bytes} Б";
     public event PropertyChangedEventHandler? PropertyChanged;
     private void VerifyAccess()
@@ -66,10 +74,12 @@ internal sealed class DownloadEntry(TrackRow track) : INotifyPropertyChanged
 // sink below is the only object a downloader may update from another thread.
 internal sealed class DownloadQueueState
 {
+    internal const string EmptyLabel = "Очередь пуста";
+    internal const string EmptyNotice = "Выберите треки или скачайте плейлист целиком.";
     private readonly int _ownerThread = Environment.CurrentManagedThreadId;
     public ObservableCollection<DownloadEntry> Entries { get; } = [];
-    public string Label { get; private set; } = "Очередь пуста";
-    public string Notice { get; private set; } = "Выберите треки или скачайте плейлист целиком.";
+    public string Label { get; private set; } = EmptyLabel;
+    public string Notice { get; private set; } = EmptyNotice;
     public bool Running { get; private set; }
     public bool Suspended { get; private set; }
     public bool FavoritesBatch { get; private set; }
@@ -89,6 +99,34 @@ internal sealed class DownloadQueueState
         Notice = replaced ? "Показана новая очередь вместо предыдущей. Сохранённые файлы остаются в скачанном." : "Пауза сохраняет готовые треки. Незавершённый трек при продолжении скачивается заново.";
         StateChanged?.Invoke();
     }
+    internal bool AppendAutomaticFavorites(IEnumerable<TrackRow> tracks, AudioQuality quality)
+    {
+        VerifyAccess();
+        var ids = Entries.Select(entry => entry.Track.Id).ToHashSet(StringComparer.Ordinal);
+        var added = false;
+        foreach (var track in tracks)
+        {
+            if (!ids.Add(track.Id)) continue;
+            AddEntry(new(track, quality));
+            added = true;
+        }
+        if (added) StateChanged?.Invoke();
+        return added;
+    }
+    internal bool DiscardUnstartedAutomaticFavorites()
+    {
+        VerifyAccess();
+        var pending = Entries.Where(entry => entry.AutomaticFavoriteQuality is not null && entry.Attempts == 0
+            && entry.State is DownloadEntryState.Queued or DownloadEntryState.Paused).ToArray();
+        foreach (var entry in pending)
+        {
+            entry.PropertyChanged -= EntryChanged;
+            entry.SetState(DownloadEntryState.Removed);
+            Entries.Remove(entry);
+        }
+        if (pending.Length > 0) StateChanged?.Invoke();
+        return pending.Length > 0;
+    }
     internal void Restore(RestoredDownloadQueue restored)
     {
         VerifyAccess();
@@ -96,7 +134,7 @@ internal sealed class DownloadQueueState
         ClearEntries();
         foreach (var item in restored.Entries)
         {
-            var entry = new DownloadEntry(item.Track);
+            var entry = new DownloadEntry(item.Track, item.AutomaticFavoriteQuality);
             entry.Restore(item.State, item.Bytes, item.Attempts, item.Error, item.RemovedFromCollection, item.SkipFavoritesDownload);
             AddEntry(entry);
         }
@@ -111,11 +149,12 @@ internal sealed class DownloadQueueState
     private void AddEntry(DownloadEntry entry)
     { Entries.Add(entry); entry.PropertyChanged += EntryChanged; }
     private void EntryChanged(object? sender, PropertyChangedEventArgs args) => StateChanged?.Invoke();
-    internal DownloadEntry[] BeginRun(bool retryFailed)
+    internal DownloadEntry[] BeginRun(bool retryFailed, IReadOnlySet<DownloadEntry>? resumeEntries = null)
     {
         VerifyAccess();
         if (Running || Suspended) return [];
-        var selected = Entries.Where(e => !e.SkipFavoritesDownload && (retryFailed ? e.State == DownloadEntryState.Failed : e.State is DownloadEntryState.Queued or DownloadEntryState.Paused)).ToArray();
+        var selected = Entries.Where(e => !e.SkipFavoritesDownload && (resumeEntries is null || resumeEntries.Contains(e))
+            && (retryFailed ? e.State == DownloadEntryState.Failed : e.State is DownloadEntryState.Queued or DownloadEntryState.Paused)).ToArray();
         if (selected.Length > 0 && retryFailed) Notice = "Повторяем только треки с ошибкой. Сохранённые и недоступные треки не скачиваются повторно.";
         else if (selected.Any(e => e.State == DownloadEntryState.Paused)) Notice = "Продолжаем очередь. Уже сохранённые треки не скачиваются повторно.";
         foreach (var entry in selected) entry.SetState(DownloadEntryState.Queued);
@@ -158,8 +197,30 @@ internal sealed class DownloadQueueState
     internal void SetCollectionLike(string trackId, bool liked)
     {
         VerifyAccess();
-        foreach (var entry in Entries.Where(e => e.Track.Id == trackId)) entry.SetCollectionLike(liked, FavoritesBatch);
+        foreach (var entry in Entries.Where(e => e.Track.Id == trackId))
+            entry.SetCollectionLike(liked, FavoritesBatch || entry.AutomaticFavoriteQuality is not null);
         if (!Running && !Suspended) EndRun(false);
+    }
+    internal bool ReconcileFavorites(IReadOnlySet<string> confirmedIds)
+    {
+        VerifyAccess();
+        var changed = false;
+        foreach (var entry in Entries)
+        {
+            if ((FavoritesBatch || entry.AutomaticFavoriteQuality is not null)
+                && entry.State is DownloadEntryState.Queued or DownloadEntryState.Resolving or DownloadEntryState.Paused or DownloadEntryState.Failed)
+                changed |= entry.SetCollectionLike(confirmedIds.Contains(entry.Track.Id), favoritesBatch: true);
+        }
+        if (changed && !Running && !Suspended) EndRun(false);
+        return changed;
+    }
+    internal void AllowExplicitActionsAfterRemoval()
+    {
+        VerifyAccess();
+        if (Running) throw new InvalidOperationException("A running download queue cannot be resumed after maintenance.");
+        Suspended = false;
+        foreach (var entry in Entries.Where(entry => entry.State == DownloadEntryState.Suspended)) entry.SetState(DownloadEntryState.Paused);
+        EndRun(interrupted: false);
     }
     internal void VerifyAccess()
     { if (Environment.CurrentManagedThreadId != _ownerThread) throw new InvalidOperationException("Download queue mutations require their owning dispatcher thread."); }

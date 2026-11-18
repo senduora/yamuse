@@ -6,7 +6,6 @@ namespace YMusic.Native;
 
 public partial class App : Application
 {
-    private Mutex? _instanceMutex;
     internal static string DataDirectory => BrandPaths.Current.DataDirectory;
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -14,13 +13,7 @@ public partial class App : Application
         var demo = e.Args.Contains("--demo", StringComparer.OrdinalIgnoreCase);
         if (!demo)
         {
-            _instanceMutex = new Mutex(true, BrandPaths.LegacyInstanceMutex, out var created);
-            if (!created)
-            {
-                MessageBox.Show("Yamuse уже открыт. Переключитесь на его окно.", AppBranding.Name, MessageBoxButton.OK, MessageBoxImage.Information);
-                Shutdown();
-                return;
-            }
+            UninstallSupport.RegisterWindowsUninstall();
             try { BrandPaths.Current.MigrateLegacyData(); }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
             {
@@ -33,10 +26,7 @@ public partial class App : Application
         }
         // A demo preview must not create the branded profile before the first
         // normal launch migrates the user's existing account and settings.
-        var window = demo
-            ? new MainWindow(demo: true, restore: false,
-                diagnosticsDirectory: Path.Combine(Path.GetTempPath(), "Yamuse", "demo-" + Environment.ProcessId))
-            : new MainWindow();
+        var window = demo ? CreateDemoWindow(Directory.CreateTempSubdirectory("Yamuse-demo-").FullName) : new MainWindow();
         MainWindow = window;
         window.InitializeFullUninstall();
         if (!demo && e.Args.Contains("--login", StringComparer.OrdinalIgnoreCase))
@@ -53,10 +43,39 @@ public partial class App : Application
         }
         window.Show();
     }
-    protected override void OnExit(ExitEventArgs e)
+    internal static Mutex? TryBeginNormalStartup(string mutexName, Func<bool> blocksStartup, Action showExistingInstance)
     {
-        _instanceMutex?.Dispose();
-        base.OnExit(e);
+        var mutex = new Mutex(true, mutexName, out var created);
+        if (!created)
+        {
+            // Another handle would keep the name alive even after the owner exits.
+            mutex.Dispose();
+            showExistingInstance();
+            return null;
+        }
+
+        var admitted = false;
+        try
+        {
+            admitted = !blocksStartup();
+            return admitted ? mutex : null;
+        }
+        finally
+        {
+            if (!admitted)
+            {
+                mutex.ReleaseMutex();
+                mutex.Dispose();
+            }
+        }
+    }
+    internal static MainWindow CreateDemoWindow(string directory)
+    {
+        var artwork = new ArtworkCache(Path.Combine(directory, "artwork"));
+        Artwork.Cache = artwork;
+        var window = new MainWindow(demo: true, restore: false, diagnosticsDirectory: directory);
+        window.Closed += (_, _) => artwork.Dispose();
+        return window;
     }
     internal static void Capture(Window window, string path)
     {

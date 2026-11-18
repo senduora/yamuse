@@ -22,6 +22,12 @@ internal sealed partial class MusicApi
     private static readonly Regex DiscoveryTime = new(
         @"^(?:(?<h>[0-9]{1,6}):)?(?<m>[0-9]{1,6}):(?<s>[0-9]{2})(?:[.,](?<f>[0-9]{1,3}))?$",
         RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
+    private static readonly Regex DiscoveryWordTime = new(
+        @"<(?:[0-9]{1,6}:)?[0-9]{1,6}:[0-5][0-9](?:[.,][0-9]{1,3})?>",
+        RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
+    private static readonly Regex DiscoveryHtmlStart = new(
+        @"^(?:<!doctype\s+html[\s>]|<!--|<(?:html|head|body|title|script|style|meta|form|div|h1|p)[\s/>])",
+        RegexOptions.CultureInvariant | RegexOptions.NonBacktracking | RegexOptions.IgnoreCase);
 
     public async Task<IReadOnlyList<HomeSection>> GetHomeSectionsAsync(Session session, CancellationToken cancellationToken)
     {
@@ -55,6 +61,7 @@ internal sealed partial class MusicApi
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(trackId);
+        var escapedTrackId = CatalogId(trackId);
         var number = trackId.Split(':')[0];
         if (number.Length == 0) throw new ArgumentException("Пустой идентификатор трека.", nameof(trackId));
         var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
@@ -66,7 +73,7 @@ internal sealed partial class MusicApi
         {
             try
             {
-                var path = $"/tracks/{Uri.EscapeDataString(trackId)}/lyrics?format={format}&timeStamp={timestamp}&sign={Uri.EscapeDataString(signature)}";
+                var path = $"/tracks/{escapedTrackId}/lyrics?format={format}&timeStamp={timestamp}&sign={Uri.EscapeDataString(signature)}";
                 using var json = await DiscoveryJsonAsync(session, path, true, cancellationToken).ConfigureAwait(false);
                 var result = DiscoveryResult(json);
                 var url = Text(result, "downloadUrl");
@@ -75,7 +82,8 @@ internal sealed partial class MusicApi
                 if (format == "LRC") return ParseDiscoveryLrc(text);
                 var plain = NormalizeDiscoveryLines(text).TrimStart('\uFEFF');
                 if (string.IsNullOrWhiteSpace(plain)) throw new DiscoveryUnavailable("Источник TEXT не выдал текст.", false);
-                return new(plain, [], false, "Синхронизация недоступна. " + failures[0].Message);
+                return new(plain, [], false, "Синхронизация недоступна. " + failures[0].Message,
+                    RetrySynchronizedLyrics: failures[0].Transient);
             }
             catch (DiscoveryUnavailable error) { failures.Add(error); }
             catch (HttpRequestException) { failures.Add(new($"Сервис {format} не ответил по сети.", true)); }
@@ -83,7 +91,7 @@ internal sealed partial class MusicApi
 
         try
         {
-            using var json = await DiscoveryJsonAsync(session, $"/tracks/{Uri.EscapeDataString(trackId)}/supplement", false, cancellationToken).ConfigureAwait(false);
+            using var json = await DiscoveryJsonAsync(session, $"/tracks/{escapedTrackId}/supplement", false, cancellationToken).ConfigureAwait(false);
             var result = DiscoveryResult(json);
             var note = "Синхронизация недоступна. " + string.Join(" ", failures.Select(error => error.Message));
             if (!result.TryGetProperty("lyrics", out var lyrics) || lyrics.ValueKind is JsonValueKind.Null)
@@ -94,13 +102,14 @@ internal sealed partial class MusicApi
             if (lyrics.ValueKind != JsonValueKind.Object) throw new DiscoveryUnavailable("Изменился формат обычного текста.", false);
             var fullAllowed = Bool(lyrics, "hasRights");
             var plain = fullAllowed ? Text(lyrics, "fullLyrics") : "";
-            if (string.IsNullOrWhiteSpace(plain)) plain = Text(lyrics, "lyrics");
+            var mayBePartial = string.IsNullOrWhiteSpace(plain);
+            if (mayBePartial) plain = Text(lyrics, "lyrics");
             if (string.IsNullOrWhiteSpace(plain)) plain = "";
             if (string.IsNullOrWhiteSpace(plain) && failures.Any(error => error.Transient || error.Denied))
                 throw new MusicException("Не удалось загрузить текст: источник временно недоступен или отказал в доступе; резервный источник не выдал текст.");
-            if (!fullAllowed) note += " Полнота доступного обычного текста не подтверждена.";
             if (plain.Length == 0) note += " Обычный текст недоступен.";
-            return new(NormalizeDiscoveryLines(plain).TrimStart('\uFEFF'), [], false, note);
+            return new(NormalizeDiscoveryLines(plain).TrimStart('\uFEFF'), [], false, note, MayBePartial: mayBePartial && plain.Length > 0,
+                RetrySynchronizedLyrics: failures[0].Transient);
         }
         catch (DiscoveryUnavailable error)
         {
@@ -152,19 +161,43 @@ internal sealed partial class MusicApi
                 using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
                 if ((int)response.StatusCode is >= 300 and <= 399)
                 {
-                    if (redirects >= 3 || response.Headers.Location is null) throw new DiscoveryUnavailable("Слишком много перенаправлений текста.", false);
-                    uri = ValidateDiscoveryLyricsUri(new Uri(uri, response.Headers.Location));
+                    if (redirects >= 3 || response.Headers.Location is not { } location || !Uri.TryCreate(uri, location, out var target))
+                        throw new DiscoveryUnavailable("Не удалось обработать перенаправление текста.", false);
+                    uri = ValidateDiscoveryLyricsUri(target);
                     continue;
                 }
                 CheckDiscoveryStatus(response);
+                var mediaType = response.Content.Headers.ContentType?.MediaType;
+                if (mediaType is not null && (mediaType.Equals("text/html", StringComparison.OrdinalIgnoreCase)
+                    || mediaType.Equals("application/xhtml+xml", StringComparison.OrdinalIgnoreCase)
+                    || mediaType.Equals("application/json", StringComparison.OrdinalIgnoreCase)
+                    || mediaType.Equals("text/json", StringComparison.OrdinalIgnoreCase)
+                    || mediaType.EndsWith("+json", StringComparison.OrdinalIgnoreCase)))
+                    throw new DiscoveryUnavailable("Вместо текста песни сервис вернул страницу или структурированные данные.", false);
                 var bytes = await ReadDiscoveryBodyAsync(response, DiscoveryLyricsLimit, timeout.Token).ConfigureAwait(false);
-                try { return new UTF8Encoding(false, true).GetString(StripDiscoveryBom(bytes).Span); }
+                timeout.Token.ThrowIfCancellationRequested();
+                string text;
+                try { text = new UTF8Encoding(false, true).GetString(StripDiscoveryBom(bytes).Span); }
                 catch (DecoderFallbackException) { throw new DiscoveryUnavailable("Кодировка текста не поддерживается.", false); }
+                if (IsDiscoveryDocument(text))
+                    throw new DiscoveryUnavailable("Вместо текста песни сервис вернул страницу или структурированные данные.", false);
+                return text;
             }
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         { throw new DiscoveryUnavailable("Сервис текста не ответил вовремя.", true); }
         catch (IOException) { throw new DiscoveryUnavailable("Не удалось дочитать текст по сети.", true); }
+    }
+
+    private static bool IsDiscoveryDocument(string text)
+    {
+        var start = text.AsSpan().TrimStart();
+        if (start.IsEmpty) return false;
+        if (start[0] == '<') return DiscoveryHtmlStart.IsMatch(start);
+        if (start[0] is not ('{' or '[')) return false;
+        // Ordinary and synchronized lyrics can begin with a bracketed annotation.
+        try { using var json = JsonDocument.Parse(text, new JsonDocumentOptions { MaxDepth = 48 }); return true; }
+        catch (JsonException) { return false; }
     }
 
     private static Uri ValidateDiscoveryLyricsUri(Uri uri)
@@ -174,7 +207,7 @@ internal sealed partial class MusicApi
     }
     private static void CheckDiscoveryStatus(HttpResponseMessage response)
     {
-        if (response.StatusCode == HttpStatusCode.PartialContent || response.Content.Headers.ContentRange is not null)
+        if (response.StatusCode == HttpStatusCode.PartialContent || response.Content.Headers.NonValidated.Contains("Content-Range"))
             throw new DiscoveryUnavailable("Сервис вернул только часть данных.", false);
         if (!response.IsSuccessStatusCode)
             throw new DiscoveryUnavailable($"Источник недоступен (HTTP {(int)response.StatusCode}).", (int)response.StatusCode >= 500 || (int)response.StatusCode == 429,
@@ -344,7 +377,11 @@ internal sealed partial class MusicApi
             while (position < line.Length && line[position] == '[')
             {
                 var close = line.IndexOf(']', position + 1);
-                if (close < 0) throw new DiscoveryUnavailable("Некорректная метка LRC.", false);
+                if (close < 0)
+                {
+                    if (times.Count > 0) break;
+                    throw new DiscoveryUnavailable("Некорректная метка LRC.", false);
+                }
                 var tag = line[(position + 1)..close];
                 var match = DiscoveryTime.Match(tag);
                 if (match.Success)
@@ -362,6 +399,7 @@ internal sealed partial class MusicApi
                         || offset is { } previous && previous != value) throw new DiscoveryUnavailable("Некорректный или противоречивый offset LRC.", false);
                     offset = value;
                 }
+                else if (times.Count > 0) break;
                 else if (tag.Length > 0 && (char.IsAsciiDigit(tag[0]) || tag[0] == '-' && tag.Length > 1 && char.IsAsciiDigit(tag[1])))
                     throw new DiscoveryUnavailable("Таймкод LRC не поддерживается.", false);
                 else if (tag.IndexOf(':') <= 0) throw new DiscoveryUnavailable("Разметка LRC не поддерживается.", false);
@@ -373,7 +411,7 @@ internal sealed partial class MusicApi
                 if (text.Length > 0) throw new DiscoveryUnavailable("В LRC есть строки без таймкодов.", false);
                 continue;
             }
-            if (text.Contains('<') && text.Contains(':')) throw new DiscoveryUnavailable("Словная разметка LRC пока не поддерживается.", false);
+            if (text.Contains('<')) text = DiscoveryWordTime.Replace(text, "").Trim();
             if (timed.Count + times.Count > 20000) throw new DiscoveryUnavailable("Слишком много временных меток LRC.", false);
             // Repeated timestamps share their text until string.Join materializes
             // every copy. Bound the expanded text and its separators first.

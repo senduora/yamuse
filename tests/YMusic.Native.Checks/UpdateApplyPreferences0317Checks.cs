@@ -29,7 +29,7 @@ internal static partial class Program
         var pending = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         R4Set(fixture.Window, "_downloadTask", pending.Task);
         var restart = R4Task<bool>(fixture.Window, "ApplyAppUpdateAsync", fixture.Updates);
-        Assert(!restart.IsCompleted && R4Get<bool>(fixture.Window, "_downloadsAutoSuspended") && fixture.Backend.Applies == 0,
+        Assert(!restart.IsCompleted && R4Get<bool>(fixture.Window, "_appUpdatePreparingRestart") && fixture.Backend.Applies == 0,
             "the update did not suspend downloads and await their atomic completion");
         R4Get<CheckBox>(fixture.Window, "SettingsAutoFavorites").IsChecked = false;
         var during = store.Load().AutoDownloadFavorites;

@@ -1,11 +1,14 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 using Velopack.Locators;
 
 namespace YMusic.Native;
@@ -14,6 +17,12 @@ internal static class UninstallSupport
 {
     internal const string RequestArgument = "--uninstall";
     internal const string CompleteArgument = "--complete-full-uninstall";
+    private const string PendingReceiptFileName = "full-uninstall.pending.json";
+    private const string StartupPending = "Полное удаление Yamuse уже запрошено или не завершено.";
+    private const string StartupMarkerUnavailable = "Не удалось проверить состояние удаления Yamuse. Приложение пока не откроет данные. Проверьте доступ к папке установки и повторите запуск.";
+    private const string RecoveryDone = "Запрос сброшен. Теперь можно снова открыть Yamuse. Для полного удаления потребуется новое подтверждение.";
+    private const string ConsumedRecovery = "Данные Yamuse уже очищены. Завершите штатное удаление приложения из параметров Windows. Если запись приложения отсутствует или установка повреждена, восстановите установку перед повтором.";
+    private const string RecoveryTitle = "Восстановление запуска Yamuse";
     private const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\YMusic.Native";
     private static string EventName => @"Local\YMusic.Native.FullUninstall." + WindowsIdentity.GetCurrent().User!.Value;
 
@@ -26,45 +35,102 @@ internal static class UninstallSupport
         (UninstallPathGuard.EntryExists(paths.LegacyMusic) ? "\n• скачанная музыка предыдущей версии:\n" + paths.LegacyMusic : "") +
         "\n\nПосторонние и изменённые аудиофайлы сохранятся. Восстановить удалённое нельзя.";
 
-    // Called after Velopack.Run, before constructing App or acquiring its mutex.
-    // Normal launches return false and never open account storage here.
+    // Called by ordinary startup after taking the application mutex, without
+    // requiring Update.exe/current to remain readable during native removal.
+    internal static string? GetNormalStartupBlockReason()
+    {
+        try
+        {
+            return HasStartupMarker(LocalDataDirectory()) ? StartupPending : null;
+        }
+        catch (Exception error) when (IsUninstallFailure(error)) { return StartupMarkerUnavailable; }
+    }
+
+    // Program invokes this after releasing its startup probe mutex. A long
+    // warning/confirmation must never prevent the admitted cleanup from exiting.
+    internal static void ShowNormalStartupBlocked(string reason)
+    {
+        if (reason != StartupPending)
+        {
+            MessageBox.Show(reason, RecoveryTitle, MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        try
+        {
+            var localData = LocalDataDirectory();
+            var candidate = InspectStartupMarkerForReset(localData);
+            if (candidate is null)
+            {
+                MessageBox.Show("Запрос уже отсутствует. Запустите Yamuse снова.", RecoveryTitle, MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (candidate.Consumed)
+            {
+                MessageBox.Show(ConsumedRecovery, RecoveryTitle, MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (!ConfirmRecovery(reason + "\n\nСбросить запрос, чтобы снова открыть приложение? Сброс затрагивает только файл запроса. Чтобы продолжить удаление, выберите «Нет» и откройте удаление Yamuse в параметрах Windows.")) return;
+
+            // Reopen the exact fixed marker under the application mutex. If it
+            // changed while the dialog was open, the previous answer is stale.
+            string message;
+            using (var main = new Mutex(true, BrandPaths.LegacyInstanceMutex, out var created))
+            {
+                message = created && TryResetStartupMarker(localData, candidate)
+                    ? RecoveryDone : "Состояние запроса изменилось или выполняется другая операция. Повторите запуск Yamuse.";
+            }
+            MessageBox.Show(message, RecoveryTitle, MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception error) when (IsUninstallFailure(error))
+        {
+            MessageBox.Show("Не удалось проверить или сбросить запрос удаления.\n\n" + error.Message,
+                RecoveryTitle, MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    internal static bool HasStartupMarker(string localDataDirectory)
+        => UninstallPathGuard.EntryExists(Path.Combine(InstallFromLocalData(localDataDirectory), PendingReceiptFileName));
+
+    private static string LocalDataDirectory() => Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    private static string InstallFromLocalData(string localDataDirectory)
+        => Path.Combine(UninstallPathGuard.Canonical(localDataDirectory), BrandPaths.LegacyPackageId);
+    private static bool ConfirmRecovery(string message)
+        => MessageBox.Show(message, RecoveryTitle, MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes;
+    private static bool IsUninstallFailure(Exception error) => error is IOException or UnauthorizedAccessException or InvalidOperationException
+        or Win32Exception or JsonException;
+
+    // Called after Velopack.Run, before constructing App. Only explicit
+    // uninstall commands are handled here.
     internal static bool TryHandleCommand(string[] args)
     {
         if (!args.Contains(RequestArgument, StringComparer.OrdinalIgnoreCase)
             && !args.Contains(CompleteArgument, StringComparer.OrdinalIgnoreCase))
-        {
-            try
-            {
-                // Check the fixed marker without requiring Update.exe/current
-                // to remain readable: native uninstall may already be removing
-                // them. Even a portable launch uses the same user data and
-                // must not recreate it during this handover.
-                var local = UninstallPathGuard.Canonical(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
-                if (UninstallPathGuard.EntryExists(Path.Combine(local, "YMusic.Native", "full-uninstall.pending.json")))
-                {
-                    MessageBox.Show("Полное удаление Yamuse уже запрошено или не завершено.\n\nЧтобы завершить удаление или проверить оставшийся запрос, откройте удаление Yamuse в параметрах Windows. До этого приложение не будет открывать данные.",
-                        "Удаление Yamuse", MessageBoxButton.OK, MessageBoxImage.Information);
-                    return true;
-                }
-            }
-            catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or System.ComponentModel.Win32Exception)
-            {
-                MessageBox.Show("Не удалось проверить состояние удаления Yamuse. Приложение не будет открывать данные.\n\nПовторите запуск после завершения удаления или проверьте доступ к папке установки.",
-                    "Удаление Yamuse", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return true;
-            }
             return false;
-        }
         try
         {
-            var paths = CurrentInstalledPaths();
             if (args.Length == 1 && args[0].Equals(RequestArgument, StringComparison.OrdinalIgnoreCase))
             {
                 if (TryForwardToOpenApplication()) return true;
                 using var main = new Mutex(true, BrandPaths.LegacyInstanceMutex, out var mainCreated);
                 if (!mainCreated)
                     throw new IOException("Yamuse открыт. Закройте его обычной командой «Выйти» и повторите удаление.");
-                if (IsReceiptConsumed(paths))
+                UninstallPaths paths;
+                try { paths = CurrentInstalledPaths(); }
+                catch (Exception error) when (IsUninstallFailure(error))
+                {
+                    var recovery = RecoverWithoutInstallation(LocalDataDirectory(), () => ConfirmRecovery(
+                        "Не удалось подготовить штатное удаление Yamuse.\n\nСбросить сохранённый запрос, чтобы снова открыть приложение? Сброс затрагивает только файл запроса."));
+                    if (recovery == PendingReceiptState.Normal) throw;
+                    if (recovery == PendingReceiptState.Consumed) throw new IOException(ConsumedRecovery, error);
+                    if (recovery == PendingReceiptState.Recovered) ShowRecoveryDone();
+                    return true;
+                }
+                var receiptState = InspectPendingReceipt(paths, () => ConfirmRecovery(
+                    "Сохранённый запрос полного удаления Yamuse повреждён или относится к прежним папкам.\n\nСбросить запрос, чтобы снова открыть приложение? Сброс затрагивает только файл запроса."));
+                if (receiptState == PendingReceiptState.Recovered)
+                    ShowRecoveryDone();
+                if (receiptState is PendingReceiptState.Recovered or PendingReceiptState.RecoveryDeclined) return true;
+                if (receiptState == PendingReceiptState.Consumed)
                 {
                     if (MessageBox.Show("Данные Yamuse уже очищены, завершение штатного удаления запрошено.\n\nПовторно запустить удаление приложения?\n\nКнопка «Нет» сохранит защиту от запуска приложения: данные не будут созданы заново.",
                         "Завершение удаления Yamuse", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes)
@@ -86,23 +152,23 @@ internal static class UninstallSupport
             }
             if (args.Length == 2 && args[0].Equals(CompleteArgument, StringComparison.OrdinalIgnoreCase))
             {
-                Finish(paths, args[1]);
+                Finish(CurrentInstalledPaths(), args[1]);
                 return true;
             }
             throw new IOException("Некорректная команда удаления. Запустите удаление из настроек Windows или Yamuse.");
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException
-            or System.ComponentModel.Win32Exception or JsonException)
+        catch (Exception error) when (IsUninstallFailure(error))
         {
             MessageBox.Show("Удаление не завершено.\n\n" + error.Message, "Удаление Yamuse", MessageBoxButton.OK, MessageBoxImage.Error);
             return true;
         }
     }
+    private static void ShowRecoveryDone() => MessageBox.Show(RecoveryDone, RecoveryTitle, MessageBoxButton.OK, MessageBoxImage.Information);
 
     internal static UninstallPaths CurrentInstalledPaths()
     {
         var paths = UninstallPaths.ForCurrentUser();
-        var locator = VelopackLocator.Current;
+        var locator = VelopackLocator.IsCurrentSet ? VelopackLocator.Current : VelopackLocator.CreateDefaultForPlatform();
         ValidateInstallation(paths, locator.AppId, locator.IsPortable, locator.CurrentlyInstalledVersion is not null,
             locator.RootAppDir, locator.AppContentDir, locator.UpdateExePath, Environment.ProcessPath!);
         return paths;
@@ -210,31 +276,121 @@ internal static class UninstallSupport
     }
 
     internal static void ValidateReceipt(UninstallPaths paths, string nonce)
-        => _ = ReadReceipt(paths, nonce);
+        => _ = ReadReceipt(paths, nonce, requireFresh: true);
 
-    private static Receipt ReadReceipt(UninstallPaths paths, string nonce)
+    private static Receipt ReadReceipt(UninstallPaths paths, string nonce, bool requireFresh)
     {
         _ = ReceiptPath(paths, nonce);
         var receipt = ReadAnyReceipt(paths);
-        if (receipt.Consumed || receipt.Nonce != nonce || receipt.CreatedUtc < DateTimeOffset.UtcNow.AddMinutes(-30))
+        if (receipt.Consumed || receipt.Nonce != nonce || requireFresh && receipt.CreatedUtc < DateTimeOffset.UtcNow.AddMinutes(-30))
             throw new IOException("Подтверждение удаления истекло или уже использовано. Повторите удаление из настроек Windows.");
         return receipt;
     }
 
     private static Receipt ReadAnyReceipt(UninstallPaths paths)
     {
-        var path = Path.Combine(paths.Install, "full-uninstall.pending.json");
-        using var ancestors = UninstallPathGuard.HoldExistingAncestors(path);
-        using var handle = UninstallPathGuard.OpenOwnedFile(path, read: true, deleteAccess: false);
-        using var file = new FileStream(handle, FileAccess.Read);
-        if (file.Length > 4096) throw new IOException("Запрос удаления повреждён.");
-        var receipt = JsonSerializer.Deserialize<Receipt>(file) ?? throw new IOException("Нет подтверждённого запроса удаления.");
-        if (receipt.Nonce is null || receipt.Nonce.Length != 64 || !receipt.Nonce.All(Uri.IsHexDigit)
-            || receipt.OriginPid <= 0 || receipt.OriginStartedUtcTicks <= 0
-            || receipt.Install != paths.Install || !MatchesReceiptDataPaths(paths, receipt.Data, receipt.Music)
-            || receipt.User != WindowsIdentity.GetCurrent().User!.Value || receipt.CreatedUtc > DateTimeOffset.UtcNow.AddMinutes(1))
-            throw new IOException("Запрос удаления повреждён или папки изменились. Защитный marker сохранён.");
+        using var marker = OpenPendingReceipt(paths.Install, deleteAccess: false);
+        if (marker is not null && ReadMarkerReceipt(marker.File, paths.Install) is { } receipt && MatchesReceiptScope(paths, receipt))
+            return receipt;
+        throw new IOException("Запрос удаления отсутствует, повреждён или папки изменились. Откройте удаление Yamuse в параметрах Windows.");
+    }
+
+    private static Receipt? ReadMarkerReceipt(FileStream file, string install)
+    {
+        if (file.Length > 4096) return null;
+        Receipt? receipt;
+        try { receipt = JsonSerializer.Deserialize<Receipt>(file); }
+        catch (JsonException) { return null; }
+        if (receipt is null || receipt.Nonce is not { Length: 64 } nonce || !nonce.All(Uri.IsHexDigit)
+            || receipt.OriginPid <= 0 || receipt.OriginStartedUtcTicks <= 0 || receipt.CreatedUtc == default
+            || string.IsNullOrWhiteSpace(receipt.Data) || string.IsNullOrWhiteSpace(receipt.Music)
+            || receipt.Install != install || receipt.User != WindowsIdentity.GetCurrent().User!.Value) return null;
         return receipt;
+    }
+
+    private static bool MatchesReceiptScope(UninstallPaths paths, Receipt receipt)
+    {
+        // A consumed receipt only permits the native uninstall retry. Moving
+        // Documents or changing the clock cannot cancel already admitted cleanup.
+        return receipt.Consumed || MatchesReceiptDataPaths(paths, receipt.Data, receipt.Music)
+            && receipt.CreatedUtc <= DateTimeOffset.UtcNow.AddMinutes(1);
+    }
+
+    internal enum PendingReceiptState { Normal, Consumed, RecoveryDeclined, Recovered }
+
+    // The Windows uninstall entry holds the application mutex across this
+    // decision. Keep the exact marker and its parents pinned through consent.
+    internal static PendingReceiptState InspectPendingReceipt(UninstallPaths paths, Func<bool> confirmRecovery)
+        => InspectPendingReceipt(paths.Install, paths, confirmRecovery);
+
+    internal static PendingReceiptState RecoverWithoutInstallation(string localDataDirectory, Func<bool> confirmRecovery)
+        => InspectPendingReceipt(InstallFromLocalData(localDataDirectory), null, confirmRecovery);
+
+    private static PendingReceiptState InspectPendingReceipt(string install, UninstallPaths? paths, Func<bool> confirmRecovery)
+    {
+        using var marker = OpenPendingReceipt(install, deleteAccess: true);
+        if (marker is null) return PendingReceiptState.Normal;
+        var receipt = ReadMarkerReceipt(marker.File, install);
+        if (receipt?.Consumed == true) return PendingReceiptState.Consumed;
+        if (receipt is not null && paths is not null && MatchesReceiptScope(paths, receipt)) return PendingReceiptState.Normal;
+        if (!confirmRecovery()) return PendingReceiptState.RecoveryDeclined;
+        ArchivePendingReceipt(install, marker.File);
+        return PendingReceiptState.Recovered;
+    }
+
+    internal sealed record StartupMarkerReset(bool Consumed, ulong Volume, ulong IdLow, ulong IdHigh, long Length, DateTime LastWriteUtc);
+
+    internal static StartupMarkerReset? InspectStartupMarkerForReset(string localDataDirectory)
+    {
+        var install = InstallFromLocalData(localDataDirectory);
+        using var marker = OpenPendingReceipt(install, deleteAccess: false);
+        if (marker is null) return null;
+        return SnapshotMarker(marker.File, ReadMarkerReceipt(marker.File, install)?.Consumed == true);
+    }
+
+    // Called under the application mutex after the startup recovery dialog.
+    internal static bool TryResetStartupMarker(string localDataDirectory, StartupMarkerReset candidate)
+    {
+        var install = InstallFromLocalData(localDataDirectory);
+        using var marker = OpenPendingReceipt(install, deleteAccess: true);
+        if (marker is null || candidate.Consumed || ReadMarkerReceipt(marker.File, install)?.Consumed == true
+            || SnapshotMarker(marker.File, consumed: false) != candidate) return false;
+        ArchivePendingReceipt(install, marker.File);
+        return true;
+    }
+
+    private static StartupMarkerReset SnapshotMarker(FileStream file, bool consumed)
+    {
+        const int fileIdInfo = 18;
+        var handle = file.SafeFileHandle;
+        if (!GetFileInformationByHandleEx(handle, fileIdInfo, out var id, (uint)Marshal.SizeOf<MarkerFileId>()))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return new(consumed, id.Volume, id.Low, id.High, file.Length, File.GetLastWriteTimeUtc(handle));
+    }
+
+    private static void ArchivePendingReceipt(string install, FileStream file)
+    {
+        var archived = Path.Combine(install, "full-uninstall.archived-" + Guid.NewGuid().ToString("N") + ".json");
+        ManagedCacheCleanup.RenameByHandle(file.SafeFileHandle, archived);
+    }
+
+    private static PendingReceiptFile? OpenPendingReceipt(string install, bool deleteAccess)
+    {
+        var path = Path.Combine(install, PendingReceiptFileName);
+        var ancestors = UninstallPathGuard.HoldAncestors(path);
+        try
+        {
+            if (ancestors.Complete)
+            {
+                var handle = UninstallPathGuard.OpenOwnedFile(path, read: true, deleteAccess: deleteAccess);
+                try { return new PendingReceiptFile(new FileStream(handle, FileAccess.Read), ancestors); }
+                catch { handle.Dispose(); throw; }
+            }
+        }
+        catch (Win32Exception error) when (error.NativeErrorCode is 2 or 3) { }
+        catch { ancestors.Dispose(); throw; }
+        ancestors.Dispose();
+        return null;
     }
 
     // A pending request from the previous release may be inspected/cancelled
@@ -246,19 +402,21 @@ internal static class UninstallSupport
     {
         // Never remove a newer request when an older waiter fails later.
         if (!HasPendingReceipt(paths)) return;
-        var receipt = ReadReceipt(paths, nonce);
+        _ = ReadReceipt(paths, nonce, requireFresh: false);
         CancelPendingReceipt(paths);
     }
 
     internal static bool HasPendingReceipt(UninstallPaths paths)
-        => UninstallPathGuard.EntryExists(Path.Combine(paths.Install, "full-uninstall.pending.json"));
+        => UninstallPathGuard.EntryExists(Path.Combine(paths.Install, PendingReceiptFileName));
 
     internal static bool IsReceiptConsumed(UninstallPaths paths)
         => HasPendingReceipt(paths) && ReadAnyReceipt(paths).Consumed;
 
     internal static bool OriginProcessExited(UninstallPaths paths, string nonce)
+        => OriginProcessExited(ReadReceipt(paths, nonce, requireFresh: true));
+
+    private static bool OriginProcessExited(Receipt receipt)
     {
-        var receipt = ReadReceipt(paths, nonce);
         try
         {
             using var origin = Process.GetProcessById(receipt.OriginPid);
@@ -271,7 +429,7 @@ internal static class UninstallSupport
 
     internal static bool CancelPendingReceipt(UninstallPaths paths)
     {
-        var path = Path.Combine(paths.Install, "full-uninstall.pending.json");
+        var path = Path.Combine(paths.Install, PendingReceiptFileName);
         using var ancestors = UninstallPathGuard.HoldExistingAncestors(path);
         if (!UninstallPathGuard.EntryExists(path)) return true;
         if (ReadAnyReceipt(paths).Consumed) return false;
@@ -286,10 +444,15 @@ internal static class UninstallSupport
         StartAfterExit(paths, waitPid, paths.Updater, ["--uninstall"], start);
     }
 
-    internal static void MarkReceiptConsumed(UninstallPaths paths, string nonce)
+    // Only called by Finish after cleanup under both mutexes. The age check
+    // already ran at admission and must not expire during cleanup or its dialogs.
+    internal static void ScheduleNativeHandoffAfterCleanup(UninstallPaths paths, string nonce, int waitPid,
+        Func<ProcessStartInfo, Process?>? start = null)
     {
-        var receipt = ReadReceipt(paths, nonce);
+        var receipt = ReadReceipt(paths, nonce, requireFresh: false);
         WriteReceipt(paths, nonce, receipt with { Consumed = true });
+        try { StartAfterExit(paths, waitPid, paths.Updater, ["--uninstall"], start); }
+        catch { WriteReceipt(paths, nonce, receipt); throw; }
     }
 
     private static void WriteReceipt(UninstallPaths paths, string nonce, Receipt receipt)
@@ -330,18 +493,18 @@ internal static class UninstallSupport
 
     private static void Finish(UninstallPaths paths, string nonce)
     {
-        var initialReceipt = ReadReceipt(paths, nonce);
-        if (initialReceipt.Data != paths.Data || initialReceipt.Music != paths.Music)
-            throw new IOException("Запрос удаления создан предыдущей версией. Повторно запустите удаление Yamuse в параметрах Windows и подтвердите актуальные папки.");
-        // Pinned Velopack's native waitPid logs and continues after 60 seconds.
-        // Independently verify full origin process exit before touching data.
-        if (!OriginProcessExited(paths, nonce)) throw new IOException("Процесс Yamuse ещё не завершился. Данные не удалены. Дождитесь закрытия приложения и повторите удаление.");
         // Hold the ordinary application mutex as well: a fresh normal launch
         // must not recreate data while the confirmed cleanup is in progress.
         using var main = new Mutex(true, BrandPaths.LegacyInstanceMutex, out var mainCreated);
         if (!mainCreated) throw new IOException("Yamuse ещё открыт. Закройте приложение и повторите удаление.");
         using var single = new Mutex(true, @"Local\YMusic.Native.FullUninstall.Cleanup." + WindowsIdentity.GetCurrent().User!.Value, out var created);
         if (!created) throw new IOException("Полное удаление уже выполняется.");
+        var initialReceipt = ReadReceipt(paths, nonce, requireFresh: true);
+        if (initialReceipt.Data != paths.Data || initialReceipt.Music != paths.Music)
+            throw new IOException("Запрос удаления создан предыдущей версией. Повторно запустите удаление Yamuse в параметрах Windows и подтвердите актуальные папки.");
+        // Pinned Velopack's native waitPid logs and continues after 60 seconds.
+        // Independently verify full origin process exit before touching data.
+        if (!OriginProcessExited(initialReceipt)) throw new IOException("Процесс Yamuse ещё не завершился. Данные не удалены. Дождитесь закрытия приложения и повторите удаление.");
         var progress = new Window
         {
             Title = "Удаление Yamuse", Width = 430, Height = 160, ResizeMode = ResizeMode.NoResize,
@@ -364,10 +527,7 @@ internal static class UninstallSupport
                             MessageBox.Show(progress, $"Данные приложения и его неизменённые скачанные файлы удалены. Посторонних или изменённых файлов/папок сохранено: {result.PreservedForeignFiles}.\n\nПапки музыки:\n{paths.Music}" +
                                 (Directory.Exists(paths.LegacyMusic) ? "\n" + paths.LegacyMusic : "") + "\n\nСейчас будет удалено приложение.",
                                 "Удаление Yamuse", MessageBoxButton.OK, MessageBoxImage.Information);
-                        var receipt = ReadReceipt(paths, nonce);
-                        MarkReceiptConsumed(paths, nonce);
-                        try { StartAfterExit(paths, Environment.ProcessId, paths.Updater, ["--uninstall"]); }
-                        catch { WriteReceipt(paths, nonce, receipt); throw; }
+                        ScheduleNativeHandoffAfterCleanup(paths, nonce, Environment.ProcessId);
                         // Keep the consumed marker until Velopack deletes the
                         // install root. It blocks new ordinary application
                         // launches during the final native handover.
@@ -389,11 +549,21 @@ internal static class UninstallSupport
     private static string ReceiptPath(UninstallPaths paths, string nonce)
     {
         if (nonce.Length != 64 || !nonce.All(Uri.IsHexDigit)) throw new IOException("Нет подтверждённого запроса удаления.");
-        return Path.Combine(paths.Install, "full-uninstall.pending.json");
+        return Path.Combine(paths.Install, PendingReceiptFileName);
     }
     private static string Quote(string path) => "\"" + path + "\"";
     private sealed record Receipt(string Nonce, string Install, string Data, string Music, string User, DateTimeOffset CreatedUtc,
         int OriginPid, long OriginStartedUtcTicks, bool Consumed = false);
+    private sealed class PendingReceiptFile(FileStream file, UninstallPathGuard.AncestorLease ancestors) : IDisposable
+    {
+        internal FileStream File => file;
+        public void Dispose() { try { file.Dispose(); } finally { ancestors.Dispose(); } }
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MarkerFileId { internal ulong Volume, Low, High; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle file, int kind, out MarkerFileId information, uint size);
     private sealed class Listener(EventWaitHandle signal, RegisteredWaitHandle registration) : IDisposable
     {
         public void Dispose() { registration.Unregister(null); signal.Dispose(); }

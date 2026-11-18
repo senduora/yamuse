@@ -1,31 +1,64 @@
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 
 namespace YMusic.Native;
 
 internal sealed class SessionStore(string directory)
 {
-    private readonly string _path = Path.Combine(directory, "session.dpapi");
+    private const int MaximumEncryptedBytes = 1024 * 1024;
+    private readonly string _path = Path.GetFullPath(Path.Combine(directory, "session.dpapi"));
     public Session? Load()
     {
-        if (!File.Exists(_path)) return null;
-        var bytes = Unprotect(File.ReadAllBytes(_path));
-        try { return JsonSerializer.Deserialize<Session>(bytes) ?? throw new CryptographicException(); }
+        byte[] encrypted;
+        try
+        {
+            using var parents = UninstallPathGuard.HoldAncestors(_path);
+            if (!parents.Complete) return null;
+            using var handle = TryOpenSessionFile();
+            if (handle is null) return null;
+            using var file = new FileStream(handle, FileAccess.Read);
+            var length = file.Length;
+            if (length is <= 0 or > MaximumEncryptedBytes) throw new CryptographicException();
+            encrypted = new byte[(int)length];
+            file.ReadExactly(encrypted);
+        }
+        catch (Win32Exception error) { throw new IOException("Не удалось прочитать сохранённый вход.", error); }
+        var bytes = Unprotect(encrypted);
+        try
+        {
+            var session = JsonSerializer.Deserialize<Session>(bytes);
+            return session is not null && MusicApi.IsOAuthValue(session.AccessToken) ? session : throw new CryptographicException();
+        }
         finally { CryptographicOperations.ZeroMemory(bytes); }
     }
     public void Save(Session session)
     {
-        Directory.CreateDirectory(directory);
         var plain = JsonSerializer.SerializeToUtf8Bytes(session);
         byte[] encrypted;
         try { encrypted = Protect(plain); }
         finally { CryptographicOperations.ZeroMemory(plain); }
-        var temp = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try { File.WriteAllBytes(temp, encrypted); File.Move(temp, _path, true); }
-        finally { if (File.Exists(temp)) File.Delete(temp); }
+        if (encrypted.Length > MaximumEncryptedBytes) throw new CryptographicException();
+        GuardedStoreFile.Write(_path, encrypted);
     }
-    public void Clear() => File.Delete(_path);
+
+    public void Clear()
+    {
+        try
+        {
+            using var storage = GuardedStoreFile.BeginWrite(_path, createParents: false, deleteAccess: true);
+            if (storage.Exists) storage.Delete();
+        }
+        catch (Win32Exception error) { throw new IOException("Не удалось удалить сохранённый вход.", error); }
+    }
+
+    private SafeFileHandle? TryOpenSessionFile()
+    {
+        try { return UninstallPathGuard.OpenOwnedFile(_path, read: true, deleteAccess: false); }
+        catch (Win32Exception error) when (error.NativeErrorCode == 2) { return null; }
+    }
 
     // CRYPTPROTECT_UI_FORBIDDEN, CurrentUser scope. No plaintext token fallback.
     private static byte[] Protect(byte[] input) => Transform(input, true);
@@ -44,10 +77,13 @@ internal sealed class SessionStore(string directory)
             {
                 var result = new byte[output.Length];
                 Marshal.Copy(output.Data, result, 0, output.Length);
-                if (!protect) ZeroNative(output.Data, output.Length);
                 return result;
             }
-            finally { LocalFree(output.Data); }
+            finally
+            {
+                if (!protect) ZeroNative(output.Data, output.Length);
+                LocalFree(output.Data);
+            }
         }
         finally { ZeroNative(blob.Data, blob.Length); Marshal.FreeHGlobal(blob.Data); }
     }

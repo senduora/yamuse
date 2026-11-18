@@ -6,7 +6,7 @@ using Windows.Media;
 
 namespace YMusic.Native;
 
-internal enum DesktopMediaAction { PlayPause, Next, Previous, Stop }
+internal enum DesktopMediaAction { Play, Pause, Next, Previous, Stop }
 
 // Native desktop SMTC, bound to this WPF window only. Requires the Windows TFM;
 // no browser, global RegisterHotKey, keyboard hook, or WinUI/WindowsAppSDK.
@@ -16,7 +16,6 @@ internal sealed class WindowsIntegration : IDisposable
     private SystemMediaTransportControls? _controls;
     private int _disposed;
     private bool _hasMedia;
-    private bool _isPlaying;
     private bool _canNext;
     private bool _canPrevious;
     private string _title = "";
@@ -26,6 +25,7 @@ internal sealed class WindowsIntegration : IDisposable
     public event Action<DesktopMediaAction>? Command;
     public event Action<string>? Failed;
     public bool IsAvailable { get; private set; }
+    internal bool HandlesMediaKeys => IsAvailable && _hasMedia;
     public string? FailureReason { get; private set; }
     internal nint WindowHandle { get; }
 
@@ -75,7 +75,6 @@ internal sealed class WindowsIntegration : IDisposable
         try
         {
             var metadataChanged = !_hasMedia || _title != title || _artist != artist || _album != album;
-            _isPlaying = isPlaying;
             _canNext = canNext;
             _canPrevious = canPrevious;
             _controls.IsPlayEnabled = true;
@@ -107,22 +106,22 @@ internal sealed class WindowsIntegration : IDisposable
         // WinRT raises this on a worker thread. Both state checks and the application
         // command run on the WPF dispatcher, after any queued Update/Clear operation.
         var button = args.Button;
-        OnWindowThread(() =>
+        OnWindowThread(() => DispatchButton(button));
+    }
+
+    private void DispatchButton(SystemMediaTransportControlsButton button)
+    {
+        if (Volatile.Read(ref _disposed) != 0 || !HandlesMediaKeys) return;
+        DesktopMediaAction? action = button switch
         {
-            if (Volatile.Read(ref _disposed) != 0 || !IsAvailable || !_hasMedia) return;
-            DesktopMediaAction? action = button switch
-            {
-                // SMTC has distinct Play and Pause commands. Gate the toggle so a
-                // repeated Play cannot accidentally pause an already playing track.
-                SystemMediaTransportControlsButton.Play when !_isPlaying => DesktopMediaAction.PlayPause,
-                SystemMediaTransportControlsButton.Pause when _isPlaying => DesktopMediaAction.PlayPause,
-                SystemMediaTransportControlsButton.Next when _canNext => DesktopMediaAction.Next,
-                SystemMediaTransportControlsButton.Previous when _canPrevious => DesktopMediaAction.Previous,
-                SystemMediaTransportControlsButton.Stop => DesktopMediaAction.Stop,
-                _ => null
-            };
-            if (action is { } command) Command?.Invoke(command);
-        });
+            SystemMediaTransportControlsButton.Play => DesktopMediaAction.Play,
+            SystemMediaTransportControlsButton.Pause => DesktopMediaAction.Pause,
+            SystemMediaTransportControlsButton.Next when _canNext => DesktopMediaAction.Next,
+            SystemMediaTransportControlsButton.Previous when _canPrevious => DesktopMediaAction.Previous,
+            SystemMediaTransportControlsButton.Stop => DesktopMediaAction.Stop,
+            _ => null
+        };
+        if (action is { } command) Command?.Invoke(command);
     }
 
     private void OnWindowThread(Action action)
@@ -135,7 +134,6 @@ internal sealed class WindowsIntegration : IDisposable
     private void ClearCore()
     {
         _hasMedia = false;
-        _isPlaying = false;
         _canNext = false;
         _canPrevious = false;
         _title = _artist = _album = "";

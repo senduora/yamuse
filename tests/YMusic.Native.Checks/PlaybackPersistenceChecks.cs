@@ -1,6 +1,8 @@
 using System.IO;
 using System.Net.Http;
 using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -108,6 +110,26 @@ internal static partial class Program
             return Task.CompletedTask;
         });
 
+        await Run("Playback persistence: an exact logout marker is missing state and can be replaced", () =>
+        {
+            var directory = PersistenceDirectory("logout-marker");
+            var path = Path.Combine(directory, PlaybackStateStore.FileName);
+            var store = new PlaybackStateStore(directory);
+            foreach (var other in new[] { "{\"version\":0 }", "{\"version\":0,\"tracks\":[]}", "{\"version\":99}" })
+            {
+                File.WriteAllText(path, other);
+                Assert(store.Load("12345") is null && store.LastReadStatus == PlaybackStateReadStatus.Invalid,
+                    "unknown or malformed state was accepted as a logout marker");
+            }
+            File.WriteAllBytes(path, "{\"version\":0}"u8.ToArray());
+            Assert(store.Load("12345") is null && store.LastReadStatus == PlaybackStateReadStatus.Missing,
+                "an exact logout marker blocked later playback saving");
+            var queue = new PlaybackQueue(); queue.SetItems([PersistenceTrack("101")]);
+            store.Save(PlaybackStateStore.Capture("12345", queue, 17));
+            Assert(store.Load("12345") is { PositionSeconds: 17 }, "new state did not replace the logout marker");
+            return Task.CompletedTask;
+        });
+
         await Run("Playback persistence: failed atomic replacement and bounded save preserve previous snapshot", () =>
         {
             var directory = PersistenceDirectory("atomic");
@@ -126,9 +148,49 @@ internal static partial class Program
             catch (JsonException) { }
             try { store.Save(snapshot with { Tracks = Array.AsReadOnly(Enumerable.Repeat(hugeTrack, PlaybackStateStore.MaximumTracks + 1).ToArray()) }); throw new InvalidOperationException("track cap was ignored"); }
             catch (JsonException) { }
-            Assert(original.SequenceEqual(File.ReadAllBytes(path)) && !Directory.EnumerateFiles(directory, ".playback-state-*.tmp").Any(), "failed save damaged snapshot or left temporary state");
+            Assert(original.SequenceEqual(File.ReadAllBytes(path)) && !Directory.EnumerateFiles(directory, "*.tmp").Any(), "failed save damaged snapshot or left temporary state");
             store.Save(snapshot with { PositionSeconds = 45 });
             Assert(store.Load("12345") is { PositionSeconds: 45 }, "subsequent replacement did not recover");
+            return Task.CompletedTask;
+        });
+
+        await Run("Playback persistence: replacement preserves a protected snapshot DACL and supported file properties", () =>
+        {
+            var directory = PersistenceDirectory("snapshot-dacl");
+            var store = new PlaybackStateStore(directory);
+            var queue = new PlaybackQueue(); queue.SetItems([PersistenceTrack("101")]);
+            var snapshot = PlaybackStateStore.Capture("12345", queue, 12);
+            store.Save(snapshot);
+            var file = new FileInfo(Path.Combine(directory, PlaybackStateStore.FileName));
+            var security = file.GetAccessControl(AccessControlSections.Access);
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: true);
+            var fixtureSid = new SecurityIdentifier("S-1-5-21-111111111-222222222-333333333-4444");
+            security.AddAccessRule(new FileSystemAccessRule(fixtureSid, FileSystemRights.ReadData, AccessControlType.Deny));
+            file.SetAccessControl(security);
+            var appliedSecurity = file.GetAccessControl(AccessControlSections.Access);
+            Assert(appliedSecurity.AreAccessRulesProtected && appliedSecurity.GetAccessRules(true, false, typeof(SecurityIdentifier))
+                .OfType<FileSystemAccessRule>().Any(rule => rule.IdentityReference.Equals(fixtureSid)),
+                "fixture Windows ACL was not applied");
+            var expected = appliedSecurity.GetSecurityDescriptorSddlForm(AccessControlSections.Access);
+            File.SetAttributes(file.FullName, File.GetAttributes(file.FullName) | FileAttributes.Hidden | FileAttributes.NotContentIndexed);
+            File.SetCreationTimeUtc(file.FullName, new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Utc));
+            var expectedAttributes = File.GetAttributes(file.FullName);
+            var expectedCreationTime = File.GetCreationTimeUtc(file.FullName);
+
+            using (var held = File.Open(file.FullName, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                try { store.Save(snapshot with { PositionSeconds = 53 }); throw new InvalidOperationException("locked replacement unexpectedly succeeded"); }
+                catch (IOException) { }
+            }
+            Assert(store.Load("12345") is { PositionSeconds: 12 }
+                && file.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access) == expected
+                && File.GetAttributes(file.FullName) == expectedAttributes && File.GetCreationTimeUtc(file.FullName) == expectedCreationTime,
+                "failed replacement altered the previous snapshot, DACL or file properties");
+            store.Save(snapshot with { PositionSeconds = 53 });
+            Assert(store.Load("12345") is { PositionSeconds: 53 }
+                && file.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access) == expected
+                && File.GetAttributes(file.FullName) == expectedAttributes && File.GetCreationTimeUtc(file.FullName) == expectedCreationTime,
+                "successful replacement lost the original DACL or supported file properties");
             return Task.CompletedTask;
         });
 
@@ -164,10 +226,12 @@ internal static partial class Program
             var requests = 0;
             using var api = new MusicApi(new FakeHandler((_, _) => { requests++; throw new InvalidOperationException("Restoration requested network"); }));
             using var offline = new OfflineLibrary(Path.Combine(directory, "music"));
-            var window = new MainWindow(api: api, store: new SessionStore(directory), restore: true, diagnosticsDirectory: directory, offline: offline,
-                preferences: new PreferencesStore(Path.Combine(directory, "preferences")));
+            var window = new MainWindow(api: api, store: new SessionStore(directory), restore: true, diagnosticsDirectory: directory, offline: offline);
             try
             {
+                Assert(PersistenceField<PreferencesStore>(window, "_preferenceStore").FilePath == Path.Combine(directory, "settings.json")
+                    && !PersistenceField<UpdateSupport>(window, "_appUpdatesOverride").State.FeedConfigured,
+                    "isolated startup used a different profile or enabled a live release check");
                 PersistenceField(window, "_account", new Account("12345", "Fixture", true));
                 PersistenceInvoke(window, "InitializePlaybackPersistence"); PersistenceInvoke(window, "RestorePlaybackState", "12345");
                 var current = PersistenceField<TrackRow?>(window, "_current");
@@ -175,6 +239,14 @@ internal static partial class Program
                 Assert(current?.Id == "101" && PersistenceField<PlaybackQueue>(window, "_playbackQueue").CurrentIndex == 1
                     && !player.HasSource && !player.IsPlaying && requests == 0, "restoration opened audio or changed current occurrence");
                 Assert(Control<TextBlock>(window, "PositionText").Text == "1:17", "restored paused position is not visible");
+                _ = new System.Windows.Interop.WindowInteropHelper(window).EnsureHandle();
+                var shell = PersistenceField<DesktopShell>(window, "_shell");
+                shell.ShowMiniPlayer();
+                var mini = MiniShellWindow(shell) ?? throw new InvalidOperationException("restored shell did not open the mini");
+                Assert(mini.TitleText.Text == current!.Title && mini.PositionText.Text == "1:17" && mini.DurationText.Text == "3:00",
+                    $"mini displayed '{mini.TitleText.Text}' at {mini.PositionText.Text} of {mini.DurationText.Text} instead of the restored track at 1:17 of 3:00");
+                Assert(!mini.SeekSlider.IsEnabled && !player.HasSource && !player.IsPlaying && requests == 0,
+                    "restored mini enabled seeking or opened audio before Play");
                 window.SignOut();
                 Assert(store.Load("12345") is null && PersistenceField<TrackRow?>(window, "_current") is null, "logout retained queue state");
             }

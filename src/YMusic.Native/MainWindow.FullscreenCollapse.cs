@@ -65,6 +65,7 @@ public partial class MainWindow
         // Keep interactions frozen while the closing frame is in flight.
         // Escape still routes at the host and repeated requests are idempotent.
         stage.SetCurrentValue(IsHitTestVisibleProperty, false);
+        stage.SetCurrentValue(IsEnabledProperty, false);
         var duration = TimeSpan.FromMilliseconds(380);
         var ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
         var timeline = new ParallelTimeline { Duration = duration, FillBehavior = FillBehavior.HoldEnd };
@@ -127,6 +128,7 @@ public partial class MainWindow
         if (ReferenceEquals(collapse.Stage.RenderTransform, collapse.Wrapper)) collapse.Stage.SetCurrentValue(RenderTransformProperty, collapse.OriginalTransform);
         collapse.Stage.SetCurrentValue(OpacityProperty, collapse.OriginalOpacity);
         collapse.Stage.SetCurrentValue(IsHitTestVisibleProperty, collapse.OriginalHitTestVisible);
+        collapse.Stage.SetCurrentValue(IsEnabledProperty, collapse.OriginalEnabled);
         collapse.Cover.SetCurrentValue(OpacityProperty, collapse.OriginalCoverOpacity);
         foreach (Image ghost in collapse.Overlay.Children) ghost.Source = null;
         collapse.Overlay.Children.Clear(); collapse.Stage.Children.Remove(collapse.Overlay);
@@ -142,6 +144,7 @@ public partial class MainWindow
         public double OriginalOpacity { get; } = stage.Opacity;
         public double OriginalCoverOpacity { get; } = cover.Opacity;
         public bool OriginalHitTestVisible { get; } = stage.IsHitTestVisible;
+        public bool OriginalEnabled { get; } = stage.IsEnabled;
         public ScaleTransform StageScale { get; } = new();
         public ScaleTransform CoverScale { get; } = new();
         public TranslateTransform CoverTranslation { get; } = new();

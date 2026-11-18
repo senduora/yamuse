@@ -32,12 +32,13 @@ internal sealed class GeniusLyricsClient : IDisposable
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("Yamuse/0.3.8");
     }
 
-    public async Task<GeniusLyrics?> FindAsync(string title, string artist, CancellationToken cancellationToken)
+    public async Task<GeniusLyrics?> FindAsync(string title, string artist, CancellationToken cancellationToken,
+        bool refresh = false, bool artistIsExact = false)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(title); ArgumentNullException.ThrowIfNull(artist);
         if (title.Length > 256 || artist.Length > 1024) return null;
-        var mainArtist = artist.Split(',', 2)[0].Trim();
+        var mainArtist = (artistIsExact ? artist : artist.Split(',', 2)[0]).Trim();
         var song = Normalize(title); var performer = Normalize(mainArtist);
         if (song.Length == 0 || performer.Length == 0) return null;
         var key = performer + "\n" + song;
@@ -45,7 +46,7 @@ internal sealed class GeniusLyricsClient : IDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (TryCached(key, out var cached)) return cached;
+            if (!refresh && TryCached(key, out var cached)) return cached;
             if (!_gates.TryGetValue(key, out gate!)) _gates[key] = gate = new();
             gate.Users++;
         }
@@ -56,7 +57,9 @@ internal sealed class GeniusLyricsClient : IDisposable
             lock (_sync)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
-                if (TryCached(key, out var cached)) return cached;
+                cancellationToken.ThrowIfCancellationRequested();
+                if (refresh) _cache.Remove(key);
+                else if (TryCached(key, out var cached)) return cached;
             }
             var result = await FindCoreAsync(title, mainArtist, song, performer, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
@@ -102,16 +105,21 @@ internal sealed class GeniusLyricsClient : IDisposable
         catch (JsonException) { throw new MusicException("Genius вернул неподдерживаемый ответ поиска."); }
         if (source is null) return null;
         var page = await FetchAsync(source, PageLimit, cancellationToken).ConfigureAwait(false);
-        if (page is null || !IsLyricsPath(page.Source)) return null;
-        var plain = ExtractLyrics(page.Body, false);
-        if (plain.Length == 0) plain = ExtractLyrics(page.Body, true);
+        if (page is null || !IsLyricsPath(page.Source) || string.IsNullOrWhiteSpace(page.Body)) return null;
+        var plain = ExtractLyrics(page.Body, false, out var modernContainer);
+        if (plain.Length == 0)
+        {
+            plain = ExtractLyrics(page.Body, true, out var legacyContainer);
+            if (!modernContainer && !legacyContainer)
+                throw new MusicException("Genius вернул страницу без поддерживаемой разметки текста.");
+        }
         return plain.Length == 0 ? null : new(plain, page.Source);
     }
 
     private static Uri? FindMatch(JsonElement root, string song, string performer)
     {
         if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("meta", out var meta) && meta.ValueKind == JsonValueKind.Object
-            && meta.TryGetProperty("status", out var status) && status.TryGetInt32(out var code) && code >= 400)
+            && meta.TryGetProperty("status", out var status) && status.ValueKind == JsonValueKind.Number && status.TryGetInt32(out var code) && code >= 400)
             throw new MusicException($"Genius временно недоступен или отказал в доступе (HTTP {code}).");
         if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("response", out var response) || response.ValueKind != JsonValueKind.Object
             || !response.TryGetProperty("sections", out var sections) || sections.ValueKind != JsonValueKind.Array)
@@ -134,7 +142,8 @@ internal sealed class GeniusLyricsClient : IDisposable
                 {
                     if (!Uri.TryCreate(url, UriKind.Absolute, out candidate!)) throw new MusicException("Genius вернул неподдерживаемый адрес песни.");
                 }
-                else if (path.StartsWith('/') && !path.StartsWith("//", StringComparison.Ordinal)) candidate = new Uri(new Uri("https://genius.com"), path);
+                else if (path.StartsWith('/') && !path.StartsWith("//", StringComparison.Ordinal)
+                    && Uri.TryCreate(new Uri("https://genius.com"), path, out var relative)) candidate = relative;
                 else continue;
                 candidate = ValidateUri(candidate);
                 if (!IsLyricsPath(candidate)) continue;
@@ -159,12 +168,14 @@ internal sealed class GeniusLyricsClient : IDisposable
                 var code = (int)response.StatusCode;
                 if (code is >= 300 and <= 399)
                 {
-                    if (redirects >= 3 || response.Headers.Location is null) throw new MusicException("Genius: слишком много перенаправлений.");
-                    uri = ValidateUri(new Uri(uri, response.Headers.Location)); continue;
+                    if (redirects >= 3 || response.Headers.Location is not { } location || !Uri.TryCreate(uri, location, out var target))
+                        throw new MusicException("Не удалось обработать перенаправление Genius.");
+                    uri = ValidateUri(target); continue;
                 }
+                if (response.StatusCode == HttpStatusCode.PartialContent || response.Content.Headers.NonValidated.Contains("Content-Range"))
+                    throw new MusicException("Genius передал только часть данных.");
                 if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Gone) return null;
                 if (!response.IsSuccessStatusCode) throw new MusicException($"Genius временно недоступен или отказал в доступе (HTTP {code}).");
-                if (response.StatusCode == HttpStatusCode.PartialContent || response.Content.Headers.ContentRange is not null) throw new MusicException("Genius передал только часть данных.");
                 if (response.Content.Headers.ContentLength > limit) throw new MusicException("Genius: превышен размер ответа.");
                 await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
                 using var bytes = new MemoryStream();
@@ -192,7 +203,7 @@ internal sealed class GeniusLyricsClient : IDisposable
         return new UriBuilder(uri) { Host = "genius.com", Fragment = "" }.Uri;
     }
     private static bool IsLyricsPath(Uri uri) => uri.AbsolutePath.TrimEnd('/').EndsWith("-lyrics", StringComparison.OrdinalIgnoreCase);
-    private static string Text(JsonElement value, string key) => value.ValueKind == JsonValueKind.Object && value.TryGetProperty(key, out var property) && property.ValueKind == JsonValueKind.String ? property.GetString() ?? "" : "";
+    private static string Text(JsonElement value, string key) => value.ValueKind == JsonValueKind.Object && value.TryGetProperty(key, out var property) ? MusicApi.JsonString(property) : "";
 
     private static string Normalize(string value)
     {
@@ -241,8 +252,9 @@ internal sealed class GeniusLyricsClient : IDisposable
         return true;
     }
 
-    private static string ExtractLyrics(string html, bool legacy)
+    private static string ExtractLyrics(string html, bool legacy, out bool foundContainer)
     {
+        foundContainer = false;
         var result = new StringBuilder(); var position = 0; var divDepth = 0; var activeDepth = 0;
         while (position < html.Length)
         {
@@ -267,7 +279,11 @@ internal sealed class GeniusLyricsClient : IDisposable
                     divDepth++;
                     if (activeDepth == 0 && (legacy ? Attribute(html, token, "class").Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Contains("lyrics", StringComparer.OrdinalIgnoreCase)
                         : Attribute(html, token, "data-lyrics-container").Equals("true", StringComparison.OrdinalIgnoreCase)))
-                    { if (result.Length > 0) result.Append('\n'); activeDepth = divDepth; }
+                    {
+                        foundContainer = true;
+                        if (result.Length > 0) result.Append('\n');
+                        activeDepth = divDepth;
+                    }
                     else if (activeDepth > 0) result.Append('\n');
                 }
                 else if (token.Closing)
@@ -338,8 +354,15 @@ internal sealed class GeniusLyricsClient : IDisposable
     {
         if (opening.Name is "script" or "style")
         {
-            var close = html.IndexOf("</" + opening.Name, opening.End, StringComparison.OrdinalIgnoreCase);
-            return close < 0 ? html.Length : ReadTag(html, close)?.End ?? html.Length;
+            var prefix = "</" + opening.Name;
+            for (var scan = opening.End; ; scan++)
+            {
+                scan = html.IndexOf(prefix, scan, StringComparison.OrdinalIgnoreCase);
+                if (scan < 0) return html.Length;
+                var end = scan + prefix.Length;
+                if (end < html.Length && (html[end] is '>' or '/' || char.IsWhiteSpace(html[end])))
+                    return ReadTag(html, scan)?.End ?? html.Length;
+            }
         }
         var depth = 1; var position = opening.End;
         while (position < html.Length)

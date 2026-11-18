@@ -16,10 +16,9 @@ public partial class MainWindow
     private Button? _expandedPlayerCoverButton, _expandedPlayerTitleButton, _expandedPlayerLyricsButton, _expandedPlayerCloseButton;
     private TextBlock? _expandedPlayerTitle, _expandedPlayerArtist, _expandedPlayerPosition, _expandedPlayerDuration;
     private ContentControl? _expandedPlayerArtistLinks;
-    private Slider? _expandedPlayerSeek;
+    private PlaybackSeekSlider? _expandedPlayerSeek;
     private Grid? _expandedLyricsPanel;
     private ListBox? _expandedLyricsList;
-    private string? _expandedCoverUri;
     private TrackRow? _expandedPlayerTrack;
     private bool _expandedSeekDragging, _expandedLyricsOpen, _expandedLyricsManualDragging;
     private int _expandedAccountGeneration;
@@ -93,7 +92,6 @@ public partial class MainWindow
             if (_expandedPlayerCoverButton is not null) _expandedPlayerCoverButton.Tag = null;
             if (_expandedPlayerTitleButton is not null) _expandedPlayerTitleButton.Tag = null;
             if (_expandedPlayerArtistLinks is not null) { _expandedPlayerArtistLinks.Content = null; _expandedPlayerArtistLinks.ContextMenu = null; }
-            _expandedCoverUri = null;
             _expandedPlayerTrack = null;
             _expandedWindowPlacement = null;
             if (ShowActivated && _expandedPreviousFocus is UIElement { IsVisible: true } focus) focus.Focus();
@@ -158,15 +156,22 @@ public partial class MainWindow
         transport.Children.Add(ExpandedForwardButton("ExpandedPlayerNext", NextButton, "\uE893", "Следующий трек", 46));
         transport.Children.Add(ExpandedQueueModeButton("ExpandedPlayerRepeat", RepeatButton, "\uE8EE", 40));
 
-        _expandedPlayerSeek = new Slider { Name = "ExpandedPlayerSeek", Minimum = 0, Maximum = 1, Margin = new Thickness(0, 10, 0, 0), SmallChange = 5, LargeChange = 15, IsMoveToPointEnabled = true };
+        _expandedPlayerSeek = new PlaybackSeekSlider { Name = "ExpandedPlayerSeek", Style = (Style)FindResource(typeof(Slider)),
+            Minimum = 0, Maximum = 1, Margin = new Thickness(0, 10, 0, 0), SmallChange = 5, LargeChange = 15, IsMoveToPointEnabled = true };
         AutomationProperties.SetName(_expandedPlayerSeek, "Позиция воспроизведения"); details.Children.Add(_expandedPlayerSeek);
         _expandedPlayerSeek.ValueChanged += (_, args) => { if (_expandedSeekDragging && _expandedPlayerPosition is not null) _expandedPlayerPosition.Text = FormatTime(TimeSpan.FromSeconds(args.NewValue)); };
         _expandedSeekGesture = new SliderGesture(_expandedPlayerSeek, () =>
         { _expandedSeekDragging = true; _expandedSeekIgnoreKeyUp = false; _expandedSeekKeyboardGesture = _expandedSeekGesture?.IsKeyboardActive == true; }, FinishExpandedSeek);
+        _expandedPlayerSeek.AutomationSeekRequested += seconds =>
+        {
+            if (_expandedCollapse is not null || !IsExpandedPlayerOpen || _expandedAccountGeneration != _accountGeneration) return;
+            _expandedSeekGesture.Cancel(); CommitSeek(seconds);
+        };
         _expandedPlayerSeek.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((_, args) => FinishExpandedSeek(!args.Canceled)), true);
         _expandedPlayerSeek.PreviewKeyUp += (_, args) =>
         {
-            if (!IsExpandedPlayerOpen || _expandedAccountGeneration != _accountGeneration || !_expandedPlayerSeek.IsEnabled || !SliderGesture.SeekKey(args.Key)) return;
+            if (_expandedCollapse is not null || !IsExpandedPlayerOpen || _expandedAccountGeneration != _accountGeneration
+                || !_expandedPlayerSeek.IsEnabled || !SliderGesture.SeekKey(args.Key)) return;
             if (_expandedSeekIgnoreKeyUp) { _expandedSeekIgnoreKeyUp = false; return; }
             PlaybackTimeline.Stop(_expandedPlayerSeek, useBaseValue: true); CommitSeek(_expandedPlayerSeek.Value); RefreshExpandedPlayer(); args.Handled = true;
         };
@@ -240,7 +245,8 @@ public partial class MainWindow
         _expandedSeekKeyboardGesture = false;
         _expandedSeekDragging = false;
         _expandedSeekGesture?.Cancel();
-        if (commit && IsExpandedPlayerOpen && _expandedAccountGeneration == _accountGeneration && _expandedPlayerSeek is { IsEnabled: true } seek) CommitSeek(seek.Value);
+        if (commit && _expandedCollapse is null && IsExpandedPlayerOpen && _expandedAccountGeneration == _accountGeneration
+            && _expandedPlayerSeek is { IsEnabled: true } seek) CommitSeek(seek.Value);
         RefreshExpandedPlayer();
     }
     private void RefreshExpandedPlayer()
@@ -253,10 +259,10 @@ public partial class MainWindow
         if (_expandedCollapse is { } collapse && !ReferenceEquals(collapse.Track, _current)) { CloseExpandedPlayer(); return; }
         if (_expandedPlayerCover is null || _expandedPlayerSeek is null) return;
         var track = _current;
-        if (!ReferenceEquals(_expandedPlayerTrack, track))
+        var trackChanged = !ReferenceEquals(_expandedPlayerTrack, track);
+        if (trackChanged)
         { CancelExpandedReveal(); _expandedPlayerTrack = track; _expandedSeekGesture?.Cancel(); _expandedSeekDragging = false; PlaybackTimeline.Stop(_expandedPlayerSeek); _expandedLyricsFollowIndex = -1; _expandedLyricsFollowUntil = default; }
-        if (_expandedCoverUri != track.CoverUri)
-        { _expandedCoverUri = track.CoverUri; Artwork.SetSourceUri(_expandedPlayerCover, track.CoverUri); }
+        Artwork.SetTrackSource(_expandedPlayerCover, track.CoverUri, trackChanged);
         _expandedPlayerTitle!.Text = track.Title; _expandedPlayerTitle.ToolTip = track.Title;
         _expandedPlayerArtist!.Text = track.Artist; _expandedPlayerArtist.ToolTip = track.Artist;
         if (!ReferenceEquals(_expandedPlayerArtistLinks!.Content, track))
@@ -270,7 +276,7 @@ public partial class MainWindow
         _expandedPlayerArtist.Visibility = hasArtistLinks ? Visibility.Collapsed : Visibility.Visible;
         _expandedPlayerCoverButton!.Tag = _expandedPlayerTitleButton!.Tag = track;
         _expandedPlayerCoverButton.IsEnabled = _expandedPlayerTitleButton.IsEnabled = _session is not null;
-        _expandedPlayerSeek.IsEnabled = SeekSlider.IsEnabled;
+        _expandedPlayerSeek.IsEnabled = _expandedCollapse is null && SeekSlider.IsEnabled;
         if (!_expandedPlayerSeek.IsEnabled) _expandedSeekDragging = false;
         if (_expandedSeekDragging) PlaybackTimeline.Stop(_expandedPlayerSeek, useBaseValue: true);
         if (!_expandedSeekDragging)
@@ -311,15 +317,17 @@ public partial class MainWindow
         _expandedLyricsList.PreviewTouchDown += (_, _) => PauseExpandedLyricsFollow();
         _expandedLyricsList.AddHandler(Thumb.DragStartedEvent, new DragStartedEventHandler((_, _) => { _expandedLyricsManualDragging = true; PauseExpandedLyricsFollow(); }), true);
         _expandedLyricsList.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((_, _) => { _expandedLyricsManualDragging = false; PauseExpandedLyricsFollow(); }), true);
-        _expandedLyricsList.PreviewKeyDown += (_, args) => { if (args.Key is Key.Up or Key.Down or Key.Home or Key.End or Key.PageUp or Key.PageDown) PauseExpandedLyricsFollow(); };
+        RegisterLyricsPageScroll(_expandedLyricsList, held => _expandedLyricsManualDragging = held, PauseExpandedLyricsFollow);
+        _expandedLyricsList.PreviewKeyDown += (_, args) =>
+        {
+            if (args.Key is Key.Up or Key.Down or Key.Home or Key.End or Key.PageUp or Key.PageDown) PauseExpandedLyricsFollow();
+            if (args.Key == Key.Enter && TrySeekLyricLine(LyricLineIndex(_expandedLyricsList, args.OriginalSource as DependencyObject, useSelection: true), expanded: true))
+                args.Handled = true;
+        };
         _expandedLyricsList.PreviewMouseLeftButtonUp += (_, args) =>
         {
-            if (!IsExpandedPlayerOpen || !_expandedLyricsOpen || args.ChangedButton != MouseButton.Left || !_player.HasSource || _expandedAccountGeneration != _accountGeneration) return;
-            if (ItemsControl.ContainerFromElement(_expandedLyricsList, args.OriginalSource as DependencyObject) is not ListBoxItem item) return;
-            var index = _expandedLyricsList.ItemContainerGenerator.IndexFromContainer(item);
-            if (index < 0 || index >= _lyricLines.Count) return;
-            args.Handled = true; _expandedLyricsFollowUntil = default; _expandedLyricsFollowIndex = -1;
-            CommitSeek(_lyricLines[index].TimeSeconds); RefreshExpandedPlayer();
+            if (args.ChangedButton == MouseButton.Left && TrySeekLyricLine(LyricLineIndex(_expandedLyricsList, args.OriginalSource as DependencyObject, useSelection: false), expanded: true))
+                args.Handled = true;
         };
         Grid.SetRow(_expandedLyricsList, 1); _expandedLyricsPanel.Children.Add(_expandedLyricsList);
     }
@@ -352,6 +360,12 @@ public partial class MainWindow
     {
         _expandedLyricsFollowUntil = DateTimeOffset.UtcNow.AddMilliseconds(3500);
         if (_expandedLyricsList is not null && FindViewer(_expandedLyricsList) is { } viewer) SmoothScroll.CancelProgrammaticAnimation(viewer);
+    }
+    private void ResetExpandedLyricsFollow()
+    {
+        _expandedLyricsFollowIndex = -1;
+        if (_expandedLyricsList is not null && FindViewer(_expandedLyricsList) is { } viewer)
+            SmoothScroll.CancelProgrammaticAnimation(viewer);
     }
     private void RefreshExpandedLyrics()
     {

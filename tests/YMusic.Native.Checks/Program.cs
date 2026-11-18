@@ -19,6 +19,7 @@ internal static partial class Program
     private static string _directory = "";
     private static int _failed;
     private static string[] _only = [];
+    private static readonly HashSet<string> MatchedPrefixes = new(StringComparer.OrdinalIgnoreCase);
     private static bool _realAccount;
     private static readonly Session FakeSession = new("fake-test-token-DO-NOT-USE", "fake-test-refresh", DateTimeOffset.UtcNow.AddHours(1), "test-device", MusicApi.RequiredScopes);
 
@@ -26,8 +27,19 @@ internal static partial class Program
     private static int Main(string[] args)
     {
         if (args.Length > 0 && args[0] == "--security-offline-child") return SecurityOffline0317Child(args[1..]);
+        var selectors = args.Where(a => a.Equals("--only", StringComparison.OrdinalIgnoreCase)
+            || a.StartsWith("--only=", StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (selectors.Length != 0)
+        {
+            if (selectors.Length == 1 && selectors[0].Length > 7)
+                _only = selectors[0][7..].Split(',', StringSplitOptions.TrimEntries).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            if (_only.Length == 0 || _only.Any(prefix => prefix.Length == 0 || prefix.StartsWith("--", StringComparison.Ordinal) || prefix.Any(char.IsControl)))
+            {
+                Console.Error.WriteLine("Use one --only= option with comma-separated, non-empty check prefixes.");
+                return 2;
+            }
+        }
         _directory = Path.GetFullPath(args.FirstOrDefault(a => !a.StartsWith("--")) ?? "check-results");
-        _only = args.FirstOrDefault(a => a.StartsWith("--only="))?[7..].Split(',') ?? [];
         _realAccount = args.Contains("--account");
         Directory.CreateDirectory(_directory);
         // A UI fixture that forgets its own artwork cache must still stay
@@ -56,24 +68,39 @@ internal static partial class Program
             .Replace("clr-namespace:YMusic.Native", "clr-namespace:YMusic.Native;assembly=YMusic.Native", StringComparison.Ordinal));
         ThemeManager.SystemLightDetector = () => false;
         ThemeManager.Initialize(application);
+        string[] unmatchedPrefixes = [];
         Dispatcher.CurrentDispatcher.BeginInvoke(new Action(async () =>
         {
             try { await CheckAll(args.Contains("--online")); }
             catch (Exception e) { _failed++; Console.WriteLine("HARNESS FAILURE: " + e); }
             finally
             {
-                File.WriteAllText(Path.Combine(_directory, "checks.json"), JsonSerializer.Serialize(new { utc = DateTimeOffset.UtcNow, failed = _failed, checks = Results }, new JsonSerializerOptions { WriteIndented = true }));
-                Console.WriteLine($"RESULT: {Results.Count - _failed}/{Results.Count} passed");
+                unmatchedPrefixes = _only.Where(prefix => !MatchedPrefixes.Contains(prefix)).ToArray();
+                foreach (var prefix in unmatchedPrefixes) Console.Error.WriteLine($"No checks matched prefix: {prefix}");
+                File.WriteAllText(Path.Combine(_directory, "checks.json"), JsonSerializer.Serialize(new { utc = DateTimeOffset.UtcNow, failed = _failed, unmatchedPrefixes, checks = Results }, new JsonSerializerOptions { WriteIndented = true }));
+                Console.WriteLine(unmatchedPrefixes.Length == 0
+                    ? $"RESULT: {Results.Count - _failed}/{Results.Count} passed"
+                    : $"RESULT: invalid selection, {unmatchedPrefixes.Length} unmatched prefix(es)");
                 Dispatcher.CurrentDispatcher.InvokeShutdown();
             }
         }));
         Dispatcher.Run();
-        return _failed > 0 ? 1 : 0;
+        return _failed > 0 || unmatchedPrefixes.Length > 0 ? 1 : 0;
     }
 
     private static async Task Run(string name, Func<Task> test)
     {
-        if (_only.Length > 0 && !_only.Any(prefix => name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))) return;
+        if (_only.Length > 0)
+        {
+            var selected = false;
+            foreach (var prefix in _only)
+            {
+                if (!name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                MatchedPrefixes.Add(prefix);
+                selected = true;
+            }
+            if (!selected) return;
+        }
         var clock = Stopwatch.StartNew();
         try { await test(); Results.Add(new { name, status = "PASS", ms = clock.ElapsedMilliseconds }); Console.WriteLine("PASS " + name); }
         catch (Exception e) { _failed++; Results.Add(new { name, status = "FAIL", ms = clock.ElapsedMilliseconds, error = e.GetType().Name, detail = e.Message }); Console.WriteLine("FAIL " + name + ": " + e); }
@@ -88,6 +115,7 @@ internal static partial class Program
     private static HttpResponseMessage Xml(string host = "s1.vlx.yandex.net") => new(HttpStatusCode.OK) { Content = new StringContent($"<download-info><host>{host}</host><path>/test/file.mp3</path><ts>1234</ts><s>salt</s></download-info>") };
     private static DeviceCode TestCode(int interval = 1, int seconds = 10) => new("fake-device-code", "TEST-CODE", new Uri("https://oauth.yandex.ru/device"), interval, seconds);
     private const string Profile = """{"result":{"account":{"uid":12345,"displayName":"Fixture Account"},"plus":{"hasPlus":true}}}""";
+    private const string ProfileAboutWithoutAvatar = """{"result":{"uid":"12345"}}""";
     private const string TokenResponse = """{"access_token":"fake-test-token-DO-NOT-USE","refresh_token":"fake-test-refresh","expires_in":3600}""";
 
     private static async Task CheckAll(bool online)
@@ -361,8 +389,9 @@ internal static partial class Program
             {
                 window.Show(); Control<Slider>(window, "VolumeSlider").Value = 0;
                 Control<Button>(window, "OfflineNav").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                await Until(() => SaField<CancellationTokenSource?>(window, "_featureCts") is null);
                 var rows = Control<ListView>(window, "TracksList");
-                Assert(rows.Items.Count == 1, "offline row not visible");
+                Assert(SaField<string>(window, "_section") == "offline" && rows.Items.Count == 1, "offline row not visible");
                 await window.PlayTrackAsync((TrackRow)rows.Items[0]); await Task.Delay(250);
                 Assert(((TrackRow)rows.Items[0]).IsPlaying && noNetwork.Seen.Count == 0, "offline playback failed or attempted API access");
                 Assert(Control<TextBlock>(window, "QualityText").Text.StartsWith("Офлайн · ", StringComparison.Ordinal)
@@ -391,9 +420,21 @@ internal static partial class Program
         });
         await Run("UI: 5000 rows virtualized, scrolling and filter; demo visibly marked", async () =>
         {
-            var window = new MainWindow(true, restore: false, diagnosticsDirectory: Path.Combine(_directory, "ui-data"), offline: new OfflineLibrary(Path.Combine(_directory, "demo-offline")));
+            var demoDirectory = Path.Combine(_directory, "ui-data");
+            var previousArtwork = Artwork.Cache;
+            var window = App.CreateDemoWindow(demoDirectory);
             try
             {
+                var buffer = Path.Combine(demoDirectory, "buffer");
+                var library = SaField<OfflineLibrary>(window, "_offline");
+                var player = SaField<NativePlayer>(window, "_player");
+                Assert(library.DirectoryPath == Path.Combine(demoDirectory, "music")
+                    && R4Get<AudioBuffer>(library, "_downloader").DirectoryPath == buffer
+                    && R4Get<AudioBuffer>(player, "_buffer").DirectoryPath == buffer
+                    && R4Get<string>(Artwork.Cache, "_directory") == Path.Combine(demoDirectory, "artwork")
+                    && R4Get<string>(SaField<SessionStore>(window, "_store"), "_path") == Path.Combine(demoDirectory, "session.dpapi"),
+                    "demo stores must use its isolated directory");
+                Assert(!SaField<UpdateSupport>(window, "_appUpdatesOverride").State.FeedConfigured, "demo enabled the installed updater");
                 window.Show(); await Task.Delay(200);
                 var list = Control<ListView>(window, "TracksList");
                 Assert(list.Items.Count == 5000, "demo row count");
@@ -414,7 +455,7 @@ internal static partial class Program
                 window.Width = 1050; window.Height = 680; window.UpdateLayout();
                 App.Capture(window, Path.Combine(_directory, "ui-minimum.png"));
             }
-            finally { window.Close(); }
+            finally { window.Close(); Artwork.Cache = previousArtwork; }
         });
         await Run("UI: device login -> profile -> 205 ordered favorites in 3 batches -> encrypted session -> logout", async () =>
         {
@@ -680,6 +721,7 @@ internal static partial class Program
             if (path == "/device/code") return Json("""{"device_code":"fake","user_code":"TEST-CODE","verification_url":"https://oauth.yandex.ru/device","interval":1,"expires_in":30}""");
             if (path == "/token") return PendingForever ? Json("""{"error":"authorization_pending"}""", HttpStatusCode.BadRequest) : Json(TokenResponse);
             if (path == "/account/status") return Json(Profile);
+            if (request.Method == HttpMethod.Get && path == "/account/about") return Json(ProfileAboutWithoutAvatar);
             if (path.Contains("/likes/tracks"))
             {
                 if (BlockLibrary) { LibraryEntered.TrySetResult(); await ReleaseLibrary.Task; }

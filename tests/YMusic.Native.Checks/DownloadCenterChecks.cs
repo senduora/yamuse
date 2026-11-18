@@ -186,6 +186,7 @@ internal static partial class Program
             { ShowActivated = false, ShowInTaskbar = false, Left = -16000, Top = 0, WindowStartupLocation = WindowStartupLocation.Manual };
             Window.Show(); _ = Window.DownloadCenterView;
             typeof(MainWindow).GetField("_session", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(Window, FakeSession);
+            typeof(MainWindow).GetField("_account", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(Window, new Account("fixture", "Fixture", true));
             typeof(MainWindow).GetField("_concurrentDownloads", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(Window, concurrency);
         }
         internal Task Start(TrackRow[] tracks) => Call(Window, "StartDownloadBatchAsync", tracks, "Тестовая очередь", null!, false);

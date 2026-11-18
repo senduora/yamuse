@@ -19,10 +19,15 @@ internal static partial class Program
         {
             var allowed = new[] { "PresentationCore", "PresentationFramework", "WindowsBase", "Velopack", "WinRT.Runtime", "Microsoft.Windows.SDK.NET", "Microsoft.CSharp", "Microsoft.Win32.Primitives", "Microsoft.Win32.Registry", "Microsoft.Win32.SystemEvents" };
             var references = typeof(NativePlayer).Assembly.GetReferencedAssemblies();
-            var undeclared = references.Where(a => !a.Name!.StartsWith("System.", StringComparison.Ordinal) && !allowed.Contains(a.Name)).ToArray();
+            var undeclared = references.Where(a => !a.Name!.StartsWith("System.", StringComparison.Ordinal)
+                && !allowed.Contains(a.Name) && !IsWindowsDesktopAutomation(a)).ToArray();
             Assert(undeclared.Length == 0, "undeclared assembly reference: " + string.Join(", ", undeclared.Select(a => a.Name)));
             Assert(references.Any(a => a.Name == "PresentationCore"), "native media reference missing");
             return Task.CompletedTask;
+
+            static bool IsWindowsDesktopAutomation(AssemblyName reference) =>
+                (reference.Name is "UIAutomationProvider" or "UIAutomationTypes")
+                && Convert.ToHexString(reference.GetPublicKeyToken() ?? []) == "31BF3856AD364E35";
         });
     }
 

@@ -133,6 +133,90 @@ internal static partial class Program
             Assert(fixture.Library.Read().Single().Id == c.Id && File.ReadAllText(foreign) == "preserve" && fixture.ResolveCalls == 0 && fixture.MediaCalls == 0, "managed deletion changed unrelated library/file/network");
         });
 
+        await Run("Playback preload: Next skips deleted or missing offline-only rows without recording them in history", async () =>
+        {
+            foreach (var (removedThroughYamuse, natural) in new[] { (true, false), (false, false), (false, true) })
+            {
+                using var f = new PreloadIntegrationFixture("stale-offline-next-" + removedThroughYamuse + "-" + natural, signedIn: false);
+                var first = f.Local("first");
+                var middleItem = await f.Save(f.Row("middle"));
+                var lastItem = await f.Save(f.Row("last"));
+                var rows = f.Library.Tracks();
+                var middle = rows.Single(row => row.Id == middleItem.Id);
+                var last = rows.Single(row => row.Id == lastItem.Id);
+                await f.Play(first, middle, last);
+                var lastOccurrence = f.Queue.OccurrenceTokenAt(2);
+                if (removedThroughYamuse)
+                {
+                    await PreloadDelete(f.Window, middle, [first, middle, last]);
+                    Assert(!middle.CanPlay, "removed offline row retained its live playable flag");
+                }
+                else
+                {
+                    PreloadInvoke(f.Window, "CancelNextPreparation", true);
+                    var path = f.Library.ResolvePath(middleItem.FileName);
+                    await f.Player.WaitForClosedLocalSourcesAsync(new HashSet<string> { path });
+                    File.Delete(path);
+                    Assert(middle.CanPlay, "fixture did not keep the disappearing file's previous row mark");
+                }
+                if (natural) f.Player.Pause();
+                await Call(f.Window, "AdvanceAsync", 1, natural);
+                Assert(!middle.CanPlay && ReferenceEquals(f.Queue.Current, last) && f.Queue.CurrentOccurrenceToken == lastOccurrence
+                    && f.Queue.History.SequenceEqual([first]) && f.Player.IsPlaying
+                    && f.Player.SourceLocalPath == f.Library.ResolvePath(lastItem.FileName) && f.ResolveCalls == 0 && f.MediaCalls == 0,
+                    "unavailable offline occurrence advanced history, stopped the following track or opened the network");
+            }
+        });
+
+        await Run("Playback preload: removed download still permits the original online row to play", async () =>
+        {
+            using var f = new PreloadIntegrationFixture("removed-online-mark");
+            var first = f.Local("first");
+            var next = f.Row("online");
+            var saved = await f.Save(next);
+            await f.Play(first, next);
+            var nextOccurrence = f.Queue.OccurrenceTokenAt(1);
+            await PreloadDelete(f.Window, next, [first, next]);
+            Assert(next.CanPlay && !next.IsDownloaded && !File.Exists(f.Library.ResolvePath(saved.FileName)),
+                "removal disabled the original service row or retained its download");
+            await PreloadAwaitPrepared(f.Window);
+            await Call(f.Window, "AdvanceAsync", 1, false);
+            Assert(f.Player.IsPlaying && ReferenceEquals(f.Queue.Current, next) && f.Queue.CurrentOccurrenceToken == nextOccurrence
+                && f.Queue.History.SequenceEqual([first]) && f.ResolveCalls == 1 && f.MediaCalls == 1,
+                "the original service row did not keep exact Next and its online fallback");
+        });
+
+        await Run("Playback preload: removing the playing indexed Wave file finishes its feedback once", async () =>
+        {
+            using var f = new PreloadIntegrationFixture("delete-current-wave");
+            var saved = await f.Save(new TrackRow
+            {
+                Id = "901", RequestId = "901", Title = "Saved first Wave track", DurationMs = 12000, Available = true
+            });
+            var path = f.Library.ResolvePath(saved.FileName);
+            // Open the actual fake Wave station so MusicApi owns its feedback.
+            await Call(f.Window, "StartWaveViewAsync", false);
+            await PreloadFeedbackIdle(f.Window);
+            var row = f.Queue.Current ?? throw new InvalidOperationException("fixture did not start its Wave queue");
+            Assert(row.Id == saved.Id && f.Player.IsPlaying && f.Player.SourceLocalPath == path
+                && f.Feedback.Where(e => e.TrackId == row.Id).Select(e => e.Type).SequenceEqual(["trackStarted"]),
+                "fixture did not play the first Wave track from its indexed file and send trackStarted");
+            var listening = PreloadGet<object>(f.Window, "_waveListening");
+            var clock = (Stopwatch)listening.GetType().GetProperty("Clock")!.GetValue(listening)!;
+            await Until(() => clock.Elapsed > TimeSpan.Zero);
+
+            await PreloadDelete(f.Window, row, [row]);
+            await PreloadFeedbackIdle(f.Window);
+            var stoppedAt = clock.Elapsed;
+            await f.Window.PlayTrackAsync(f.Local("after-deletion"));
+            await PreloadFeedbackIdle(f.Window);
+            var events = f.Feedback.Where(e => e.TrackId == row.Id).ToArray();
+            Assert(!File.Exists(path) && !clock.IsRunning && clock.Elapsed == stoppedAt
+                && PreloadGet<object?>(f.Window, "_waveListening") is null && events.Select(e => e.Type).SequenceEqual(["trackStarted", "skip"])
+                && Math.Abs(events[1].Seconds - stoppedAt.TotalSeconds) < .08,
+                "deleting the playing file retained Wave listening or sent duplicate feedback");
+        });
+
         await Run("Playback preload: Wave prefetch emits no listening feedback and overlap finish excludes paused wall time", async () =>
         {
             using var fixture = new PreloadIntegrationFixture("wave");

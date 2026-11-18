@@ -9,23 +9,27 @@ param(
     [string]$DotnetPath = 'dotnet'
 )
 $ErrorActionPreference = 'Stop'
+$toolsPath = Join-Path $PSScriptRoot '..\..'
+. (Join-Path $toolsPath 'ScriptPaths.ps1')
+$projectRoot = Resolve-YamuseFileSystemPath (Join-Path $toolsPath '..')
+$dotnetExecutable = Resolve-YamuseDotnet $DotnetPath
 $runner = Join-Path $PSScriptRoot 'bin/PrivateDesktopRunner.dll'
-# Always perform an incremental build so a cached launcher from an older target
-# cannot survive an SDK migration. Use the selected host instead of global runtime.
-& $DotnetPath build (Join-Path $PSScriptRoot 'PrivateDesktopRunner.csproj') -o (Join-Path $PSScriptRoot 'bin') -v quiet
-if ($LASTEXITCODE -ne 0) { throw "Private desktop runner build failed: $LASTEXITCODE" }
 $configuration = [ordered]@{
-    Executable = [IO.Path]::GetFullPath($Executable)
+    Executable = Resolve-YamuseFileSystemPath $Executable
     Arguments = @($Arguments)
-    WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
-    LogPath = [IO.Path]::GetFullPath($LogPath)
-    ReceiptPath = [IO.Path]::GetFullPath($ReceiptPath)
+    WorkingDirectory = Resolve-YamuseFileSystemPath $WorkingDirectory
+    LogPath = Resolve-YamuseFileSystemPath $LogPath
+    ReceiptPath = Resolve-YamuseFileSystemPath $ReceiptPath
     TimeoutSeconds = $TimeoutSeconds
 }
+# Always perform an incremental build so a cached launcher from an older target
+# cannot survive an SDK migration. Use the selected host instead of global runtime.
+Invoke-YamuseDotnet $dotnetExecutable $projectRoot @('build',(Join-Path $PSScriptRoot 'PrivateDesktopRunner.csproj'),'-o',(Join-Path $PSScriptRoot 'bin'),'-v','quiet')
+if ($LASTEXITCODE -ne 0) { throw "Private desktop runner build failed: $LASTEXITCODE" }
 $configurationPath = Join-Path $PSScriptRoot ('invocation-' + [Guid]::NewGuid().ToString('N') + '.json')
 try {
     [IO.File]::WriteAllText($configurationPath,($configuration | ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
-    & $DotnetPath $runner $configurationPath
+    Invoke-YamuseDotnet $dotnetExecutable $projectRoot @($runner,$configurationPath)
     $runnerExit = $LASTEXITCODE
     Write-Output ('Private desktop receipt: ' + $configuration.ReceiptPath)
     exit $runnerExit

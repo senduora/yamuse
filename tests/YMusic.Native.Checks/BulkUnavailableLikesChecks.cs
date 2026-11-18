@@ -77,13 +77,22 @@ internal static partial class Program
         });
         await Run("Bulk unlike: active and already unliked selections are skipped without removing unrelated favorites", async () =>
         {
-            using var f = new UlFixture("bulk-eligibility"); await f.Start();
+            using var f = new UlFixture("bulk-eligibility", includeUnselectedFavorite: true); await f.Start();
             var active = f.Queue.Entries.Single(e => e.Track.Id == "ul-other"); active.SetState(DownloadEntryState.Downloading);
-            var likes = SaField<HashSet<string>>(f.Window, "_favoriteTrackIds"); likes.Remove("ul-error");
-            foreach (var entry in f.Queue.Entries) f.List.SelectedItems.Add(entry);
+            var unselected = f.Queue.Entries.Single(e => e.Track.Id == "ul-unselected");
+            var alreadyUnliked = f.Queue.Entries.Single(e => e.Track.Id == "ul-error");
+            f.RemoveServerLike(alreadyUnliked.Track.Id);
+            var likes = SaField<HashSet<string>>(f.Window, "_favoriteTrackIds"); likes.Remove(alreadyUnliked.Track.Id);
+            f.List.SelectedItems.Clear();
+            foreach (var entry in f.Queue.Entries.Where(entry => !ReferenceEquals(entry, unselected))) f.List.SelectedItems.Add(entry);
+            Assert(f.List.SelectedItems.Count == 3 && !f.List.SelectedItems.Contains(unselected), "fixture did not leave an unselected favorite");
             await Call(f.Window, "UnlikeSelectedDownloadAsync");
-            Assert(f.Writes.SequenceEqual(["ul-dead"]) && !active.RemovedFromCollection && likes.SetEquals(["ul-other"]),
+            Assert(f.Writes.SequenceEqual(["ul-dead"]) && !active.RemovedFromCollection && !unselected.RemovedFromCollection
+                && f.IsLiked(active.Track.Id) && f.IsLiked(unselected.Track.Id)
+                && likes.SetEquals([active.Track.Id, unselected.Track.Id]),
                 "batch included an active/non-favorite track or removed an unselected favorite");
+            Assert(alreadyUnliked.RemovedFromCollection && alreadyUnliked.SkipFavoritesDownload,
+                "verified membership did not exclude an already unliked failed favorite from retry");
         });
         await Run("Client polish014: footer shows version RAM CPU in order while diagnostics stay in Settings", async () =>
         {
@@ -120,6 +129,78 @@ internal static partial class Program
                 }
                 finally { if (!closed) shell.RequestExit(); }
             }
+            return Task.CompletedTask;
+        });
+        await Run("Client polish014: an unavailable tray restores the window and registers again on TaskbarCreated", () =>
+        {
+            var owner = new Window { Width = 240, Height = 100, Left = -16000, ShowActivated = false, ShowInTaskbar = false };
+            owner.Show();
+            var canAdd = false;
+            var canModify = true;
+            var addCount = 0;
+            using var shell = new DesktopShell(owner, message =>
+            {
+                if (message == 1) return canModify;
+                if (message != 0) return true;
+                addCount++;
+                return canAdd;
+            }) { MinimizeToTray = true };
+            try
+            {
+                Assert(shell.MinimizeToTray && !shell.IsAvailable && owner.IsVisible, "failed initial registration lost the preference or hid the owner");
+                canAdd = true;
+                TaskbarCreated();
+                Assert(shell.IsAvailable && addCount == 2, "first TaskbarCreated did not register a requested tray");
+                var iconData = typeof(DesktopShell).GetMethod("CreateIconData", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(shell, null)!;
+                var flags = (uint)iconData.GetType().GetField("Flags")!.GetValue(iconData)!;
+                Assert((flags & 0x80) != 0, "version 4 tray icon omitted NIF_SHOWTIP");
+                owner.Close();
+                Assert(!owner.IsVisible, "working tray did not allow close-to-tray");
+                canModify = false;
+                shell.Update("Fixture song", "Fixture artist", true, false, false);
+                Assert(!shell.IsAvailable && shell.MinimizeToTray && owner.IsVisible, "failed modification lost the preference or left the window hidden");
+                canAdd = false;
+                TaskbarCreated();
+                Assert(!shell.IsAvailable && shell.MinimizeToTray, "failed recreation lost the preference");
+                canAdd = true;
+                TaskbarCreated();
+                Assert(shell.IsAvailable && addCount == 4, "later TaskbarCreated did not recover the tray");
+            }
+            finally { shell.RequestExit(); }
+            return Task.CompletedTask;
+
+            void TaskbarCreated()
+            {
+                const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+                var message = (uint)typeof(DesktopShell).GetField("_taskbarCreated", flags)!.GetValue(shell)!;
+                Assert(message != 0, "could not register the TaskbarCreated message");
+                typeof(DesktopShell).GetMethod("WindowProcedure", flags)!.Invoke(shell, [shell.WindowHandle, (int)message, (nint)0, (nint)0, false]);
+            }
+        });
+        await Run("Client polish014: a version 4 tray context menu anchors at its icon and returns focus on Cancel", () =>
+        {
+            var owner = new Window { Width = 240, Height = 100, Left = -16000, ShowActivated = false, ShowInTaskbar = false };
+            owner.Show();
+            var operations = new List<uint>();
+            Guid icon = default;
+            (int X, int Y)? menu = null;
+            using var shell = new DesktopShell(owner, message => { operations.Add(message); return true; })
+            {
+                TrayMenuAnchorForChecks = guid => { icon = guid; return (-400, 925); },
+                TrackTrayMenuForChecks = (x, y) => { menu = (x, y); return 0; },
+                MinimizeToTray = true
+            };
+            try
+            {
+                owner.Close();
+                Assert(!owner.IsVisible, "fixture did not hide the main window");
+                object[] callback = [shell.WindowHandle, 0x8000 + 51, (nint)(-1), (nint)(0x10000 | 0x7b), false];
+                typeof(DesktopShell).GetMethod("WindowProcedure", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(shell, callback);
+                Assert((bool)callback[^1] && icon == shell.IconGuid && menu is (-400, 925)
+                    && operations.SequenceEqual(new uint[] { 0, 4, 3 }) && !owner.IsVisible,
+                    "keyboard tray menu used the pointer, lost focus, or opened the owner on Cancel");
+            }
+            finally { shell.RequestExit(); }
             return Task.CompletedTask;
         });
     }

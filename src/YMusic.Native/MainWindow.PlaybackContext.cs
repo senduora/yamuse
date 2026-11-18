@@ -8,17 +8,18 @@ public partial class MainWindow
     // Reuse the existing navigation snapshot. The arrays below belong to this
     // capture; TrackRow metadata is immutable, while its live marks stay shared.
     private BrowseSnapshot? _playbackContext;
-    private IReadOnlyList<TrackRow>? _playbackContextQueue;
+    private long _playbackContextQueueVersion;
     private int _playbackContextAccount;
     private string? _playbackContextUid;
     private ListSortRule? _playbackContextSort;
     private Dictionary<string, List<TrackRow>> _playbackContextRows = new(StringComparer.Ordinal);
-    private PlaybackContextOccurrence[] _playbackContextOccurrences = [];
+    private Dictionary<long, PlaybackContextOccurrence> _playbackContextOccurrences = [];
     private readonly record struct PlaybackContextOccurrence(int RequestOrdinal, int RequestCount, int ReferenceOrdinal, int ReferenceCount);
 
-    private bool HasPlaybackContext => !_closed && _playbackContext is not null && _queue.Count > 0
-        && ReferenceEquals(_playbackContextQueue, _playbackQueue.Items)
+    private bool OwnsPlaybackContext => !_closed && _playbackContext is not null
+        && _playbackContextQueueVersion == _playbackQueue.ReplacementVersion
         && _playbackContextAccount == _accountGeneration && _playbackContextUid == _account?.Uid;
+    private bool HasPlaybackContext => OwnsPlaybackContext && _queue.Count > 0;
 
     private void CapturePlaybackContext()
     {
@@ -35,7 +36,7 @@ public partial class MainWindow
             snapshot = snapshot with { Album = album with { Tracks = Array.AsReadOnly(snapshot.Tracks) } };
         _playbackContext = snapshot;
         _playbackContextSort = CurrentListSort;
-        _playbackContextQueue = _playbackQueue.Items;
+        _playbackContextQueueVersion = _playbackQueue.ReplacementVersion;
         CapturePlaybackContextOccurrences(snapshot.Tracks);
         _playbackContextAccount = _accountGeneration;
         _playbackContextUid = _account?.Uid;
@@ -44,8 +45,8 @@ public partial class MainWindow
 
     private void ClearPlaybackContext(bool clearView = false)
     {
-        _restoredSourceAlbum = null; _restoredSourceAlbumQueue = null;
-        _playbackContext = null; _playbackContextQueue = null; _playbackContextUid = null; _playbackContextSort = null;
+        _restoredSourceAlbum = null;
+        _playbackContext = null; _playbackContextUid = null; _playbackContextSort = null;
         _playbackContextOccurrences = [];
         if (clearView) _playbackContextRows = new(StringComparer.Ordinal);
         UpdatePlaybackContextButton();
@@ -53,7 +54,7 @@ public partial class MainWindow
 
     private void ValidatePlaybackContext()
     {
-        if (_playbackContext is not null && !HasPlaybackContext) ClearPlaybackContext();
+        if (_playbackContext is not null && !OwnsPlaybackContext) ClearPlaybackContext();
     }
 
     private void UpdatePlaybackContextButton()
@@ -116,22 +117,21 @@ public partial class MainWindow
         }
         var referenceCounts = new Dictionary<TrackRow, int>(ReferenceEqualityComparer.Instance);
         foreach (var pair in positions) referenceCounts[pair.Key] = pair.Value.Count;
-        _playbackContextOccurrences = new PlaybackContextOccurrence[_queue.Count];
+        _playbackContextOccurrences = new(_queue.Count);
         for (var i = 0; i < _queue.Count; i++)
         {
             var row = _queue[i];
             if (positions.TryGetValue(row, out var occurrences) && occurrences.TryDequeue(out var position))
-                _playbackContextOccurrences[i] = new(position.RequestOrdinal, requestCounts[row.RequestId], position.ReferenceOrdinal, referenceCounts[row]);
+                _playbackContextOccurrences[_playbackQueue.OccurrenceTokenAt(i)] = new(position.RequestOrdinal,
+                    requestCounts[row.RequestId], position.ReferenceOrdinal, referenceCounts[row]);
         }
     }
 
     private (TrackRow Row, int ReferenceOrdinal)? PlaybackContextCurrentOccurrence()
     {
-        var index = _playbackQueue.CurrentIndex;
-        if (_playbackQueue.Current is not { } current || index < 0 || index >= _playbackContextOccurrences.Length
+        if (_playbackQueue.Current is not { } current || _playbackQueue.CurrentOccurrenceToken is not { } token
+            || !_playbackContextOccurrences.TryGetValue(token, out var occurrence)
             || !_playbackContextRows.TryGetValue(current.RequestId, out var rows)) return null;
-        var occurrence = _playbackContextOccurrences[index];
-        if (occurrence.ReferenceOrdinal <= 0) return null;
         var referenceCount = rows.Count(row => ReferenceEquals(row, current));
         if (referenceCount == occurrence.ReferenceCount)
             return (current, occurrence.ReferenceOrdinal);
@@ -143,16 +143,16 @@ public partial class MainWindow
         return (target, rows.Take(occurrence.RequestOrdinal).Count(row => ReferenceEquals(row, target)));
     }
 
-    private int SyncPlaybackContextSelection(bool reveal = false)
+    private int SyncPlaybackContextSelection(bool reveal = false, bool preserveSelectionIfUnavailable = false)
     {
         if (!IsPlaybackContextView() || _playbackQueue.Current is null || !reveal && (_current is null || !_player.HasSource || _loadingStream
             || !ReferenceEquals(_playbackQueue.Current, _current))) return -1;
         var occurrence = PlaybackContextCurrentOccurrence();
-        if (occurrence is not { } target) { TracksList.SelectedIndex = -1; return -1; }
+        if (occurrence is not { } target) return Unavailable();
         var row = target.Row;
         if (FilterBox.Text.Trim() is { Length: > 0 } filter && !row.Matches(filter))
         {
-            if (!reveal) { TracksList.SelectedIndex = -1; return -1; }
+            if (!reveal) return Unavailable();
             FilterBox.Clear(); _filterTimer.Stop(); _query = ""; _view.Refresh();
         }
         var ordinal = target.ReferenceOrdinal; var visibleIndex = 0;
@@ -166,8 +166,13 @@ public partial class MainWindow
             }
             visibleIndex++;
         }
-        TracksList.SelectedIndex = -1;
-        return -1;
+        return Unavailable();
+
+        int Unavailable()
+        {
+            if (!preserveSelectionIfUnavailable) TracksList.SelectedIndex = -1;
+            return -1;
+        }
     }
 
     private void PlaybackContext_Click(object sender, RoutedEventArgs e)

@@ -3,6 +3,7 @@
 
   <Window.Resources>
     <local:CatalogGroupLabel x:Key="CatalogGroupLabel"/>
+    <local:TrackRowPlaybackHighlight x:Key="TrackRowPlaybackHighlight"/>
     <Style x:Key="ArtistLink" TargetType="Button" BasedOn="{StaticResource TextLink}">
       <Setter Property="Padding" Value="0,2,0,2"/><Setter Property="FontSize" Value="13"/>
       <Setter Property="HorizontalContentAlignment" Value="Left"/><Setter Property="ToolTip" Value="Открыть исполнителя"/>
@@ -214,7 +215,7 @@
         </Grid>
       </StackPanel>
       <Grid Grid.Row="3">
-        <ListView x:Name="TracksList" local:SmoothScroll.Enabled="True" SelectionMode="Extended" Background="Transparent" Foreground="{DynamicResource ForegroundBrush}" BorderThickness="0" Padding="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.CanContentScroll="True" VirtualizingPanel.ScrollUnit="Pixel" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" MouseDoubleClick="Tracks_DoubleClick" SelectionChanged="Tracks_SelectionChanged" PreviewMouseRightButtonDown="Track_RightClick">
+        <ListView x:Name="TracksList" local:SmoothScroll.Enabled="True" SelectionMode="Extended" AlternationCount="2147483647" Background="Transparent" Foreground="{DynamicResource ForegroundBrush}" BorderThickness="0" Padding="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.CanContentScroll="True" VirtualizingPanel.ScrollUnit="Pixel" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" MouseDoubleClick="Tracks_DoubleClick" SelectionChanged="Tracks_SelectionChanged" PreviewMouseRightButtonDown="Track_RightClick">
           <ListView.ContextMenu><ContextMenu>
             <MenuItem Header="Добавить в избранное" Click="LikeTrack_Click"><MenuItem.Icon><Path Data="{StaticResource MenuLikeGeometry}" Style="{StaticResource MenuGlyph}"/></MenuItem.Icon></MenuItem>
             <MenuItem Header="Убрать из избранного" Click="UnlikeTrack_Click"><MenuItem.Icon><Path Data="{StaticResource MenuUnlikeGeometry}" Style="{StaticResource MenuGlyph}"/></MenuItem.Icon></MenuItem>
@@ -231,6 +232,11 @@
           </ListView.Resources>
           <ListView.ItemContainerStyle>
             <Style TargetType="ListViewItem">
+              <Setter Property="local:TrackRowPlaybackHighlight.IsCurrent"><Setter.Value><MultiBinding Converter="{StaticResource TrackRowPlaybackHighlight}">
+                <Binding Path="QueuePlayingIndex" RelativeSource="{RelativeSource AncestorType=local:MainWindow}"/>
+                <Binding Path="(ItemsControl.AlternationIndex)" RelativeSource="{RelativeSource Self}"/>
+                <Binding Path="IsPlaying"/>
+              </MultiBinding></Setter.Value></Setter>
               <Setter Property="Height" Value="46"/><Setter Property="Padding" Value="4,0"/><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Opacity" Value="{Binding RowOpacity}"/>
               <Setter Property="Background" Value="Transparent"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}"/>
               <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListViewItem">
@@ -243,10 +249,10 @@
                   <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="RowHover" Property="local:Motion.Opacity" Value="1"/></Trigger>
                   <Trigger Property="IsSelected" Value="True"><Setter TargetName="RowBorder" Property="Background" Value="{DynamicResource AccentSelectionBrush}"/><Setter TargetName="RowHover" Property="Visibility" Value="Collapsed"/></Trigger>
                   <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="RowBorder" Property="BorderBrush" Value="{DynamicResource AccentFocusBrush}"/></Trigger>
-                  <DataTrigger Binding="{Binding IsPlaying}" Value="True"><Setter TargetName="PlayingMark" Property="Visibility" Value="Visible"/></DataTrigger>
+                  <Trigger Property="local:TrackRowPlaybackHighlight.IsCurrent" Value="True"><Setter TargetName="PlayingMark" Property="Visibility" Value="Visible"/></Trigger>
                 </ControlTemplate.Triggers>
               </ControlTemplate></Setter.Value></Setter>
-              <Style.Triggers><DataTrigger Binding="{Binding IsPlaying}" Value="True"><Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}"/></DataTrigger></Style.Triggers>
+              <Style.Triggers><Trigger Property="local:TrackRowPlaybackHighlight.IsCurrent" Value="True"><Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}"/></Trigger></Style.Triggers>
             </Style>
           </ListView.ItemContainerStyle>
           <ListView.View>
@@ -510,8 +516,8 @@
               <StackPanel Margin="0,0,20,0"><TextBlock Text="Одновременные скачивания"/><TextBlock Text="От 1 до 10 треков. Изменение применяется к следующей загрузке." Style="{StaticResource SettingsNote}" Margin="0,6,0,0"/></StackPanel>
               <ComboBox x:Name="SettingsDownloads" Grid.Column="1" SelectionChanged="SettingsSelection_Changed" VerticalAlignment="Top" AutomationProperties.Name="Количество одновременных скачиваний"/>
             </Grid>
-            <TextBlock Text="Музыка сохраняется в Документы\Yamuse\Music. Скачанные треки доступны без интернета." Style="{StaticResource SettingsNote}" Margin="0,22,0,14"/>
-            <WrapPanel><Button Content="Открыть папку" Click="OpenMusicFolder_Click" Margin="0,0,8,6"/><Button x:Name="SettingsClearCache" Content="Очистить кэш" Click="SettingsClearCache_Click" Margin="0,0,8,6" ToolTip="Обложки и анализ громкости будут созданы заново; скачанная музыка останется."/><Button x:Name="SettingsClearOffline" Content="Удалить всё скачанное" Click="SettingsClearOffline_Click" Margin="0,0,0,6"/></WrapPanel>
+            <TextBlock x:Name="SettingsOfflineLocation" Text="Музыка сохраняется в Документы\Yamuse\Music. Скачанные треки доступны без интернета." Style="{StaticResource SettingsNote}" Margin="0,22,0,14"/>
+            <WrapPanel><Button x:Name="SettingsOpenMusicFolder" Content="Открыть папку" Click="OpenMusicFolder_Click" Margin="0,0,8,6"/><Button x:Name="SettingsClearCache" Content="Очистить кэш" Click="SettingsClearCache_Click" Margin="0,0,8,6" ToolTip="Обложки и анализ громкости будут созданы заново; скачанная музыка останется."/><Button x:Name="SettingsClearOffline" Content="Удалить всё скачанное" Click="SettingsClearOffline_Click" Margin="0,0,0,6"/></WrapPanel>
             <StackPanel x:Name="MaintenancePanel" Visibility="Collapsed" Margin="0,12,0,0"><ProgressBar x:Name="MaintenanceProgress" Minimum="0" Maximum="100" Height="6" Foreground="{DynamicResource AccentTextBrush}" Margin="0,0,0,8"/><TextBlock x:Name="MaintenanceStatus" FontSize="12" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap"/></StackPanel>
           </StackPanel></Border>
           <Border Style="{StaticResource SettingsCard}"><StackPanel>
@@ -551,7 +557,7 @@
         <StackPanel x:Name="TransportControls" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
           <Button x:Name="ShuffleButton" Style="{StaticResource PlayerButton}" Click="Shuffle_Click" AutomationProperties.Name="Перемешивание" ToolTip="Перемешать"><Grid Width="24" Height="28"><Path Data="M 3,8 L 6,8 C 10,8 13,20 17,20 L 21,20 M 17,16 L 21,20 L 17,24 M 3,20 L 6,20 C 10,20 13,8 17,8 L 21,8 M 17,4 L 21,8 L 17,12" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.3" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Stretch="Uniform" Width="17" Height="17" VerticalAlignment="Center"/><Ellipse x:Name="ShuffleIndicator" Width="3" Height="3" Fill="{DynamicResource AccentBrush}" VerticalAlignment="Bottom" Visibility="Collapsed"/></Grid></Button>
           <Button x:Name="PreviousButton" Content="&#xE892;" FontFamily="Segoe MDL2 Assets" Style="{StaticResource PlayerButton}" AutomationProperties.Name="Предыдущий трек" ToolTip="Предыдущий трек" Click="Previous_Click" IsEnabled="False"/>
-          <Button x:Name="PlayPauseButton" Content="&#xE768;" FontFamily="Segoe MDL2 Assets" FontSize="17" Style="{StaticResource RoundPlayButton}" AutomationProperties.Name="Воспроизведение или пауза" ToolTip="Воспроизведение / пауза · Пробел" Margin="10,0" Click="PlayPause_Click" IsEnabled="False"/>
+          <Button x:Name="PlayPauseButton" Content="&#xE768;" FontFamily="Segoe MDL2 Assets" FontSize="17" Style="{StaticResource RoundPlayButton}" AutomationProperties.Name="Воспроизвести" ToolTip="Воспроизвести · Пробел" Margin="10,0" Click="PlayPause_Click" IsEnabled="False"/>
           <Button x:Name="NextButton" Content="&#xE893;" FontFamily="Segoe MDL2 Assets" Style="{StaticResource PlayerButton}" AutomationProperties.Name="Следующий трек" ToolTip="Следующий трек" Click="Next_Click" IsEnabled="False"/>
           <Button x:Name="RepeatButton" Style="{StaticResource PlayerButton}" Click="Repeat_Click" AutomationProperties.Name="Повтор" ToolTip="Повтор"><Grid Width="24" Height="28">
             <Path x:Name="RepeatArrows" Data="M 4,14 V 10 Q 4,6 8,6 H 20 M 17,3 L 20,6 L 17,9 M 20,14 V 18 Q 20,22 16,22 H 4 M 7,19 L 4,22 L 7,25" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"/>
@@ -586,7 +592,7 @@
           <Grid.ColumnDefinitions><ColumnDefinition Width="44"/><ColumnDefinition Width="*"/><ColumnDefinition Width="44"/></Grid.ColumnDefinitions>
           <TextBlock x:Name="PositionText" Text="0:00" Foreground="{StaticResource MutedBrush}" FontSize="12" VerticalAlignment="Center"/>
           <Grid Grid.Column="1" x:Name="TimelineSeekHost">
-            <Slider x:Name="SeekSlider" Minimum="0" Maximum="1" IsMoveToPointEnabled="True" IsEnabled="False" PreviewKeyUp="Seek_KeyUp" AutomationProperties.Name="Позиция воспроизведения"/>
+            <local:PlaybackSeekSlider x:Name="SeekSlider" Style="{StaticResource {x:Type Slider}}" Minimum="0" Maximum="1" IsMoveToPointEnabled="True" IsEnabled="False" PreviewKeyUp="Seek_KeyUp" AutomationProperties.Name="Позиция воспроизведения"/>
             <Grid x:Name="SeekHoverOverlay" IsHitTestVisible="False" Visibility="Collapsed">
               <Border x:Name="SeekHoverRange" HorizontalAlignment="Left" Margin="8,0,0,0" Height="4" CornerRadius="2" Background="#70B9B8C1"/>
               <Canvas><Border x:Name="SeekHoverMarker" Width="2" Height="14" Background="{DynamicResource ForegroundBrush}" CornerRadius="1" Canvas.Top="6"/><Border x:Name="SeekHoverBubble" Width="60" Height="25" Background="{DynamicResource PopupBrush}" BorderBrush="{DynamicResource StrongBorderBrush}" BorderThickness="1" CornerRadius="7" Canvas.Top="-22"><TextBlock x:Name="SeekHoverTime" Foreground="{DynamicResource ForegroundBrush}" FontSize="12" FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></Canvas>

@@ -15,6 +15,8 @@ public partial class MainWindow
     {
         if (StatusNotification is null || _closed) return;
         if (string.IsNullOrWhiteSpace(StatusText.Text)) { HideStatusNotification(); return; }
+        if (error && _shellCommandActive.Value && (!IsVisible || WindowState == WindowState.Minimized))
+            _shell?.ShowMiniCommandError(StatusText.Text);
         if (_statusDismissTimer is null)
         {
             _statusDismissTimer = new DispatcherTimer();

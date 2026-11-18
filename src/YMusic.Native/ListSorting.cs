@@ -40,7 +40,7 @@ internal sealed class ListSourceOrder : IDisposable
     public void Dispose() => _notifications.CollectionChanged -= Changed;
 }
 
-internal sealed class StableListComparer(ListSortRule rule, ListSourceOrder order,
+internal sealed class StableListComparer(ListSortRule rule, ListSourceOrder? order = null,
     IReadOnlyDictionary<string, int>? groups = null) : IComparer
 {
     private readonly CompareInfo _text = CultureInfo.CurrentCulture.CompareInfo;
@@ -63,7 +63,7 @@ internal sealed class StableListComparer(ListSortRule rule, ListSourceOrder orde
         var compared = missingLeft ? 0 : left is string ls && right is string rs
             ? _text.Compare(ls, rs, CompareOptions.IgnoreCase) : ((IComparable)left!).CompareTo(right);
         if (compared != 0) return rule.Descending ? -Math.Sign(compared) : Math.Sign(compared);
-        return order.Rank(x).CompareTo(order.Rank(y));
+        return order is null ? 0 : order.Rank(x).CompareTo(order.Rank(y));
     }
     private object? Key(object value) => value switch
     {
@@ -92,7 +92,8 @@ internal sealed class StableListComparer(ListSortRule rule, ListSourceOrder orde
 
 internal sealed class ListSortStore(string directory)
 {
-    private readonly string _path = Path.Combine(directory, "list-sorting.json");
+    private const int MaximumFileBytes = 8192;
+    private readonly string _path = Path.Combine(Path.GetFullPath(directory), "list-sorting.json");
     private static readonly JsonSerializerOptions Json = new()
     { WriteIndented = true, Converters = { new JsonStringEnumConverter<ListSortField>(allowIntegerValues: false) } };
     internal static bool ValidContext(string key) => key is
@@ -105,8 +106,8 @@ internal sealed class ListSortStore(string directory)
     {
         try
         {
-            if (!File.Exists(_path) || new FileInfo(_path).Length > 8192) return [];
-            var values = JsonSerializer.Deserialize<Dictionary<string, ListSortRule?>>(File.ReadAllBytes(_path), Json);
+            if (GuardedStoreFile.Read(_path, MaximumFileBytes) is not { } bytes) return [];
+            var values = JsonSerializer.Deserialize<Dictionary<string, ListSortRule?>>(bytes, Json);
             return values?.Where(p => ValidContext(p.Key) && p.Value is { } rule && Enum.IsDefined(rule.Field))
                 .ToDictionary(p => p.Key, p => Normalize(p.Value!), StringComparer.Ordinal) ?? [];
         }
@@ -117,17 +118,8 @@ internal sealed class ListSortStore(string directory)
         var safe = rules.Where(p => ValidContext(p.Key) && p.Value is { } rule && Enum.IsDefined(rule.Field))
             .ToDictionary(p => p.Key, p => Normalize(p.Value), StringComparer.Ordinal);
         var bytes = JsonSerializer.SerializeToUtf8Bytes(safe, Json);
-        if (bytes.Length > 8192) throw new IOException("Слишком большой файл сортировки.");
-        Directory.CreateDirectory(directory);
-        var temporary = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try
-        {
-            using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            { file.Write(bytes); file.Flush(true); }
-            if (File.Exists(_path)) File.Replace(temporary, _path, null);
-            else File.Move(temporary, _path);
-        }
-        finally { AudioBuffer.Delete(temporary); }
+        if (bytes.Length > MaximumFileBytes) throw new IOException("Слишком большой файл сортировки.");
+        GuardedStoreFile.Write(_path, bytes);
     }
     private static ListSortRule Normalize(ListSortRule rule) => rule.Field == ListSortField.Original ? new() : rule;
 }

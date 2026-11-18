@@ -6,7 +6,8 @@ internal sealed record OfflinePlaylistTrack(
     [property: JsonRequired] string Id, [property: JsonRequired] string RequestId,
     [property: JsonRequired] string Title, [property: JsonRequired] string Artist,
     [property: JsonRequired] string Album, [property: JsonRequired] long DurationMs,
-    [property: JsonRequired] bool Available, string? CoverUri = null, IReadOnlyList<ArtistReference>? Artists = null, string? AlbumId = null);
+    [property: JsonRequired] bool Available, string? CoverUri = null, IReadOnlyList<ArtistReference>? Artists = null, string? AlbumId = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PrimaryArtistName = null);
 
 internal sealed record OfflinePlaylist(
     [property: JsonRequired] string Owner, [property: JsonRequired] string Kind,

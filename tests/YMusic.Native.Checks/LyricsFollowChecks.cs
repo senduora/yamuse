@@ -1,4 +1,3 @@
-using System.Collections;
 using System.Globalization;
 using System.IO;
 using System.Net;
@@ -29,6 +28,9 @@ internal static partial class Program
         {
             await Run("Lyrics follow: Yandex plain upgrades to exact timed LRCLIB with source and reopen cache", CheckLyricsFollowFallback);
             await Run("Lyrics follow: LRCLIB miss retains Yandex plain without Genius", CheckLyricsFollowPlain);
+            await Run("Lyrics follow: transient LRCLIB fallback retries and applies the paused restored position", CheckLyricsFollowRetryAndResume);
+            await Run("Lyrics follow: transient Yandex timing retries after a plain fallback", CheckLyricsFollowYandexRetry);
+            await Run("Lyrics follow: distinct editions cannot share the current-track lyrics cache", CheckLyricsFollowEditions);
             await Run("Lyrics follow: Yandex authentication/access/server errors never start another provider", CheckLyricsFollowProviderErrors);
             await Run("Lyrics follow: canceled late LRCLIB cannot replace a new track or enter its cache", CheckLyricsFollowRace);
             await Run("Lyrics follow: native clock, exact single click and backward seek, visible playback timer", CheckLyricsFollowNative);
@@ -85,6 +87,79 @@ internal static partial class Program
         Assert(LyricsUiField<TextBlock>(fixture.Window, "_lyricsNote")!.Text.Contains("Яндекс", StringComparison.Ordinal), "plain Yandex source attribution was lost");
     }
 
+    private static async Task CheckLyricsFollowRetryAndResume()
+    {
+        var track = LyricsFollowTrack("42109");
+        var requests = 0;
+        using var fixture = new LyricsFollowFixture("retry-and-resume", LyricsFollowYandexPlain("Original Yandex plain"), (_, _) =>
+            Task.FromResult(++requests == 1 ? Json("{}", HttpStatusCode.ServiceUnavailable)
+                : LyricsFollowRecord(track, "[00:00]First\n[00:04]Second\n[00:08]Third")));
+        var window = fixture.Window;
+        var queue = LyricsUiField<PlaybackQueue>(window, "_playbackQueue")!;
+        queue.SetItems([track]);
+        LyricsUiSet(window, "_current", track);
+        LyricsUiSet(window, "_restoredPlaybackOccurrence", queue.CurrentOccurrenceToken!.Value);
+        LyricsUiSet(window, "_restoredPlaybackSeconds", 9d);
+        LyricsUiOpen(window);
+        await Until(() => LyricsUiLines(window).SequenceEqual(new[] { "Original Yandex plain" }));
+        Assert(!LyricsUiCached(window, track), "temporary LRCLIB failure cached the plain fallback");
+
+        LyricsUiOpen(window); LyricsUiOpen(window);
+        await Until(() => LyricsUiLines(window).SequenceEqual(new[] { "First", "Second", "Third" }));
+        Assert(requests == 2 && !LyricsUiField<NativePlayer>(window, "_player")!.HasSource
+            && Control<ListBox>(window, "LyricsList").SelectedIndex == 2, "timed lyrics missed the saved paused position or opened media");
+    }
+
+    private static async Task CheckLyricsFollowYandexRetry()
+    {
+        var yandexLrc = 0;
+        using var fixture = new LyricsFollowFixture("yandex-retry", new FakeHandler((request, _) =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.AbsolutePath == "/fixture-timed")
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("[00:00]Recovered timed fixture") });
+            if (uri.Query.Contains("format=LRC", StringComparison.Ordinal))
+                return Task.FromResult(++yandexLrc == 1 ? Json("{}", HttpStatusCode.ServiceUnavailable)
+                    : Json("""{"result":{"downloadUrl":"https://fixture.yandex.net/fixture-timed"}}"""));
+            return Task.FromResult(LyricsUiYandex(request, "Original Yandex plain"));
+        }), (_, _) => Task.FromResult(Json("{}", HttpStatusCode.NotFound)));
+        var track = LyricsFollowTrack("42110");
+        var window = fixture.Window;
+        LyricsUiSet(window, "_current", track);
+        LyricsUiOpen(window);
+        await Until(() => LyricsUiLines(window).SequenceEqual(["Original Yandex plain"]));
+        Assert(!LyricsUiCached(window, track), "temporary Yandex timing failure cached the plain fallback");
+
+        LyricsUiOpen(window); LyricsUiOpen(window);
+        await Until(() => LyricsUiLines(window).SequenceEqual(["Recovered timed fixture"]));
+        Assert(yandexLrc == 2 && fixture.Lrclib.Seen.Count == 1 && LyricsUiCached(window, track),
+            "LRC recovery stayed blocked or was not cached after success");
+    }
+
+    private static async Task CheckLyricsFollowEditions()
+    {
+        TrackRow Edition(string album) => new() { Id = "42111", RequestId = "42111:" + album, AlbumId = album,
+            Album = album, Title = "Edition fixture", Artist = "Fixture Artist", DurationMs = 180000, Available = true };
+        var first = Edition("7"); var second = Edition("8");
+        using var fixture = new LyricsFollowFixture("editions", LyricsFollowYandexPlain("Original Yandex plain"), (request, _) =>
+        {
+            var track = LyricsFollowQuery(request.RequestUri!)["album_name"] == first.Album ? first : second;
+            return Task.FromResult(LyricsFollowRecord(track, "[00:01]Edition " + track.Album));
+        });
+        var window = fixture.Window;
+        LyricsUiSet(window, "_current", first);
+        LyricsUiOpen(window);
+        await Until(() => LyricsUiLines(window).SequenceEqual(["Edition 7"]));
+        LyricsUiSet(window, "_current", second);
+        LyricsUiInvoke(window, "RefreshLyrics");
+        await Until(() => LyricsUiLines(window).SequenceEqual(["Edition 8"]));
+        LyricsUiSet(window, "_current", first);
+        LyricsUiInvoke(window, "RefreshLyrics");
+        await Until(() => LyricsUiLines(window).SequenceEqual(["Edition 7"]));
+        Assert(fixture.Lrclib.Seen.Count == 2 && LyricsUiCached(window, first) && LyricsUiCached(window, second),
+            "edition lookup reused or displaced a sibling result");
+    }
+
     private static async Task CheckLyricsFollowProviderErrors()
     {
         foreach (var status in new[] { HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden, HttpStatusCode.ServiceUnavailable })
@@ -96,7 +171,7 @@ internal static partial class Program
             LyricsUiSet(fixture.Window, "_current", track); LyricsUiOpen(fixture.Window);
             await Until(() => LyricsUiField<CancellationTokenSource>(fixture.Window, "_lyricsCts") is null);
             Assert(fixture.Lrclib.Seen.Count == 0 && fixture.Genius.Seen.Count == 0, "Yandex failure bypassed provider error handling");
-            Assert(!LyricsUiField<IDictionary>(fixture.Window, "_lyricsCache")!.Contains(track.Id)
+            Assert(!LyricsUiCached(fixture.Window, track)
                 && LyricsUiLines(fixture.Window).Length == 0, "Yandex failure entered the absence cache or displayed fallback text");
             Assert(!LyricsUiField<TextBlock>(fixture.Window, "_lyricsNote")!.Text.Contains("Текст не найден", StringComparison.Ordinal), "provider error was presented as an absent song");
         }
@@ -134,8 +209,7 @@ internal static partial class Program
             await returned.Task.WaitAsync(TimeSpan.FromSeconds(5));
             await Until(() => LyricsUiLines(fixture.Window).SequenceEqual(new[] { "Current timed response", "Current second" }));
             await Until(() => LyricsUiDisposed(oldCancellation));
-            var cache = LyricsUiField<IDictionary>(fixture.Window, "_lyricsCache")!;
-            Assert(!cache.Contains(oldTrack.Id) && cache.Contains(newTrack.Id), "late canceled LRCLIB response entered the cache");
+            Assert(!LyricsUiCached(fixture.Window, oldTrack) && LyricsUiCached(fixture.Window, newTrack), "late canceled LRCLIB response entered the cache");
             Assert(LyricsUiField<TextBlock>(fixture.Window, "_lyricsHeading")!.Text == newTrack.Title
                 && fixture.Genius.Seen.Count == 0, "late response changed the heading or started another provider");
         }
@@ -181,6 +255,11 @@ internal static partial class Program
         await Until(() => !player.IsPlaying && !timer.IsEnabled);
         await Call(window, "TogglePlaybackAsync");
         await Until(() => player.IsPlaying && timer.IsEnabled);
+        LyricsUiField<DispatcherTimer>(window, "_progressTimer")!.Stop();
+        LyricsUiSet(window, "_pendingSeek", 18d);
+        LyricsUiField<System.Diagnostics.Stopwatch>(window, "_seekClock")!.Restart();
+        await Until(() => list.SelectedIndex == 36);
+        Assert(Math.Abs(player.Position.TotalSeconds - 18) > .8, "fixture did not exercise an unacknowledged seek");
         LyricsUiOpen(window);
         Assert(!timer.IsEnabled && !Control<Grid>(window, "LyricsPanel").IsVisible && player.IsPlaying, "hidden lyrics kept its timer or stopped audio");
         fixture.Close();

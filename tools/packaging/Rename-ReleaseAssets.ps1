@@ -3,7 +3,8 @@ param([Parameter(Mandatory)][string]$OutputFolder,
     [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$folder = [IO.Path]::GetFullPath($OutputFolder)
+. (Join-Path $PSScriptRoot '..\ScriptPaths.ps1')
+$folder = Resolve-YamuseFileSystemPath $OutputFolder
 $names = [ordered]@{
     'YMusic.Native-win-Setup.exe' = 'Yamuse-win-Setup.exe'
     'YMusic.Native-win-Portable.zip' = 'Yamuse-win-Portable.zip'

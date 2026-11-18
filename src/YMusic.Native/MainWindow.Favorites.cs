@@ -13,9 +13,11 @@ public partial class MainWindow
     private FavoritesCacheStore? _favoritesStore;
     private string? _favoritesAccountUid;
     private bool _favoritesCacheRead, _favoritesCacheComplete;
+    private int? _verifiedFavoritesGeneration;
     private long _favoritesLikeRevision;
     private DateTimeOffset _favoritesMetadataSavedUtc;
     private Task? _favoritesCacheSaveTask;
+    private DispatcherOperation? _favoritesOpenRefresh;
     // Deterministic fixtures can hold the asynchronous boundaries without touching
     // a real profile, disk scheduler, music account or native input.
     internal Func<string, CancellationToken, Task<FavoritesCacheSnapshot?>>? FavoritesCacheReader { get; set; }
@@ -24,14 +26,32 @@ public partial class MainWindow
     private void ResetFavoritesCacheAccount()
     {
         _libraryCts?.Cancel();
+        _favoritesOpenRefresh?.Abort();
+        _favoritesOpenRefresh = null;
         _favoritesAccountUid = null;
         _favoritesCacheRead = _favoritesCacheComplete = false;
+        _favoritesSnapshotReady = false;
+        _verifiedFavoritesGeneration = null;
         _favoritesMetadataSavedUtc = default;
         _favoritesLikeRevision++;
         _favoritesCache.Clear();
         _favoriteTrackIds.Clear();
         _favoriteIdsKnown = false;
         if (_section == "favorites") _tracks.ReplaceAll([]);
+    }
+
+    private void RefreshFavoritesOnOpen()
+    {
+        if (_account is not { } account || _favoritesOpenRefresh is not null || !CanRefresh()) return;
+        var generation = _accountGeneration;
+        _favoritesOpenRefresh = Dispatcher.InvokeAsync(() =>
+        {
+            _favoritesOpenRefresh = null;
+            if (_account?.Uid == account.Uid && _accountGeneration == generation && CanRefresh()) _ = RefreshLibraryAsync();
+        }, DispatcherPriority.Background);
+
+        bool CanRefresh() => _section == "favorites" && _session is not null && !_demo && !SessionWriteAdmissionClosed
+            && !DownloadQueueRestorePending && _libraryCts is not { IsCancellationRequested: false };
     }
 
     internal async Task RefreshLibraryAsync(bool refreshMetadata = false)
@@ -72,14 +92,17 @@ public partial class MainWindow
                 Guard();
                 _favoritesCacheRead = true;
                 if (snapshot is not null && snapshot.AccountHash == FavoritesCacheStore.AccountHash(uid)
-                    && likeRevision == _favoritesLikeRevision && _favoritesCache.Count == 0)
+                    && likeRevision == _favoritesLikeRevision && !_favoritesCacheComplete && _favoritesCache.Count == 0)
                 {
                     _favoritesMetadataSavedUtc = snapshot.SavedUtc;
                     _favoritesCacheComplete = true;
                     var cached = FavoritesCacheStore.Restore(snapshot);
                     _favoritesCache.AddRange(cached);
-                    _favoriteTrackIds.UnionWith(cached.Select(row => row.Id));
-                    _favoriteIdsKnown = true;
+                    if (_verifiedFavoritesGeneration != generation)
+                    {
+                        _favoriteTrackIds.UnionWith(cached.Select(row => row.Id));
+                        _favoriteIdsKnown = true;
+                    }
                     _diagnostics.TotalTracks = _diagnostics.LoadedTracks = cached.Length;
                     if (_section == "favorites")
                     {
@@ -98,27 +121,25 @@ public partial class MainWindow
             var ids = await _api.GetLikedIdsAsync(session, uid, cts.Token);
             Guard();
             ids = ids.Where(id => !removed.Contains(id.Id)).ToArray();
-            _favoriteTrackIds.Clear();
-            _favoriteTrackIds.UnionWith(ids.Select(id => id.Id));
-            _favoriteIdsKnown = true;
-            UpdatePlayerLikeState();
+            ApplyVerifiedFavoriteIds(ids);
             _diagnostics.TotalTracks = ids.Count;
-            var hasRows = _favoritesCache.Count > 0;
+            var hasSnapshot = _favoritesCacheComplete;
             var reuse = !refreshMetadata && _favoritesMetadataSavedUtc > DateTimeOffset.UtcNow - FavoritesMetadataLifetime
                 && _favoritesMetadataSavedUtc <= DateTimeOffset.UtcNow.AddMinutes(5);
-            var metadata = reuse ? _favoritesCache.GroupBy(row => row.RequestId, StringComparer.Ordinal)
+            var metadata = hasSnapshot ? _favoritesCache.GroupBy(row => row.RequestId, StringComparer.Ordinal)
                 .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal) : [];
             var ordered = new TrackRow?[ids.Count];
             var missing = new List<int>();
             for (var i = 0; i < ids.Count; i++)
-                if (metadata.TryGetValue(ids[i].RequestId, out var row)) ordered[i] = FavoriteNumber(row, i + 1);
+                if (reuse && metadata.TryGetValue(ids[i].RequestId, out var row) && row.HasTrackMetadata)
+                    ordered[i] = FavoriteNumber(row, i + 1);
                 else missing.Add(i);
 
             // A populated view remains usable while the new snapshot is assembled.
             // Cold loading appends in small dispatcher slices, never Reset per page.
-            if (!hasRows)
+            if (!hasSnapshot)
             {
-                _favoritesCacheComplete = false;
+                _favoritesCache.Clear();
                 if (_section == "favorites" && _tracks.Count > 0) ShowRows([]);
             }
             _diagnostics.LoadedTracks = ordered.Count(row => row is not null);
@@ -126,9 +147,20 @@ public partial class MainWindow
             for (var offset = 0; offset < missing.Count; offset += 100)
             {
                 var positions = missing.Skip(offset).Take(100).ToArray();
-                var rows = await _api.GetTracksAsync(session, positions.Select(index => ids[index]).ToArray(), 0, cts.Token);
+                var references = positions.Select(index => ids[index]).ToArray();
+                var rows = await _api.GetTracksAsync(session, references, 0, cts.Token);
                 Guard();
-                var page = rows.Select((row, index) => FavoriteNumber(row, positions[index] + 1)).ToArray();
+                if (!rows.Select(row => row.RequestId).SequenceEqual(references.Select(reference => reference.RequestId)))
+                    throw new MusicException("Ответ не соответствует запрошенной странице избранного.");
+                var page = new TrackRow[rows.Count];
+                for (var i = 0; i < rows.Count; i++)
+                {
+                    var row = rows[i];
+                    var number = positions[i] + 1;
+                    if (!row.HasTrackMetadata && metadata.TryGetValue(row.RequestId, out var cached))
+                        page[i] = FavoriteNumber(cached, number, available: false, hasTrackMetadata: false);
+                    else page[i] = FavoriteNumber(row, number);
+                }
                 var epoch = _offlineViewEpoch;
                 OfflineMark[]? marks = null;
                 try
@@ -150,7 +182,7 @@ public partial class MainWindow
                 if (marks is not null && epoch == _offlineViewEpoch && !_offlineMaintenance) ApplyOfflineMarks(marks);
                 ApplyTrackLikeStates(page);
                 for (var i = 0; i < page.Length; i++) ordered[positions[i]] = page[i];
-                if (!hasRows)
+                if (!hasSnapshot)
                 {
                     for (var first = 0; first < page.Length; first += 16)
                     {
@@ -177,17 +209,8 @@ public partial class MainWindow
             Guard();
             var complete = ordered.Where(row => row is not null && !removed.Contains(row.Id))
                 .Select((row, index) => FavoriteNumber(row!, index + 1)).ToArray();
-            foreach (var row in complete)
-            {
-                var playing = _player.HasSource && _current?.RequestId == row.RequestId;
-                if (row.IsPlaying != playing) row.IsPlaying = playing;
-            }
-            _favoritesCache.Clear();
-            _favoritesCache.AddRange(complete);
-            _favoritesCacheComplete = true;
             if (!reuse || metadata.Count == 0) _favoritesMetadataSavedUtc = DateTimeOffset.UtcNow;
-            _diagnostics.TotalTracks = _diagnostics.LoadedTracks = complete.Length;
-            if (_section == "favorites") ApplyFavoritesSnapshot(complete);
+            PublishFavoritesSnapshot(complete);
             PersistFavoritesCache();
             _diagnostics.Timing("favorites_all_ms", clock.Elapsed.TotalMilliseconds);
             _diagnostics.Stage = _player.IsPlaying ? "playing" : "library_ready";
@@ -202,7 +225,14 @@ public partial class MainWindow
             if (Current())
             {
                 _diagnostics.Stage = "library_partial_or_error";
-                ShowError(error, _favoritesCache.Count > 0 ? "Сохранённый список доступен. " : "");
+                if (!_favoritesCacheComplete)
+                {
+                    _favoritesCache.Clear();
+                    _diagnostics.LoadedTracks = 0;
+                    if (_section == "favorites") ShowRows([]);
+                }
+                if (_section == "favorites") ShowError(error, _favoritesCache.Count > 0 ? "Сохранённый список доступен. " : "");
+                else _diagnostics.LastErrorType = error.GetType().Name;
             }
         }
         finally
@@ -214,11 +244,78 @@ public partial class MainWindow
         }
     }
 
-    private static TrackRow FavoriteNumber(TrackRow row, int number) => row.Number == number ? row : new()
+    private void ApplyVerifiedFavoriteIds(IReadOnlyList<LikedId> ids)
     {
-        Number = number, Id = row.Id, RequestId = row.RequestId, Title = row.Title, Artist = row.Artist,
-        Artists = row.Artists, Album = row.Album, AlbumId = row.AlbumId, CoverUri = row.CoverUri,
-        DurationMs = row.DurationMs, Available = row.Available, LocalPath = row.LocalPath, LocalQuality = row.LocalQuality,
+        if (_favoritesSnapshotReady && (!_favoritesCacheComplete
+            || !_favoritesCache.Select(row => row.RequestId).SequenceEqual(ids.Select(reference => reference.RequestId))))
+        {
+            _favoritesSnapshotReady = false;
+            UpdatePlaylistDownloadedStatus();
+        }
+        _favoriteTrackIds.Clear();
+        _favoriteTrackIds.UnionWith(ids.Select(reference => reference.Id));
+        _verifiedFavoritesGeneration = _accountGeneration;
+        foreach (var id in _pendingConfirmedFavorites.Keys.Where(id => !_favoriteTrackIds.Contains(id)).ToArray())
+            _pendingConfirmedFavorites.Remove(id);
+        _favoriteIdsKnown = true;
+        ReconcileDownloadQueueWithVerifiedFavorites();
+        UpdatePlayerLikeState();
+    }
+
+    private void ReconcileDownloadQueueWithVerifiedFavorites()
+    {
+        if (_verifiedFavoritesGeneration == _accountGeneration && _favoritesAccountUid is { } uid && uid == _account?.Uid)
+            ReconcileDownloadQueueFavorites(uid, _favoriteTrackIds);
+    }
+
+    private bool TryApplyConfirmedFavoriteSnapshot(TrackRow? likedTrack, IReadOnlyList<LikedId> readback)
+    {
+        if (_favoritesAccountUid != _account?.Uid || !_favoritesCacheComplete && likedTrack is not null) return false;
+
+        var metadata = new Dictionary<string, TrackRow>(StringComparer.Ordinal);
+        foreach (var row in _favoritesCache) metadata.TryAdd(row.RequestId, row);
+
+        var rows = new TrackRow[readback.Count];
+        for (var i = 0; i < readback.Count; i++)
+        {
+            var reference = readback[i];
+            if (metadata.TryGetValue(reference.RequestId, out var row))
+            {
+                rows[i] = FavoriteNumber(row, i + 1);
+                continue;
+            }
+            // Use the source row only if it carries online metadata for this context.
+            if (likedTrack is null || reference.Id != likedTrack.Id || reference.RequestId != likedTrack.RequestId
+                && (reference.AlbumId is null || reference.AlbumId != likedTrack.AlbumId)) return false;
+            rows[i] = FavoriteNumber(likedTrack, i + 1, reference.RequestId);
+        }
+
+        if (_favoritesMetadataSavedUtc == default) _favoritesMetadataSavedUtc = DateTimeOffset.UtcNow;
+        PublishFavoritesSnapshot(rows);
+        _favoritesSnapshotReady = true;
+        UpdatePlaylistDownloadedStatus();
+        return true;
+    }
+
+    private void PublishFavoritesSnapshot(TrackRow[] rows)
+    {
+        foreach (var row in rows) row.IsPlaying = _player.HasSource && _current?.RequestId == row.RequestId;
+        _favoritesCache.Clear();
+        _favoritesCache.AddRange(rows);
+        _favoritesCacheRead = true;
+        _favoritesCacheComplete = true;
+        _diagnostics.TotalTracks = _diagnostics.LoadedTracks = rows.Length;
+        if (_section == "favorites") ApplyFavoritesSnapshot(rows);
+    }
+
+    private static TrackRow FavoriteNumber(TrackRow row, int number, string? requestId = null, bool? available = null, bool? hasTrackMetadata = null)
+        => row.Number == number && requestId is null && (available is null || available == row.Available)
+            && (hasTrackMetadata is null || hasTrackMetadata == row.HasTrackMetadata) ? row : new()
+    {
+        Number = number, Id = row.Id, RequestId = requestId ?? row.RequestId, Title = row.Title, Artist = row.Artist,
+        Artists = row.Artists, PrimaryArtistName = row.PrimaryArtistName, Album = row.Album, AlbumId = row.AlbumId, CoverUri = row.CoverUri,
+        DurationMs = row.DurationMs, Available = available ?? row.Available, HasTrackMetadata = hasTrackMetadata ?? row.HasTrackMetadata,
+        LocalPath = row.LocalPath, LocalQuality = row.LocalQuality, IsOfflineLibraryRow = row.IsOfflineLibraryRow,
         DownloadedPath = row.DownloadedPath, DownloadedQuality = row.DownloadedQuality,
         IsLiked = row.IsLiked, LikeStateKnown = row.LikeStateKnown, CanToggleLike = row.CanToggleLike, IsPlaying = row.IsPlaying
     };
@@ -254,19 +351,27 @@ public partial class MainWindow
 
     private void PersistFavoritesCache()
     {
-        if (_favoritesStore is null || !_favoritesCacheComplete || _favoritesAccountUid != _account?.Uid || _account is null) return;
+        if (SessionWriteAdmissionClosed || _favoritesStore is null
+            || !_favoritesCacheComplete || _favoritesAccountUid != _account?.Uid || _account is null) return;
         try
         {
-            var snapshot = FavoritesCacheStore.Capture(_account.Uid, _favoritesCache, _favoritesMetadataSavedUtc);
-            _favoritesCacheSaveTask = SaveAsync();
+            var uid = _account.Uid;
+            var generation = _accountGeneration;
+            var store = _favoritesStore;
+            var snapshot = FavoritesCacheStore.Capture(uid, _favoritesCache, _favoritesMetadataSavedUtc);
+            var save = SaveAsync();
+            _favoritesCacheSaveTask = _favoritesCacheSaveTask is { IsCompleted: false } previous
+                ? Task.WhenAll(previous, save) : save;
             async Task SaveAsync()
             {
-                try { await _favoritesStore.SaveInBackgroundAsync(snapshot); }
+                try { await store.SaveInBackgroundAsync(snapshot); }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or System.Text.Json.JsonException)
-                { if (!_closed) _diagnostics.LastErrorType = "FavoritesCacheSave:" + error.GetType().Name; }
+                { if (!_closed && _account?.Uid == uid && _accountGeneration == generation) _diagnostics.LastErrorType = "FavoritesCacheSave:" + error.GetType().Name; }
             }
         }
         catch (Exception error) when (error is IOException or ArgumentException or System.Text.Json.JsonException)
         { _diagnostics.LastErrorType = "FavoritesCacheSave:" + error.GetType().Name; }
     }
+
+    private Task DrainFavoritesCacheWritesAsync() => _favoritesCacheSaveTask ?? Task.CompletedTask;
 }
