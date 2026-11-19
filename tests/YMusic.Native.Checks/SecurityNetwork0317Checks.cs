@@ -289,18 +289,22 @@ internal static partial class Program
         await Run("Security network 0317: Genius retries an unreadable song page and caches explicit misses", async () =>
         {
             const string match = """{"response":{"sections":[{"type":"song","hits":[{"result":{"title":"Fixture song","primary_artist":{"name":"Fixture artist"},"path":"/Fixture-song-lyrics"}}]}]}}""";
-            var pages = 0;
-            var http = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath switch
+            foreach (var unreadable in new[] { "", " \r\n", "<main>Temporary fixture page</main>", "<div class='lyrics'><br></div>",
+                "<div data-lyrics-container='true'>&nbsp;</div>" })
             {
-                "/api/search/multi" => Json(match),
-                "/Fixture-song-lyrics" => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(++pages == 1
-                    ? "<main>Temporary fixture page</main>" : "<div data-lyrics-container='true'>Fixture lyric</div>") },
-                _ => throw new InvalidOperationException("Unexpected Genius fixture route")
-            }));
-            using var genius = new GeniusLyricsClient(http);
-            await Throws<MusicException>(() => genius.FindAsync("Fixture song", "Fixture artist", default));
-            Assert((await genius.FindAsync("Fixture song", "Fixture artist", default))?.PlainText == "Fixture lyric" && pages == 2,
-                "Genius cached the unreadable page as an absent text");
+                var pages = 0;
+                var http = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath switch
+                {
+                    "/api/search/multi" => Json(match),
+                    "/Fixture-song-lyrics" => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(++pages == 1
+                        ? unreadable : "<div data-lyrics-container='true'>Fixture lyric</div>") },
+                    _ => throw new InvalidOperationException("Unexpected Genius fixture route")
+                }));
+                using var genius = new GeniusLyricsClient(http);
+                await Throws<MusicException>(() => genius.FindAsync("Fixture song", "Fixture artist", default));
+                Assert((await genius.FindAsync("Fixture song", "Fixture artist", default))?.PlainText == "Fixture lyric" && pages == 2,
+                    "Genius cached an unusable successful page as absent text");
+            }
 
             var emptySearch = new FakeHandler((_, _) => Task.FromResult(Json("""{"response":{"sections":[{"type":"song","hits":[]}]}}""")));
             using var missing = new GeniusLyricsClient(emptySearch);
@@ -310,13 +314,13 @@ internal static partial class Program
             Assert(await missing.FindAsync("Unknown song", "Fixture artist", default, refresh: true) is null && emptySearch.Seen.Count == 2,
                 "an explicit refresh reused the Genius negative cache");
 
-            foreach (var (status, body) in new[] { (HttpStatusCode.NotFound, ""), (HttpStatusCode.OK, ""),
-                (HttpStatusCode.OK, "<div class='lyrics'><br></div>") })
+            foreach (var status in new[] { HttpStatusCode.NotFound, HttpStatusCode.Gone })
             {
                 var emptyPage = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath == "/api/search/multi"
-                    ? Json(match) : new HttpResponseMessage(status) { Content = new StringContent(body) }));
+                    ? Json(match) : new HttpResponseMessage(status) { Content = new StringContent("") }));
                 using var empty = new GeniusLyricsClient(emptyPage);
-                Assert(await empty.FindAsync("Fixture song", "Fixture artist", default) is null && emptyPage.Seen.Count == 2,
+                Assert(await empty.FindAsync("Fixture song", "Fixture artist", default) is null
+                    && await empty.FindAsync("Fixture song", "Fixture artist", default) is null && emptyPage.Seen.Count == 2,
                     "an explicitly absent lyric was reported as broken markup");
             }
 
@@ -329,6 +333,31 @@ internal static partial class Program
             using var partial = new GeniusLyricsClient(range);
             await Throws<MusicException>(() => partial.FindAsync("Fixture song", "Fixture artist", default));
             Assert(range.Seen.Count == 1, "Genius accepted a search response with malformed Content-Range");
+        });
+
+        await Run("Security network 0317: Genius retries missing search endpoints and keys exact queries", async () =>
+        {
+            const string match = """{"response":{"sections":[{"type":"song","hits":[{"result":{"title":"Fixture song","primary_artist":{"name":"Fixture artist"},"path":"/Fixture-song-lyrics"}}]}]}}""";
+            foreach (var status in new[] { HttpStatusCode.NotFound, HttpStatusCode.Gone })
+            {
+                var searches = 0;
+                var http = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath == "/api/search/multi"
+                    ? ++searches == 1 ? Json("{}", status) : Json(match)
+                    : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("<div data-lyrics-container='true'>Fixture lyric</div>") }));
+                using var genius = new GeniusLyricsClient(http);
+                await Throws<MusicException>(() => genius.FindAsync("Fixture song", "Fixture artist", default));
+                Assert((await genius.FindAsync("Fixture song", "Fixture artist", default))?.PlainText == "Fixture lyric" && searches == 2,
+                    "Genius treated a missing search endpoint as a cached song miss");
+            }
+
+            var queryHttp = new FakeHandler((request, _) => Task.FromResult(request.RequestUri!.AbsolutePath != "/api/search/multi"
+                ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("<div data-lyrics-container='true'>New text</div>") }
+                : Uri.UnescapeDataString(request.RequestUri.Query).EndsWith("Fixture song?", StringComparison.Ordinal)
+                    ? Json("""{"response":{"sections":[{"type":"song","hits":[]}]}}""") : Json(match)));
+            using var queryClient = new GeniusLyricsClient(queryHttp);
+            Assert(await queryClient.FindAsync("Fixture song?", "Fixture artist", default) is null
+                && (await queryClient.FindAsync("Fixture song!", "Fixture artist", default))?.PlainText == "New text" && queryHttp.Seen.Count == 3,
+                "a normalized matching key reused a miss for a different exact query");
         });
     }
 

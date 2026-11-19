@@ -13,6 +13,15 @@ internal static partial class Program
 {
     private static async Task CheckLoudness()
     {
+        await Run("Loudness: native readers use the literal percent-encoded-looking local path", async () =>
+        {
+            var directory = LoudnessDirectory("literal%61");
+            var path = Path.Combine(directory, "track%20reference.mp3");
+            await File.WriteAllBytesAsync(path, await EncodeAudioFixtureAsync("mp3", MediaEncodingProfile.CreateMp3(AudioEncodingQuality.High)));
+            Assert(await Task.Run(() => LoudnessAnalysis.ProbeOfflineAudio(path, "mp3", default)) is not null
+                && await LoudnessAnalysis.AnalyzeAsync(path, default) is not null,
+                "the local audio filename was reinterpreted as a file URI");
+        });
         await Run("Loudness: actual MF PCM decode, mono/stereo reference, resampling and attenuation-only gain", async () =>
         {
             var directory = LoudnessDirectory("pcm");

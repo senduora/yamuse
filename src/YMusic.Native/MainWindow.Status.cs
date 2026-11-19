@@ -10,11 +10,14 @@ public partial class MainWindow
     private DispatcherTimer? _statusDismissTimer;
     private int _statusNotificationVersion;
     private bool _statusNotificationError;
+    private bool _statusNotificationShown;
 
-    private void ShowStatusNotification(bool error)
+    private bool ShowStatusNotification(bool error)
     {
-        if (StatusNotification is null || _closed) return;
-        if (string.IsNullOrWhiteSpace(StatusText.Text)) { HideStatusNotification(); return; }
+        if (StatusNotification is null || _closed) return false;
+        if (string.IsNullOrWhiteSpace(StatusText.Text)) { HideStatusNotification(); return false; }
+        var newlyShown = !_statusNotificationShown;
+        _statusNotificationShown = true;
         if (error && _shellCommandActive.Value && (!IsVisible || WindowState == WindowState.Minimized))
             _shell?.ShowMiniCommandError(StatusText.Text);
         if (_statusDismissTimer is null)
@@ -36,6 +39,7 @@ public partial class MainWindow
         _statusNotificationError = error;
         AnimateStatusNotification(true);
         UpdateStatusNotificationLifetime();
+        return newlyShown;
     }
 
     private void UpdateStatusNotificationLifetime()
@@ -51,6 +55,7 @@ public partial class MainWindow
 
     private void HideStatusNotification()
     {
+        _statusNotificationShown = false;
         _statusDismissTimer?.Stop();
         if (StatusNotification is not null) AnimateStatusNotification(false);
     }

@@ -39,6 +39,7 @@ internal sealed class DesktopShell : IDisposable
     private bool _isPlaying;
     private bool _canNext;
     private bool _canPrevious;
+    private bool _canPlay;
     private ImageSource? _cover;
     private string? _coverUri;
     private double _positionSeconds, _durationSeconds, _volumePercent = 70, _speedRatio = 1;
@@ -107,20 +108,21 @@ internal sealed class DesktopShell : IDisposable
         owner.StateChanged += OwnerStateChanged;
     }
 
-    public void Update(string title, string artist, bool isPlaying, bool canNext, bool canPrevious)
+    public void Update(string title, string artist, bool isPlaying, bool canNext, bool canPrevious, bool canPlay)
     {
         OnWindowThread(() =>
         {
             var nextTitle = (title ?? "").Replace('\0', ' ');
             var nextArtist = (artist ?? "").Replace('\0', ' ');
             if (_title == nextTitle && _artist == nextArtist && _isPlaying == isPlaying
-                && _canNext == canNext && _canPrevious == canPrevious) return;
+                && _canNext == canNext && _canPrevious == canPrevious && _canPlay == canPlay) return;
             var tipChanged = _title != nextTitle || _artist != nextArtist;
             _title = nextTitle;
             _artist = nextArtist;
             _isPlaying = isPlaying;
             _canNext = canNext;
             _canPrevious = canPrevious;
+            _canPlay = canPlay;
             UpdateMiniPlayer();
             if (IsAvailable && tipChanged)
             {
@@ -183,6 +185,7 @@ internal sealed class DesktopShell : IDisposable
             if (_ownerClosed) return;
             if (_mini is not null) { _mini.Show(); if (_mini.ShowActivated) _mini.Activate(); return; }
             var window = new MiniPlayerWindow();
+            if (_owner is MainWindow main) main.AttachMediaCommands(window);
             window.Command += Dispatch;
             window.SeekRequested += MiniSeekRequested;
             window.VolumeRequested += MiniVolumeRequested;
@@ -224,7 +227,7 @@ internal sealed class DesktopShell : IDisposable
         }
     }
 
-    private void UpdateMiniPlayer() => _mini?.Update(_title, _artist, _isPlaying, _canNext, _canPrevious);
+    private void UpdateMiniPlayer() => _mini?.Update(_title, _artist, _isPlaying, _canNext, _canPrevious, _canPlay);
     internal void ShowMiniCommandError(string text)
         => OnWindowThread(() => { if (_mini is { IsVisible: true } mini) mini.ShowCommandError(text); });
 
@@ -305,19 +308,17 @@ internal sealed class DesktopShell : IDisposable
             : 0;
         switch (selected)
         {
-            case 0:
-                if (IsAvailable && Volatile.Read(ref _disposed) == 0)
-                {
-                    var data = CreateIconData();
-                    _ = NotifyIcon(NimSetFocus, ref data);
-                }
-                break;
             case 1: ShowMainWindow(); break;
             case 2: ShowMiniPlayer(); break;
             case 3: Dispatch(ShellAction.PlayPause); break;
             case 4: Dispatch(ShellAction.Next); break;
             case 5: Dispatch(ShellAction.Previous); break;
             case 6: Dispatch(ShellAction.Exit); break;
+        }
+        if (selected is 0 or 3 or 4 or 5 && IsAvailable && Volatile.Read(ref _disposed) == 0)
+        {
+            var data = CreateIconData();
+            _ = NotifyIcon(NimSetFocus, ref data);
         }
     }
 
@@ -341,7 +342,7 @@ internal sealed class DesktopShell : IDisposable
             _ = AppendMenu(menu, 0, 1, "Открыть " + AppBranding.Name);
             _ = AppendMenu(menu, 0, 2, "Мини-плеер");
             _ = AppendMenu(menu, 0x800, 0, null);
-            _ = AppendMenu(menu, string.IsNullOrWhiteSpace(_title) ? 0x1u : 0u, 3, _isPlaying ? "Пауза" : "Играть");
+            _ = AppendMenu(menu, _canPlay ? 0u : 0x1u, 3, _isPlaying ? "Пауза" : "Играть");
             _ = AppendMenu(menu, _canNext ? 0u : 0x1u, 4, "Следующий трек");
             _ = AppendMenu(menu, _canPrevious ? 0u : 0x1u, 5, "Предыдущий трек");
             _ = AppendMenu(menu, 0x800, 0, null);
@@ -357,7 +358,7 @@ internal sealed class DesktopShell : IDisposable
     private void Dispatch(ShellAction action)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
-        if (action == ShellAction.PlayPause && string.IsNullOrWhiteSpace(_title)
+        if (action == ShellAction.PlayPause && !_canPlay
             || action == ShellAction.Next && !_canNext
             || action == ShellAction.Previous && !_canPrevious
             || action == ShellAction.ToggleLike && (!_canLike || string.IsNullOrWhiteSpace(_title))) return;

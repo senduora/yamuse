@@ -12,10 +12,37 @@ internal static partial class Program
     {
         await Run("Track links037: text links and search rows use flat templates at both window sizes", TlAppearance);
         await Run("Track links037: player exposes exact individual artists and complete artist menu without changing queue", TlPlayerArtists);
+        await Run("Track links037: a reused artist presenter closes the previous track menu", TlReusedArtistPopup);
         await Run("Track links037: album column opens exact album and Back preserves playlist selection and offset", TlAlbumNavigation);
         await Run("Track links037: legacy album resolves by exact track and portable updater stays inactive", TlLegacyAlbum);
         await Run("Track links037: newer unresolved album link owns navigation before either response", TlLegacyAlbumLatestLookup);
+        await Run("Track links037: replacement and section navigation cancel held album and artist HTTP reads", TlNavigationCancelsAlbumAndArtistRead);
+        await Run("Track links037: a new query in the same section supersedes an earlier unresolved album link", TlNewSearchWinsOverTrackLink);
+        await Run("Track links037: latest offline or legacy album navigation wins while both reads are held", TlOfflineAndLegacyAlbum);
         await Run("Track links037: update controls separate download and explicit restart and finish pending offline writes", TlUpdateControls);
+    }
+
+    private static async Task TlReusedArtistPopup()
+    {
+        using var fixture = new SaFixture("artist-popup-reuse");
+        var window = fixture.Window;
+        await fixture.Activate();
+        var template = (DataTemplate)window.FindResource("TrackArtistLinks");
+        var host = (Grid)template.LoadContent();
+        host.DataContext = new TrackRow
+        {
+            Id = "401", RequestId = "401", Title = "Earlier", Artist = "Original artist",
+            Artists = [new("301", "Original artist")]
+        };
+        Ta0317RaiseOpening(host, 10, 10);
+        var stale = host.ContextMenu;
+        Assert(stale is not null && stale.Items.Count == 1, "fixture did not attach an artist menu to the shared template");
+        host.DataContext = new TrackRow { Id = "402", RequestId = "402", Title = "Later", Artist = "Artist without ID" };
+        Ta0317RaiseOpening(host, 10, 10);
+        var requestCount = fixture.Handler.Seen.Count;
+        ((MenuItem)stale!.Items[0]).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+        Assert(host.ContextMenu is null && !stale.IsOpen && fixture.Handler.Seen.Count == requestCount,
+            "a reused presenter kept or executed the previous track's artist menu");
     }
 
     private static async Task TlAppearance()
@@ -128,12 +155,14 @@ internal static partial class Program
         var enteredLatest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseOld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseLatest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationToken oldRead = default, latestRead = default;
         f.RespondOverride = async (request, token) =>
         {
             if (request.RequestUri!.AbsolutePath != "/tracks") return null;
             var body = Uri.UnescapeDataString(await request.Content!.ReadAsStringAsync(token));
             var isOld = body.Contains(old.RequestId, StringComparison.Ordinal);
             var row = isOld ? old : latest;
+            if (isOld) oldRead = token; else latestRead = token;
             (isOld ? enteredOld : enteredLatest).TrySetResult();
             await (isOld ? releaseOld : releaseLatest).Task;
             return Json(JsonSerializer.Serialize(new
@@ -148,6 +177,8 @@ internal static partial class Program
             await enteredOld.Task.WaitAsync(TimeSpan.FromSeconds(5));
             var pendingLatest = Call(window, "OpenTrackAlbumAsync", latest);
             await enteredLatest.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(oldRead.IsCancellationRequested && !latestRead.IsCancellationRequested,
+                "a replacement link left the former HTTP request alive or canceled its own read");
             releaseOld.TrySetResult();
             await pendingOld;
             Assert(SaField<string>(window, "_section") == "favorites" && f.Handler.Seen.All(call => !call.Uri.AbsolutePath.StartsWith("/albums/", StringComparison.Ordinal)),
@@ -158,6 +189,134 @@ internal static partial class Program
                 "the newer exact album was never opened or changed playback");
         }
         finally { releaseOld.TrySetResult(); releaseLatest.TrySetResult(); }
+    }
+
+    private static async Task TlNavigationCancelsAlbumAndArtistRead()
+    {
+        using var f = new SaFixture("legacy-album-artist-cancel"); await f.Activate(); var w = f.Window;
+        var album = new TrackRow { Id = "old-album", RequestId = "old-album:1" };
+        var artist = new TrackRow { Id = "old-artist", RequestId = "old-artist:1" };
+        var albumEntered = new TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var artistEntered = new TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.RespondOverride = async (request, token) =>
+        {
+            if (request.RequestUri!.AbsolutePath != "/tracks") return null;
+            var body = Uri.UnescapeDataString(await request.Content!.ReadAsStringAsync(token));
+            var isAlbum = body.Contains(album.RequestId, StringComparison.Ordinal);
+            (isAlbum ? albumEntered : artistEntered).TrySetResult(token);
+            await release.Task;
+            return Json(JsonSerializer.Serialize(new { result = new[] { SaTrack(isAlbum ? album.Id : artist.Id) } }));
+        };
+        try
+        {
+            var old = Call(w, "OpenTrackAlbumAsync", album);
+            var albumToken = await albumEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            SaInvoke(w, "ArtistName_Click", new Button { Tag = artist }, new RoutedEventArgs(Button.ClickEvent));
+            var artistToken = await artistEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(albumToken.IsCancellationRequested && !artistToken.IsCancellationRequested,
+                "resolving the newer artist link did not cancel only the former album read");
+            SaClick(Control<Button>(w, "SearchNav"));
+            Assert(artistToken.IsCancellationRequested, "leaving the section did not cancel the artist metadata HTTP read");
+            release.TrySetResult();
+            await old;
+            await w.Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+            Assert(SaField<string>(w, "_section") == "search" && !f.Player.HasSource
+                && !f.Handler.Seen.Any(call => call.Uri.AbsolutePath.StartsWith("/albums/", StringComparison.Ordinal)
+                    || call.Uri.AbsolutePath.EndsWith("/brief-info", StringComparison.Ordinal)),
+                "a late lookup navigated or opened playback after both tokens were canceled");
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    private static async Task TlNewSearchWinsOverTrackLink()
+    {
+        using var fixture = new SaFixture("same-section-search-over-link");
+        await fixture.Activate();
+        var window = fixture.Window;
+        SaClick(Control<Button>(window, "SearchNav"));
+        var track = new TrackRow { Id = "legacy-track", RequestId = "legacy-track:1" };
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.RespondOverride = async (request, _) =>
+        {
+            if (request.RequestUri!.AbsolutePath != "/tracks") return null;
+            entered.TrySetResult();
+            await release.Task;
+            return Json(JsonSerializer.Serialize(new { result = new[] { SaTrack(track.Id) } }));
+        };
+        try
+        {
+            var oldLookup = Call(window, "OpenTrackAlbumAsync", track);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Control<TextBox>(window, "CatalogQuery").Text = "Fixture newer query";
+            await Call(window, "SearchCatalogViewAsync", false);
+            release.TrySetResult();
+            await oldLookup;
+            Assert(SaField<string>(window, "_section") == "search" && fixture.Searches.Any(search => search.Text == "Fixture newer query")
+                && fixture.Handler.Seen.All(request => !request.Uri.AbsolutePath.StartsWith("/albums/", StringComparison.Ordinal)),
+                "the earlier metadata lookup replaced the newer search in the same section");
+            Assert(!fixture.Player.HasSource, "catalog navigation started playback");
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    private static async Task TlOfflineAndLegacyAlbum()
+    {
+        foreach (var offlineIsLatest in new[] { false, true })
+        {
+            using var f = new SaFixture("offline-legacy-order-" + offlineIsLatest);
+            await f.Activate();
+            var window = f.Window;
+            var legacy = new TrackRow { Id = "legacy-held-track", RequestId = "legacy-held-track:1" };
+            var enteredLegacy = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseLegacy = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var enteredOffline = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseOffline = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            f.RespondOverride = async (request, _) =>
+            {
+                if (request.RequestUri!.AbsolutePath != "/tracks") return null;
+                enteredLegacy.TrySetResult();
+                await releaseLegacy.Task;
+                return Json(JsonSerializer.Serialize(new { result = new[] { SaTrack(legacy.Id) } }));
+            };
+            window.OfflineViewAfterRead = _ => { enteredOffline.TrySetResult(); return releaseOffline.Task; };
+            Task OpenLegacy() => Call(window, "OpenTrackAlbumAsync", legacy);
+            Task OpenOffline() => Call(window, "ShowOffline");
+            try
+            {
+                if (offlineIsLatest)
+                {
+                    var older = OpenLegacy();
+                    await enteredLegacy.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                    var latest = OpenOffline();
+                    await enteredOffline.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                    releaseLegacy.TrySetResult();
+                    await older;
+                    Assert(SaField<string>(window, "_section") == "favorites", "the obsolete link changed sections while offline was loading");
+                    releaseOffline.TrySetResult();
+                    await latest;
+                    Assert(SaField<string>(window, "_section") == "offline"
+                        && f.Handler.Seen.All(call => !call.Uri.AbsolutePath.StartsWith("/albums/", StringComparison.Ordinal)),
+                        "the newer offline view was canceled by the obsolete metadata");
+                }
+                else
+                {
+                    var older = OpenOffline();
+                    await enteredOffline.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                    var latest = OpenLegacy();
+                    await enteredLegacy.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                    releaseOffline.TrySetResult();
+                    await older;
+                    Assert(SaField<string>(window, "_section") == "favorites", "the obsolete offline read changed sections while the album link was resolving");
+                    releaseLegacy.TrySetResult();
+                    await latest;
+                    Assert(SaField<AlbumDetails?>(window, "_activeAlbumDetails")?.Id == "1", "the newer exact album was never opened");
+                }
+                Assert(!f.Player.HasSource, "navigation started playback");
+            }
+            finally { releaseLegacy.TrySetResult(); releaseOffline.TrySetResult(); }
+        }
     }
 
     private static async Task TlUpdateControls()

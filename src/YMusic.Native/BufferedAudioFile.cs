@@ -9,13 +9,14 @@ namespace YMusic.Native;
 // completed file to Windows. Cleanup reopens the original object by handle.
 internal sealed class BufferedAudioFile : IDisposable
 {
-    private const uint ReadAttributes = 0x80, DeleteAccess = 0x10000, GenericRead = 0x80000000;
+    private const uint ReadExtendedAttributes = 0x8, ReadAttributes = 0x80, DeleteAccess = 0x10000, GenericRead = 0x80000000;
     private const uint Overlapped = 0x40000000;
-    private const int SharingViolation = 32, LockViolation = 33, UserMappedFile = 1224;
     private const FileShare IdentityShare = FileShare.ReadWrite | FileShare.Delete;
     private readonly object _gate = new();
     private readonly UninstallPathGuard.AncestorLease _ancestors;
     private readonly SafeFileHandle _identity;
+    private SafeFileHandle? _receipt;
+    private AudioBufferRecovery? _recovery;
     private FileStream? _stream;
 
     internal string Path { get; }
@@ -54,6 +55,12 @@ internal sealed class BufferedAudioFile : IDisposable
         }
     }
 
+    internal void RecordForRecovery(AudioBufferRecovery recovery)
+    {
+        _receipt = AudioBufferRecovery.Record(Path, Stream.SafeFileHandle);
+        if (_receipt is not null) _recovery = recovery;
+    }
+
     private static FileStream ReopenReader(FileStream current, FileShare share)
     {
         SafeFileHandle handle;
@@ -89,32 +96,41 @@ internal sealed class BufferedAudioFile : IDisposable
     {
         try
         {
-            using var file = Reopen(_identity, DeleteAccess, IdentityShare);
+            using var file = Reopen(_identity, DeleteAccess | ReadAttributes | ReadExtendedAttributes, IdentityShare);
+            if (FileSecurityPreservation.HasNamedStreamsOrExtendedAttributes(file)) return false;
             UninstallPathGuard.UnlinkByHandle(file);
+            if (_receipt is not null) AudioBufferRecovery.RemoveReceipt(_receipt);
             return false;
         }
-        catch (Win32Exception error)
+        catch (Exception error) when (error is Win32Exception or IOException)
         {
-            return error.NativeErrorCode is SharingViolation or LockViolation or UserMappedFile;
+            return AudioBufferRecovery.IsTemporarilyHeld(error);
         }
     }
 
     private async Task RetryUnlinkAsync()
     {
+        var stillHeld = false;
         try
         {
             // Native decoding and output routing can still be releasing a read handle.
             for (var delay = 50; delay <= 6400; delay *= 2)
             {
                 await Task.Delay(delay).ConfigureAwait(false);
-                if (!UnlinkRequiresRetry()) break;
+                stillHeld = UnlinkRequiresRetry();
+                if (!stillHeld) break;
             }
         }
-        finally { ReleaseIdentity(); }
+        finally
+        {
+            ReleaseIdentity();
+            if (stillHeld) _recovery?.Defer(Path);
+        }
     }
 
     private void ReleaseIdentity()
     {
+        _receipt?.Dispose();
         _identity.Dispose();
         _ancestors.Dispose();
     }

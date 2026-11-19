@@ -20,6 +20,18 @@ internal sealed class PlaybackInput : IDisposable
     internal Task Completion => _resource is ProgressiveAudio audio ? audio.Completion : Task.CompletedTask;
     internal PlaybackInput(Uri uri, string path, IDisposable resource)
         { Uri = uri; Path = path; _resource = resource; }
+
+    internal static Uri FileUri(string path)
+    {
+        // Implicit file URIs interpret literal percent escapes in Windows paths.
+        // Encode them before WPF or WinRT obtains the path through Uri.LocalPath.
+        var escaped = System.IO.Path.GetFullPath(path).Replace('\\', '/')
+            .Replace("%", "%25", StringComparison.Ordinal)
+            .Replace("#", "%23", StringComparison.Ordinal)
+            .Replace("?", "%3F", StringComparison.Ordinal);
+        return new Uri((escaped.StartsWith("//", StringComparison.Ordinal) ? "file:" : "file:///") + escaped);
+    }
+
     public void Dispose() => _resource.Dispose();
 }
 
@@ -45,16 +57,18 @@ internal sealed class ProgressiveAudio : IDisposable
     internal Task Completion { get; }
 
     internal ProgressiveAudio(AudioBuffer owner, AudioDescriptor audio, long length, BufferedAudioFile file,
-        byte[] firstChunk, AudioBuffer.PlaybackRepresentation representation, IProgress<AudioProgress>? progress)
+        byte[] firstChunk, AudioBuffer.PlaybackRepresentation representation, IProgress<AudioProgress>? progress, CancellationToken token)
     {
         _owner = owner; _audio = audio; _length = length; _file = file; _representation = representation; _progress = progress;
         _listener = new(IPAddress.Loopback, 0);
         try
         {
+            token.ThrowIfCancellationRequested();
             file.Stream.SetLength(length);
             RandomAccess.Write(file.Stream.SafeFileHandle, firstChunk, 0);
             _downloaded = firstChunk.Length;
             _chunks[0] = new(() => Task.CompletedTask);
+            token.ThrowIfCancellationRequested();
             _listener.Start(8);
             _requestPath = "/audio/" + Convert.ToHexString(RandomNumberGenerator.GetBytes(32)) + audio.Extension;
             Uri = new($"http://127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}{_requestPath}");
@@ -171,7 +185,7 @@ internal sealed class ProgressiveAudio : IDisposable
         caller.ThrowIfCancellationRequested();
         var entry = _chunks.GetOrAdd(chunk, NewChunk);
         if (entry.Fetch.IsValueCreated && entry.Fetch.Value.Exception?.InnerException is AudioBuffer.RangeUnavailableException failure
-            && failure.RemainingDelay == TimeSpan.Zero)
+            && failure.CanRetryFromReader)
         {
             var replacement = NewChunk(chunk);
             if (_chunks.TryUpdate(chunk, replacement, entry)) entry.Replaced.TrySetResult();

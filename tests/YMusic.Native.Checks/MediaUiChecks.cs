@@ -153,7 +153,7 @@ internal static partial class Program
         using var metadataApi = new MusicApi(fixture.Handler);
         var metadata = (await metadataApi.GetTracksAsync(FakeSession, [new("900", "91")], 0, default)).Single();
         Assert(metadata.CoverUri is not null, "fake API cover metadata missing");
-        var media = File.ReadAllBytes(WriteWave("media-ui-cover-30s.wav", 30));
+        var media = SilentMp3Seconds(30);
         var audioFixture = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(media) }));
         var libraryDirectory = Path.Combine(directory, "offline");
         using (var writer = new OfflineLibrary(libraryDirectory, new AudioBuffer(Path.Combine(directory, "writer-buffer"), audioFixture)))

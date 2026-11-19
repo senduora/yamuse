@@ -2,16 +2,22 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Net;
 using System.Net.Http;
+using System.Text.Json;
 
 namespace YMusic.Native;
 
 internal enum DownloadEntryState { Queued, Resolving, Downloading, Completed, Failed, Unavailable, Paused, Suspended, Removed }
+internal enum DownloadQueueAppendResult { Unchanged, Added, Rejected }
+internal sealed record DeferredFavoriteState(DownloadEntryState PreviousState, AudioQuality? PreviousQuality,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    PlaybackTrackState? PreviousTrack = null);
 
 internal sealed class DownloadEntry(TrackRow track, AudioQuality? automaticFavoriteQuality = null) : INotifyPropertyChanged
 {
     private readonly int _ownerThread = Environment.CurrentManagedThreadId;
-    internal TrackRow Track { get; } = track;
-    internal AudioQuality? AutomaticFavoriteQuality { get; } = automaticFavoriteQuality;
+    internal TrackRow Track { get; private set; } = track;
+    internal AudioQuality? AutomaticFavoriteQuality { get; private set; } = automaticFavoriteQuality;
+    internal DeferredFavoriteState? DeferredFavorite { get; private set; }
     public string Title => Track.Title;
     public string Artist => Track.Artist;
     public DownloadEntryState State { get; private set; } = DownloadEntryState.Queued;
@@ -35,9 +41,31 @@ internal sealed class DownloadEntry(TrackRow track, AudioQuality? automaticFavor
         DownloadEntryState.Removed => "Удалён", _ => ""
     };
     internal void SetState(DownloadEntryState state, string error = "")
-    { VerifyAccess(); State = state; Error = error; Changed(); }
+    {
+        VerifyAccess();
+        if (state == DownloadEntryState.Removed) { Bytes = 0; TotalBytes = null; }
+        if (state is not (DownloadEntryState.Queued or DownloadEntryState.Paused or DownloadEntryState.Suspended)) DeferredFavorite = null;
+        State = state; Error = error; Changed();
+    }
     internal void Begin()
-    { VerifyAccess(); Attempts++; Bytes = 0; TotalBytes = null; SetState(DownloadEntryState.Resolving); }
+    { VerifyAccess(); Attempts = Math.Min(Attempts + 1, DownloadQueueStore.MaximumAttempts); Bytes = 0; TotalBytes = null; SetState(DownloadEntryState.Resolving); }
+    internal void RequeueAutomaticFavorite(TrackRow currentTrack, AudioQuality quality)
+    {
+        VerifyAccess();
+        if (State is DownloadEntryState.Removed or DownloadEntryState.Unavailable)
+            DeferredFavorite = new(State, AutomaticFavoriteQuality, DownloadQueueStore.ToSavedTrack(Track));
+        Track = currentTrack; AutomaticFavoriteQuality = quality;
+        Bytes = 0; TotalBytes = null; SetState(DownloadEntryState.Queued);
+    }
+    internal void DiscardDeferredFavorite(bool favoritesBatch)
+    {
+        VerifyAccess();
+        if (DeferredFavorite is not { } deferred) return;
+        if (deferred.PreviousTrack is { } previous) Track = DownloadQueueStore.ToTrackRow(previous, Track.Number);
+        AutomaticFavoriteQuality = deferred.PreviousQuality;
+        SetCollectionLike(!RemovedFromCollection, favoritesBatch || AutomaticFavoriteQuality is not null);
+        SetState(deferred.PreviousState, deferred.PreviousState == DownloadEntryState.Unavailable ? DownloadFailure.UnavailableReason : "");
+    }
     internal void Progress(AudioProgress progress)
     {
         VerifyAccess();
@@ -48,10 +76,12 @@ internal sealed class DownloadEntry(TrackRow track, AudioQuality? automaticFavor
     }
     internal void Complete(long bytes)
     { VerifyAccess(); Bytes = Math.Max(0, bytes); TotalBytes = Bytes > 0 ? Bytes : null; SetState(DownloadEntryState.Completed); }
-    internal void Restore(DownloadEntryState state, long bytes, int attempts, string error, bool removedFromCollection, bool skipFavoritesDownload)
+    internal void Restore(DownloadEntryState state, long bytes, int attempts, string error, bool removedFromCollection,
+        bool skipFavoritesDownload, DeferredFavoriteState? deferredFavorite = null)
     {
         VerifyAccess(); Bytes = Math.Max(0, bytes); TotalBytes = state == DownloadEntryState.Completed && Bytes > 0 ? Bytes : null;
         Attempts = attempts; RemovedFromCollection = removedFromCollection; SkipFavoritesDownload = skipFavoritesDownload;
+        DeferredFavorite = deferredFavorite;
         SetState(state, DownloadFailure.RestorableReason(error));
     }
     internal bool SetCollectionLike(bool liked, bool favoritesBatch)
@@ -87,39 +117,125 @@ internal sealed class DownloadQueueState
     public bool CanResume => !Running && !Suspended && Entries.Any(e => !e.SkipFavoritesDownload && (e.State is DownloadEntryState.Queued or DownloadEntryState.Paused));
     public bool CanRetry => !Running && !Suspended && Entries.Any(e => !e.SkipFavoritesDownload && e.State == DownloadEntryState.Failed);
     public bool HasPaused => Entries.Any(e => !e.SkipFavoritesDownload && (e.State is DownloadEntryState.Paused or DownloadEntryState.Suspended));
-    public string Summary => Entries.Count == 0 ? Label : $"{Label} · сохранено {Entries.Count(e => e.State == DownloadEntryState.Completed)}/{Entries.Count} · активно {Entries.Count(e => e.Active)} · ошибок {Entries.Count(e => e.State == DownloadEntryState.Failed && !e.SkipFavoritesDownload)} · {DownloadEntry.FormatBytes(Entries.Sum(e => e.Bytes))}" + (Entries.Any(e => e.SkipFavoritesDownload) ? $" · убрано из коллекции {Entries.Count(e => e.SkipFavoritesDownload)}" : "");
+    public string Summary
+    {
+        get
+        {
+            var removed = Entries.Count(entry => entry.State == DownloadEntryState.Removed);
+            var retained = Entries.Count - removed;
+            var summary = retained == 0 ? Label : $"{Label} · сохранено {Entries.Count(e => e.State == DownloadEntryState.Completed)}/{retained} · активно {Entries.Count(e => e.Active)} · ошибок {Entries.Count(e => e.State == DownloadEntryState.Failed && !e.SkipFavoritesDownload)} · {DownloadEntry.FormatBytes(Entries.Sum(e => e.Bytes))}";
+            var excluded = Entries.Count(entry => entry.SkipFavoritesDownload);
+            if (excluded > 0) summary += $" · убрано из коллекции {excluded}";
+            if (removed > 0) summary += $" · удалено {removed}";
+            return summary;
+        }
+    }
     internal void Replace(IEnumerable<TrackRow> tracks, string label, bool favoritesBatch = false)
     {
         VerifyAccess();
         if (Running) throw new InvalidOperationException("A running download queue cannot be replaced.");
         var replaced = Entries.Count > 0;
         ClearEntries();
-        foreach (var track in tracks.DistinctBy(t => t.Id, StringComparer.Ordinal)) AddEntry(new(track));
+        foreach (var track in SelectWorkTracks(tracks)) AddEntry(new(track));
         Label = label; Suspended = false; FavoritesBatch = favoritesBatch;
         Notice = replaced ? "Показана новая очередь вместо предыдущей. Сохранённые файлы остаются в скачанном." : "Пауза сохраняет готовые треки. Незавершённый трек при продолжении скачивается заново.";
         StateChanged?.Invoke();
     }
-    internal bool AppendAutomaticFavorites(IEnumerable<TrackRow> tracks, AudioQuality quality)
+    internal static IReadOnlyList<TrackRow> SelectWorkTracks(IEnumerable<TrackRow> tracks, int limit = int.MaxValue)
     {
-        VerifyAccess();
-        var ids = Entries.Select(entry => entry.Track.Id).ToHashSet(StringComparer.Ordinal);
-        var added = false;
+        var positions = new Dictionary<string, int>(StringComparer.Ordinal);
+        var selected = new List<TrackRow>();
         foreach (var track in tracks)
         {
-            if (!ids.Add(track.Id)) continue;
-            AddEntry(new(track, quality));
-            added = true;
+            if (positions.TryAdd(track.Id, selected.Count))
+            {
+                selected.Add(track);
+                if (selected.Count >= limit) break;
+            }
+            else if (track.Available && !selected[positions[track.Id]].Available)
+                selected[positions[track.Id]] = track;
         }
-        if (added) StateChanged?.Invoke();
-        return added;
+        return selected;
+    }
+    internal DownloadQueueAppendResult AppendAutomaticFavorites(IEnumerable<TrackRow> tracks, AudioQuality quality,
+        ICollection<TrackRow>? completedCandidates = null, Func<IEnumerable<DownloadEntry>, bool>? admit = null, bool requeueExisting = false)
+    {
+        VerifyAccess();
+        var byId = Entries.ToDictionary(entry => entry.Track.Id, StringComparer.Ordinal);
+        var added = new List<DownloadEntry>();
+        var requeued = new Dictionary<DownloadEntry, TrackRow>();
+        var completed = new List<TrackRow>();
+        foreach (var track in SelectWorkTracks(tracks, DownloadQueueStore.MaximumEntries + 1))
+        {
+            if (!byId.TryGetValue(track.Id, out var entry))
+            {
+                added.Add(new(track, quality));
+                if (Entries.Count + added.Count > DownloadQueueStore.MaximumEntries)
+                    return DownloadQueueAppendResult.Rejected;
+                continue;
+            }
+            if (entry.SkipFavoritesDownload || !track.Available) continue;
+            if (completedCandidates is not null && entry.State == DownloadEntryState.Completed) completed.Add(track);
+            if (requeueExisting && entry.State is (DownloadEntryState.Removed or DownloadEntryState.Unavailable))
+                requeued.Add(entry, track);
+        }
+        var changed = added.Count > 0 || requeued.Count > 0;
+        if (changed && !CanAdmitAutomaticChanges(added, requeued, quality, admit)) return DownloadQueueAppendResult.Rejected;
+        foreach (var entry in added) AddEntry(entry);
+        foreach (var (entry, track) in requeued) entry.RequeueAutomaticFavorite(track, quality);
+        if (completedCandidates is not null)
+            foreach (var track in completed) completedCandidates.Add(track);
+        if (changed) StateChanged?.Invoke();
+        return changed ? DownloadQueueAppendResult.Added : DownloadQueueAppendResult.Unchanged;
+    }
+    internal DownloadEntry[] RequeueMissingCompletedFavorites(IReadOnlyList<TrackRow> missing, AudioQuality quality,
+        Func<IEnumerable<DownloadEntry>, bool> admit, out bool rejected)
+    {
+        VerifyAccess();
+        rejected = false;
+        if (missing.Count == 0) return [];
+        var byId = Entries.ToDictionary(entry => entry.Track.Id, StringComparer.Ordinal);
+        var requeued = new Dictionary<DownloadEntry, TrackRow>();
+        foreach (var track in missing.DistinctBy(track => track.Id, StringComparer.Ordinal))
+        {
+            if (!byId.TryGetValue(track.Id, out var entry) || entry.State != DownloadEntryState.Completed || entry.SkipFavoritesDownload) continue;
+            requeued.Add(entry, track);
+        }
+        if (requeued.Count == 0) return [];
+        rejected = !CanAdmitAutomaticChanges([], requeued, quality, admit);
+        if (rejected) return [];
+        foreach (var (entry, track) in requeued) entry.RequeueAutomaticFavorite(track, quality);
+        Running = true;
+        StateChanged?.Invoke();
+        return requeued.Keys.ToArray();
+    }
+
+    private bool CanAdmitAutomaticChanges(IEnumerable<DownloadEntry> added, IReadOnlyDictionary<DownloadEntry, TrackRow> requeued,
+        AudioQuality quality, Func<IEnumerable<DownloadEntry>, bool>? admit)
+    {
+        return admit is null || admit(Entries.Select(Project).Concat(added));
+
+        DownloadEntry Project(DownloadEntry entry)
+        {
+            if (!requeued.TryGetValue(entry, out var track)) return entry;
+            var candidate = new DownloadEntry(entry.Track, entry.AutomaticFavoriteQuality);
+            candidate.SetState(entry.State);
+            candidate.RequeueAutomaticFavorite(track, quality);
+            return candidate;
+        }
     }
     internal bool DiscardUnstartedAutomaticFavorites()
     {
         VerifyAccess();
-        var pending = Entries.Where(entry => entry.AutomaticFavoriteQuality is not null && entry.Attempts == 0
+        var pending = Entries.Where(entry => entry.AutomaticFavoriteQuality is not null && (entry.Attempts == 0 || entry.DeferredFavorite is not null)
             && entry.State is DownloadEntryState.Queued or DownloadEntryState.Paused).ToArray();
         foreach (var entry in pending)
         {
+            if (entry.DeferredFavorite is not null)
+            {
+                entry.DiscardDeferredFavorite(FavoritesBatch);
+                continue;
+            }
             entry.PropertyChanged -= EntryChanged;
             entry.SetState(DownloadEntryState.Removed);
             Entries.Remove(entry);
@@ -135,7 +251,7 @@ internal sealed class DownloadQueueState
         foreach (var item in restored.Entries)
         {
             var entry = new DownloadEntry(item.Track, item.AutomaticFavoriteQuality);
-            entry.Restore(item.State, item.Bytes, item.Attempts, item.Error, item.RemovedFromCollection, item.SkipFavoritesDownload);
+            entry.Restore(item.State, item.Bytes, item.Attempts, item.Error, item.RemovedFromCollection, item.SkipFavoritesDownload, item.DeferredFavorite);
             AddEntry(entry);
         }
         Label = restored.Label; FavoritesBatch = restored.FavoritesBatch; Suspended = false;
@@ -181,13 +297,16 @@ internal sealed class DownloadQueueState
         VerifyAccess();
         if (interrupted && !Suspended) Pause();
         Running = false;
+        if (!Suspended)
+        {
+            if (HasPaused) Notice = "Очередь на паузе. Нажмите «Продолжить»: сохранённые треки не скачиваются повторно.";
+            else if (Entries.Any(e => e.State == DownloadEntryState.Failed && !e.SkipFavoritesDownload)) Notice = "Загрузка завершена с ошибками. Кнопка «Повторить неудачные» повторит только треки с ошибкой.";
+            else if (Entries.Any(e => e.State == DownloadEntryState.Unavailable && !e.SkipFavoritesDownload)) Notice = "Доступные треки сохранены. Недоступные треки можно проверить после обновления каталога.";
+            else if (Entries.Any(e => e.SkipFavoritesDownload)) Notice = "Треки, убранные из «Мне нравится», исключены из повторной загрузки.";
+            else if (Entries.Any(e => e.State == DownloadEntryState.Removed)) Notice = "Удалённые треки больше не учитываются в загрузке.";
+            else if (Entries.Count > 0) Notice = "Все треки очереди сохранены и доступны в разделе «Скачанное».";
+        }
         StateChanged?.Invoke();
-        if (Suspended) return;
-        if (HasPaused) Notice = "Очередь на паузе. Нажмите «Продолжить»: сохранённые треки не скачиваются повторно.";
-        else if (Entries.Any(e => e.State == DownloadEntryState.Failed && !e.SkipFavoritesDownload)) Notice = "Загрузка завершена с ошибками. Кнопка «Повторить неудачные» повторит только треки с ошибкой.";
-        else if (Entries.Any(e => e.State == DownloadEntryState.Unavailable && !e.SkipFavoritesDownload)) Notice = "Доступные треки сохранены. Недоступные треки можно проверить после обновления каталога.";
-        else if (Entries.Any(e => e.SkipFavoritesDownload)) Notice = "Треки, убранные из «Мне нравится», исключены из повторной загрузки.";
-        else if (Entries.Count > 0) Notice = "Все треки очереди сохранены и доступны в разделе «Скачанное».";
     }
     internal void Removed(string? trackId)
     {
@@ -201,15 +320,17 @@ internal sealed class DownloadQueueState
             entry.SetCollectionLike(liked, FavoritesBatch || entry.AutomaticFavoriteQuality is not null);
         if (!Running && !Suspended) EndRun(false);
     }
-    internal bool ReconcileFavorites(IReadOnlySet<string> confirmedIds)
+    internal bool ReconcileFavorites(IReadOnlySet<string> confirmedIds, Action<string> onReliked)
     {
         VerifyAccess();
         var changed = false;
         foreach (var entry in Entries)
         {
-            if ((FavoritesBatch || entry.AutomaticFavoriteQuality is not null)
-                && entry.State is DownloadEntryState.Queued or DownloadEntryState.Resolving or DownloadEntryState.Paused or DownloadEntryState.Failed)
-                changed |= entry.SetCollectionLike(confirmedIds.Contains(entry.Track.Id), favoritesBatch: true);
+            if (!FavoritesBatch && entry.AutomaticFavoriteQuality is null) continue;
+            var id = entry.Track.Id;
+            var liked = confirmedIds.Contains(id);
+            if (liked && entry.SkipFavoritesDownload) onReliked(id);
+            changed |= entry.SetCollectionLike(liked, favoritesBatch: true);
         }
         if (changed && !Running && !Suspended) EndRun(false);
         return changed;
@@ -236,28 +357,39 @@ internal sealed class DownloadProgressSink(Action? changed = null) : IProgress<A
 
 internal static class DownloadFailure
 {
+    internal const string UnavailableReason = "Трек недоступен в каталоге. Обновите список и проверьте доступность в сервисе.";
     private const string UnknownReason = "Не удалось загрузить трек. Повторите; если ошибка сохранится, откройте диагностику.";
     // A snapshot can only carry reasons authored here, never arbitrary exception
     // messages, signed audio URLs, credentials or paths from an earlier process.
-    internal static string RestorableReason(string reason) => reason switch
+    // The v2 checkpoint uses these indices on disk. Append new reasons at the end.
+    private static readonly string[] ReasonsByCode =
+    [
+        "", "Вход больше не действует. Войдите заново и запустите загрузку.",
+        "Нет доступа к папке скачанного. Проверьте права и свободное место.",
+        "На диске закончилось свободное место. Освободите место и повторите.",
+        "Не удалось сохранить файл. Проверьте папку скачанного, свободное место и доступ к диску.",
+        "Сервер не ответил вовремя. Проверьте сеть и повторите загрузку.",
+        "Сервер отклонил доступ к аудио. Проверьте вход, подписку и доступность трека.",
+        "Ошибка соединения с сервером. Проверьте сеть и повторите загрузку.",
+        "Не удалось безопасно обновить скачанное. Проверьте папку и индекс библиотеки; файлы сохранены.",
+        "Трек превышает допустимый размер 256 МБ.",
+        "Аудиофайл получен не полностью или не прошёл проверку. Повторите загрузку.",
+        "Сервис не выдал полное аудио. Проверьте вход, подписку и доступность трека.",
+        "Аудиосервер временно отклонил запрос. Повторите загрузку позже.",
+        "Не удалось получить безопасный полный аудиофайл от сервиса. Повторите загрузку позже.",
+        "Трек недоступен в каталоге. Обновите список и проверьте доступность в сервисе.",
+        UnknownReason
+    ];
+    private static readonly HashSet<string> RestorableReasons = new(ReasonsByCode, StringComparer.Ordinal);
+    internal static string RestorableReason(string reason) => RestorableReasons.Contains(reason) ? reason : UnknownReason;
+    internal static string HighestCheckpointReason => ReasonsByCode[^1];
+    internal static int CheckpointReasonCode(string reason)
     {
-        "" or "Вход больше не действует. Войдите заново и запустите загрузку."
-        or "Нет доступа к папке скачанного. Проверьте права и свободное место."
-        or "На диске закончилось свободное место. Освободите место и повторите."
-        or "Не удалось сохранить файл. Проверьте папку скачанного, свободное место и доступ к диску."
-        or "Сервер не ответил вовремя. Проверьте сеть и повторите загрузку."
-        or "Сервер отклонил доступ к аудио. Проверьте вход, подписку и доступность трека."
-        or "Ошибка соединения с сервером. Проверьте сеть и повторите загрузку."
-        or "Не удалось безопасно обновить скачанное. Проверьте папку и индекс библиотеки; файлы сохранены."
-        or "Трек превышает допустимый размер 256 МБ."
-        or "Аудиофайл получен не полностью или не прошёл проверку. Повторите загрузку."
-        or "Сервис не выдал полное аудио. Проверьте вход, подписку и доступность трека."
-        or "Аудиосервер временно отклонил запрос. Повторите загрузку позже."
-        or "Не удалось получить безопасный полный аудиофайл от сервиса. Повторите загрузку позже."
-        or "Трек недоступен в каталоге. Обновите список и проверьте доступность в сервисе."
-        or UnknownReason => reason,
-        _ => UnknownReason
-    };
+        var code = Array.IndexOf(ReasonsByCode, reason);
+        return code >= 0 ? code : throw new JsonException("Неизвестная причина ошибки загрузки.");
+    }
+    internal static string CheckpointReasonText(int code) => code >= 0 && code < ReasonsByCode.Length
+        ? ReasonsByCode[code] : throw new JsonException("Неизвестный код ошибки загрузки.");
     // Never show Exception.Message: HTTP errors and paths can contain signed URLs,
     // tokens or private directories. Only locally authored reasons reach the UI.
     internal static string Describe(Exception error) => error switch

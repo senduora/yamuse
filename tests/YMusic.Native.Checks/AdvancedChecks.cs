@@ -20,7 +20,7 @@ internal static partial class Program
     {
         await Run("Offline integration: downloaded catalog track reopens locally after restart without account or network", async () =>
         {
-            var media = File.ReadAllBytes(WriteWave("instant-offline.wav", 4));
+            var media = SilentMp3Seconds(4);
             var directory = Path.Combine(_directory, "instant-library");
             var original = new TrackRow { Id = "870", RequestId = "870:1", Title = "Saved fixture", Artist = "Fixture", DurationMs = 4000, Available = true };
             using (var first = new OfflineLibrary(directory, new AudioBuffer(Path.Combine(_directory, "instant-buffer"), new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(media) })))))
@@ -49,7 +49,7 @@ internal static partial class Program
             var fixture = new CatalogFixture();
             fixture.Extra = (request, _) => Task.FromResult(request.RequestUri!.AbsolutePath == "/get-file-info"
                 ? Json("{\"result\":{\"downloadInfo\":{\"quality\":\"lossless\",\"codec\":\"mp3\",\"bitrate\":320,\"transport\":\"raw\",\"url\":\"https://s1.vlx.yandex.net/audio.mp3\"}}}") : throw new InvalidOperationException("unexpected full-playlist request"));
-            var media = File.ReadAllBytes(WriteWave("playlist-full.wav", 3));
+            var media = SilentMp3Seconds(3);
             var mediaHandler = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(media) }));
             var directory = Path.Combine(_directory, "whole-playlist");
             var library = new OfflineLibrary(directory, new AudioBuffer(Path.Combine(_directory, "whole-playlist-buffer"), mediaHandler));
@@ -109,7 +109,7 @@ internal static partial class Program
             var fixture = new CatalogFixture();
             fixture.Extra = (request, _) => Task.FromResult(request.RequestUri!.AbsolutePath.EndsWith("/download-info")
                 ? Json("{\"result\":[{\"codec\":\"mp3\",\"bitrateInKbps\":192,\"downloadInfoUrl\":\"https://storage.mds.yandex.net/fake\"}]}") : Xml());
-            var media = File.ReadAllBytes(WriteWave("multi-download.wav", 2));
+            var media = SilentMp3Seconds(CatalogFixture.TrackDurationSeconds);
             var calls = 0; var blockThird = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var mediaHandler = new FakeHandler(async (_, token) =>
             {

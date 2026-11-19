@@ -19,6 +19,8 @@ public partial class MainWindow
         if (CatalogQuery.Text.Trim().Length > 0) await SearchCatalogViewAsync(false);
         else
         {
+            AdvanceViewGeneration();
+            _initialCatalogRead = null;
             _featureCts?.Cancel(); ResetSearchResults();
             ShowCatalogItems([]); SetStatus("Введите название или имя исполнителя и нажмите Enter.");
         }

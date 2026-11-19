@@ -234,7 +234,7 @@ internal static partial class Program
             Fr0317Set(Window, "_current", First); Fr0317Get<PlaybackQueue>(Window, "_playbackQueue").SetItems([First, Second], First);
             // A never-started private request suppresses network-only lyric discovery
             // while exercising its existing visibility/cancellation machinery.
-            Fr0317Set(Window, "_lyricsCts", new CancellationTokenSource());
+            LyricsUiAssignPending(Window, new CancellationTokenSource());
             var playerCover = (Image)Window.FindName("PlayerCover"); playerCover.Source = Artwork; Layout();
             SourceBounds = playerCover.TransformToAncestor(Root).TransformBounds(new Rect(playerCover.RenderSize));
             Assert(!Window.IsVisible && PresentationSource.FromVisual(Window) is null && new WindowInteropHelper(Window).Handle == IntPtr.Zero, "fixture constructor created a native window");

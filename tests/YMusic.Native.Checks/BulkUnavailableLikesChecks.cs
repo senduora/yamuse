@@ -49,6 +49,24 @@ internal static partial class Program
             Assert(!SaField<bool>(f.Window, "_catalogWriting") && f.Unlike.IsEnabled && f.Retry.IsEnabled, "batch did not restore actions for the remaining selection");
             await BulkCapture(f, "confirmed");
         });
+        await Run("Bulk unlike: a keyboard menu snapshots the focused row before selection changes", async () =>
+        {
+            using var f = new UlFixture("bulk-keyboard-menu");
+            await f.Start();
+            var focused = f.Queue.Entries.Single(entry => entry.Track.Id == "ul-error");
+            SaClick(BulkSelectButton(f));
+            f.List.ScrollIntoView(focused);
+            f.Window.UpdateLayout();
+            Ta0317RaiseOpening((ListViewItem)f.List.ItemContainerGenerator.ContainerFromItem(focused));
+            var menu = f.List.ContextMenu!;
+            Ta0317Open(menu);
+            Assert(f.Menu.IsEnabled && ReferenceEquals(f.List.SelectedItem, focused), "the keyboard menu ignored the focused download");
+            SaClick(BulkSelectButton(f));
+            f.Menu.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            await Until(() => f.Writes.Count == 1 && !SaField<bool>(f.Window, "_catalogWriting"));
+            Assert(f.Writes.Single() == focused.Track.Id, "unlike used a selection made after opening the menu");
+            menu.RaiseEvent(new RoutedEventArgs(ContextMenu.ClosedEvent));
+        });
         await Run("Bulk unlike: a partial failure preserves confirmed removals and stops before further writes", async () =>
         {
             foreach (var failure in new[] { "http", "revision", "readback" })
@@ -157,7 +175,7 @@ internal static partial class Program
                 owner.Close();
                 Assert(!owner.IsVisible, "working tray did not allow close-to-tray");
                 canModify = false;
-                shell.Update("Fixture song", "Fixture artist", true, false, false);
+                shell.Update("Fixture song", "Fixture artist", true, false, false, canPlay: true);
                 Assert(!shell.IsAvailable && shell.MinimizeToTray && owner.IsVisible, "failed modification lost the preference or left the window hidden");
                 canAdd = false;
                 TaskbarCreated();
@@ -177,28 +195,46 @@ internal static partial class Program
                 typeof(DesktopShell).GetMethod("WindowProcedure", flags)!.Invoke(shell, [shell.WindowHandle, (int)message, (nint)0, (nint)0, false]);
             }
         });
-        await Run("Client polish014: a version 4 tray context menu anchors at its icon and returns focus on Cancel", () =>
+        await Run("Client polish014: a version 4 tray context menu returns focus after Cancel and playback actions", () =>
         {
             var owner = new Window { Width = 240, Height = 100, Left = -16000, ShowActivated = false, ShowInTaskbar = false };
             owner.Show();
             var operations = new List<uint>();
+            var actions = new List<ShellAction>();
             Guid icon = default;
             (int X, int Y)? menu = null;
+            uint selection = 0;
             using var shell = new DesktopShell(owner, message => { operations.Add(message); return true; })
             {
                 TrayMenuAnchorForChecks = guid => { icon = guid; return (-400, 925); },
-                TrackTrayMenuForChecks = (x, y) => { menu = (x, y); return 0; },
+                TrackTrayMenuForChecks = (x, y) => { menu = (x, y); return selection; },
                 MinimizeToTray = true
             };
             try
             {
+                shell.Command += actions.Add;
+                shell.Update("Fixture track", "Fixture artist", true, canNext: true, canPrevious: true, canPlay: true);
                 owner.Close();
                 Assert(!owner.IsVisible, "fixture did not hide the main window");
                 object[] callback = [shell.WindowHandle, 0x8000 + 51, (nint)(-1), (nint)(0x10000 | 0x7b), false];
-                typeof(DesktopShell).GetMethod("WindowProcedure", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(shell, callback);
+                var dispatch = typeof(DesktopShell).GetMethod("WindowProcedure", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                dispatch.Invoke(shell, callback);
                 Assert((bool)callback[^1] && icon == shell.IconGuid && menu is (-400, 925)
-                    && operations.SequenceEqual(new uint[] { 0, 4, 3 }) && !owner.IsVisible,
+                    && operations.SequenceEqual(new uint[] { 0, 4, 1, 3 }) && !owner.IsVisible,
                     "keyboard tray menu used the pointer, lost focus, or opened the owner on Cancel");
+                for (selection = 3; selection <= 5; selection++) dispatch.Invoke(shell, callback);
+                Assert(actions.SequenceEqual(new[] { ShellAction.PlayPause, ShellAction.Next, ShellAction.Previous })
+                    && operations.Skip(3).SequenceEqual(new uint[] { 3, 3, 3, 3 }) && !owner.IsVisible,
+                    "playback commands from the tray did not return focus without opening an app window");
+                selection = 3;
+                shell.Update("", "", false, false, false, canPlay: true);
+                dispatch.Invoke(shell, callback);
+                Assert(actions.Count == 4 && actions[^1] == ShellAction.PlayPause, "tray did not start ready playback from an empty player");
+                shell.Update("", "", false, false, false, canPlay: false);
+                dispatch.Invoke(shell, callback);
+                shell.Update("Opening fixture", "", false, false, false, canPlay: false);
+                dispatch.Invoke(shell, callback);
+                Assert(actions.Count == 4, "tray dispatched Play while the main command was disabled");
             }
             finally { shell.RequestExit(); }
             return Task.CompletedTask;

@@ -73,16 +73,26 @@ internal sealed class PreferencesStore
     public void Save(PlayerPreferences preferences)
     {
         ArgumentNullException.ThrowIfNull(preferences);
+        SaveCore(_ => preferences, recoverMalformed: true);
+    }
+
+    internal void Merge(Func<PlayerPreferences, PlayerPreferences> apply)
+    {
+        ArgumentNullException.ThrowIfNull(apply);
+        SaveCore(saved => apply(saved is null ? new() : Normalize(saved)), recoverMalformed: false);
+    }
+
+    private void SaveCore(Func<PlayerPreferences?, PlayerPreferences> build, bool recoverMalformed)
+    {
         lock (_gate)
         {
-            try { WriteSettings(preferences); }
+            try { WriteSettings(build, recoverMalformed); }
             catch (Win32Exception error) { throw new IOException("Не удалось сохранить настройки.", error); }
         }
     }
 
-    private void WriteSettings(PlayerPreferences preferences)
+    private void WriteSettings(Func<PlayerPreferences?, PlayerPreferences> build, bool recoverMalformed)
     {
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(Normalize(preferences), JsonOptions);
         var directory = Path.GetDirectoryName(FilePath)!;
         var id = Guid.NewGuid().ToString("N");
         using var storage = GuardedStoreFile.BeginWrite(FilePath);
@@ -92,27 +102,34 @@ internal sealed class PreferencesStore
         try
         {
             string? backupPath = null;
+            PlayerPreferences? saved = null;
             using (var existing = storage.OpenExisting())
             {
                 if (existing is not null)
                 {
                     using var original = new FileStream(existing, FileAccess.Read);
-                    if (original.Length > MaximumFileBytes)
+                    if (!TryReadSettings(original, out saved))
                     {
-                        backupPath = ArchiveOversizedOriginal(existing, directory);
-                    }
-                    else if (!TryReadSettings(original, out _))
-                    {
-                        backup = storage.CreateStage(Path.Combine(directory, $".settings-{id}-backup.tmp"));
-                        WriteBackup(original, backup);
-                        backupPath = Path.Combine(directory, $"settings.corrupt-{DateTime.UtcNow:yyyyMMddTHHmmssfffffffZ}-{id}.json");
-                        ManagedCacheCleanup.RenameByHandle(backup, backupPath);
+                        if (!recoverMalformed) throw new IOException("Не удалось прочитать прежние настройки для объединения изменений.");
+                        if (original.Length > MaximumFileBytes)
+                        {
+                            backupPath = ArchiveOversizedOriginal(existing, directory);
+                        }
+                        else
+                        {
+                            backup = storage.CreateStage(Path.Combine(directory, $".settings-{id}-backup.tmp"));
+                            WriteBackup(original, backup);
+                            backupPath = Path.Combine(directory, $"settings.corrupt-{DateTime.UtcNow:yyyyMMddTHHmmssfffffffZ}-{id}.json");
+                            ManagedCacheCleanup.RenameByHandle(backup, backupPath);
+                            UninstallPathGuard.KeepFileOnClose(backup);
+                        }
                     }
                 }
             }
 
             // Creating the oversized archive can update the original's metadata.
             // Stage records the original for commit after that operation.
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(Normalize(build(saved)), JsonOptions);
             staged = storage.Stage(bytes);
             storage.Commit(staged);
             published = true;
@@ -270,8 +287,7 @@ internal sealed class PreferencesStore
 
     private SafeFileHandle? TryOpenSettingsFile()
     {
-        try { return UninstallPathGuard.OpenOwnedFile(FilePath, read: true, deleteAccess: false); }
-        catch (Win32Exception error) when (error.NativeErrorCode == 2) { return null; }
+        try { return GuardedStoreFile.OpenForRead(FilePath); }
         catch (Win32Exception error) { throw new IOException("Не удалось открыть файл настроек.", error); }
     }
 
@@ -283,6 +299,26 @@ internal sealed class PreferencesStore
         {
             preferences = JsonSerializer.Deserialize<PlayerPreferences>(stream, JsonOptions);
             return preferences is not null;
+        }
+        catch (JsonException) { return false; }
+    }
+
+    internal static bool IsOwnedFile(SafeFileHandle file)
+    {
+        if (GuardedStoreFile.ReadFromHandle(file, MaximumFileBytes) is not { } bytes) return false;
+        try
+        {
+            using var json = JsonDocument.Parse(bytes, new JsonDocumentOptions { AllowDuplicateProperties = false, MaxDepth = 8 });
+            if (json.RootElement.ValueKind != JsonValueKind.Object) return false;
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var property in json.RootElement.EnumerateObject())
+            {
+                if (!names.Add(property.Name)) return false;
+                if (property.Name.Equals("theme", StringComparison.OrdinalIgnoreCase)
+                    && property.Value.ValueKind is not (JsonValueKind.Null or JsonValueKind.String)) return false;
+            }
+            var options = new JsonSerializerOptions(JsonOptions) { UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow };
+            return names.Count != 0 && json.RootElement.Deserialize<PlayerPreferences>(options) is not null;
         }
         catch (JsonException) { return false; }
     }

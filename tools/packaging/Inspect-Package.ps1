@@ -3,10 +3,13 @@ param([Parameter(Mandatory)][string]$OutputFolder,
     [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$ExpectedVersion,
     [Parameter(Mandatory)][string]$ReferencePublishedFolder,
     [string]$ExpectedPackId = 'YMusic.Native',
+    [ValidatePattern('\A[A-Fa-f0-9]{64}\z')][string]$ExpectedStageInventorySha256,
     [string]$ExpectedProductSha256,
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedAppHostSha256,
     [string]$ExpectedProjectNoticesSha256,
     [string]$ExpectedProjectLicenseSha256,
-    [string]$ExpectedIconSha256)
+    [string]$ExpectedIconSha256,
+    [IO.FileStream]$OutputLease)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot '..\ScriptPaths.ps1')
@@ -19,22 +22,24 @@ function Get-ZipEntrySha256($Entry) {
     finally { $algorithm.Dispose(); $entryStream.Dispose() }
 }
 function Assert-FullReleaseAsset($Release, [string]$Version, [string]$PackageId, [IO.FileInfo]$Package, [string]$Sha256) {
-    if (@($Release.PSObject.Properties.Name).Count -ne 1 -or !$Release.PSObject.Properties['Assets'] -or
+    if ($Release -isnot [System.Management.Automation.PSCustomObject] -or @($Release.PSObject.Properties.Name).Count -ne 1 -or 'Assets' -cnotin $Release.PSObject.Properties.Name -or
         $Release.Assets -isnot [array] -or $Release.Assets.Count -ne 1) { throw 'Release feed must contain exactly one full asset.' }
     $asset = $Release.Assets[0]
-    if ($asset.PackageId -cne $PackageId -or $asset.Version -cne $Version -or $asset.Type -cne 'Full' -or
-        $asset.FileName -cne $Package.Name -or $asset.FileName -cne "Yamuse-$Version-full.nupkg" -or
+    if ($asset -isnot [System.Management.Automation.PSCustomObject] -or $asset.PackageId -isnot [string] -or $asset.PackageId -cne $PackageId -or
+        $asset.Version -isnot [string] -or $asset.Version -cne $Version -or $asset.Type -isnot [string] -or $asset.Type -cne 'Full' -or
+        $asset.FileName -isnot [string] -or $asset.FileName -cne $Package.Name -or $asset.FileName -cne "Yamuse-$Version-full.nupkg" -or
         ($asset.Size -isnot [int] -and $asset.Size -isnot [long]) -or $asset.Size -ne $Package.Length -or
         $asset.SHA256 -isnot [string] -or $asset.SHA256 -notmatch '^[A-Fa-f0-9]{64}$' -or $asset.SHA256 -ne $Sha256) {
         throw 'Release feed does not describe the exact full Yamuse asset.'
     }
 }
 function Assert-ReleaseIndexes([string]$Folder, [IO.FileInfo]$Package, $Release, [string]$Sha1) {
-    $entries = @(Get-Content -LiteralPath (Join-Path $Folder 'assets.win.json') -Raw | ConvertFrom-Json)
+    $entries = Read-PackagingJson (Join-Path $Folder 'assets.win.json') -AsArray
     $expected = @{ Installer='Yamuse-win-Setup.exe'; Full=$Package.Name; Portable='Yamuse-win-Portable.zip' }
     if ($entries.Count -ne $expected.Count) { throw 'assets.win.json must contain the Installer, Full and Portable entries.' }
     foreach ($type in $expected.Keys) {
         $matches = @($entries | Where-Object {
+            if ($_ -isnot [System.Management.Automation.PSCustomObject]) { return $false }
             $keys = @($_.PSObject.Properties.Name)
             $keys.Count -eq 2 -and 'Type' -cin $keys -and 'RelativeFileName' -cin $keys -and
             $_.Type -is [string] -and $_.Type -ceq $type -and
@@ -77,12 +82,53 @@ function Assert-ArchiveMatchesPublish($Archive, [string]$Prefix, $Files, [string
     }
     return $matched
 }
+function Write-PackageEvidence([string]$Path, [string]$Content) {
+    Assert-PackagingPath $Path -File
+    $temporary = Join-Path ([IO.Path]::GetDirectoryName($Path)) ('.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $written = $false
+    try {
+        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $written = $true
+        try {
+            $data = [Text.Encoding]::UTF8.GetBytes($Content + [Environment]::NewLine)
+            $stream.Write($data, 0, $data.Length)
+        } finally { $stream.Dispose() }
+        Assert-PackagingPath $Path -File
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporary, $Path, [NullString]::Value) }
+        else { [IO.File]::Move($temporary, $Path) }
+    } finally {
+        if ($written -and [IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+    }
+}
 
 if ($ExpectedPackId -cne 'YMusic.Native') { throw 'Expected the official Yamuse package ID YMusic.Native.' }
 $outputPath = Resolve-YamuseFileSystemPath $OutputFolder
+if ($null -eq $OutputLease) {
+    $lease = Open-PackagingOutput $outputPath -AllowExisting
+    try {
+        $PSBoundParameters['OutputLease'] = $lease
+        & $PSCommandPath @PSBoundParameters
+    }
+    finally { $lease.Dispose() }
+    return
+}
+# Pack passes its live reservation; a standalone invocation acquires its own.
+if (!$OutputLease.CanWrite -or $OutputLease.SafeFileHandle.IsInvalid -or $OutputLease.SafeFileHandle.IsClosed -or
+    ![string]::Equals($OutputLease.Name, (Join-Path $outputPath $yamusePackageOutputLockName), [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'The inspection lease must belong to this OutputFolder.'
+}
 $referencePath = Resolve-YamuseFileSystemPath $ReferencePublishedFolder
-foreach ($name in @('Yamuse-win-Setup.exe','Yamuse-win-Portable.zip',"Yamuse-$ExpectedVersion-full.nupkg")) {
-    if (!(Test-Path -LiteralPath (Join-Path $outputPath $name) -PathType Leaf)) { throw 'Branded Yamuse download is missing.' }
+Assert-PackagingPath $outputPath -Required
+foreach ($name in @('Yamuse-win-Setup.exe','Yamuse-win-Portable.zip',"Yamuse-$ExpectedVersion-full.nupkg",'releases.win.json','assets.win.json','RELEASES')) {
+    Assert-PackagingPath (Join-Path $outputPath $name) -File -Required
+}
+foreach ($name in @('setup.manifest.xml','package.nuspec.xml','package-evidence.json')) {
+    Assert-PackagingPath (Join-Path $outputPath $name) -File
+}
+$referenceFiles = Get-PublishedFileInventory $referencePath
+$referenceInventorySha256 = Get-PublishedInventorySha256 $referenceFiles
+if ($ExpectedStageInventorySha256 -and $referenceInventorySha256 -ne $ExpectedStageInventorySha256) {
+    throw 'Final stage inventory differs from the approved publish and packaging additions.'
 }
 $projectRoot = Resolve-YamuseFileSystemPath (Join-Path $PSScriptRoot '..\..')
 $sourceIcon = Join-Path $projectRoot 'src\YMusic.Native\Assets\Yamuse.ico'
@@ -101,7 +147,7 @@ $package = $packages[0]
 # Velopack 1.2.161's unsigned Setup appends the complete nupkg. Verify the
 # embedded payload too, so Legal notices/product DLL are proven in Setup.
 $packageHash = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash
-$release = Get-Content -LiteralPath (Join-Path $outputPath 'releases.win.json') -Raw | ConvertFrom-Json
+$release = Read-PackagingJson (Join-Path $outputPath 'releases.win.json')
 Assert-FullReleaseAsset $release $ExpectedVersion $ExpectedPackId $package $packageHash
 $packageSha1 = (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA1).Hash
 Assert-ReleaseIndexes $outputPath $package $release $packageSha1
@@ -115,8 +161,10 @@ try {
     if ($setupPayloadHash -ne $packageHash) { throw 'Setup does not embed the verified full package.' }
 } finally { $setupPayloadAlgorithm.Dispose(); $setupStream.Dispose() }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$referenceFiles = Get-PublishedFileInventory $referencePath
 $runtimeProof = Assert-PinnedPublishRuntime $referencePath $ExpectedVersion $referenceFiles
+$mainExePath = Join-Path $referencePath 'YMusic.Native.exe'
+$mainExeHash = Assert-YamuseAppHost $mainExePath $referenceFiles['YMusic.Native.exe'].sha256
+if ($ExpectedAppHostSha256 -and $mainExeHash -ne $ExpectedAppHostSha256) { throw 'Packaged apphost differs from the checked publish SHA-256.' }
 $runtimeProofHashes = @{}
 foreach ($file in @('coreclr.dll','hostfxr.dll','hostpolicy.dll','PresentationFramework.dll','Velopack.dll','YMusic.Native.deps.json','YMusic.Native.runtimeconfig.json')) {
     $runtimeProofHashes[$file] = $referenceFiles[$file].sha256
@@ -132,8 +180,6 @@ try {
     $version = $metadata.package.metadata.version
     if ($id -isnot [string] -or $id -cne $ExpectedPackId -or $version -isnot [string] -or $version -cne $ExpectedVersion) { throw 'Package id/version mismatch.' }
     if ($metadata.package.metadata.title -ne 'Yamuse' -or $metadata.package.metadata.authors -ne 'senduora') { throw 'Package display title/authors must be Yamuse/senduora.' }
-    $mainExePath = Join-Path $referencePath 'YMusic.Native.exe'
-    $mainExeHash = $referenceFiles['YMusic.Native.exe'].sha256
     $mainExeInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($mainExePath)
     if ($mainExeInfo.ProductName -ne 'Yamuse' -or $mainExeInfo.FileDescription -ne 'Yamuse') { throw 'Main executable ProductName/Title must be Yamuse.' }
     if ($referenceFiles['Assets/Yamuse.ico'].sha256 -ne $ExpectedIconSha256 -or (Get-ZipEntrySha256 ($archive.GetEntry('setup.ico'))) -ne $ExpectedIconSha256) { throw 'Packaged Yamuse icon differs from the approved source.' }
@@ -272,8 +318,8 @@ if (!$setupIconMatches) { throw 'Setup icon resources differ from the approved Y
 if ($setup.VersionInfo.ProductName -ne 'Yamuse' -or $setup.VersionInfo.CompanyName -ne 'senduora') { throw 'Setup ProductName/CompanyName must be Yamuse/senduora.' }
 $manifest = [PackagingManifestReader]::Read($setup.FullName)
 if ($manifest -notmatch 'requestedExecutionLevel\s+level=["'']asInvoker["'']') { throw 'Setup must request asInvoker, not elevation.' }
-$manifest | Set-Content -LiteralPath (Join-Path $outputPath 'setup.manifest.xml') -Encoding utf8
-$nuspecText | Set-Content -LiteralPath (Join-Path $outputPath 'package.nuspec.xml') -Encoding utf8
+Write-PackageEvidence (Join-Path $outputPath 'setup.manifest.xml') $manifest
+Write-PackageEvidence (Join-Path $outputPath 'package.nuspec.xml') $nuspecText
 
 $evidence = [pscustomobject]@{
     inspectedAt=(Get-Date -Format o); packId=$id; version=$version; productDllSha256=$productHash; legalNoticesVerified=$true; projectNoticesSha256=$ExpectedProjectNoticesSha256;
@@ -281,6 +327,7 @@ $evidence = [pscustomobject]@{
     mainExecutableSha256=$mainExeHash; mainExecutableProduct=$mainExeInfo.ProductName; executableIconMatches=$executableIconMatches; setupIconMatches=$setupIconMatches; iconFrameSizes=[YamuseIconVerifier]::FrameSizes($sourceIcon);
     setupEmbedsVerifiedNupkg=$true; setupPackageOffset=$payloadOffset; setupEmbeddedNupkgSha256=$setupPayloadHash;
     runtime=$runtimeProof.version; runtimeFilesSha256=$runtimeProofHashes; runtimeValidation=$runtimeProof;
+    stagePublishInventorySha256=$referenceInventorySha256; stageInventoryMatchedExpected=[bool]$ExpectedStageInventorySha256;
     fullMatchesVerifiedFiles=$true; fullMatchedFileCount=$fullMatchCount; portableMatchesVerifiedFiles=$true; portableMatchedFileCount=$portableMatchCount;
     officialFullAssetVerified=$true; assetIndexVerified=$true; legacyReleaseIndexVerified=$true; fullPackageSha1=$packageSha1;
     setupFileVersion=$setup.VersionInfo.FileVersion; setupProduct=$setup.VersionInfo.ProductName;
@@ -288,9 +335,10 @@ $evidence = [pscustomobject]@{
     setupSignature=(Get-AuthenticodeSignature -LiteralPath $setup.FullName).Status.ToString();
     installRoot='%LOCALAPPDATA%\YMusic.Native'; preservedData='%LOCALAPPDATA%\Yamuse';
     preservedMusic='Documents\Yamuse\Music';
-    files=@(Get-ChildItem -LiteralPath $outputPath -File | Where-Object { $_.Name -ne 'package-evidence.json' } | ForEach-Object {
+    files=@(Get-ChildItem -LiteralPath $outputPath -File | Where-Object { $_.Name -notin @('package-evidence.json', 'build-provenance.json', $yamusePackageOutputLockName) } | ForEach-Object {
+        Assert-PackagingPath $_.FullName -File -Required
         [pscustomobject]@{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash}
     }); packageEntries=$inventory
 }
-$evidence | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outputPath 'package-evidence.json') -Encoding utf8
+Write-PackageEvidence (Join-Path $outputPath 'package-evidence.json') ($evidence | ConvertTo-Json -Depth 5)
 Write-Output "Package metadata, feed asset hashes and non-elevated Setup manifest: PASS ($version)"

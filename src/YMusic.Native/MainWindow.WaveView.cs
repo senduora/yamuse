@@ -21,10 +21,8 @@ public partial class MainWindow
         if (_waveStarting) return;
         if (_current is not null && IsWaveTrackInView(_current) && IsCurrentWaveView && _queue.Any(row => ReferenceEquals(row, _current)))
         { await TogglePlaybackAsync(); return; }
-        var playable = WavePlayableTracks(_waveTracks);
-        if (!IsCurrentWaveView || playable.Length == 0) { await StartWaveViewAsync(true); return; }
-        _playbackQueue.SetItems(playable);
-        if (_playbackQueue.Current is { } first) await PlayTrackAsync(first);
+        if (IsCurrentWaveView && _waveTracks.Count > 0) await StartWavePlaybackAsync(_waveBatch);
+        else await StartWaveViewAsync(true);
     }
 
     private void UpdateMainContentVisibility()

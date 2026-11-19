@@ -33,7 +33,7 @@ internal sealed class BrandPaths
         DataDirectory = FixedChild(LocalData, "Yamuse");
         LegacyDataDirectory = FixedChild(LocalData, "YMusic.Native.Prototype");
         if (documents is null) return;
-        _documents = UninstallPathGuard.Canonical(documents);
+        _documents = UninstallPathGuard.Canonical(documents, allowVolumeRoot: true);
         if (UninstallPathGuard.Contains(LocalData, _documents) || UninstallPathGuard.Contains(_documents, LocalData))
             throw new IOException("Системные папки пересекаются. Перенос данных остановлен.");
         AvailableMusicDirectory = FixedChild(_documents, "Yamuse", "Music");
@@ -48,8 +48,7 @@ internal sealed class BrandPaths
         try
         {
             var paths = FromKnownFolders(local, documents);
-            var volume = new DriveInfo(Path.GetPathRoot(paths.Documents)!);
-            if (volume.DriveType is DriveType.Network or DriveType.NoRootDirectory or DriveType.Unknown)
+            if (!UninstallPathGuard.IsLocalVolume(paths.Documents))
                 return new BrandPaths(local, documents: null);
             using var documentsAnchor = UninstallPathGuard.HoldAncestors(Path.Combine(paths.Documents, ".yamuse-documents"));
             if (!documentsAnchor.Complete) return new BrandPaths(local, documents: null);
@@ -76,7 +75,7 @@ internal sealed class BrandPaths
         return path;
     }
 
-    // Call only after acquiring LegacyInstanceMutex, before constructing stores
+    // Call only after acquiring the profile instance lease, before constructing stores
     // or MainWindow. Each tree is renamed on its original volume: no audio or
     // encrypted account file is read, copied, decrypted, rewritten or hashed.
     // All plans are preflighted before the first rename. A later I/O failure can
@@ -100,7 +99,7 @@ internal sealed class BrandPaths
             if (ancestors.Complete && UninstallPathGuard.EntryExists(parent))
             {
                 using var directory = OpenMigrationDirectory(parent);
-                if (!Directory.EnumerateFileSystemEntries(parent).Any()) UninstallPathGuard.DeleteByHandle(directory);
+                if (!DirectoryContainsData(parent, directory)) UninstallPathGuard.DeleteByHandle(directory);
             }
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception) { }
@@ -137,13 +136,13 @@ internal sealed class BrandPaths
                 {
                     var destination = OpenMigrationDirectory(target);
                     plan._leases.Add(destination);
-                    if (Directory.EnumerateFileSystemEntries(target).Any())
+                    if (DirectoryContainsData(target, destination))
                     {
-                        if (Directory.EnumerateFileSystemEntries(source).Any())
-                            throw new IOException("Нельзя автоматически перенести данные: обе папки содержат файлы. Файлы сохранены.\n\n" + source + "\n" + target);
+                        if (DirectoryContainsData(source, plan._sourceHandle))
+                            throw new IOException("Нельзя автоматически перенести данные: обе папки содержат данные. Данные сохранены.\n\n" + source + "\n" + target);
                         plan._sourceHandle.Dispose();
                         plan._sourceHandle = null;
-                        return plan; // An empty legacy folder contains no data.
+                        return plan; // The legacy folder has neither entries nor extra metadata.
                     }
                     plan._emptyTarget = destination;
                 }
@@ -179,6 +178,8 @@ internal sealed class BrandPaths
             {
                 // Delete only the checked, empty directory by handle. A file
                 // created in it since preflight makes deletion fail safely.
+                if (FileSecurityPreservation.HasNamedStreamsOrExtendedAttributes(_emptyTarget))
+                    throw new IOException("В папке назначения появились дополнительные данные. Перенос остановлен.");
                 UninstallPathGuard.DeleteByHandle(_emptyTarget);
                 _emptyTarget.Dispose();
                 _emptyTarget = null;
@@ -194,6 +195,9 @@ internal sealed class BrandPaths
             foreach (var lease in _leases.AsEnumerable().Reverse()) lease.Dispose();
         }
     }
+
+    private static bool DirectoryContainsData(string path, SafeFileHandle directory)
+        => Directory.EnumerateFileSystemEntries(path).Any() || FileSecurityPreservation.HasNamedStreamsOrExtendedAttributes(directory);
 
     // Rename the checked root through its own DELETE-capable handle while its
     // parents remain pinned. An external rename/link substitution is denied;

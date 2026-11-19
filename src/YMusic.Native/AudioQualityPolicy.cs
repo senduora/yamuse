@@ -20,7 +20,7 @@ internal static class AudioQualityPolicy
             && Family(candidateCodec) == Family(existingCodec) && candidateBitrate > existingBitrate;
     }
 
-    private static int Rank(string codec, int bitrate)
+    internal static int Rank(string codec, int bitrate)
     {
         var family = Family(codec);
         if (family == "flac") return 3;
@@ -42,7 +42,8 @@ public partial class MainWindow
         AudioQuality quality, CancellationToken token)
     {
         // An optional quality probe must never refresh credentials or require login
-        // before opening a valid offline file. Unindexed user files stay local.
+        // before opening a valid offline file. Offline-only rows stay local.
+        if (track.IsOfflineLibraryRow || !track.Available) return null;
         var session = _session;
         if (session is null || session.ExpiresAtUtc <= DateTimeOffset.UtcNow.AddMinutes(1)) return null;
         var accountGeneration = _accountGeneration;
@@ -50,14 +51,14 @@ public partial class MainWindow
         {
             var existing = _offline.Find(track);
             if (existing is null || !string.Equals(localPath, _offline.ResolvePath(existing.FileName), StringComparison.OrdinalIgnoreCase)
-                || AudioQualityPolicy.IsSufficient(existing.Codec, existing.Bitrate, quality)) return null;
+                || AudioQualityPolicy.IsSufficient(existing.Codec, existing.QualityBitrate, quality)) return null;
             using var budget = CancellationTokenSource.CreateLinkedTokenSource(token);
             budget.CancelAfter(AudioQualityPolicy.OfflineUpgradeTimeoutMilliseconds);
             var audio = await _api.ResolveAudioAsync(session, track.RequestId, quality, budget.Token);
             token.ThrowIfCancellationRequested();
             budget.Token.ThrowIfCancellationRequested();
             if (accountGeneration != _accountGeneration || !ReferenceEquals(session, _session)) return null;
-            return AudioQualityPolicy.IsBetter(audio.Codec, audio.Bitrate, existing.Codec, existing.Bitrate) ? audio : null;
+            return AudioQualityPolicy.IsBetter(audio.Codec, audio.Bitrate, existing.Codec, existing.QualityBitrate) ? audio : null;
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested) { return null; }
         catch (Exception error) when (error is MusicException or HttpRequestException or IOException or JsonException or FormatException or TimeoutException)

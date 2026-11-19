@@ -24,8 +24,9 @@ public partial class MainWindow
         _ = CommitAndCloseAsync();
     }
 
-    private Task DrainExitWritesAsync() => !_restore || _demo ? Task.CompletedTask
-        : Task.WhenAll(DrainFavoritesCacheWritesAsync(), DrainSessionRefreshWritesAsync());
+    private Task DrainExitWritesAsync() => _restore && !_demo
+        ? Task.WhenAll(DrainFavoritesCacheWritesAsync(), DrainSessionRefreshWritesAsync())
+        : DrainSessionRefreshWritesAsync();
 
     private async Task CommitAndCloseAsync()
     {
@@ -37,6 +38,9 @@ public partial class MainWindow
             if (_closed) return;
             RefreshAppUpdateUi();
             ArmUpdateSchedule();
+            if (_offlineMaintenanceCompletion is { } maintenance)
+                await maintenance.Task.WaitAsync(_lifetime.Token);
+            if (_closed) return;
             downloads = PauseDownloadsForClose();
             var writes = DrainExitWritesAsync();
             if (_downloadTask is { } pending)
@@ -44,7 +48,11 @@ public partial class MainWindow
             await writes.WaitAsync(_lifetime.Token);
             while (!_closed && !_lifetime.IsCancellationRequested)
             {
+                var updateCheckSettled = await SettleUpdateCheckAsync();
+                if (_closed || _lifetime.IsCancellationRequested) return;
                 var failure = SaveStateBeforeClosing();
+                if (!updateCheckSettled && _updateCheckCompletion is not null)
+                    failure = failure is null ? UpdateCheckStillRunning : failure + "\n" + UpdateCheckStillRunning;
                 var choice = failure is null ? MessageBoxResult.No : AskHowToClose(failure);
                 if (choice == MessageBoxResult.Yes) continue;
                 if (choice != MessageBoxResult.No) return;
@@ -64,6 +72,7 @@ public partial class MainWindow
         {
             _closeCommitApproved = false;
             _closeCommitInProgress = false;
+            ResumeDeferredRestoredArtwork();
             if (!_closed)
             {
                 RefreshAppUpdateUi();
@@ -89,9 +98,16 @@ public partial class MainWindow
         var resumePendingFavorites = hasPendingFavorites && !autoWasSuspended && !_downloadQueue.HasPaused && !_downloadQueue.Suspended;
         HashSet<DownloadEntry> entries = wasRunning
             ? _downloadQueue.Entries.Where(entry => entry.Active || entry.State == DownloadEntryState.Queued).ToHashSet() : [];
+        var pendingTerminalRows = resumePendingFavorites ? _downloadQueue.Entries.Where(entry =>
+            entry.State is DownloadEntryState.Unavailable or DownloadEntryState.Removed
+            && _pendingConfirmedFavorites.ContainsKey(entry.Track.Id)).ToArray() : [];
         var countBeforePause = _downloadQueue.Entries.Count;
         var revision = PauseDownloadQueueForAppUpdate();
-        if (resumePendingFavorites) entries.UnionWith(_downloadQueue.Entries.Skip(countBeforePause));
+        if (resumePendingFavorites)
+        {
+            entries.UnionWith(_downloadQueue.Entries.Skip(countBeforePause));
+            entries.UnionWith(pendingTerminalRows.Where(entry => entry is { State: DownloadEntryState.Paused, DeferredFavorite: not null }));
+        }
         return new(revision, generation, autoWasEnabled, autoWasSuspended, pending, entries);
     }
 
@@ -117,9 +133,13 @@ public partial class MainWindow
     {
         List<string>? failures = null;
         if (!TryFlushPendingSessionChange()) (failures ??= []).Add(PendingSessionSaveFailure);
-        if (!TrySavePlaybackStateForExit()) (failures ??= []).Add("Не удалось сохранить очередь воспроизведения и позицию.");
-        if (!TrySaveDownloadQueueCheckpoint()) (failures ??= []).Add("Не удалось сохранить очередь загрузок.");
+        if (!TrySavePlaybackStateForExit()) (failures ??= []).Add(PlaybackStateSaveFailure);
+        if (!TrySaveDownloadQueueCheckpoint()) (failures ??= []).Add(HasPendingDownloadQueueClear
+            ? "Не удалось отменить сохранённую очередь после выхода из аккаунта. Она может восстановиться при следующем входе."
+            : "Не удалось сохранить очередь загрузок.");
         if (!TrySavePreferencesForUpdate(out var failure)) (failures ??= []).Add(failure ?? "Не удалось сохранить настройки.");
+        if (!TryFlushUnsavedListSorts()) (failures ??= []).Add("Не удалось сохранить сортировку списков.");
+        if (!TryCommitUpdateSchedule()) (failures ??= []).Add(UpdateScheduleSaveFailure);
         return failures is null ? null : string.Join("\n", failures);
     }
 

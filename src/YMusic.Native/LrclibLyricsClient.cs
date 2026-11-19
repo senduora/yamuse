@@ -94,16 +94,20 @@ internal sealed class LrclibLyricsClient : IDisposable
                 || !record.TryGetProperty("duration", out var length) || length.ValueKind != JsonValueKind.Number || !length.TryGetDouble(out var actualDuration)
                 || !double.IsFinite(actualDuration) || actualDuration <= 0) return LrclibLookup.Unavailable;
             if (Normalize(title) != Normalize(track.Title) || Normalize(artist) != Normalize(track.Artist)
-                || !string.IsNullOrWhiteSpace(track.Album) && Normalize(ReadName(record, "albumName")) != Normalize(track.Album)
                 || Math.Abs(actualDuration - duration) > 2) return default;
-            if (record.TryGetProperty("instrumental", out var instrumental))
+            if (!string.IsNullOrWhiteSpace(track.Album))
             {
-                if (instrumental.ValueKind == JsonValueKind.True) return default;
-                if (instrumental.ValueKind != JsonValueKind.False) return LrclibLookup.Unavailable;
+                if (!record.TryGetProperty("albumName", out var album)) return LrclibLookup.Unavailable;
+                if (album.ValueKind == JsonValueKind.Null) return default;
+                if (!TryReadText(album, out var albumName)) return LrclibLookup.Unavailable;
+                if (Normalize(albumName) != Normalize(track.Album)) return default;
             }
-            if (!record.TryGetProperty("syncedLyrics", out var synced) || synced.ValueKind == JsonValueKind.Null) return default;
-            if (synced.ValueKind != JsonValueKind.String) return LrclibLookup.Unavailable;
-            var text = MusicApi.JsonString(synced);
+            if (!record.TryGetProperty("instrumental", out var instrumental)) return LrclibLookup.Unavailable;
+            if (instrumental.ValueKind == JsonValueKind.True) return default;
+            if (instrumental.ValueKind != JsonValueKind.False) return LrclibLookup.Unavailable;
+            if (!record.TryGetProperty("syncedLyrics", out var synced)) return LrclibLookup.Unavailable;
+            if (synced.ValueKind == JsonValueKind.Null) return default;
+            if (!TryReadText(synced, out var text)) return LrclibLookup.Unavailable;
             if (string.IsNullOrWhiteSpace(text)) return default;
             var parsed = MusicApi.ParseSynchronizedLyrics(text);
             timeout.Token.ThrowIfCancellationRequested();
@@ -120,6 +124,14 @@ internal sealed class LrclibLyricsClient : IDisposable
 
     private static string ReadName(JsonElement record, string property)
         => record.TryGetProperty(property, out var value) ? MusicApi.JsonString(value) : "";
+
+    private static bool TryReadText(JsonElement value, out string text)
+    {
+        text = "";
+        if (value.ValueKind != JsonValueKind.String) return false;
+        try { text = value.GetString() ?? ""; return true; }
+        catch (InvalidOperationException) { return false; }
+    }
 
     private static string Normalize(string value) => string.Join(' ',
         value.Normalize(NormalizationForm.FormKC).Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).ToUpperInvariant();

@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using YMusic.Native;
 
 internal static partial class Program
@@ -13,10 +14,34 @@ internal static partial class Program
     private static async Task CheckDownloadCenter()
     {
         await Run("Download center: dispatcher ownership, bounded progress sink and safe errors", DownloadCenterModelChecks);
+        await Run("Download center: the confirmed context row sets the WPF range anchor without changing its group", DownloadCenterContextAnchor);
         await Run("Download center: bounded workers, individual progress, pause and explicit resume preserve completed files", DownloadCenterPauseResume);
         await Run("Download center: limits one and ten bound active requests and cancellation admission", DownloadCenterLimits);
         await Run("Download center: retry only failed tracks and indexed storage excludes foreign files", DownloadCenterRetry);
         await Run("Download center: logout and clear never restart a suspended queue", DownloadCenterAccountAndClear);
+    }
+
+    private static async Task DownloadCenterContextAnchor()
+    {
+        using var fixture = new DownloadCenterFixture("context-anchor", 1);
+        fixture.Queue.Replace([DcTrack("1"), DcTrack("2"), DcTrack("3")], "Fixture queue");
+        UlSet(fixture.Window, "_downloadQueueAccountUid", "fixture");
+        SaInvoke(fixture.Window, "DownloadCenter_Click", fixture.Window, new RoutedEventArgs());
+        fixture.Window.UpdateLayout();
+        var list = SaField<ListView>(fixture.Window, "_downloadEntriesList");
+        var entries = fixture.Queue.Entries;
+        Assert(list.Items.Count == entries.Count, "the owned fixture queue was not displayed");
+        list.SelectedItems.Add(entries[1]);
+        list.SelectedItems.Add(entries[2]);
+        list.ScrollIntoView(entries[1]);
+        await Until(() => { fixture.Window.UpdateLayout(); return list.ItemContainerGenerator.ContainerFromIndex(1) is ListViewItem; });
+        var row = (ListViewItem)list.ItemContainerGenerator.ContainerFromIndex(1);
+        var routed = 0;
+        row.AddHandler(UIElement.MouseRightButtonDownEvent,
+            new MouseButtonEventHandler((_, args) => { if (args.ChangedButton == MouseButton.Right) routed++; }), true);
+        Ta0317RaiseOpening(row, 10, 10);
+        Assert(routed == 1 && list.SelectedItems.Cast<DownloadEntry>().ToHashSet().SetEquals(new[] { entries[1], entries[2] }),
+            "the confirmed download context target did not preserve its group and refresh the WPF range anchor");
     }
     private static async Task DownloadCenterModelChecks()
     {
@@ -146,7 +171,7 @@ internal static partial class Program
     private static TrackRow DcTrack(string id, bool available = true) => new() { Id = id, RequestId = id + ":91", Title = "Проверка " + id, Artist = "Тестовый исполнитель", DurationMs = 3000, Available = available };
     private sealed class DownloadCenterFixture : IDisposable
     {
-        internal static readonly byte[] Media = new byte[131072];
+        internal static readonly byte[] Media = SilentMp3Bytes(131072);
         internal string DirectoryPath { get; }
         internal string BufferPath { get; }
         internal MainWindow Window { get; }

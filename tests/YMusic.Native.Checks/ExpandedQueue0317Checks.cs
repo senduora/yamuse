@@ -25,6 +25,7 @@ internal static partial class Program
             await Run("ExpandedQueue0317: four independent responsive pane states retain accessible controls", Eq0317Layout);
             await Run("ExpandedQueue0317: 3904 rows recycle and refresh only on queue changes", Eq0317LargeQueue);
             await Run("ExpandedQueue0317: exact duplicate occurrence keyboard selection rejects stale account and queue snapshots", Eq0317Selection);
+            await Run("ExpandedQueue0317: passive Wave append keeps a pressed occurrence only at the same live hit", Eq0317PassivePress);
             await Run("ExpandedQueue0317: fullscreen shared-cover reveal is bounded and cancels on rapid close account and lifetime", Eq0317Reveal);
             File.WriteAllText(Path.Combine(_directory, "expanded-queue-0317-scope.json"), JsonSerializer.Serialize(new
             {
@@ -139,8 +140,22 @@ internal static partial class Program
         f.Queue.SetItems([f.First, f.First, f.Second], f.First); await w.PlayTrackAsync(f.First); var originalItems = f.Queue.Items;
         EpOpen(w); EpInvoke(w, "SetExpandedQueueVisible", true, false); w.UpdateLayout();
         var list = EpField<ListBox>(w, "_expandedQueueList"); var token = f.Queue.CurrentOccurrenceToken;
-        EpSet(w, "_pendingSeek", 30d); list.SelectedIndex = 1;
-        list.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, PresentationSource.FromVisual(list), Environment.TickCount, Key.Enter) { RoutedEvent = Keyboard.PreviewKeyDownEvent });
+        EpSet(w, "_pendingSeek", 30d); list.SelectedIndex = 2;
+        list.ScrollIntoView(list.Items[1]);
+        w.UpdateLayout();
+        var duplicate = (ListBoxItem)list.ItemContainerGenerator.ContainerFromIndex(1);
+        KeyEventArgs Enter(ModifierKeys modifiers) => new(new Pk040Keyboard(modifiers), new Pk040Source(duplicate), Environment.TickCount, Key.Enter)
+            { RoutedEvent = Keyboard.PreviewKeyDownEvent };
+        var modified = Enter(ModifierKeys.Control);
+        duplicate.RaiseEvent(modified);
+        Assert(!modified.Handled && f.Queue.CurrentOccurrenceToken == token, "modified Enter selected the expanded queue occurrence");
+        var repeated = Enter(ModifierKeys.None);
+        typeof(KeyEventArgs).GetMethod("SetRepeat", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(repeated, [true]);
+        duplicate.RaiseEvent(repeated);
+        Assert(repeated.Handled && f.Queue.CurrentOccurrenceToken == token, "held Enter selected the expanded queue occurrence");
+        var plain = Enter(ModifierKeys.None);
+        duplicate.RaiseEvent(plain);
+        Assert(plain.Handled, "plain Enter did not activate its expanded queue occurrence");
         await Until(() => !EpField<bool>(w, "_loadingStream"));
         Assert(f.Queue.CurrentIndex == 1 && f.Queue.CurrentOccurrenceToken != token && ReferenceEquals(f.Queue.Items, originalItems) && f.Player.SourceLocalPath == f.First.LocalPath
             && EpField<double?>(w, "_pendingSeek") is null, "keyboard queue selection lost exact duplicate occurrence, replaced queue, or retained stale seek");
@@ -150,6 +165,80 @@ internal static partial class Program
         await Eq0317PlayRow(w, fresh); Assert(f.Queue.Version == version, "old account queue row entered playback");
         EpSet(w, "_accountGeneration", generation); w.SignOut(); await Eq0317PlayRow(w, fresh);
         Assert(!f.Player.HasSource && f.Queue.Items.Count == 0 && list.ItemsSource is null && f.MediaCalls == 0, "late signed-out click revived playback or retained rows");
+    }
+
+    private static async Task Eq0317PassivePress()
+    {
+        foreach (var action in new[] { "append", "different", "trim", "replace", "panel-close", "fullscreen-close", "logout" })
+        {
+            using var f = new TwFixture("expanded-press-refill-" + action);
+            var w = f.Window;
+            await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Волна", true));
+            await f.Ready("1234");
+            var q = EpField<PlaybackQueue>(w, "_playbackQueue");
+            var current = q.Current!;
+            var incoming = q.Items[1];
+            var count = action == "trim" ? 22 : 2;
+            var duplicate = new TrackRow { Id = "expanded-repeated", RequestId = "expanded-repeated",
+                Title = "Два вхождения", DurationMs = 30000, Available = true,
+                LocalPath = PlaybackOptionsSilentWave("expanded-press-" + action, 30) };
+            var prior = Enumerable.Range(0, count).Select(index => index < 2 ? duplicate
+                : new TrackRow { Id = $"expanded-past-{index}", RequestId = $"expanded-past-{index}", Title = "Прослушано", Available = true }).ToArray();
+            TrackRow[] rows = [.. prior, current, incoming];
+            q.SetItems(rows);
+            for (var i = 0; i < count; i++) q.Next();
+            var pressed = q.OccurrenceTokenAt(0);
+            var cursor = q.CurrentOccurrenceToken;
+            f.HoldMore = true;
+            var refill = Call(w, "ExtendWaveQueueAsync");
+            try
+            {
+                await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                EpOpen(w);
+                EpInvoke(w, "SetExpandedQueueVisible", true, false);
+                var list = EpField<ListBox>(w, "_expandedQueueList");
+                EpSet(w, "_expandedQueueRevealPending", false);
+                await Dispatcher.Yield(DispatcherPriority.Loaded);
+                var viewer = EpVisuals<ScrollViewer>(list).First();
+                viewer.ScrollToTop();
+                w.UpdateLayout();
+                var down = RowAt(0);
+                var origin = Center(down);
+                EpInvoke(w, "RememberExpandedQueuePress", list, down, origin, 1);
+                Assert(EpField<object?>(w, "_expandedQueuePress") is not null, "fixture did not capture a row press");
+
+                f.Release.TrySetResult();
+                await refill.WaitAsync(TimeSpan.FromSeconds(5));
+                viewer.ScrollToTop();
+                w.UpdateLayout();
+                Assert(q.Items.Any(track => track.Id == "901") && q.CurrentOccurrenceToken == cursor,
+                    "the held passive response did not preserve the live cursor");
+                Assert((EpField<object?>(w, "_expandedQueuePress") is null) == (action == "trim"),
+                    $"{action}: the refresh lost the surviving press or retained an evicted token");
+                var hit = action == "different" ? Center(RowAt(1)) : origin;
+                if (action == "replace")
+                {
+                    q.SetItems(rows, current);
+                    EpInvoke(w, "RefreshExpandedQueue");
+                }
+                if (action == "panel-close") EpInvoke(w, "SetExpandedQueueVisible", false, false);
+                if (action == "fullscreen-close") EpInvoke(w, "CloseExpandedPlayer");
+                if (action == "logout") w.SignOut();
+
+                var before = q.CurrentOccurrenceToken;
+                await Call(w, "ReleaseExpandedQueuePressAsync", list, hit);
+                if (action == "append")
+                    Assert(q.CurrentOccurrenceToken == pressed && f.Player.IsPlaying && q.CurrentIndex == 0,
+                        "the released click did not activate the original live duplicate");
+                else
+                    Assert(q.CurrentOccurrenceToken == before && q.CurrentOccurrenceToken != pressed,
+                        $"{action}: a stale click activated a different occurrence or survived teardown");
+
+                ListBoxItem RowAt(int index) => (ListBoxItem)list.ItemContainerGenerator.ContainerFromIndex(index);
+                Point Center(ListBoxItem row) => row.TranslatePoint(new Point(row.ActualWidth / 2, row.ActualHeight / 2), list);
+            }
+            finally { f.Release.TrySetResult(); }
+        }
     }
 
     private static Task Eq0317PlayRow(MainWindow window, object row) => (Task)typeof(MainWindow).GetMethod("PlayExpandedQueueRowAsync", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(window, [row])!;

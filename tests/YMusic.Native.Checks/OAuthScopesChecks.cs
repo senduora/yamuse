@@ -1,6 +1,7 @@
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Reflection;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
@@ -17,6 +18,7 @@ internal static partial class Program
     // constant must fail the wire and activation checks below.
     private const string OAuthMusicScopes = "music:content music:read music:write";
     private const string OAuthDeviceReply = """{"device_code":"scope-fixture-code","user_code":"TEST-SCOPE","verification_url":"https://oauth.yandex.ru/device","interval":1,"expires_in":30}""";
+    private const string OAuthConfirmedProfile = """{"result":{"account":{"uid":12345,"displayName":"Fixture","avatarId":"123/fixture"}}}""";
     private const string OAuthRotatedTokens = """{"access_token":"fixture-new-access","refresh_token":"fixture-new-refresh","expires_in":3600}""";
 
     private static async Task CheckOAuthScopes()
@@ -48,7 +50,9 @@ internal static partial class Program
 
         await Run("OAuthScopes: malformed JSON or verification address fails with a controlled response", async () =>
         {
-            foreach (var reply in new[] { "null", "[]", "\"fixture-payload\"", OAuthDeviceReply.Replace("https://oauth.yandex.ru/device", "relative-fixture-payload", StringComparison.Ordinal),
+            foreach (var reply in new[] { "null", "[]", "\"fixture-payload\"",
+                OAuthDeviceReply[..^1] + ",\"verification_url\":\"https://oauth.yandex.ru/device\"}",
+                OAuthDeviceReply.Replace("https://oauth.yandex.ru/device", "relative-fixture-payload", StringComparison.Ordinal),
                 OAuthDeviceReply.Replace("\"scope-fixture-code\"", "17", StringComparison.Ordinal) })
             {
                 var http = new OAuthScopesHandler((_, _) => Task.FromResult(Json(reply)));
@@ -57,6 +61,62 @@ internal static partial class Program
                 Assert(http.Seen.Count == 1 && !error.Message.Contains("fixture-payload", StringComparison.Ordinal),
                     "malformed OAuth reply appeared in the error or scheduled a retry");
             }
+        });
+
+        await Run("OAuthScopes: device code expires across response body and delayed polling without a token POST", async () =>
+        {
+            var shortReply = OAuthDeviceReply.Replace("\"expires_in\":30", "\"expires_in\":1", StringComparison.Ordinal);
+            using (var fixture = new OAuthScopesUiFixture("device-code-body-expiry", null, (request, _) =>
+            {
+                Assert(request.RequestUri!.AbsolutePath == "/device/code", "an expired code reached the token endpoint");
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new OAuthBodyContent(shortReply, token => Task.Delay(1250, token))
+                });
+            }))
+            {
+                var panel = Control<FrameworkElement>(fixture.Window, "CodePanel");
+                var visibility = System.ComponentModel.DependencyPropertyDescriptor.FromProperty(UIElement.VisibilityProperty, typeof(FrameworkElement))!;
+                var shown = false;
+                EventHandler observe = (_, _) => shown |= panel.Visibility == Visibility.Visible;
+                visibility.AddValueChanged(panel, observe);
+                try { await fixture.Window.StartLoginAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+                finally { visibility.RemoveValueChanged(panel, observe); }
+
+                Assert(!shown && fixture.Http.Seen.Count == 1
+                    && Control<TextBlock>(fixture.Window, "StatusText").Text.Contains("Время действия кода истекло", StringComparison.Ordinal),
+                    "the delayed device response presented an expired code or attempted exchange");
+            }
+
+            var http = new FakeHandler((_, _) => Task.FromResult(Json(OAuthDeviceReply)));
+            using var api = new MusicApi(http);
+            var code = await api.BeginLoginAsync("test-device", default);
+            // Model time spent before CompleteLoginAsync without launching the browser.
+            var aged = code with { ReceivedAtTimestamp = code.ReceivedAtTimestamp - System.Diagnostics.Stopwatch.Frequency * 60 };
+            var expired = await Throws<MusicException>(() => api.CompleteLoginAsync(aged, "test-device", default));
+            Assert(expired.Message.Contains("Время действия кода истекло", StringComparison.Ordinal) && http.Seen.Count == 1,
+                "starting the poll loop extended the original deadline");
+        });
+
+        await Run("OAuthScopes: a server poll minimum above 60 and slow down above 120 are honored", async () =>
+        {
+            var reply = OAuthDeviceReply.Replace("\"interval\":1", "\"interval\":75", StringComparison.Ordinal);
+            var http = new FakeHandler((request, _) =>
+            {
+                Assert(request.RequestUri!.AbsolutePath == "/device/code", "an interval outside the code lifetime started a poll");
+                return Task.FromResult(Json(reply));
+            });
+            using var api = new MusicApi(http);
+            var code = await api.BeginLoginAsync("test-device", default);
+            Assert(code.IntervalSeconds == 75, "the server's initial minimum was shortened");
+            var slow = MusicApi.NextDevicePollIntervalSeconds(120, MusicApi.DevicePollDelay.SlowDown);
+            Assert(slow == 125 && MusicApi.NextDevicePollIntervalSeconds(slow, MusicApi.DevicePollDelay.SlowDown) == 130
+                && MusicApi.NextDevicePollIntervalSeconds(slow, MusicApi.DevicePollDelay.TemporaryFailure) >= slow,
+                "a retry shortened the already required server interval");
+            var expires = await Throws<MusicException>(() =>
+                api.CompleteLoginAsync(code with { ExpiresInSeconds = 1 }, "test-device", default).WaitAsync(TimeSpan.FromSeconds(4)));
+            Assert(expires.Message.Contains("Время действия кода истекло", StringComparison.Ordinal) && http.Seen.Count == 1,
+                "a minimum exceeding the remaining lifetime did not wait for expiry");
         });
 
         await Run("OAuthScopes: omitted token response scope uses documented requested grant and canonical storage", async () =>
@@ -155,7 +215,8 @@ internal static partial class Program
 
         await Run("OAuthScopes: transient refresh failures can be retried with the same saved grant", async () =>
         {
-            HttpStatusCode[] failures = [HttpStatusCode.TooManyRequests, HttpStatusCode.InternalServerError, HttpStatusCode.ServiceUnavailable, HttpStatusCode.Unauthorized];
+            HttpStatusCode[] failures = [HttpStatusCode.RequestTimeout, HttpStatusCode.TooManyRequests, HttpStatusCode.InternalServerError,
+                HttpStatusCode.ServiceUnavailable, HttpStatusCode.Unauthorized];
             var attempts = 0;
             var stored = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-1) };
             var store = new SessionStore(OAuthScopesDirectory("refresh-temporary"));
@@ -166,8 +227,7 @@ internal static partial class Program
             for (var i = 0; i < failures.Length; i++)
             {
                 var error = await Throws<MusicException>(() => api.RefreshAsync(store.Load()!, default));
-                var denied = failures[i] == HttpStatusCode.Unauthorized;
-                Assert(error.Authentication == denied && error.Message.Contains(denied ? "Войдите заново" : "временно недоступен", StringComparison.Ordinal)
+                Assert(!error.Authentication && error.Message.Contains("временно недоступен", StringComparison.Ordinal)
                     && !error.Message.Contains("fixture-private-response", StringComparison.Ordinal)
                     && http.Seen.Count == i + 1 && store.Load() == stored,
                     "refresh misclassified the response, retried automatically, or changed the saved grant");
@@ -184,7 +244,8 @@ internal static partial class Program
             {
                 var http = new FakeHandler((_, _) => Task.FromResult(Json(OAuthTokenWithScopeJson(scopeJson))));
                 using var api = new MusicApi(http);
-                Assert((await Throws<MusicException>(() => api.RefreshAsync(FakeSession, default))).Authentication && http.Seen.Count == 1,
+                var error = await Throws<MusicException>(() => api.RefreshAsync(FakeSession, default));
+                Assert(error.Authentication == scopeJson.StartsWith('"') && http.Seen.Count == 1,
                     "refresh accepted unsuitable rights or retried a rejected grant");
             }
         });
@@ -236,6 +297,7 @@ internal static partial class Program
                 (HttpStatusCode.Redirect, "{\"status\":\"ok\"}"),
                 (HttpStatusCode.PartialContent, "{\"status\":\"ok\"}"),
                 (HttpStatusCode.OK, "{\"status\":\"ok\",\"error\":\"private-revoke-payload\"}"),
+                (HttpStatusCode.OK, """{"status":"private-revoke-payload","status":"ok"}"""),
                 (HttpStatusCode.OK, "{\"status\":\"private-revoke-payload\"}"),
                 (HttpStatusCode.OK, "{}"), (HttpStatusCode.OK, "null"),
                 (HttpStatusCode.OK, "private-revoke-payload-malformed-json")
@@ -326,19 +388,111 @@ internal static partial class Program
             }
         });
 
-        await Run("OAuthScopes: an unreadable session file cannot be treated as a first login", async () =>
+        await Run("OAuthScopes: damaged saved login keeps recovery instructions until repair or removal", async () =>
+        {
+            foreach (var replaced in new[] { false, true })
+            foreach (var repaired in new[] { false, true })
+            {
+                var expired = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
+                var healthy = FakeSession with { AccessToken = "fixture-repaired-access", ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(30) };
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                using var fixture = new OAuthScopesUiFixture("damaged-login-card", replaced ? expired : null, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/token" when replaced:
+                            entered.TrySetResult();
+                            await release.Task;
+                            return Json("""{"error":"invalid_grant"}""", HttpStatusCode.BadRequest);
+                        case "/account/status" when request.Headers.Authorization?.Parameter == healthy.AccessToken:
+                            return Json(OAuthConfirmedProfile);
+                        case "/users/12345/likes/tracks": return Json("""{"result":{"library":{"tracks":[]}}}""");
+                        case "/device/code": return Json("""{"error":"fixture-stop"}""", HttpStatusCode.BadRequest);
+                        default: throw new InvalidOperationException("Damaged login reached an unexpected route");
+                    }
+                });
+                var title = Control<TextBlock>(fixture.Window, "LoginTitle");
+                byte[] corrupt = [1, 2, 3, 4, 5];
+                if (replaced)
+                {
+                    var restore = Call(fixture.Window, "RestoreAsync");
+                    try
+                    {
+                        await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                        File.WriteAllBytes(fixture.SessionPath, corrupt);
+                    }
+                    finally { release.TrySetResult(); }
+                    await restore.WaitAsync(TimeSpan.FromSeconds(4));
+                    Assert(title.Text.Contains("Проверьте", StringComparison.Ordinal)
+                        && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(corrupt),
+                        "retirement removed the independent damaged replacement");
+                    await fixture.Window.StartLoginAsync();
+                }
+                else
+                {
+                    File.WriteAllBytes(fixture.SessionPath, corrupt);
+                    await Call(fixture.Window, "RestoreAsync");
+                }
+
+                var baseline = replaced ? 1 : 0;
+                AssertDamagedCard();
+                PreloadInvoke(fixture.Window, "HideStatusNotification");
+                Assert(Control<Border>(fixture.Window, "StatusNotification").Visibility == Visibility.Collapsed,
+                    "the fixture did not dismiss the transient notification");
+                AssertDamagedCard();
+                await fixture.Window.StartLoginAsync();
+                AssertDamagedCard();
+
+                if (repaired) fixture.Store.Save(healthy);
+                else fixture.Store.Clear();
+                await fixture.Window.StartLoginAsync();
+                string[] next = repaired ? ["/account/status", "/users/12345/likes/tracks"] : ["/device/code"];
+                Assert(fixture.Http.Seen.Skip(baseline).Select(sent => sent.Uri.AbsolutePath).SequenceEqual(next)
+                    && (repaired ? OAuthSession(fixture.Window) == healthy
+                        && Control<Border>(fixture.Window, "LoginPanel").Visibility == Visibility.Collapsed
+                        : !File.Exists(fixture.SessionPath) && title.Text != "Сохранённый вход повреждён"),
+                    "repair did not resume the saved login or removal did not permit a new code");
+
+                void AssertDamagedCard()
+                {
+                    var text = Control<TextBlock>(fixture.Window, "LoginDescription").Text;
+                    Assert(title.Text == "Сохранённый вход повреждён" && text.Contains("Яндекс ID", StringComparison.Ordinal)
+                        && text.Contains("удалите повреждённый файл session.dpapi", StringComparison.Ordinal)
+                        && fixture.Http.Seen.Count == baseline && OAuthSession(fixture.Window) is null
+                        && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(corrupt),
+                        "damaged login lost its recovery instructions, changed on disk, or sent an authorization request");
+                }
+            }
+        });
+
+        await Run("OAuthScopes: a locked session survives startup and resumes without a device code", async () =>
         {
             using var fixture = new OAuthScopesUiFixture("locked-session", FakeSession,
-                (_, _) => throw new InvalidOperationException("unreadable session reached authorization network"));
+                (request, _) => Task.FromResult(request.RequestUri!.AbsolutePath switch
+                {
+                    "/account/status" => Json(OAuthConfirmedProfile),
+                    "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                    _ => throw new InvalidOperationException("Temporary session blockage triggered device authorization")
+                }));
             var before = File.ReadAllBytes(fixture.SessionPath);
             using (File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None))
             {
                 await Throws<IOException>(() => Task.FromResult(fixture.Store.Load()));
+                await Call(fixture.Window, "RestoreAsync");
+                Assert(Control<TextBlock>(fixture.Window, "StatusText").Text.Contains("временно недоступен", StringComparison.Ordinal),
+                    "startup treated a sharing lock as a damaged record");
                 await fixture.Window.StartLoginAsync();
+                Assert(fixture.Http.Seen.Count == 0
+                    && Control<TextBlock>(fixture.Window, "StatusText").Text.Contains("временно недоступен", StringComparison.Ordinal),
+                    "retry while locked reached the network or lost the temporary failure explanation");
             }
-            Assert(fixture.Http.Seen.Count == 0 && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before)
-                && Control<TextBlock>(fixture.Window, "StatusText").Text.Contains("отзовите", StringComparison.OrdinalIgnoreCase),
-                "unreadable session was replaced or triggered login without an explanation");
+            Assert(File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before), "locked startup changed the stored record");
+            await fixture.Window.StartLoginAsync();
+            Assert(PreloadGet<Account?>(fixture.Window, "_account")?.Uid == "12345" && OAuthSession(fixture.Window) == FakeSession
+                && fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(["/account/status", "/users/12345/likes/tracks"])
+                && fixture.Http.Seen.All(sent => sent.Authorization == "OAuth " + FakeSession.AccessToken),
+                "retry after unlock did not restore the original account");
         });
 
         await Run("OAuthScopes: legacy restore revokes then clears storage and asks for new login without account request", async () =>
@@ -402,11 +556,84 @@ internal static partial class Program
             });
             var before = File.ReadAllBytes(fixture.SessionPath); var restore = Call(fixture.Window, "RestoreAsync");
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            var drain = Call(fixture.Window, "DrainExitWritesAsync");
+            Assert(!drain.IsCompleted, "exit did not observe an admitted legacy revoke");
             var cts = (CancellationTokenSource)typeof(MainWindow).GetField("_authCts", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(fixture.Window)!;
             cts.Cancel(); await restore.WaitAsync(TimeSpan.FromSeconds(3));
+            await drain.WaitAsync(TimeSpan.FromSeconds(3));
             Assert(File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before) && fixture.Http.Seen.Count == 1
                 && fixture.Http.Seen[0].Uri.AbsolutePath == "/revoke_token" && OAuthSession(fixture.Window) is null,
                 "canceled revoke removed the retry record or restored an account");
+        });
+
+        await Run("OAuthScopes: exit waits for legacy revoke and prevents following device authorization", async () =>
+        {
+            foreach (var confirmed in new[] { false, true })
+            {
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var original = FakeSession with { Scope = null };
+                using var fixture = new OAuthScopesUiFixture("legacy-exit-drain", original, async (request, _) =>
+                {
+                    Assert(request.RequestUri!.AbsolutePath == "/revoke_token", "Unexpected auth during exit");
+                    entered.TrySetResult();
+                    await release.Task;
+                    return confirmed ? Json("""{"status":"ok"}""") : Json("{}", HttpStatusCode.ServiceUnavailable);
+                });
+                var login = fixture.Window.StartLoginAsync();
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+                    R4Set(fixture.Window, "_closeCommitInProgress", true);
+                    var drain = Call(fixture.Window, "DrainExitWritesAsync");
+                    Assert(!drain.IsCompleted && fixture.Store.Load() == original, "exit finished before legacy revocation completed");
+                    release.TrySetResult();
+                    await drain.WaitAsync(TimeSpan.FromSeconds(3));
+                    Assert(fixture.Store.Load() == (confirmed ? null : original) && fixture.Http.Seen.Count == 1,
+                        "exit did not honor the revoke result or sent a new device request");
+                    await login.WaitAsync(TimeSpan.FromSeconds(3));
+                }
+                finally
+                {
+                    release.TrySetResult();
+                    R4Set(fixture.Window, "_closeCommitInProgress", false);
+                }
+            }
+        });
+
+        await Run("OAuthScopes: a confirmed legacy revoke preserves a replacement session", async () =>
+        {
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var fixture = new OAuthScopesUiFixture("legacy-replaced-during-revoke", FakeSession with { Scope = null },
+                async (request, _) =>
+                {
+                    if (request.RequestUri!.AbsolutePath == "/revoke_token")
+                    {
+                        entered.TrySetResult();
+                        await release.Task;
+                        return Json("""{"status":"ok"}""");
+                    }
+                    if (request.RequestUri.AbsolutePath == "/account/status") return Json(OAuthConfirmedProfile);
+                    if (request.RequestUri.AbsolutePath == "/users/12345/likes/tracks") return Json("""{"result":{"library":{"tracks":[]}}}""");
+                    throw new InvalidOperationException("A replaced session was ignored");
+                });
+            var login = fixture.Window.StartLoginAsync();
+            try
+            {
+                await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+                fixture.Store.Save(FakeSession);
+                var replacement = File.ReadAllBytes(fixture.SessionPath);
+                release.TrySetResult();
+                await login.WaitAsync(TimeSpan.FromSeconds(3));
+                Assert(fixture.Http.Seen.Count == 1 && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(replacement),
+                    "a confirmed revoke deleted or replaced another saved grant");
+            }
+            finally { release.TrySetResult(); }
+            await fixture.Window.StartLoginAsync();
+            Assert(OAuthSession(fixture.Window) == FakeSession
+                && fixture.Http.Seen.All(sent => sent.Uri.AbsolutePath != "/device/code"),
+                "the replacement session could not be restored after confirming the obsolete revoke");
         });
 
         await Run("OAuthScopes: confirmed legacy revoke retries only local deletion after a sharing failure", async () =>
@@ -463,14 +690,197 @@ internal static partial class Program
                 _ => throw new InvalidOperationException("scoped restore reached unexpected route")
             }));
             var guest = PreloadGet<CancellationTokenSource>(fixture.Window, "_accountCts").Token;
+            var published = File.ReadAllBytes(fixture.SessionPath);
             await Call(fixture.Window, "RestoreAsync");
             Assert(OAuthSession(fixture.Window)?.Scope == OAuthMusicScopes && fixture.Store.Load()?.Scope == OAuthMusicScopes
                 && Control<TextBlock>(fixture.Window, "AccountText").Text == "Fixture Account"
+                && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(published)
                 && fixture.Http.Seen.Any(sent => sent.Uri.AbsolutePath == "/account/status")
                 && fixture.Http.Seen.All(sent => sent.Uri.Host == "api.music.yandex.net" && sent.Authorization == "OAuth " + FakeSession.AccessToken),
                 "restricted stored session no longer restores through its music account");
             Assert(guest.IsCancellationRequested && !PreloadGet<CancellationTokenSource>(fixture.Window, "_accountCts").IsCancellationRequested,
                 "activation did not invalidate guest work and open a live account scope");
+        });
+
+        await Run("OAuthScopes: legacy device ID migration waits for the confirmed profile and preserves its source", async () =>
+        {
+            foreach (var replaced in new[] { false, true })
+            {
+                var original = FakeSession with { DeviceId = "", ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(30) };
+                var replacement = FakeSession with { AccessToken = "fixture-replacement-access" };
+                var profiles = 0;
+                using var fixture = new OAuthScopesUiFixture("legacy-device-profile", original, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/account/status" => ++profiles == 1 ? Json("{}", HttpStatusCode.ServiceUnavailable) : Json(OAuthConfirmedProfile),
+                        "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                        _ => throw new InvalidOperationException("Device ID migration started an unexpected OAuth exchange")
+                    }));
+                var originalBytes = File.ReadAllBytes(fixture.SessionPath);
+                await Call(fixture.Window, "RestoreAsync");
+                Assert(OAuthSession(fixture.Window) is null && OAuthFlushSessionChange(fixture.Window)
+                    && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(originalBytes),
+                    "an unconfirmed profile published the normalized device ID");
+
+                if (replaced) fixture.Store.Save(replacement);
+                var beforeRetry = File.ReadAllBytes(fixture.SessionPath);
+                await fixture.Window.StartLoginAsync();
+                var active = OAuthSession(fixture.Window);
+                Assert(active is not null && Guid.TryParse(active.DeviceId, out _)
+                    && fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath)
+                        .SequenceEqual(["/account/status", "/account/status", "/users/12345/likes/tracks"]),
+                    "the legacy session did not confirm its profile with the normalized device ID");
+                Assert(replaced ? File.ReadAllBytes(fixture.SessionPath).SequenceEqual(beforeRetry) : fixture.Store.Load() == active,
+                    "device ID migration changed a replacement or failed to publish its own record");
+            }
+        });
+
+        await Run("OAuthScopes: stored access denial refreshes once and respects temporary or terminal failures", async () =>
+        {
+            foreach (var outcome in new[] { "success", "temporary-refresh", "invalid-grant" })
+            {
+                var refreshAttempts = 0;
+                using var fixture = new OAuthScopesUiFixture("early-access-denial", FakeSession, (request, _) =>
+                {
+                    if (request.RequestUri!.AbsolutePath == "/token")
+                    {
+                        refreshAttempts++;
+                        return Task.FromResult(outcome switch
+                        {
+                            "temporary-refresh" when refreshAttempts == 1 => Json("{}", HttpStatusCode.ServiceUnavailable),
+                            "invalid-grant" => Json("""{"error":"invalid_grant"}""", HttpStatusCode.BadRequest),
+                            _ => Json(OAuthRotatedTokens)
+                        });
+                    }
+                    return Task.FromResult(request.RequestUri.AbsolutePath switch
+                    {
+                        "/account/status" when request.Headers.Authorization?.Parameter == FakeSession.AccessToken
+                            => Json("{}", HttpStatusCode.Unauthorized),
+                        "/account/status" => Json(OAuthConfirmedProfile),
+                        "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                        _ => throw new InvalidOperationException("Profile recovery started an unexpected authorization exchange")
+                    });
+                });
+                var before = File.ReadAllBytes(fixture.SessionPath);
+                await Call(fixture.Window, "RestoreAsync");
+                Assert(refreshAttempts == 1 && fixture.Http.Seen.Take(2).Select(reply => reply.Uri.AbsolutePath).SequenceEqual(["/account/status", "/token"]),
+                    "a first access refusal did not use exactly one refresh for the saved session");
+                if (outcome == "temporary-refresh")
+                {
+                    Assert(OAuthSession(fixture.Window) is null && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before),
+                        "a temporary refresh failure deleted or replaced the old grant");
+                    await fixture.Window.StartLoginAsync();
+                    Assert(refreshAttempts == 2, "explicit retry did not reuse the original grant");
+                }
+                if (outcome == "invalid-grant")
+                {
+                    Assert(fixture.Store.Load() is null && OAuthSession(fixture.Window) is null,
+                        "a terminal rejection retained the unusable grant or activated the account");
+                }
+                else
+                {
+                    Assert(OAuthSession(fixture.Window) == fixture.Store.Load() && fixture.Store.Load() is { RefreshToken: "fixture-new-refresh" }
+                        && fixture.Http.Seen.Last(reply => reply.Uri.AbsolutePath == "/account/status").Authorization == "OAuth fixture-new-access",
+                        "profile recovery did not commit a valid rotation and activate the account");
+                }
+                Assert(fixture.Http.Seen.Where(sent => sent.Uri.AbsolutePath == "/token")
+                    .All(sent => OAuthForm(sent.Body)["refresh_token"] == FakeSession.RefreshToken),
+                    "profile recovery did not exchange the original refresh token");
+            }
+        });
+
+        await Run("OAuthScopes: profile 401 after a validated refresh retains the new grant until a profile retry", async () =>
+        {
+            foreach (var expired in new[] { false, true })
+            {
+                var stored = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(expired ? -5 : 30) };
+                // OAuth may renew the refresh token while retaining the same access token.
+                var access = expired ? stored.AccessToken : "fixture-new-access";
+                using var fixture = new OAuthScopesUiFixture("restored-profile-denied", stored, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/token" => Json(OAuthRotatedTokens.Replace("fixture-new-access", access, StringComparison.Ordinal)),
+                        "/account/status" => Json("{}", HttpStatusCode.Unauthorized),
+                        _ => throw new InvalidOperationException("Unconfirmed restored profile started another flow")
+                    }));
+
+                await Call(fixture.Window, "RestoreAsync");
+                string[] beforeRetry = expired ? ["/token", "/account/status"] : ["/account/status", "/token", "/account/status"];
+                Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(beforeRetry)
+                    && OAuthSession(fixture.Window) is null && PreloadGet<Account?>(fixture.Window, "_account") is null
+                    && fixture.Store.Load() is { AccessToken: var persistedAccess, RefreshToken: "fixture-new-refresh",
+                        DeviceProfilePending: false, ProfileRefreshValidated: true }
+                    && persistedAccess == access,
+                    "a resource-only refusal deleted a validated refresh grant, refreshed again, or activated a profile");
+
+                var rotated = File.ReadAllBytes(fixture.SessionPath);
+                await fixture.Window.StartLoginAsync();
+                Assert(fixture.Http.Seen.Skip(beforeRetry.Length).Select(sent => sent.Uri.AbsolutePath).SequenceEqual(["/account/status"])
+                    && fixture.Http.Seen.Last().Authorization == "OAuth " + access
+                    && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(rotated) && OAuthSession(fixture.Window) is null,
+                    "manual retry exchanged or changed the validated grant after a profile-only refusal");
+                fixture.Window.CloseSaveFailurePrompt = failure => throw new InvalidOperationException(failure);
+                fixture.Window.Close();
+                await Until(() => PreloadGet<bool>(fixture.Window, "_closed"));
+
+                var profiles = 0;
+                using var restarted = new OAuthScopesUiFixture("restarted-restored-profile-denied", null, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/account/status" when request.Headers.Authorization?.Parameter == access
+                            => ++profiles == 1 ? Json("{}", HttpStatusCode.Unauthorized) : Json(OAuthConfirmedProfile),
+                        "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                        _ => throw new InvalidOperationException("Restart started another exchange for the validated grant")
+                    }), existingSessionDirectory: fixture.DirectoryPath);
+                await Call(restarted.Window, "RestoreAsync");
+                Assert(restarted.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(["/account/status"])
+                    && OAuthSession(restarted.Window) is null && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(rotated),
+                    "restart did not preserve the rotated grant across another profile refusal");
+                await restarted.Window.StartLoginAsync();
+                Assert(PreloadGet<Account?>(restarted.Window, "_account")?.Uid == "12345"
+                    && restarted.Http.Seen.Select(sent => sent.Uri.AbsolutePath)
+                        .SequenceEqual(["/account/status", "/account/status", "/users/12345/likes/tracks"])
+                    && restarted.Store.Load() is { ProfileRefreshValidated: false, DeviceProfilePending: false }
+                    && OAuthSession(restarted.Window) == restarted.Store.Load(),
+                    "restart did not confirm the same access or settle the profile validation marker");
+            }
+        });
+
+        await Run("OAuthScopes: ambiguous profile identity cannot activate or authorize a playlist write", async () =>
+        {
+            var replies = new[]
+            {
+                """{"result":{"account":{"uid":6789}},"result":{"account":{"uid":12345}}}""",
+                """{"result":{"account":{"uid":6789},"account":{"uid":12345}}}""",
+                """{"result":{"account":{"uid":6789,"uid":12345}}}"""
+            };
+            foreach (var reply in replies)
+            {
+                var read = 0;
+                using var fixture = new OAuthScopesUiFixture("ambiguous-profile", FakeSession, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/account/status" => Json(++read == 1 ? reply : OAuthConfirmedProfile),
+                        "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                        _ => throw new InvalidOperationException("Ambiguous profile sent an account-bound request")
+                    }));
+                var before = File.ReadAllBytes(fixture.SessionPath);
+                await Call(fixture.Window, "RestoreAsync");
+                Assert(OAuthSession(fixture.Window) is null && fixture.Http.Seen.Count == 1
+                    && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before),
+                    "ambiguous identity activated an account or erased the prior grant");
+                await fixture.Window.StartLoginAsync();
+                Assert(PreloadGet<Account?>(fixture.Window, "_account")?.Uid == "12345"
+                    && fixture.Http.Seen.All(sent => sent.Uri.AbsolutePath != "/device/code"),
+                    "an unambiguous reread could not restore the original authorization");
+
+                var http = new FakeHandler((request, _) => request.RequestUri!.AbsolutePath == "/account/status"
+                    ? Task.FromResult(Json(reply)) : throw new InvalidOperationException("Ambiguous profile reached a playlist write"));
+                using var api = new MusicApi(http);
+                var error = await Throws<MusicException>(() => api.CreatePlaylistAsync(FakeSession, "Fixture playlist", default));
+                Assert(!error.Authentication && http.Seen.Count == 1,
+                    "a duplicate owner field allowed a write or became terminal authentication failure");
+            }
         });
 
         await Run("OAuthScopes: optional profile refusal after confirmed account does not block activation", async () =>
@@ -563,6 +973,208 @@ internal static partial class Program
                 && fixture.Http.Seen[1].Authorization == "OAuth fixture-new-access", "restore did not use the rotated access token");
         });
 
+        await Run("OAuthScopes: startup retries HTTP 408 and ambiguous refresh replies without a device code", async () =>
+        {
+            (HttpStatusCode Status, string Body)[] failures =
+            [
+                (HttpStatusCode.RequestTimeout, """{"error":"invalid_grant"}"""),
+                (HttpStatusCode.TooManyRequests, """{"error":"invalid_grant"}"""),
+                (HttpStatusCode.ServiceUnavailable, """{"error":"invalid_grant"}"""),
+                (HttpStatusCode.BadRequest, """{"error":"invalid_client"}"""),
+                (HttpStatusCode.BadRequest, """{"error":"invalid_client","error":"invalid_grant"}"""),
+                (HttpStatusCode.BadRequest, """{"error":"invalid_grant","access_token":"fixture-contradictory"}"""),
+                (HttpStatusCode.Unauthorized, """{"error":"invalid_client"}"""),
+                (HttpStatusCode.Unauthorized, """{"error":"fixture-private-response"}"""),
+                (HttpStatusCode.Unauthorized, ""),
+                (HttpStatusCode.Unauthorized, """{"error":"invalid_client","error":"invalid_grant"}"""),
+                (HttpStatusCode.Unauthorized, """{"error":"invalid_grant","refresh_token":"fixture-contradictory"}"""),
+                (HttpStatusCode.OK, """{"error":"fixture-private-response"}"""),
+                (HttpStatusCode.OK, """{"error":"invalid_grant"}"""),
+                (HttpStatusCode.OK, """{"error":null}"""),
+                (HttpStatusCode.OK, """{"access_token":42}"""),
+                (HttpStatusCode.OK, OAuthConflictingScopes(restrictedLast: true)),
+                (HttpStatusCode.OK, OAuthConflictingScopes(restrictedLast: false)),
+                (HttpStatusCode.OK, "not JSON")
+            ];
+            var expired = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
+            var attempts = 0;
+            using var fixture = new OAuthScopesUiFixture("refresh-startup-recovery", expired, (request, _) =>
+            {
+                if (request.RequestUri!.AbsolutePath == "/token")
+                {
+                    if (attempts >= failures.Length) return Task.FromResult(Json(OAuthRotatedTokens));
+                    var failure = failures[attempts++];
+                    return Task.FromResult(Json(failure.Body, failure.Status));
+                }
+                return Task.FromResult(request.RequestUri.AbsolutePath switch
+                {
+                    "/account/status" => Json("""{"result":{"account":{"uid":12345,"displayName":"Fixture","avatarId":"123/fixture"}}}"""),
+                    "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                    _ => throw new InvalidOperationException("A nonterminal refresh attempted to start another device flow")
+                });
+            });
+            var before = File.ReadAllBytes(fixture.SessionPath);
+            for (var attempt = 0; attempt < failures.Length; attempt++)
+            {
+                if (attempt == 0) await Call(fixture.Window, "RestoreAsync");
+                else await fixture.Window.StartLoginAsync();
+                Assert(OAuthSession(fixture.Window) is null && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before)
+                    && fixture.Http.Seen.Count == attempt + 1,
+                    "nonterminal startup failure removed or replaced the saved grant");
+            }
+            await fixture.Window.StartLoginAsync();
+            var renewals = fixture.Http.Seen.Where(sent => sent.Uri.AbsolutePath == "/token").ToArray();
+            Assert(renewals.Length == failures.Length + 1
+                && renewals.All(sent => OAuthForm(sent.Body)["refresh_token"] == expired.RefreshToken)
+                && fixture.Http.Seen.All(sent => sent.Uri.AbsolutePath != "/device/code")
+                && OAuthSession(fixture.Window) == fixture.Store.Load()
+                && fixture.Store.Load() is { RefreshToken: "fixture-new-refresh", Scope: OAuthMusicScopes },
+                "explicit retry failed to rotate the original grant and activate the account");
+        });
+
+        await Run("OAuthScopes: conflicting device token scopes never activate or save a new grant", async () =>
+        {
+            foreach (var restrictedLast in new[] { false, true })
+            {
+                using var fixture = new OAuthScopesUiFixture("device-duplicate-scope", null, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/device/code" => Json(OAuthDeviceReply),
+                        "/token" => Json(OAuthConflictingScopes(restrictedLast)),
+                        _ => throw new InvalidOperationException("Ambiguous device token reached a profile request")
+                    }));
+                await fixture.Window.StartLoginAsync();
+                Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(["/device/code", "/token"])
+                    && fixture.Store.Load() is null && OAuthSession(fixture.Window) is null,
+                    "a duplicate scope order activated or saved a new grant");
+            }
+        });
+
+        await Run("OAuthScopes: confirmed startup refresh rejection clears only the rejected grant", async () =>
+        {
+            foreach (var status in new[] { HttpStatusCode.BadRequest, HttpStatusCode.Unauthorized })
+            {
+                var expired = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
+                using var fixture = new OAuthScopesUiFixture("refresh-terminal", expired, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/token" => Json("""{"error":"invalid_grant"}""", status),
+                        "/device/code" => Json("""{"error":"fixture-stop"}""", HttpStatusCode.BadRequest),
+                        _ => throw new InvalidOperationException("Rejected grant was used for a Music API request")
+                    }));
+                await Call(fixture.Window, "RestoreAsync");
+                Assert(fixture.Store.Load() is null && OAuthSession(fixture.Window) is null
+                    && fixture.Http.Seen.Count == 1
+                    && Control<TextBlock>(fixture.Window, "StatusText").Text.Contains("Войдите заново", StringComparison.Ordinal),
+                    "terminal rejection did not retire the expired grant and request a new login");
+                await fixture.Window.StartLoginAsync();
+                Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(["/token", "/device/code"]),
+                    "a terminally rejected grant was retried instead of requesting a new code");
+            }
+        });
+
+        await Run("OAuthScopes: terminal refresh retires the exact legacy device record during update preparation", async () =>
+        {
+            foreach (var replaced in new[] { false, true })
+            {
+                var old = FakeSession with { DeviceId = "", ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
+                var latest = FakeSession with { AccessToken = "fixture-replacement-access", RefreshToken = "fixture-replacement-refresh" };
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                using var fixture = new OAuthScopesUiFixture("legacy-device-terminal", old, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/token":
+                            entered.TrySetResult();
+                            await release.Task;
+                            return Json("""{"error":"invalid_grant"}""", HttpStatusCode.BadRequest);
+                        case "/device/code": return Json("""{"error":"fixture-stop"}""", HttpStatusCode.BadRequest);
+                        case "/account/status" when replaced && request.Headers.Authorization?.Parameter == latest.AccessToken:
+                            return Json(OAuthConfirmedProfile);
+                        case "/users/12345/likes/tracks" when replaced:
+                            return Json("""{"result":{"library":{"tracks":[]}}}""");
+                        default: throw new InvalidOperationException("Unexpected legacy device rejection route");
+                    }
+                });
+
+                var restore = Call(fixture.Window, "RestoreAsync");
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    Assert(Guid.TryParse(PreloadGet<Session?>(fixture.Window, "_unactivatedSession")?.DeviceId, out _),
+                        "the legacy device ID was not normalized for the active restore");
+                    R4Set(fixture.Window, "_appUpdatePreparingRestart", true);
+                    if (replaced) fixture.Store.Save(latest);
+                    var replacementBytes = replaced ? File.ReadAllBytes(fixture.SessionPath) : null;
+                    release.TrySetResult();
+                    await restore;
+
+                    Assert(fixture.Http.Seen.Count == 1
+                        && PreloadGet<Session?>(fixture.Window, "_unactivatedSession") is null && OAuthSession(fixture.Window) is null,
+                        "terminal refresh did not retire the normalized pending session");
+                    Assert(replaced ? File.ReadAllBytes(fixture.SessionPath).SequenceEqual(replacementBytes!) : fixture.Store.Load() is null,
+                        "terminal refresh removed a replacement or left its exact original grant");
+                }
+                finally
+                {
+                    release.TrySetResult();
+                    R4Set(fixture.Window, "_appUpdatePreparingRestart", false);
+                }
+
+                await fixture.Window.StartLoginAsync();
+                string[] expected = replaced ? ["/token", "/account/status", "/users/12345/likes/tracks"] : ["/token", "/device/code"];
+                Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(expected),
+                    "explicit login repeated a rejected refresh, skipped the replacement, or failed to request a new code");
+            }
+        });
+
+        await Run("OAuthScopes: rotation updates the exact retirement record only after a successful write", async () =>
+        {
+            foreach (var lockStore in new[] { false, true })
+            {
+                var original = FakeSession with { DeviceId = "", ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                using var fixture = new OAuthScopesUiFixture("rotation-retirement-record", original, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/token":
+                            var refreshToken = OAuthForm(await request.Content!.ReadAsStringAsync())["refresh_token"];
+                            if (refreshToken != original.RefreshToken)
+                                return Json("""{"error":"invalid_grant"}""", HttpStatusCode.BadRequest);
+                            entered.TrySetResult();
+                            await release.Task;
+                            return Json(OAuthRotatedTokens.Replace("3600", "1", StringComparison.Ordinal));
+                        case "/account/status":
+                            return Json("{}", HttpStatusCode.ServiceUnavailable);
+                        default: throw new InvalidOperationException("Unexpected rotation retirement route");
+                    }
+                });
+
+                var restore = Call(fixture.Window, "RestoreAsync");
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    using var held = lockStore ? File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None) : null;
+                    release.TrySetResult();
+                    await restore;
+                }
+                finally { release.TrySetResult(); }
+
+                Assert(lockStore ? fixture.Store.Load() == original : fixture.Store.Load() is { RefreshToken: "fixture-new-refresh" },
+                    "the fixture did not exercise the selected persistence result");
+                var pending = PreloadGet<Session>(fixture.Window, "_unactivatedSession");
+                await Until(() => pending.ExpiresAtUtc <= DateTimeOffset.UtcNow);
+                await fixture.Window.StartLoginAsync();
+                Assert(fixture.Store.Load() is null && OAuthSession(fixture.Window) is null
+                    && fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(["/token", "/account/status", "/token"])
+                    && OAuthForm(fixture.Http.Seen.Last().Body)["refresh_token"] == "fixture-new-refresh",
+                    "terminal refresh did not remove the grant actually present on disk");
+            }
+        });
+
         await Run("OAuthScopes: malformed account status cannot activate an account or erase a rotated grant", async () =>
         {
             var expired = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
@@ -624,36 +1236,746 @@ internal static partial class Program
 
         await Run("OAuthScopes: approved device login retries the profile without requesting another device code", async () =>
         {
-            OAuthScopesUiFixture? active = null;
-            var confirmedBeforeProfile = false;
-            var profiles = 0;
-            using var fixture = new OAuthScopesUiFixture("approved-device-profile", null, (request, _) =>
+            foreach (var denied in new[] { false, true })
             {
-                return Task.FromResult(request.RequestUri!.AbsolutePath switch
+                OAuthScopesUiFixture? active = null;
+                var confirmedBeforeProfile = false;
+                var profiles = 0;
+                var posts = 0;
+                using var fixture = new OAuthScopesUiFixture("approved-device-profile", null, (request, _) =>
                 {
-                    "/device/code" => Json(OAuthDeviceReply),
-                    "/token" => Json(OAuthRotatedTokens),
-                    "/account/status" => ProfileReply(),
-                    "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
-                    _ => throw new InvalidOperationException("Unexpected device login fixture route")
+                    return Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/device/code" => Json(OAuthDeviceReply),
+                        "/token" => ++posts == 1 ? Json(OAuthRotatedTokens) : Json("{}", HttpStatusCode.ServiceUnavailable),
+                        "/account/status" => ProfileReply(),
+                        "/users/12345/likes/tracks" when !denied => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                        _ => throw new InvalidOperationException("Unexpected device login fixture route")
+                    });
                 });
+                active = fixture;
+
+                await fixture.Window.StartLoginAsync();
+                Assert(confirmedBeforeProfile && OAuthSession(fixture.Window) is null, "temporary profile error lost or activated the accepted grant");
+                await fixture.Window.StartLoginAsync();
+                Assert(fixture.Http.Seen.Count(sent => sent.Uri.AbsolutePath == "/device/code") == 1 && posts == 1 && profiles == 2,
+                    "repeating login requested a second token POST instead of finishing the current authorization");
+                Assert(denied ? OAuthSession(fixture.Window) is null && fixture.Store.Load() is null
+                        && PreloadGet<Session?>(fixture.Window, "_unactivatedSession") is null
+                    : OAuthSession(fixture.Window) is { AccessToken: "fixture-new-access" },
+                    "retrying a device profile did not keep its terminal or successful outcome");
+
+                HttpResponseMessage ProfileReply()
+                {
+                    confirmedBeforeProfile = active!.Store.Load() is { Scope: OAuthMusicScopes, RefreshToken: "fixture-new-refresh" };
+                    return ++profiles == 1 ? Json("{}", HttpStatusCode.ServiceUnavailable)
+                        : denied ? Json("{}", HttpStatusCode.Unauthorized) : Json(OAuthConfirmedProfile);
+                }
+            }
+        });
+
+        await Run("OAuthScopes: canceled close drains the sent device exchange and retries only the profile", async () =>
+        {
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            OAuthScopesUiFixture? active = null;
+            using var fixture = new OAuthScopesUiFixture("close-during-device-token", FakeSession, async (request, _) =>
+            {
+                switch (request.RequestUri!.AbsolutePath)
+                {
+                    case "/device/code": return Json(OAuthDeviceReply);
+                    case "/token":
+                        entered.TrySetResult();
+                        await release.Task;
+                        return Json(OAuthRotatedTokens);
+                    case "/account/status":
+                        Assert(!PreloadGet<bool>(active!.Window, "_closeCommitInProgress"), "a profile request overtook close preparation");
+                        return Json("""{"result":{"account":{"uid":12345,"displayName":"Fixture","avatarId":"123/fixture"}}}""");
+                    case "/users/12345/likes/tracks": return Json("""{"result":{"library":{"tracks":[]}}}""");
+                    default: throw new InvalidOperationException("Unexpected close fixture route");
+                }
             });
             active = fixture;
-
-            await fixture.Window.StartLoginAsync();
-            Assert(confirmedBeforeProfile && OAuthSession(fixture.Window) is null, "temporary profile error lost or activated the accepted grant");
-            await fixture.Window.StartLoginAsync();
-            Assert(OAuthSession(fixture.Window) is { AccessToken: "fixture-new-access" }
-                && fixture.Http.Seen.Count(sent => sent.Uri.AbsolutePath == "/device/code") == 1
-                && fixture.Http.Seen.Count(sent => sent.Uri.AbsolutePath == "/token") == 1 && profiles == 2,
-                "repeating login requested another code instead of finishing the current authorization");
-
-            HttpResponseMessage ProfileReply()
+            string? closeFailure = null;
+            fixture.Window.CloseSaveFailurePrompt = reason =>
             {
-                confirmedBeforeProfile = active!.Store.Load() is { Scope: OAuthMusicScopes, RefreshToken: "fixture-new-refresh" };
-                return ++profiles == 1 ? Json("{}", HttpStatusCode.ServiceUnavailable)
-                    : Json("""{"result":{"account":{"uid":12345,"displayName":"Fixture Account","avatarId":"567/fixture"}}}""");
+                closeFailure = reason;
+                return MessageBoxResult.Cancel;
+            };
+            var login = fixture.Window.StartLoginAsync();
+            try
+            {
+                await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                using (File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    fixture.Window.Close();
+                    var drain = Call(fixture.Window, "DrainExitWritesAsync");
+                    Assert(!drain.IsCompleted && closeFailure is null, "close did not wait for the already-sent device POST");
+                    release.TrySetResult();
+                    await login.WaitAsync(TimeSpan.FromSeconds(3));
+                    await Until(() => !PreloadGet<bool>(fixture.Window, "_closeCommitInProgress"));
+                    Assert(closeFailure?.Contains("Не удалось сохранить обновлённый вход", StringComparison.Ordinal) == true,
+                        "close omitted the failed write of the accepted device token");
+                }
             }
+            finally
+            {
+                release.TrySetResult();
+                fixture.Window.CloseSaveFailurePrompt = null;
+            }
+
+            if (OAuthSession(fixture.Window) is null) await fixture.Window.StartLoginAsync();
+            else Assert(OAuthFlushSessionChange(fixture.Window), "the accepted grant could not be saved after canceling close");
+            Assert(OAuthSession(fixture.Window) == fixture.Store.Load() && fixture.Store.Load() is { RefreshToken: "fixture-new-refresh" }
+                && fixture.Http.Seen.Count(sent => sent.Uri.AbsolutePath == "/device/code") == 1
+                && fixture.Http.Seen.Count(sent => sent.Uri.AbsolutePath == "/token") == 1,
+                "canceling close lost the accepted grant or started another device flow");
+        });
+
+        await Run("OAuthScopes: a deferred device profile rejection never refreshes or removes a different saved login", async () =>
+        {
+            foreach (var apply in new[] { false, true })
+            {
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var finishDownload = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var posts = 0;
+                using var fixture = new OAuthScopesUiFixture("device-rejection-after-exit", FakeSession, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/device/code": return Json(OAuthDeviceReply);
+                        case "/token":
+                            if (++posts != 1) return Json("{}", HttpStatusCode.ServiceUnavailable);
+                            entered.TrySetResult();
+                            await release.Task;
+                            return Json(OAuthRotatedTokens);
+                        case "/account/status": return Json("{}", HttpStatusCode.Unauthorized);
+                        default: throw new InvalidOperationException("Unexpected deferred device fixture route");
+                    }
+                });
+                var bytes = File.ReadAllBytes(fixture.SessionPath);
+                var (updates, backend) = await OAuthPendingUpdate(fixture);
+                string? closeFailure = null;
+                fixture.Window.CloseSaveFailurePrompt = reason => { closeFailure = reason; return MessageBoxResult.Cancel; };
+                var login = fixture.Window.StartLoginAsync();
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    using var held = File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None);
+                    // Exit can resume before the login continuation after the
+                    // token write. Keep a normal exit dependency pending.
+                    R4Set(fixture.Window, "_downloadTask", finishDownload.Task);
+                    var applying = apply ? R4Task<bool>(fixture.Window, "ApplyAppUpdateAsync", updates) : null;
+                    if (!apply) fixture.Window.Close();
+                    var exitFlag = apply ? "_appUpdatePreparingRestart" : "_closeCommitInProgress";
+                    Assert(PreloadGet<bool>(fixture.Window, exitFlag),
+                        "the fixture did not pause the admitted device grant before its first profile");
+                    release.TrySetResult();
+                    await login.WaitAsync(TimeSpan.FromSeconds(4));
+                    Assert(PreloadGet<bool>(fixture.Window, exitFlag)
+                        && fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(["/device/code", "/token"]),
+                        $"the first profile was admitted during {(apply ? "apply" : "close")} preparation");
+                    finishDownload.TrySetResult();
+                    if (applying is not null)
+                        Assert(!await applying && backend.Applies == 0, "apply bypassed the pending session save");
+                    else
+                    {
+                        await Until(() => !PreloadGet<bool>(fixture.Window, "_closeCommitInProgress"));
+                        Assert(closeFailure?.Contains("Не удалось сохранить обновлённый вход", StringComparison.Ordinal) == true,
+                            "close omitted the pending session save");
+                    }
+                }
+                finally
+                {
+                    release.TrySetResult();
+                    finishDownload.TrySetResult();
+                    R4Set(fixture.Window, "_downloadTask", null);
+                    fixture.Window.CloseSaveFailurePrompt = null;
+                }
+
+                Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(["/device/code", "/token"]),
+                    "exit preparation left an unsolicited profile request");
+                await fixture.Window.StartLoginAsync();
+                Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(["/device/code", "/token", "/account/status"])
+                    && OAuthSession(fixture.Window) is null && PreloadGet<Session?>(fixture.Window, "_unactivatedSession") is null
+                    && OAuthFlushSessionChange(fixture.Window) && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(bytes),
+                    "the first profile rejection started a refresh or mutated a different saved login");
+            }
+        });
+
+        await Run("OAuthScopes: profile activation keeps the session write result reached during close or apply", async () =>
+        {
+            foreach (var apply in new[] { false, true })
+            foreach (var (removed, restoring) in new[] { (true, false), (false, false), (false, true) })
+            {
+                var original = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(restoring ? -5 : 30) };
+                var tokenEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var releaseToken = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var profileEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var releaseProfile = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var tokenPosts = 0;
+                using var fixture = new OAuthScopesUiFixture("profile-save-result", original, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/device/code" when !restoring: return Json(OAuthDeviceReply);
+                        case "/token":
+                            if (++tokenPosts == 2 && removed)
+                                return Json(OAuthRotatedTokens.Replace("fixture-new-", "fixture-later-", StringComparison.Ordinal));
+                            if (tokenPosts == 3 && removed)
+                                return Json(OAuthRotatedTokens.Replace("fixture-new-", "fixture-new-login-", StringComparison.Ordinal));
+                            Assert(tokenPosts == 1, "activation admitted an unexpected refresh");
+                            tokenEntered.TrySetResult();
+                            await releaseToken.Task;
+                            return Json(removed ? OAuthRotatedTokens.Replace("3600", "30", StringComparison.Ordinal) : OAuthRotatedTokens);
+                        case "/account/status":
+                            profileEntered.TrySetResult();
+                            await releaseProfile.Task;
+                            return Json(OAuthConfirmedProfile);
+                        case "/users/12345/likes/tracks": return Json("""{"result":{"library":{"tracks":[]}}}""");
+                        default: throw new InvalidOperationException("Unexpected profile activation route");
+                    }
+                });
+                var preferences = new PreferencesStore(Path.Combine(fixture.DirectoryPath, "close-preferences"));
+                preferences.Save(new PlayerPreferences());
+                R4Set(fixture.Window, "_preferenceStore", preferences);
+                var (updates, backend) = await OAuthPendingUpdate(fixture);
+                R4Set(fixture.Window, "_appUpdatesOverride", updates);
+                var login = restoring ? Call(fixture.Window, "RestoreAsync") : fixture.Window.StartLoginAsync();
+                try
+                {
+                    await tokenEntered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    using (File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                    {
+                        releaseToken.TrySetResult();
+                        await profileEntered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                        Assert(!OAuthFlushSessionChange(fixture.Window), "the device save was not pending while its profile was held");
+                    }
+                    Assert(fixture.Store.Load() == original, "the original record changed during the blocked save");
+                    if (removed) fixture.Store.Clear();
+
+                    // The browser decision has already been reached with restore:false.
+                    R4Set(fixture.Window, "_restore", true);
+                    using (File.Open(preferences.FilePath, FileMode.Open, FileAccess.Read, FileShare.None))
+                    {
+                        if (apply)
+                        {
+                            Assert(!await R4Task<bool>(fixture.Window, "ApplyAppUpdateAsync", updates) && backend.Applies == 0
+                                && PreloadGet<string?>(fixture.Window, "_appUpdateFailure")?.Contains("настройки", StringComparison.Ordinal) == true,
+                                "apply did not resolve the session save before deferring on preferences");
+                        }
+                        else
+                        {
+                            string? failure = null;
+                            fixture.Window.CloseSaveFailurePrompt = reason => { failure = reason; return MessageBoxResult.Cancel; };
+                            fixture.Window.Close();
+                            await Until(() => !PreloadGet<bool>(fixture.Window, "_closeCommitInProgress"));
+                            Assert(failure is not null && failure.Contains("настройки", StringComparison.Ordinal)
+                                && !failure.Contains("обновлённый вход", StringComparison.Ordinal)
+                                && !PreloadGet<bool>(fixture.Window, "_closed"),
+                                "close did not resolve the session save before canceling on preferences");
+                        }
+                    }
+                    R4Set(fixture.Window, "_restore", false);
+                    var written = fixture.Store.Load();
+                    Assert(!login.IsCompleted && (removed ? written is null
+                        : written is { RefreshToken: "fixture-new-refresh" } && written.DeviceProfilePending != restoring
+                            && written.ProfileRefreshValidated == restoring),
+                        "exit preparation did not settle the original save while the profile was held");
+
+                    releaseProfile.TrySetResult();
+                    await login.WaitAsync(TimeSpan.FromSeconds(4));
+                    var active = OAuthSession(fixture.Window);
+                    string[] routes = restoring ? ["/token", "/account/status", "/users/12345/likes/tracks"]
+                        : removed ? ["/device/code", "/token", "/account/status", "/token", "/users/12345/likes/tracks"]
+                        : ["/device/code", "/token", "/account/status", "/users/12345/likes/tracks"];
+                    Assert(active is { DeviceProfilePending: false }
+                        && active.RefreshToken == (removed ? "fixture-later-refresh" : "fixture-new-refresh")
+                        && PreloadGet<Account?>(fixture.Window, "_account")?.Uid == "12345"
+                        && fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(routes)
+                        && OAuthFlushSessionChange(fixture.Window),
+                        "the confirmed profile did not activate once after the window remained open");
+                    Assert(removed ? !File.Exists(fixture.SessionPath)
+                        : fixture.Store.Load() == (written! with { DeviceProfilePending = false, ProfileRefreshValidated = false }),
+                        "profile activation or refresh recreated a removed login or did not settle its pending profile");
+                    if (removed)
+                    {
+                        fixture.Window.SignOut();
+                        await fixture.Window.StartLoginAsync();
+                        Assert(fixture.Store.Load() is { RefreshToken: "fixture-new-login-refresh", DeviceProfilePending: false }
+                            && OAuthSession(fixture.Window) == fixture.Store.Load() && tokenPosts == 3,
+                            "new device authorization could not publish after independently observing the empty path");
+                    }
+                }
+                finally
+                {
+                    releaseToken.TrySetResult();
+                    releaseProfile.TrySetResult();
+                    fixture.Window.CloseSaveFailurePrompt = null;
+                    R4Set(fixture.Window, "_restore", false);
+                }
+            }
+        });
+
+        await Run("OAuthScopes: a restarted pending device profile is verified or retired without another token POST", async () =>
+        {
+            foreach (var apply in new[] { false, true })
+            foreach (var denied in new[] { false, true })
+            {
+                var first = new OAuthScopesUiFixture("pending-device-restart", null, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/device/code" => Json(OAuthDeviceReply),
+                        "/token" => Json(OAuthRotatedTokens),
+                        "/account/status" => Json("{}", HttpStatusCode.ServiceUnavailable),
+                        _ => throw new InvalidOperationException("Unexpected first device profile route")
+                    }));
+                using (first)
+                {
+                    await first.Window.StartLoginAsync();
+                    Assert(first.Store.Load() is { RefreshToken: "fixture-new-refresh", DeviceProfilePending: true }
+                        && OAuthSession(first.Window) is null,
+                        "the incomplete device grant was not saved with its pending profile provenance");
+                    if (apply)
+                    {
+                        var (updates, backend) = await OAuthPendingUpdate(first);
+                        Assert(await R4Task<bool>(first.Window, "ApplyAppUpdateAsync", updates) && backend.Applies == 1,
+                            "fixture apply did not finish with the pending device grant");
+                    }
+                    else
+                    {
+                        first.Window.CloseSaveFailurePrompt = failure => throw new InvalidOperationException(failure);
+                        first.Window.Close();
+                        await Until(() => PreloadGet<bool>(first.Window, "_closed"));
+                    }
+                }
+
+                using var reopened = new OAuthScopesUiFixture("reopened-pending-device", null, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/account/status" => denied ? Json("{}", HttpStatusCode.Unauthorized) : Json(OAuthConfirmedProfile),
+                        "/users/12345/likes/tracks" when !denied => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                        "/token" => Json("{}", HttpStatusCode.ServiceUnavailable),
+                        _ => throw new InvalidOperationException("Restarted device profile started unexpected authorization")
+                    }), existingSessionDirectory: first.DirectoryPath);
+                await Call(reopened.Window, "RestoreAsync");
+                string[] routes = denied ? ["/account/status"] : ["/account/status", "/users/12345/likes/tracks"];
+                Assert(reopened.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(routes)
+                    && (denied ? reopened.Store.Load() is null && OAuthSession(reopened.Window) is null
+                        : reopened.Store.Load() is { RefreshToken: "fixture-new-refresh", DeviceProfilePending: false }
+                            && OAuthSession(reopened.Window) == reopened.Store.Load()),
+                    "restart refreshed before the first confirmed profile or failed to settle its exact stored grant");
+            }
+        });
+
+        await Run("OAuthScopes: an expired pending device grant refreshes before its first profile after restart", async () =>
+        {
+            foreach (var (apply, locked, replaced) in new[] { (false, false, false), (true, true, false), (true, true, true) })
+            {
+                using var first = new OAuthScopesUiFixture("expired-pending-device", null, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/device/code" => Json(OAuthDeviceReply),
+                        "/token" => Json(OAuthRotatedTokens),
+                        "/account/status" => Json("{}", HttpStatusCode.ServiceUnavailable),
+                        _ => throw new InvalidOperationException("Unexpected initial device login route")
+                    }));
+                await first.Window.StartLoginAsync();
+                var pending = first.Store.Load() ?? throw new InvalidOperationException("device grant was not saved");
+                Assert(pending.DeviceProfilePending && OAuthSession(first.Window) is null,
+                    "the initial temporary profile failure did not retain the pending grant");
+                if (apply)
+                {
+                    var (updates, backend) = await OAuthPendingUpdate(first);
+                    Assert(await R4Task<bool>(first.Window, "ApplyAppUpdateAsync", updates) && backend.Applies == 1,
+                        "apply did not keep the pending grant for restart");
+                }
+                else
+                {
+                    first.Window.CloseSaveFailurePrompt = failure => throw new InvalidOperationException(failure);
+                    first.Window.Close();
+                    await Until(() => PreloadGet<bool>(first.Window, "_closed"));
+                }
+                pending = pending with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-1) };
+                first.Store.Save(pending);
+                var original = File.ReadAllBytes(first.SessionPath);
+
+                var refreshes = 0;
+                var pendingAtProfile = false;
+                using var reopened = new OAuthScopesUiFixture("reopened-expired-device", null, (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/token":
+                            return Task.FromResult(++refreshes == 1 ? Json("{}", HttpStatusCode.ServiceUnavailable)
+                                : Json(OAuthRotatedTokens.Replace("fixture-new-", "fixture-recovered-", StringComparison.Ordinal)));
+                        case "/account/status":
+                            pendingAtProfile = request.Headers.Authorization?.Parameter == "fixture-recovered-access";
+                            return Task.FromResult(Json("{}", HttpStatusCode.Unauthorized));
+                        default: throw new InvalidOperationException("Expired device grant started an unexpected exchange");
+                    }
+                }, existingSessionDirectory: first.DirectoryPath);
+                await Call(reopened.Window, "RestoreAsync");
+                Assert(reopened.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(["/token"])
+                    && OAuthSession(reopened.Window) is null && File.ReadAllBytes(first.SessionPath).SequenceEqual(original),
+                    "a transient refresh attempted the stale profile or changed the pending stored grant");
+
+                using (var held = locked ? File.Open(first.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None) : null)
+                {
+                    await reopened.Window.StartLoginAsync();
+                    if (locked) Assert(!OAuthFlushSessionChange(reopened.Window), "the profile 401 dropped the locked rotation");
+                }
+                Assert(pendingAtProfile && reopened.Http.Seen.Select(sent => sent.Uri.AbsolutePath)
+                    .SequenceEqual(["/token", "/token", "/account/status"])
+                    && reopened.Http.Seen.Take(2).All(sent => OAuthForm(sent.Body)["refresh_token"] == pending.RefreshToken)
+                    && OAuthSession(reopened.Window) is null,
+                    "a profile-only 401 refreshed again or activated an unverified account");
+                if (replaced)
+                {
+                    first.Store.Save(FakeSession with { AccessToken = "fixture-independent-login" });
+                    var replacement = File.ReadAllBytes(first.SessionPath);
+                    Assert(OAuthFlushSessionChange(reopened.Window), "a replacement did not supersede the old pending rotation");
+                    await reopened.Window.StartLoginAsync();
+                    Assert(reopened.Http.Seen.Select(sent => sent.Uri.AbsolutePath)
+                        .SequenceEqual(["/token", "/token", "/account/status", "/account/status"])
+                        && File.ReadAllBytes(first.SessionPath).SequenceEqual(replacement),
+                        "retrying a rotated profile exchanged twice or deleted the independent login");
+                    continue;
+                }
+                Assert(OAuthFlushSessionChange(reopened.Window)
+                    && reopened.Store.Load() is { RefreshToken: "fixture-recovered-refresh", DeviceProfilePending: true, ProfileRefreshValidated: true },
+                    "the verified refresh was not retained with its pending profile");
+                var rotated = File.ReadAllBytes(first.SessionPath);
+                await reopened.Window.StartLoginAsync();
+                Assert(reopened.Http.Seen.Select(sent => sent.Uri.AbsolutePath)
+                    .SequenceEqual(["/token", "/token", "/account/status", "/account/status"])
+                    && File.ReadAllBytes(first.SessionPath).SequenceEqual(rotated),
+                    "the in-window retry did not preserve the exact rotated grant");
+                reopened.Window.CloseSaveFailurePrompt = failure => throw new InvalidOperationException(failure);
+                reopened.Window.Close();
+                await Until(() => PreloadGet<bool>(reopened.Window, "_closed"));
+
+                var profiles = 0;
+                using var restarted = new OAuthScopesUiFixture("restarted-rotated-device", null, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/account/status" when request.Headers.Authorization?.Parameter == "fixture-recovered-access"
+                            => ++profiles == 1 ? Json("{}", HttpStatusCode.Unauthorized) : Json(OAuthConfirmedProfile),
+                        "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                        _ => throw new InvalidOperationException("Restarting the rotated grant requested another OAuth exchange")
+                    }), existingSessionDirectory: first.DirectoryPath);
+                await Call(restarted.Window, "RestoreAsync");
+                Assert(OAuthSession(restarted.Window) is null && File.ReadAllBytes(first.SessionPath).SequenceEqual(rotated),
+                    "the first profile refusal after restart erased or changed the rotated grant");
+                await restarted.Window.StartLoginAsync();
+                Assert(restarted.Http.Seen.Select(sent => sent.Uri.AbsolutePath)
+                    .SequenceEqual(["/account/status", "/account/status", "/users/12345/likes/tracks"])
+                    && restarted.Store.Load() is { DeviceProfilePending: false, ProfileRefreshValidated: false }
+                    && OAuthSession(restarted.Window) == restarted.Store.Load(),
+                    "the restarted profile did not settle its refreshed session without another POST");
+            }
+        });
+
+        await Run("OAuthScopes: a pending access that expires during its profile request uses one bounded refresh", async () =>
+        {
+            foreach (var (device, outcome) in new[]
+            {
+                (true, "temporary"), (true, "deferred"),
+                (false, "success"), (false, "deferred"), (false, "profile-refusal")
+            })
+            {
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var refreshes = 0;
+                var renewedProfiles = 0;
+                var deferred = outcome == "deferred";
+                var temporary = outcome == "temporary";
+                var profileRefused = outcome == "profile-refusal";
+                using var fixture = new OAuthScopesUiFixture("access-expires-in-profile", null, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/account/status" when request.Headers.Authorization?.Parameter == FakeSession.AccessToken:
+                            entered.TrySetResult();
+                            await release.Task;
+                            return Json("{}", HttpStatusCode.Unauthorized);
+                        case "/token":
+                            return ++refreshes == 1 && temporary ? Json("{}", HttpStatusCode.ServiceUnavailable) : Json(OAuthRotatedTokens);
+                        case "/account/status" when request.Headers.Authorization?.Parameter == "fixture-new-access":
+                            return ++renewedProfiles == 1 && profileRefused
+                                ? Json("{}", HttpStatusCode.Unauthorized) : Json(OAuthConfirmedProfile);
+                        case "/users/12345/likes/tracks":
+                            return Json("""{"result":{"library":{"tracks":[]}}}""");
+                        default: throw new InvalidOperationException("Pending profile deadline reached an unexpected route");
+                    }
+                });
+                var original = FakeSession with
+                {
+                    DeviceProfilePending = device,
+                    ProfileRefreshValidated = !device,
+                    ExpiresAtUtc = DateTimeOffset.UtcNow.AddSeconds(2)
+                };
+                fixture.Store.Save(original);
+                var before = File.ReadAllBytes(fixture.SessionPath);
+                var restore = Call(fixture.Window, "RestoreAsync");
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    Assert(fixture.Http.Seen.Count == 1 && fixture.Http.Seen[0].Uri.AbsolutePath == "/account/status",
+                        "the still-valid pending access was not admitted directly to the profile");
+                    await Until(() => original.ExpiresAtUtc <= DateTimeOffset.UtcNow);
+                    if (deferred) R4Set(fixture.Window, "_appUpdatePreparingRestart", true);
+                    release.TrySetResult();
+                    await restore.WaitAsync(TimeSpan.FromSeconds(4));
+                    string[] requests = outcome switch
+                    {
+                        "deferred" => ["/account/status"],
+                        "temporary" => ["/account/status", "/token"],
+                        "profile-refusal" => ["/account/status", "/token", "/account/status"],
+                        _ => ["/account/status", "/token", "/account/status", "/users/12345/likes/tracks"]
+                    };
+                    Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(requests),
+                        "profile expiry did not trigger exactly the allowed exchange within the original attempt");
+                    if (deferred || temporary)
+                        Assert(OAuthSession(fixture.Window) is null && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before),
+                            "a deferred or temporarily unavailable refresh changed the pending grant");
+                    if (profileRefused)
+                        Assert(OAuthSession(fixture.Window) is null
+                            && fixture.Store.Load() is { ProfileRefreshValidated: true, RefreshToken: "fixture-new-refresh" },
+                            "another profile 401 discarded the just-renewed grant");
+                }
+                finally
+                {
+                    release.TrySetResult();
+                    R4Set(fixture.Window, "_appUpdatePreparingRestart", false);
+                }
+
+                if (outcome != "success") await fixture.Window.StartLoginAsync();
+                string[] expected = outcome switch
+                {
+                    "temporary" => ["/account/status", "/token", "/token", "/account/status", "/users/12345/likes/tracks"],
+                    "profile-refusal" => ["/account/status", "/token", "/account/status", "/account/status", "/users/12345/likes/tracks"],
+                    _ => ["/account/status", "/token", "/account/status", "/users/12345/likes/tracks"]
+                };
+                Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(expected)
+                    && fixture.Http.Seen.Where(sent => sent.Uri.AbsolutePath == "/token")
+                        .All(sent => OAuthForm(sent.Body)["refresh_token"] == original.RefreshToken)
+                    && OAuthSession(fixture.Window) == fixture.Store.Load()
+                    && fixture.Store.Load() is { RefreshToken: "fixture-new-refresh", DeviceProfilePending: false, ProfileRefreshValidated: false },
+                    "retry after the pending access deadline did not recover with the original refresh");
+            }
+        });
+
+        await Run("OAuthScopes: device polling delay and explicit cancellation do not hold exit", async () =>
+        {
+            foreach (var inFlight in new[] { false, true })
+            {
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                using var fixture = new OAuthScopesUiFixture("cancel-device-token", null, async (request, _) =>
+                {
+                    if (request.RequestUri!.AbsolutePath == "/device/code")
+                        return Json(inFlight ? OAuthDeviceReply : OAuthDeviceReply.Replace("\"interval\":1", "\"interval\":60", StringComparison.Ordinal));
+                    Assert(request.RequestUri.AbsolutePath == "/token", "canceled device flow reached an unexpected route");
+                    entered.TrySetResult();
+                    await release.Task;
+                    return Json(OAuthRotatedTokens);
+                });
+                var login = fixture.Window.StartLoginAsync();
+                try
+                {
+                    if (inFlight) await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    else await Until(() => Control<FrameworkElement>(fixture.Window, "CodePanel").Visibility == Visibility.Visible);
+                    var drain = Call(fixture.Window, "DrainExitWritesAsync");
+                    Assert(drain.IsCompleted == !inFlight, "exit waited for a polling interval or missed the admitted exchange");
+                    PreloadGet<CancellationTokenSource>(fixture.Window, "_authCts").Cancel();
+                    await drain.WaitAsync(TimeSpan.FromSeconds(3));
+                    Assert(fixture.Store.Load() is null, "canceling the device flow left a stored grant");
+                }
+                finally { release.TrySetResult(); }
+                await login.WaitAsync(TimeSpan.FromSeconds(3));
+                Assert(fixture.Store.Load() is null && OAuthSession(fixture.Window) is null && fixture.Http.Seen.Count == (inFlight ? 2 : 1),
+                    "late device reply bypassed explicit cancel or issued an extra poll");
+            }
+        });
+
+        await Run("OAuthScopes: polling resumes the same device code after a canceled exit or deferred update", async () =>
+        {
+            foreach (var flag in new[] { "_closeCommitInProgress", "_appUpdatePreparingRestart" })
+            {
+                using var fixture = new OAuthScopesUiFixture("device-poll-resume", null, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/device/code" => Json(OAuthDeviceReply),
+                        "/token" => Json(OAuthRotatedTokens),
+                        "/account/status" => Json("""{"result":{"account":{"uid":12345,"displayName":"Fixture","avatarId":"123/fixture"}}}"""),
+                        "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                        _ => throw new InvalidOperationException("Unexpected device poll route")
+                    }));
+                var login = fixture.Window.StartLoginAsync();
+                await Until(() => Control<FrameworkElement>(fixture.Window, "CodePanel").Visibility == Visibility.Visible);
+                var auth = PreloadGet<CancellationTokenSource>(fixture.Window, "_authCts");
+                R4Set(fixture.Window, flag, true);
+                try
+                {
+                    await Task.Delay(1500);
+                    Assert(!login.IsCompleted && fixture.Http.Seen.Count == 1 && fixture.Store.Load() is null
+                        && Control<FrameworkElement>(fixture.Window, "CodePanel").Visibility == Visibility.Visible
+                        && ReferenceEquals(PreloadGet<CancellationTokenSource>(fixture.Window, "_authCts"), auth)
+                        && Call(fixture.Window, "DrainExitWritesAsync").IsCompleted,
+                        "a temporarily closed exit gate sent or lost a poll, or waited for the device flow");
+                }
+                finally { R4Set(fixture.Window, flag, false); }
+                await login.WaitAsync(TimeSpan.FromSeconds(4));
+                Assert(OAuthSession(fixture.Window) is { RefreshToken: "fixture-new-refresh" }
+                    && fixture.Http.Seen.Count(sent => sent.Uri.AbsolutePath == "/device/code") == 1
+                    && OAuthForm(fixture.Http.Seen.Single(sent => sent.Uri.AbsolutePath == "/token").Body)["code"] == "scope-fixture-code",
+                    "reopening the gate failed to reuse the original device code exactly once");
+            }
+        });
+
+        await Run("OAuthScopes: device polling backs off after 429, 503, a request timeout or connection setup failure", async () =>
+        {
+            (HttpStatusCode? Status, HttpRequestError? Transport)[] failures =
+            [
+                (HttpStatusCode.TooManyRequests, null), (HttpStatusCode.ServiceUnavailable, null), (null, null),
+                (null, HttpRequestError.NameResolutionError), (null, HttpRequestError.ConnectionError)
+            ];
+            foreach (var failure in failures)
+            {
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                var firstPoll = new TaskCompletionSource<TimeSpan>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var resumedPoll = new TaskCompletionSource<TimeSpan>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var polls = 0;
+                using var fixture = new OAuthScopesUiFixture("device-poll-backoff", null, async (request, token) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/device/code": return Json(OAuthDeviceReply);
+                        case "/token":
+                            if (++polls > 1)
+                            {
+                                resumedPoll.TrySetResult(clock.Elapsed);
+                                return Json(OAuthRotatedTokens);
+                            }
+                            firstPoll.TrySetResult(clock.Elapsed);
+                            if (failure.Transport is { } transport) throw new HttpRequestException(transport, "fixture connection setup");
+                            if (failure.Status is null)
+                            {
+                                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                                throw new InvalidOperationException("Fake OAuth request timeout did not cancel the transport");
+                            }
+                            var response = Json("{}", failure.Status.Value);
+                            if (failure.Status == HttpStatusCode.TooManyRequests)
+                                response.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(3));
+                            return response;
+                        case "/account/status": return Json(OAuthConfirmedProfile);
+                        case "/users/12345/likes/tracks": return Json("""{"result":{"library":{"tracks":[]}}}""");
+                        default: throw new InvalidOperationException("Unexpected device retry route");
+                    }
+                }, requestTimeout: failure is (null, null) ? TimeSpan.FromMilliseconds(250) : null);
+                var login = fixture.Window.StartLoginAsync();
+                var started = await firstPoll.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                await Task.Delay(150);
+                Assert(!login.IsCompleted && Control<FrameworkElement>(fixture.Window, "CodePanel").Visibility == Visibility.Visible,
+                    "a temporary response discarded the code or hid the confirmation panel");
+                await login.WaitAsync(TimeSpan.FromSeconds(8));
+                var resumed = await resumedPoll.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                var minimum = failure.Status == HttpStatusCode.TooManyRequests ? 2.9 : 1.9;
+                Assert((resumed - started).TotalSeconds >= minimum && OAuthSession(fixture.Window) is { RefreshToken: "fixture-new-refresh" }
+                    && fixture.Http.Seen.Count(sent => sent.Uri.AbsolutePath == "/device/code") == 1
+                    && fixture.Http.Seen.Where(sent => sent.Uri.AbsolutePath == "/token")
+                        .Select(sent => OAuthForm(sent.Body)["code"]).SequenceEqual(["scope-fixture-code", "scope-fixture-code"]),
+                    "device retry did not back off and exchange the same code once");
+            }
+        });
+
+        await Run("OAuthScopes: device poll backoff respects original expiry and explicit cancellation", async () =>
+        {
+            var http = new FakeHandler((_, _) =>
+            {
+                var response = Json("{}", HttpStatusCode.TooManyRequests);
+                response.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromMinutes(5));
+                return Task.FromResult(response);
+            });
+            using var api = new MusicApi(http);
+            var expired = await Throws<MusicException>(() =>
+                api.CompleteLoginAsync(TestCode(0, 1), "test-device", CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(4)));
+            Assert(expired.Message.Contains("Время действия кода истекло", StringComparison.Ordinal),
+                "device retry did not finish with the code expiry message");
+            Assert(http.Seen.Count == 1, $"an overflowing Retry-After sent another poll before expiry completed (requests: {http.Seen.Count})");
+
+            using var cancel = new CancellationTokenSource();
+            var waiting = api.CompleteLoginAsync(TestCode(0, 30), "test-device", cancel.Token);
+            await Until(() => http.Seen.Count == 2);
+            cancel.Cancel();
+            await Throws<OperationCanceledException>(() => waiting.WaitAsync(TimeSpan.FromSeconds(3)));
+            Assert(http.Seen.Count == 2, "canceling a delayed retry sent another poll");
+        });
+
+        await Run("OAuthScopes: ambiguous transport or TLS failure does not replay a device exchange", async () =>
+        {
+            (HttpRequestError Error, bool AfterHeaders)[] failures =
+            [
+                (HttpRequestError.SecureConnectionError, false), (HttpRequestError.ResponseEnded, false),
+                (HttpRequestError.Unknown, false), (HttpRequestError.ConnectionError, true)
+            ];
+            foreach (var failure in failures)
+            {
+                var http = new FakeHandler((_, _) =>
+                {
+                    var error = new HttpRequestException(failure.Error, "fixture exchange failure");
+                    return !failure.AfterHeaders ? Task.FromException<HttpResponseMessage>(error)
+                        : Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                        {
+                            Content = new OAuthBodyContent(OAuthRotatedTokens, _ => Task.FromException(error))
+                        });
+                });
+                using var api = new MusicApi(http);
+                await Throws<HttpRequestException>(() =>
+                    api.CompleteLoginAsync(TestCode(0), "test-device", default).WaitAsync(TimeSpan.FromSeconds(4)));
+                Assert(http.Seen.Count == 1, "an ambiguous transport failure repeated the exchange");
+            }
+        });
+
+        await Run("OAuthScopes: timeout reading a successful device exchange does not send a second POST", async () =>
+        {
+            var bodyRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var http = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new OAuthBodyContent(OAuthRotatedTokens, async token =>
+                {
+                    bodyRead.TrySetResult();
+                    await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                })
+            }));
+            using var api = new MusicApi(http, TimeSpan.FromMilliseconds(250));
+            var failure = await Throws<MusicException>(() =>
+                api.CompleteLoginAsync(TestCode(0, 15), "test-device", default).WaitAsync(TimeSpan.FromSeconds(4)));
+            Assert(bodyRead.Task.IsCompleted && http.Seen.Count == 1
+                && failure.Message.Contains("Не удалось прочитать результат обмена", StringComparison.Ordinal),
+                "a stalled success body lost its specific failure or replayed the exchange");
+        });
+
+        await Run("OAuthScopes: an admitted device exchange can finish when its local deadline expires", async () =>
+        {
+            var expiryReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var http = new FakeHandler(async (_, _) =>
+            {
+                await expiryReached.Task;
+                return Json(OAuthRotatedTokens);
+            });
+            using var api = new MusicApi(http);
+            using var owner = new CancellationTokenSource();
+            var grant = await api.CompleteLoginAsync(TestCode(0, 1), "test-device", owner.Token, async (send, pollToken) =>
+            {
+                using var registration = pollToken.Register(() => expiryReached.TrySetResult());
+                return await send(owner.Token);
+            }).WaitAsync(TimeSpan.FromSeconds(4));
+            Assert(expiryReached.Task.IsCompleted && http.Seen.Count == 1
+                && grant is { RefreshToken: "fixture-new-refresh", Scope: OAuthMusicScopes },
+                "the local code deadline canceled or repeated an already-sent exchange owned by the current login");
         });
 
         await Run("OAuthScopes: rejected device profile cannot leave a saved or pending grant", async () =>
@@ -672,6 +1994,205 @@ internal static partial class Program
                 "an account with a rejected grant was activated or remained saved");
         });
 
+        await Run("OAuthScopes: an unpublished device grant cannot retire the previous saved login", async () =>
+        {
+            foreach (var scenario in new[] { "rejected", "signed-out", "new-record" })
+            {
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var absent = scenario == "new-record";
+                using var fixture = new OAuthScopesUiFixture("unpublished-device-rejection", absent ? null : FakeSession, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/device/code": return Json(OAuthDeviceReply);
+                        case "/token":
+                            entered.TrySetResult();
+                            await release.Task;
+                            return Json(OAuthRotatedTokens);
+                        case "/account/status": return Json("{}", scenario == "signed-out" ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.Unauthorized);
+                        default: throw new InvalidOperationException("Unexpected profile rejection fixture route");
+                    }
+                });
+                var login = fixture.Window.StartLoginAsync();
+                byte[] before;
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    if (absent) fixture.Store.Save(FakeSession);
+                    before = File.ReadAllBytes(fixture.SessionPath);
+                    using var held = absent ? null : File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None);
+                    release.TrySetResult();
+                    await login;
+                    if (scenario == "signed-out")
+                    {
+                        Assert(PreloadGet<Session?>(fixture.Window, "_unactivatedSession") is { RefreshToken: "fixture-new-refresh" },
+                            "the fixture did not retain a pending device grant");
+                        fixture.Window.SignOut();
+                    }
+                    Assert(OAuthFlushSessionChange(fixture.Window), "the rejected grant left an unauthorized removal or save pending");
+                }
+                finally { release.TrySetResult(); }
+                Assert(OAuthSession(fixture.Window) is null && PreloadGet<Session?>(fixture.Window, "_unactivatedSession") is null
+                    && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before),
+                    "an unpublished device grant replaced or deleted a different saved login");
+            }
+        });
+
+        await Run("OAuthScopes: canceled close retains a saved grant awaiting refresh and clears a rejected device grant", async () =>
+        {
+            foreach (var restoring in new[] { false, true })
+            {
+                var saved = restoring ? FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(30) } : null;
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var profileReads = 0;
+                using var fixture = new OAuthScopesUiFixture("close-profile-refusal", saved, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/device/code" when !restoring: return Json(OAuthDeviceReply);
+                        case "/token": return Json(OAuthRotatedTokens);
+                        case "/account/status":
+                            if (++profileReads == 1)
+                            {
+                                entered.TrySetResult();
+                                await release.Task;
+                            }
+                            return restoring && request.Headers.Authorization?.Parameter == "fixture-new-access"
+                                ? Json(OAuthConfirmedProfile) : Json("{}", HttpStatusCode.Unauthorized);
+                        case "/users/12345/likes/tracks" when restoring:
+                            return Json("""{"result":{"library":{"tracks":[]}}}""");
+                        default: throw new InvalidOperationException("Unexpected canceled close fixture route");
+                    }
+                });
+                var preferences = new PreferencesStore(Path.Combine(fixture.DirectoryPath, "close-preferences"));
+                preferences.Save(new PlayerPreferences());
+                R4Set(fixture.Window, "_preferenceStore", preferences);
+                var login = restoring ? Call(fixture.Window, "RestoreAsync") : fixture.Window.StartLoginAsync();
+                var promptShown = false;
+                Exception? responseFailure = null;
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    Assert(fixture.Store.Load()?.RefreshToken == (restoring ? saved!.RefreshToken : "fixture-new-refresh"),
+                        "the admitted profile had no saved grant");
+                    var before = File.ReadAllBytes(fixture.SessionPath);
+                    R4Set(fixture.Window, "_restore", true);
+                    using var held = File.Open(preferences.FilePath, FileMode.Open, FileAccess.Read, FileShare.None);
+                    fixture.Window.CloseSaveFailurePrompt = _ =>
+                    {
+                        promptShown = true;
+                        var frame = new System.Windows.Threading.DispatcherFrame();
+                        fixture.Window.Dispatcher.BeginInvoke(new Action(async () =>
+                        {
+                            try { release.TrySetResult(); await login.WaitAsync(TimeSpan.FromSeconds(3)); }
+                            catch (Exception error) { responseFailure = error; }
+                            finally { frame.Continue = false; }
+                        }));
+                        System.Windows.Threading.Dispatcher.PushFrame(frame);
+                        return MessageBoxResult.Cancel;
+                    };
+                    fixture.Window.Close();
+                    await Until(() => promptShown && !PreloadGet<bool>(fixture.Window, "_closeCommitInProgress"));
+                    Assert(responseFailure is null && OAuthSession(fixture.Window) is null,
+                        "the canceled close did not finish the profile refusal without activating an account");
+                    if (restoring)
+                    {
+                        Assert(fixture.Http.Seen.Count == 1 && PreloadGet<Session?>(fixture.Window, "_unactivatedSession") == saved
+                            && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before),
+                            "the deferred refresh lost the saved login");
+                    }
+                    else
+                    {
+                        Assert(PreloadGet<Session?>(fixture.Window, "_unactivatedSession") is null && fixture.Store.Load() is null,
+                            "the canceled close left the rejected device grant in the window or on disk");
+                    }
+                }
+                finally
+                {
+                    release.TrySetResult();
+                    fixture.Window.CloseSaveFailurePrompt = null;
+                    R4Set(fixture.Window, "_restore", false);
+                }
+                if (restoring)
+                {
+                    await fixture.Window.StartLoginAsync();
+                    Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath)
+                        .SequenceEqual(["/account/status", "/account/status", "/token", "/account/status", "/users/12345/likes/tracks"])
+                        && OAuthForm(fixture.Http.Seen.Single(sent => sent.Uri.AbsolutePath == "/token").Body)["refresh_token"] == saved!.RefreshToken
+                        && OAuthSession(fixture.Window) == fixture.Store.Load() && fixture.Store.Load() is { RefreshToken: "fixture-new-refresh" },
+                        "canceling close did not resume the original login with one refresh");
+                }
+            }
+        });
+
+        await Run("OAuthScopes: abandoning an unverified login preserves the previous account's exact checkpoints", async () =>
+        {
+            const string owner = "12345";
+            var expired = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
+            using var fixture = new OAuthScopesUiFixture("abandon-unverified-login", expired, async (request, token) =>
+            {
+                switch (request.RequestUri!.AbsolutePath)
+                {
+                    case "/token":
+                        var body = OAuthForm(await request.Content!.ReadAsStringAsync(token));
+                        return body["grant_type"] == "refresh_token"
+                            ? Json("""{"error":"invalid_grant"}""", HttpStatusCode.BadRequest) : Json(OAuthRotatedTokens);
+                    case "/device/code": return Json(OAuthDeviceReply);
+                    case "/account/status" when request.Headers.Authorization?.Parameter == "fixture-new-access":
+                        return Json("{}", HttpStatusCode.Forbidden);
+                    case "/account/status" when request.Headers.Authorization?.Parameter == FakeSession.AccessToken:
+                        return Json(OAuthConfirmedProfile);
+                    case "/users/12345/likes/tracks": return Json("""{"result":{"library":{"tracks":[]}}}""");
+                    case "/tracks": return Json("""{"result":[]}""");
+                    default: throw new InvalidOperationException("Unverified authorization reached another account operation");
+                }
+            });
+            R4Set(fixture.Window, "_restore", true);
+            R4Call(fixture.Window, "InitializePlaybackPersistence");
+            R4Call(fixture.Window, "InitializeDownloadPersistence");
+            var playback = new PlaybackQueue();
+            var song = new TrackRow { Id = "10", RequestId = "10", Title = "Previous track", DurationMs = 120_000, Available = true };
+            playback.SetItems([song], song);
+            new PlaybackStateStore(fixture.DirectoryPath).Save(PlaybackStateStore.Capture(owner, playback, 37));
+            var downloads = new DownloadQueueState();
+            downloads.Replace([new TrackRow { Id = "11", RequestId = "11", Title = "Previous download", Available = true }], "Previous downloads");
+            Assert(new DownloadQueueStore(fixture.DirectoryPath).Save(DownloadQueueStore.Capture(owner, downloads, AudioQuality.Optimal, false, null)),
+                "the test download checkpoint was not written");
+            var playbackPath = Path.Combine(fixture.DirectoryPath, PlaybackStateStore.FileName);
+            var downloadsPath = Path.Combine(fixture.DirectoryPath, DownloadQueueStore.FileName);
+            var playbackBytes = File.ReadAllBytes(playbackPath);
+            var downloadsBytes = File.ReadAllBytes(downloadsPath);
+
+            await Call(fixture.Window, "RestoreAsync");
+            Assert(fixture.Store.Load() is null && PreloadGet<Account?>(fixture.Window, "_account") is null,
+                "the previous expired grant did not reach the explicit terminal response");
+
+            // The normal persistence stores remain initialized. The browser is suppressed for the fake device flow.
+            R4Set(fixture.Window, "_restore", false);
+            try { await fixture.Window.StartLoginAsync(); }
+            finally { R4Set(fixture.Window, "_restore", true); }
+            Assert(fixture.Store.Load() is { AccessToken: "fixture-new-access" } && OAuthSession(fixture.Window) is null
+                && PreloadGet<Account?>(fixture.Window, "_account") is null && Control<Button>(fixture.Window, "LogoutButton").Visibility == Visibility.Visible,
+                "the fixture did not reach a pending grant with a refused profile");
+            fixture.Window.SignOut();
+            Assert(fixture.Store.Load() is null && File.ReadAllBytes(playbackPath).SequenceEqual(playbackBytes)
+                && File.ReadAllBytes(downloadsPath).SequenceEqual(downloadsBytes),
+                "abandoning an unverified grant deleted or rewrote an earlier account's checkpoint");
+
+            fixture.Store.Save(FakeSession);
+            await Call(fixture.Window, "RestoreAsync");
+            Assert(PreloadGet<Account?>(fixture.Window, "_account")?.Uid == owner
+                && PreloadGet<PlaybackQueue>(fixture.Window, "_playbackQueue").Current?.Id == "10"
+                && PreloadGet<double?>(fixture.Window, "_restoredPlaybackSeconds") == 37
+                && PreloadGet<DownloadQueueState>(fixture.Window, "_downloadQueue").Entries.Single().Track.Id == "11",
+                "the original verified account could not recover both preserved checkpoints");
+            fixture.Window.SignOut();
+            Assert(!File.Exists(playbackPath) && !File.Exists(downloadsPath),
+                "the verified owner's explicit logout stopped clearing its own checkpoints");
+        });
+
         await Run("OAuthScopes: logout supersedes a failed save and retries the pending removal", async () =>
         {
             var expired = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
@@ -680,7 +2201,7 @@ internal static partial class Program
                 Assert(request.RequestUri!.AbsolutePath == "/token", "Unexpected logout fixture request");
                 return Task.FromResult(Json(OAuthRotatedTokens));
             });
-            typeof(MainWindow).GetField("_session", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(fixture.Window, expired);
+            OAuthUseStoredSession(fixture);
             using (File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None))
             {
                 await Call(fixture.Window, "EnsureSessionAsync", CancellationToken.None);
@@ -692,6 +2213,265 @@ internal static partial class Program
             }
             Assert(fixture.Store.Load() == expired && OAuthFlushSessionChange(fixture.Window) && fixture.Store.Load() is null,
                 "retry restored the previous account or failed to remove it");
+        });
+
+        await Run("OAuthScopes: admitted refresh preserves a newer saved login before its first write", async () =>
+        {
+            foreach (var restoring in new[] { false, true })
+            {
+                var expired = FakeSession with { DeviceId = "", ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
+                var replacement = FakeSession with { AccessToken = "fixture-new-owner-access", RefreshToken = "fixture-new-owner-refresh" };
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                using var fixture = new OAuthScopesUiFixture("refresh-new-owner", expired, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/token":
+                            entered.TrySetResult();
+                            await release.Task;
+                            return Json(OAuthRotatedTokens);
+                        case "/account/status" when restoring: return Json(OAuthConfirmedProfile);
+                        case "/users/12345/likes/tracks" when restoring: return Json("""{"result":{"library":{"tracks":[]}}}""");
+                        default: throw new InvalidOperationException("Unexpected newer login fixture route");
+                    }
+                });
+                if (!restoring) OAuthUseStoredSession(fixture);
+                var refresh = restoring ? Call(fixture.Window, "RestoreAsync") : Call(fixture.Window, "EnsureSessionAsync", CancellationToken.None);
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    fixture.Store.Save(replacement);
+                    var bytes = File.ReadAllBytes(fixture.SessionPath);
+                    release.TrySetResult();
+                    await refresh;
+                    Assert(OAuthSession(fixture.Window) is { RefreshToken: "fixture-new-refresh" } && OAuthFlushSessionChange(fixture.Window)
+                        && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(bytes),
+                        "the admitted refresh replaced another login or did not preserve its own in-memory session");
+                    fixture.Window.SignOut();
+                    Assert(OAuthSession(fixture.Window) is null && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(bytes),
+                        "logout let an in-memory rotation delete another saved login");
+                }
+                finally { release.TrySetResult(); }
+            }
+        });
+
+        await Run("OAuthScopes: close and apply retry only the observed saved login", async () =>
+        {
+            foreach (var apply in new[] { false, true })
+            foreach (var logout in new[] { false, true })
+            foreach (var replaced in new[] { false, true })
+            {
+                var expired = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
+                var replacement = FakeSession with { AccessToken = "fixture-new-owner-access", RefreshToken = "fixture-new-owner-refresh" };
+                using var fixture = new OAuthScopesUiFixture("exit-session-retry", expired, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath == "/token" ? Json(OAuthRotatedTokens)
+                        : throw new InvalidOperationException("Unexpected exit session fixture route")));
+                OAuthUseStoredSession(fixture);
+                var (updates, backend) = await OAuthPendingUpdate(fixture);
+                var prompts = 0;
+                fixture.Window.CloseSaveFailurePrompt = _ => { prompts++; return MessageBoxResult.Cancel; };
+                try
+                {
+                    using (File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                    {
+                        await Call(fixture.Window, "EnsureSessionAsync", CancellationToken.None);
+                        Assert(OAuthSession(fixture.Window) is { RefreshToken: "fixture-new-refresh" }, "the active grant did not rotate");
+                        if (logout) fixture.Window.SignOut();
+                        Assert(!await ExitAsync(), "exit bypassed a locked pending session change");
+                    }
+                    Assert(fixture.Store.Load() == expired, "the locked attempt changed the original grant");
+                    if (replaced) fixture.Store.Save(replacement);
+                    var before = File.ReadAllBytes(fixture.SessionPath);
+                    Assert(await ExitAsync() && (apply ? backend.Applies == 1 : prompts == 1),
+                        "the exit coordinator did not finish after the pending write became resolvable");
+                    Assert(replaced
+                        ? File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before)
+                        : logout ? fixture.Store.Load() is null : fixture.Store.Load() is { RefreshToken: "fixture-new-refresh" },
+                        "the exit retry did not preserve the replacement or finish its own session change");
+                }
+                finally { fixture.Window.CloseSaveFailurePrompt = null; }
+
+                async Task<bool> ExitAsync()
+                {
+                    if (apply) return await R4Task<bool>(fixture.Window, "ApplyAppUpdateAsync", updates);
+                    fixture.Window.Close();
+                    await Until(() => !PreloadGet<bool>(fixture.Window, "_closeCommitInProgress"));
+                    return PreloadGet<bool>(fixture.Window, "_closed");
+                }
+            }
+        });
+
+        await Run("OAuthScopes: terminal active refresh cancels its pending write and repeated exchanges", async () =>
+        {
+            foreach (var apply in new[] { false, true })
+            foreach (var replaced in new[] { false, true })
+            foreach (var retainsRefresh in new[] { false, true })
+            {
+                var original = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
+                var replacement = FakeSession with { AccessToken = "fixture-new-owner-access", RefreshToken = "fixture-new-owner-refresh" };
+                var activeRefresh = retainsRefresh ? original.RefreshToken : "fixture-new-refresh";
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var posts = 0;
+                using var fixture = new OAuthScopesUiFixture("terminal-active-refresh", original, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/account/status": return Json(OAuthConfirmedProfile);
+                        case "/token":
+                            switch (++posts)
+                            {
+                                case 1:
+                                    entered.TrySetResult();
+                                    await release.Task;
+                                    return Json(retainsRefresh ? """{"access_token":"fixture-new-access","expires_in":1}"""
+                                        : OAuthRotatedTokens.Replace("3600", "1", StringComparison.Ordinal));
+                                case 2: return Json("{}", HttpStatusCode.ServiceUnavailable);
+                                default: return Json("""{"error":"invalid_grant"}""", HttpStatusCode.BadRequest);
+                            }
+                        default: throw new InvalidOperationException("Unexpected active refresh route");
+                    }
+                });
+                var restore = Call(fixture.Window, "RestoreAsync");
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    using (File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                    {
+                        release.TrySetResult();
+                        await restore.WaitAsync(TimeSpan.FromSeconds(4));
+                        Assert(OAuthSession(fixture.Window)?.RefreshToken == activeRefresh
+                            && posts == 2 && !OAuthFlushSessionChange(fixture.Window),
+                            "temporary active refresh removed the pending write or did not follow confirmed activation");
+
+                        await Throws<RefreshGrantRejectedException>(() => Call(fixture.Window, "EnsureSessionAsync", CancellationToken.None));
+                        await Throws<RefreshGrantRejectedException>(() => Call(fixture.Window, "EnsureSessionAsync", CancellationToken.None));
+                        Assert(posts == 3 && OAuthFlushSessionChange(fixture.Window) != retainsRefresh
+                            && fixture.Http.Seen.Where(sent => sent.Uri.AbsolutePath == "/token").Skip(1)
+                                .All(sent => OAuthForm(sent.Body)["refresh_token"] == activeRefresh),
+                            "the rejected active grant was retried, or retained a pending save");
+                    }
+                    if (replaced) fixture.Store.Save(replacement);
+                    var before = File.ReadAllBytes(fixture.SessionPath);
+                    if (apply)
+                    {
+                        var (updates, backend) = await OAuthPendingUpdate(fixture);
+                        Assert(await R4Task<bool>(fixture.Window, "ApplyAppUpdateAsync", updates) && backend.Applies == 1,
+                            "the rejected write remained an apply dependency");
+                    }
+                    else
+                    {
+                        fixture.Window.CloseSaveFailurePrompt = failure => throw new InvalidOperationException(failure);
+                        fixture.Window.Close();
+                        await Until(() => PreloadGet<bool>(fixture.Window, "_closed"));
+                    }
+                    Assert(retainsRefresh && !replaced ? !File.Exists(fixture.SessionPath)
+                        : File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before)
+                            && fixture.Store.Load() == (replaced ? replacement : original),
+                        "exit published the rejected grant or removed another stored login");
+                }
+                finally
+                {
+                    release.TrySetResult();
+                    fixture.Window.CloseSaveFailurePrompt = null;
+                }
+            }
+        });
+
+        await Run("OAuthScopes: exit retires the exact published active grant after a terminal refresh rejection", async () =>
+        {
+            foreach (var apply in new[] { false, true })
+            foreach (var replaced in new[] { false, true })
+            foreach (var markerWriteBlocked in new[] { false, true })
+            {
+                var posts = 0;
+                var profileEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var releaseProfile = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                using var active = new OAuthScopesUiFixture("published-active-rejection", null, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/device/code": return Json(OAuthDeviceReply);
+                        case "/token":
+                            return ++posts switch
+                            {
+                                1 => Json(OAuthRotatedTokens.Replace("3600", "30", StringComparison.Ordinal)),
+                                2 => Json("{}", HttpStatusCode.ServiceUnavailable),
+                                _ => Json("""{"error":"invalid_grant"}""", HttpStatusCode.BadRequest)
+                            };
+                        case "/account/status":
+                            if (markerWriteBlocked)
+                            {
+                                profileEntered.TrySetResult();
+                                await releaseProfile.Task;
+                            }
+                            return Json(OAuthConfirmedProfile);
+                        default: throw new InvalidOperationException("Unexpected active grant rejection route");
+                    }
+                });
+                var login = active.Window.StartLoginAsync();
+                Session? published;
+                byte[] before;
+                try
+                {
+                    if (markerWriteBlocked) await profileEntered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    else await login;
+                    published = active.Store.Load();
+                    Assert(published is { RefreshToken: "fixture-new-refresh" } && published.DeviceProfilePending == markerWriteBlocked,
+                        "the fixture did not establish the expected published device grant");
+                    before = File.ReadAllBytes(active.SessionPath);
+
+                    using (File.Open(active.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None))
+                    {
+                        releaseProfile.TrySetResult();
+                        await login.WaitAsync(TimeSpan.FromSeconds(4));
+                        Assert(OAuthSession(active.Window) == (published! with { DeviceProfilePending = false }) && posts == 2
+                            && (!markerWriteBlocked || !OAuthFlushSessionChange(active.Window)),
+                            "the active profile was not verified or its marker write did not remain blocked");
+                        await Throws<RefreshGrantRejectedException>(() => Call(active.Window, "EnsureSessionAsync", CancellationToken.None));
+                        await Throws<RefreshGrantRejectedException>(() => Call(active.Window, "EnsureSessionAsync", CancellationToken.None));
+                        Assert(posts == 3 && !OAuthFlushSessionChange(active.Window),
+                            "the rejected published grant was sent again or its blocked retirement was discarded");
+                    }
+                }
+                finally { releaseProfile.TrySetResult(); }
+                Assert(File.ReadAllBytes(active.SessionPath).SequenceEqual(before),
+                    "the blocked retirement altered the published record");
+
+                var newer = FakeSession with { AccessToken = "fixture-later-owner-access", ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(30) };
+                if (markerWriteBlocked) newer = newer with { RefreshToken = published!.RefreshToken };
+                if (replaced) active.Store.Save(newer);
+                var replacementBytes = replaced ? File.ReadAllBytes(active.SessionPath) : null;
+                if (apply)
+                {
+                    var (updates, backend) = await OAuthPendingUpdate(active);
+                    Assert(await R4Task<bool>(active.Window, "ApplyAppUpdateAsync", updates) && backend.Applies == 1,
+                        "apply did not settle the terminal grant's exact retirement");
+                }
+                else
+                {
+                    active.Window.CloseSaveFailurePrompt = failure => throw new InvalidOperationException(failure);
+                    active.Window.Close();
+                    await Until(() => PreloadGet<bool>(active.Window, "_closed"));
+                }
+                Assert(replaced ? File.ReadAllBytes(active.SessionPath).SequenceEqual(replacementBytes!) : !File.Exists(active.SessionPath),
+                    "exit retained the rejected published grant or removed its independent replacement");
+
+                using var reopened = new OAuthScopesUiFixture("reopened-active-rejection", null, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/account/status" when request.Headers.Authorization?.Parameter == newer.AccessToken => Json(OAuthConfirmedProfile),
+                        "/users/12345/likes/tracks" => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                        "/token" => Json("{}", HttpStatusCode.ServiceUnavailable),
+                        _ => throw new InvalidOperationException("Unexpected restart after rejected grant")
+                    }), existingSessionDirectory: active.DirectoryPath);
+                await Call(reopened.Window, "RestoreAsync");
+                string[] routes = replaced ? ["/account/status", "/users/12345/likes/tracks"] : [];
+                Assert(reopened.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(routes)
+                    && OAuthSession(reopened.Window) == (replaced ? newer : null),
+                    "restart sent another refresh for the rejected grant or failed to restore the replacement");
+            }
         });
 
         await Run("OAuthScopes: canceling startup restore keeps rotated credentials without activating the account", async () =>
@@ -721,6 +2501,175 @@ internal static partial class Program
                 "canceling startup restore lost the rotation or activated the account");
         });
 
+        await Run("OAuthScopes: canceled restore retires a terminal grant inside the admitted refresh", async () =>
+        {
+            foreach (var (outcome, pendingProfile) in new[]
+            {
+                ("immediate", false), ("immediate", true), ("close", false), ("apply", true),
+                ("replacement", true), ("temporary", false)
+            })
+            {
+                var expired = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5), DeviceProfilePending = pendingProfile };
+                var replacement = expired with { AccessToken = "fixture-replacement-access", ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(30) };
+                var locked = outcome is "close" or "apply" or "replacement";
+                var temporary = outcome == "temporary";
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var posts = 0;
+                using var fixture = new OAuthScopesUiFixture("cancel-terminal-restore", expired, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/token":
+                            if (++posts > 1) return Json(OAuthRotatedTokens);
+                            entered.TrySetResult();
+                            await release.Task;
+                            return temporary ? Json("{}", HttpStatusCode.ServiceUnavailable)
+                                : Json("""{"error":"invalid_grant"}""", HttpStatusCode.BadRequest);
+                        case "/device/code": return Json("""{"error":"fixture-stop"}""", HttpStatusCode.BadRequest);
+                        case "/account/status" when temporary: return Json(OAuthConfirmedProfile);
+                        case "/users/12345/likes/tracks" when temporary: return Json("""{"result":{"library":{"tracks":[]}}}""");
+                        default: throw new InvalidOperationException("Canceled restore sent an unexpected request");
+                    }
+                });
+                var initialBytes = File.ReadAllBytes(fixture.SessionPath);
+                var restore = Call(fixture.Window, "RestoreAsync");
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    using var held = locked ? File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None) : null;
+                    PreloadGet<CancellationTokenSource>(fixture.Window, "_authCts").Cancel();
+                    var drain = Call(fixture.Window, "DrainSessionRefreshWritesAsync");
+                    Assert(!drain.IsCompleted, "canceling the screen abandoned an admitted refresh");
+                    release.TrySetResult();
+                    await drain.WaitAsync(TimeSpan.FromSeconds(4));
+                    Assert(temporary ? File.ReadAllBytes(fixture.SessionPath).SequenceEqual(initialBytes)
+                        : locked ? !OAuthFlushSessionChange(fixture.Window) : !File.Exists(fixture.SessionPath),
+                        "the admitted refresh did not settle or retain its exact retirement before draining");
+                    await restore.WaitAsync(TimeSpan.FromSeconds(4));
+                    Assert(posts == 1 && OAuthSession(fixture.Window) is null
+                        && (PreloadGet<Session?>(fixture.Window, "_unactivatedSession") is not null) == temporary,
+                        "canceled restore activated a profile or retained the rejected grant in memory");
+                }
+                finally { release.TrySetResult(); }
+
+                if (!locked)
+                {
+                    await fixture.Window.StartLoginAsync();
+                    string[] requests = temporary ? ["/token", "/token", "/account/status", "/users/12345/likes/tracks"]
+                        : ["/token", "/device/code"];
+                    Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(requests)
+                        && (temporary ? fixture.Store.Load() is { RefreshToken: "fixture-new-refresh" } : !File.Exists(fixture.SessionPath)),
+                        "manual retry did not distinguish a temporary refresh failure from confirmed rejection");
+                    continue;
+                }
+
+                var replaced = outcome == "replacement";
+                if (replaced) fixture.Store.Save(replacement);
+                var replacementBytes = replaced ? File.ReadAllBytes(fixture.SessionPath) : null;
+                if (outcome == "apply")
+                {
+                    var (updates, backend) = await OAuthPendingUpdate(fixture);
+                    Assert(await R4Task<bool>(fixture.Window, "ApplyAppUpdateAsync", updates) && backend.Applies == 1,
+                        "apply did not finish the exact retirement after release");
+                }
+                else
+                {
+                    fixture.Window.CloseSaveFailurePrompt = failure => throw new InvalidOperationException(failure);
+                    fixture.Window.Close();
+                    await Until(() => PreloadGet<bool>(fixture.Window, "_closed"));
+                }
+                Assert(replaced ? File.ReadAllBytes(fixture.SessionPath).SequenceEqual(replacementBytes!) : !File.Exists(fixture.SessionPath),
+                    "exit left a rejected grant or deleted a replacement with the same refresh");
+
+                using var reopened = new OAuthScopesUiFixture("reopened-canceled-terminal-restore", null, (request, _) =>
+                    Task.FromResult(request.RequestUri!.AbsolutePath switch
+                    {
+                        "/account/status" when replaced && request.Headers.Authorization?.Parameter == replacement.AccessToken
+                            => Json(OAuthConfirmedProfile),
+                        "/users/12345/likes/tracks" when replaced => Json("""{"result":{"library":{"tracks":[]}}}"""),
+                        _ => throw new InvalidOperationException("Restart tried the rejected refresh again")
+                    }), existingSessionDirectory: fixture.DirectoryPath);
+                await Call(reopened.Window, "RestoreAsync");
+                string[] routes = replaced ? ["/account/status", "/users/12345/likes/tracks"] : [];
+                Assert(reopened.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(routes)
+                    && OAuthSession(reopened.Window) == (replaced ? replacement with { DeviceProfilePending = false } : null),
+                    "restart sent the rejected grant again or could not open the preserved replacement");
+            }
+        });
+
+        await Run("OAuthScopes: terminal manual restore updates the login card and next action", async () =>
+        {
+            foreach (var canceled in new[] { false, true })
+            foreach (var outcome in new[] { "remove", "blocked", "replace" })
+            {
+                var expired = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
+                var replacement = expired with { AccessToken = "fixture-current-saved-access", ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(30) };
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var posts = 0;
+                using var fixture = new OAuthScopesUiFixture("terminal-restore-card", expired, async (request, _) =>
+                {
+                    switch (request.RequestUri!.AbsolutePath)
+                    {
+                        case "/token":
+                            if (++posts == 1) return Json("{}", HttpStatusCode.ServiceUnavailable);
+                            entered.TrySetResult();
+                            await release.Task;
+                            return Json("""{"error":"invalid_grant"}""", HttpStatusCode.BadRequest);
+                        case "/device/code": return Json("""{"error":"fixture-stop"}""", HttpStatusCode.BadRequest);
+                        case "/account/status" when request.Headers.Authorization?.Parameter == replacement.AccessToken:
+                            return Json(OAuthConfirmedProfile);
+                        case "/users/12345/likes/tracks": return Json("""{"result":{"library":{"tracks":[]}}}""");
+                        default: throw new InvalidOperationException("Terminal card reached an unexpected route");
+                    }
+                });
+                var title = Control<TextBlock>(fixture.Window, "LoginTitle");
+                var description = Control<TextBlock>(fixture.Window, "LoginDescription");
+                var logout = Control<Button>(fixture.Window, "LogoutButton");
+                await Call(fixture.Window, "RestoreAsync");
+                Assert(title.Text == "Завершите вход" && logout.Visibility == Visibility.Visible,
+                    "the initial temporary refresh did not offer profile recovery");
+
+                var retry = fixture.Window.StartLoginAsync();
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(4));
+                    using var held = outcome == "blocked" ? File.Open(fixture.SessionPath, FileMode.Open, FileAccess.Read, FileShare.None) : null;
+                    if (outcome == "replace") fixture.Store.Save(replacement);
+                    if (canceled) PreloadGet<CancellationTokenSource>(fixture.Window, "_authCts").Cancel();
+                    release.TrySetResult();
+                    await retry.WaitAsync(TimeSpan.FromSeconds(4));
+
+                    var expected = outcome switch
+                    {
+                        "blocked" => "повторить удаление",
+                        "replace" => "проверить сохранённый вход",
+                        _ => "получить новый код"
+                    };
+                    Assert(title.Text != "Завершите вход" && description.Text.Contains(expected, StringComparison.Ordinal)
+                        && logout.Visibility == Visibility.Collapsed && posts == 2,
+                        "the terminal response left a stale profile retry card or offered the wrong next action");
+                    if (outcome == "blocked")
+                    {
+                        await fixture.Window.StartLoginAsync();
+                        Assert(fixture.Http.Seen.Count == 2 && description.Text.Contains(expected, StringComparison.Ordinal),
+                            "retrying a blocked removal contacted OAuth or forgot the removal instructions");
+                    }
+                }
+                finally { release.TrySetResult(); }
+
+                byte[]? replacementBytes = outcome == "replace" ? File.ReadAllBytes(fixture.SessionPath) : null;
+                await fixture.Window.StartLoginAsync();
+                string[] routes = outcome == "replace" ? ["/token", "/token", "/account/status", "/users/12345/likes/tracks"]
+                    : ["/token", "/token", "/device/code"];
+                Assert(fixture.Http.Seen.Select(sent => sent.Uri.AbsolutePath).SequenceEqual(routes)
+                    && (outcome == "replace" ? OAuthSession(fixture.Window) == replacement
+                        && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(replacementBytes!) : !File.Exists(fixture.SessionPath)),
+                    "the action offered after terminal rejection did not match the exact stored state");
+            }
+        });
+
         await Run("OAuthScopes: canceling caller work preserves the account token rotation", async () =>
         {
             var expired = FakeSession with { ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5) };
@@ -733,7 +2682,7 @@ internal static partial class Program
                 await release.Task;
                 return Json(OAuthRotatedTokens);
             });
-            typeof(MainWindow).GetField("_session", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(fixture.Window, expired);
+            OAuthUseStoredSession(fixture);
             using var caller = new CancellationTokenSource();
             var pending = Call(fixture.Window, "EnsureSessionAsync", caller.Token);
             try
@@ -815,8 +2764,7 @@ internal static partial class Program
                     await release.Task;
                     return Json(OAuthRotatedTokens);
                 });
-                if (!restore)
-                    typeof(MainWindow).GetField("_session", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(fixture.Window, expired);
+                if (!restore) OAuthUseStoredSession(fixture);
                 var pending = restore ? Call(fixture.Window, "RestoreAsync")
                     : Call(fixture.Window, "EnsureSessionAsync", CancellationToken.None);
                 try
@@ -884,6 +2832,13 @@ internal static partial class Program
     ];
     private static string OAuthTokenWithScope(string scope) => OAuthTokenWithScopeJson(JsonSerializer.Serialize(scope));
     private static string OAuthTokenWithScopeJson(string scopeJson) => TokenResponse[..^1] + ",\"scope\":" + scopeJson + "}";
+    private static string OAuthConflictingScopes(bool restrictedLast)
+    {
+        var restricted = JsonSerializer.Serialize(OAuthMusicScopes);
+        var broad = JsonSerializer.Serialize(OAuthMusicScopes + " login:email");
+        return OAuthRotatedTokens[..^1] + ",\"scope\":" + (restrictedLast ? broad : restricted)
+            + ",\"scope\":" + (restrictedLast ? restricted : broad) + "}";
+    }
     private static Dictionary<string, string> OAuthForm(string body) => body.Split('&').Select(field => field.Split('=', 2))
         .ToDictionary(pair => Uri.UnescapeDataString(pair[0].Replace('+', ' ')), pair => Uri.UnescapeDataString(pair[1].Replace('+', ' ')), StringComparer.Ordinal);
     private static string OAuthScopesDirectory(string name)
@@ -894,6 +2849,23 @@ internal static partial class Program
     private static Session? OAuthSession(MainWindow window) =>
         (Session?)typeof(MainWindow).GetField("_session", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window);
     private static bool OAuthFlushSessionChange(MainWindow window) => (bool)PreloadInvoke(window, "TryFlushPendingSessionChange")!;
+
+    private static void OAuthUseStoredSession(OAuthScopesUiFixture fixture)
+    {
+        var saved = fixture.Store.Load() ?? throw new InvalidOperationException("The fixture has no stored session");
+        R4Set(fixture.Window, "_session", saved);
+        R4Set(fixture.Window, "_ownedStoredSession", saved);
+    }
+
+    private static async Task<(UpdateSupport Updates, Qf061A10UpdateBackend Backend)> OAuthPendingUpdate(OAuthScopesUiFixture fixture)
+    {
+        var feed = Path.Combine(fixture.DirectoryPath, "feed.json");
+        File.WriteAllText(feed, """{"githubRepository":"https://github.com/senduora/yamuse"}""");
+        var backend = new Qf061A10UpdateBackend();
+        var updates = new UpdateSupport(feed, true, _ => backend);
+        await updates.CheckAsync();
+        return (updates, backend);
+    }
     private static async Task OAuthAssertUnreadableLoginBlocked(OAuthScopesUiFixture fixture, byte[] before)
     {
         await fixture.Window.StartLoginAsync();
@@ -903,6 +2875,9 @@ internal static partial class Program
         var message = Control<TextBlock>(fixture.Window, "StatusText").Text;
         Assert(message.Contains("Яндекс ID", StringComparison.Ordinal) && message.Contains("отзов", StringComparison.OrdinalIgnoreCase)
             && message.Contains("удал", StringComparison.OrdinalIgnoreCase), "unreadable login did not explain manual device revoke and local session reset");
+        Assert(Control<TextBlock>(fixture.Window, "LoginTitle").Text == "Сохранённый вход повреждён"
+            && Control<TextBlock>(fixture.Window, "LoginDescription").Text.Contains("session.dpapi", StringComparison.Ordinal),
+            "the first manual attempt did not retain recovery instructions on the login card");
         var error = await Throws<MusicException>(() => Call(fixture.Window, "PreparePlayerLoginAsync", CancellationToken.None));
         Assert(error.Authentication && fixture.Http.Seen.Count == 0 && File.ReadAllBytes(fixture.SessionPath).SequenceEqual(before),
             "unreadable session preparation was not a non-mutating authentication failure");
@@ -919,6 +2894,26 @@ internal static partial class Program
         finally { CryptographicOperations.ZeroMemory(plain); }
     }
     private sealed record OAuthScopesRequest(HttpMethod Method, Uri Uri, string? Authorization, string? Cookie, string? ContentType, string Body);
+    private sealed class OAuthBodyContent(string json, Func<CancellationToken, Task> beforeWrite) : HttpContent
+    {
+        private readonly byte[] _bytes = Encoding.UTF8.GetBytes(json);
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = _bytes.Length;
+            return true;
+        }
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+            => SerializeToStreamAsync(stream, context, CancellationToken.None);
+
+        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
+        {
+            await beforeWrite(cancellationToken);
+            await stream.WriteAsync(_bytes, cancellationToken);
+        }
+    }
+
     private sealed class OAuthScopesHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> respond) : HttpMessageHandler
     {
         internal List<OAuthScopesRequest> Seen { get; } = [];
@@ -933,19 +2928,23 @@ internal static partial class Program
     private sealed class OAuthScopesUiFixture : IDisposable
     {
         internal string DirectoryPath { get; }
-        internal string SessionPath => Path.Combine(DirectoryPath, "session.dpapi");
+        internal string SessionPath { get; }
         internal SessionStore Store { get; }
         internal OAuthScopesHandler Http { get; }
         internal MainWindow Window { get; }
-        internal OAuthScopesUiFixture(string name, Session? saved, Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> respond)
+        internal OAuthScopesUiFixture(string name, Session? saved, Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> respond,
+            TimeSpan? requestTimeout = null, string? existingSessionDirectory = null)
         {
-            DirectoryPath = OAuthScopesDirectory(name); Store = new SessionStore(DirectoryPath);
+            DirectoryPath = OAuthScopesDirectory(name);
+            var sessionDirectory = existingSessionDirectory ?? DirectoryPath;
+            SessionPath = Path.Combine(sessionDirectory, "session.dpapi");
+            Store = new SessionStore(sessionDirectory);
             if (saved is not null) Store.Save(saved);
             Http = new OAuthScopesHandler(respond);
             var noNetwork = new FakeHandler((_, _) => throw new InvalidOperationException("auth fixture attempted media download"));
             var player = new NativePlayer(new AudioBuffer(Path.Combine(DirectoryPath, "player-buffer"), noNetwork));
             player.SetVolume(0);
-            Window = new MainWindow(api: new MusicApi(Http), store: Store, restore: false, diagnosticsDirectory: DirectoryPath,
+            Window = new MainWindow(api: new MusicApi(Http, requestTimeout), store: Store, restore: false, diagnosticsDirectory: DirectoryPath,
                 offline: new OfflineLibrary(Path.Combine(DirectoryPath, "music"), new AudioBuffer(Path.Combine(DirectoryPath, "download-buffer"),
                     new FakeHandler((_, _) => throw new InvalidOperationException("auth fixture attempted offline download")))),
                 player: player, preferences: new PreferencesStore(Path.Combine(DirectoryPath, "preferences")));

@@ -46,6 +46,36 @@ internal static partial class Program
                 && (f.Player.Position - position).TotalSeconds < 1, "return reopened, sought or changed playback");
             Assert((string)f.Button.ToolTip == "К списку воспроизведения · Плейлист origin", "tooltip follows the viewed page rather than queue source");
         });
+        await Run("PlaybackContext0317: fullscreen source returns to the exact queue occurrence", async () =>
+        {
+            using var f = new Pc0317Fixture("fullscreen-return");
+            TrackRow[] rows = [f.Row("repeat", title: "Первое вхождение"), f.Row("repeat", title: "Второе вхождение"), .. f.Rows(2)];
+            f.Playlist("origin", rows);
+            await f.Play(rows[0]);
+            f.Playlist("other", f.Rows(3, "other"));
+            await Pc0317Call(f.Window, "AdvanceAsync", 1, false);
+            var slot = Pc0317Get<object>(f.Player, "_current");
+            var token = f.Queue.CurrentOccurrenceToken;
+            var host = (ContentControl)f.Window.FindName("ExpandedPlayerHost");
+            EpOpen(f.Window);
+            await Pc0317Idle();
+            var surface = Pc0317Get<Grid>(f.Window, "_expandedPlayerSurface");
+            var button = EpVisuals<Button>(surface).Single(b => b.Name == "ExpandedPlayerSource");
+            Assert(host.Visibility == Visibility.Visible && button.Visibility == Visibility.Visible && button.IsEnabled
+                && button.Content is System.Windows.Shapes.Path { Data: not null }
+                && AutomationProperties.GetName(button) == AutomationProperties.GetName(f.Button),
+                "fullscreen source action did not expose the same confirmed accessible source");
+            EpClick(button);
+            await Pc0317Idle();
+            Assert(host.Visibility == Visibility.Collapsed && Pc0317Get<PlaylistDetails>(f.Window, "_activePlaylist").Kind == "origin"
+                && ReferenceEquals(f.List.SelectedItem, rows[1]) && f.Queue.CurrentOccurrenceToken == token
+                && ReferenceEquals(slot, Pc0317Get<object>(f.Player, "_current")),
+                "fullscreen source action selected another occurrence, reopened audio or left the overlay open");
+            EpOpen(f.Window);
+            Pc0317Invoke(f.Window, "ClearPlaybackContext", false);
+            await Pc0317Idle();
+            Assert(button.Visibility == Visibility.Collapsed && !button.IsEnabled, "fullscreen showed an unknown playback source");
+        });
         await Run("PlaybackContext0317: fresh playlist rows select by exact composite RequestId and a fresh start replaces source", async () =>
         {
             using var f = new Pc0317Fixture("fresh"); var old = f.Rows(4); f.Playlist("origin", old); await f.Play(old[0]);
@@ -57,6 +87,27 @@ internal static partial class Program
             f.Playlist("other", f.Rows(1, "unrelated")); f.Return(); await Pc0317Idle();
             Assert(Pc0317Get<PlaylistDetails>(f.Window, "_activePlaylist").Kind == "new-origin" && ReferenceEquals(f.List.SelectedItem, exact[1])
                 && f.Queue.Current!.RequestId == "same:album-B", "new launch or equal entity IDs lost the exact album-bearing track identity");
+        });
+        await Run("PlaybackContext0317: Back and sorting mark only the playing occurrence of identical request IDs", async () =>
+        {
+            using var f = new Pc0317Fixture("playing-duplicate");
+            var first = f.Row("same", title: "А"); var second = f.Row("same", title: "Я");
+            f.Playlist("origin", [first, second]);
+            await f.Play(second);
+            var token = f.Queue.CurrentOccurrenceToken;
+            Assert(f.Window.QueuePlayingIndex == 1 && second.IsPlaying && !first.IsPlaying, "source playlist marked both request matches");
+            f.Playlist("other", f.Rows(1, "other"));
+            Pc0317Invoke(f.Window, "BrowseBack_Click", null, null); await Pc0317Idle();
+            Assert(f.Window.QueuePlayingIndex == 1 && second.IsPlaying && !first.IsPlaying, "Back spread playback to the first duplicate");
+            Pc0317Invoke(f.Window, "ChangeListSort", new ListSortRule(ListSortField.Title, true));
+            Assert(f.Window.QueuePlayingIndex == 0 && ReferenceEquals(f.List.Items[0], second) && f.Queue.CurrentOccurrenceToken == token,
+                "sorting kept the marker at the old index or changed playback");
+
+            f.Playlist("same-reference", [first, second, first]);
+            f.List.SelectedIndex = 2;
+            await Pc0317Call(f.Window, "PlaySelectedAsync");
+            Assert(f.Queue.CurrentIndex == 2 && f.Window.QueuePlayingIndex == 2,
+                "the shared row reference lost its source occurrence ordinal");
         });
         await Run("PlaybackContext0317: favorites and album snapshots restore the source list without a service request", async () =>
         {

@@ -24,6 +24,8 @@ internal sealed record FavoritesCacheSnapshot(
     [property: JsonRequired] DateTimeOffset SavedUtc,
     [property: JsonRequired] IReadOnlyList<FavoritesTrackMetadata> Tracks);
 
+internal enum FavoritesCacheReadStatus { Missing, Loaded, Invalid, Unavailable }
+
 internal sealed class FavoritesCacheStore
 {
     internal const int CurrentVersion = 1, MaximumTracks = 50_000, MaximumBytes = 32 * 1024 * 1024;
@@ -49,8 +51,11 @@ internal sealed class FavoritesCacheStore
     internal string FilePath(string accountUid) => Path.Combine(_directory, AccountHash(accountUid) + ".json");
 
     internal FavoritesCacheSnapshot? Load(string accountUid)
+        => Read(accountUid).Snapshot;
+
+    internal (FavoritesCacheReadStatus Status, FavoritesCacheSnapshot? Snapshot) Read(string accountUid)
     {
-        if (!ValidAccountUid(accountUid)) return null;
+        if (!ValidAccountUid(accountUid)) return (FavoritesCacheReadStatus.Invalid, null);
         var hash = AccountHash(accountUid);
         var path = Path.Combine(_directory, hash + ".json");
         lock (States.GetOrAdd(path, _ => new()))
@@ -58,21 +63,38 @@ internal sealed class FavoritesCacheStore
             try
             {
                 using var location = SafeDirectoryScope.Acquire(_directory, create: false);
-                if (location is null) return null;
-                using var handle = OpenChecked(path, directory: false, missingAllowed: true);
-                if (handle is null) return null;
-                using var stream = new FileStream(handle, FileAccess.Read);
-                if (stream.Length > MaximumBytes) return null;
-                var bytes = new byte[checked((int)stream.Length)];
-                stream.ReadExactly(bytes);
-                var snapshot = JsonSerializer.Deserialize<FavoritesCacheSnapshot>(bytes, Json);
-                if (snapshot is null) return null;
-                Validate(snapshot);
-                return snapshot.AccountHash == hash ? Copy(snapshot) : null;
+                if (location is null) return (FavoritesCacheReadStatus.Missing, null);
+                using var handle = GuardedStoreFile.OpenForRead(path);
+                if (handle is null) return (FavoritesCacheReadStatus.Missing, null);
+                ValidateChecked(handle, path, directory: false);
+                if (GuardedStoreFile.ReadFromHandle(handle, MaximumBytes) is not { } bytes)
+                    return (FavoritesCacheReadStatus.Invalid, null);
+                var snapshot = ReadSnapshot(bytes, Json);
+                return snapshot.AccountHash == hash ? (FavoritesCacheReadStatus.Loaded, Copy(snapshot))
+                    : (FavoritesCacheReadStatus.Invalid, null);
             }
-            catch (Exception error) when (error is JsonException or IOException or UnauthorizedAccessException)
-            { return null; }
+            catch (JsonException) { return (FavoritesCacheReadStatus.Invalid, null); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception)
+            { return (FavoritesCacheReadStatus.Unavailable, null); }
         }
+    }
+
+    private static FavoritesCacheSnapshot ReadSnapshot(byte[] bytes, JsonSerializerOptions options)
+    {
+        var snapshot = JsonSerializer.Deserialize<FavoritesCacheSnapshot>(bytes, options) ?? throw new JsonException();
+        Validate(snapshot);
+        return snapshot;
+    }
+
+    internal static bool IsOwnedFile(string name, SafeFileHandle file)
+    {
+        if (GuardedStoreFile.ReadFromHandle(file, MaximumBytes) is not { } bytes) return false;
+        try
+        {
+            var options = new JsonSerializerOptions(Json) { AllowDuplicateProperties = false };
+            return ReadSnapshot(bytes, options).AccountHash == name[..64];
+        }
+        catch (JsonException) { return false; }
     }
 
     internal Task SaveInBackgroundAsync(FavoritesCacheSnapshot snapshot)
@@ -140,28 +162,29 @@ internal sealed class FavoritesCacheStore
 
     private void WriteAtomic(string path, byte[] bytes, StoreState state, long revision)
     {
+        _ = UninstallPathGuard.Canonical(path);
         using var location = SafeDirectoryScope.Acquire(_directory, create: true)!;
-        // Check an existing destination without following a reparse point.
-        using (OpenChecked(path, directory: false, missingAllowed: true)) { }
-        var temporary = Path.Combine(_directory, ".favorites-cache-" + Guid.NewGuid().ToString("N") + ".tmp");
+        using var storage = GuardedStoreFile.BeginWrite(path);
+        using (var existing = storage.OpenExisting())
+            if (existing is not null) ValidateChecked(existing, path, directory: false);
+        using var staged = storage.Stage(bytes);
+        var published = false;
         try
         {
-            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
-            { stream.Write(bytes); stream.Flush(flushToDisk: true); }
             _beforeCommit?.Invoke();
-            // Same-directory rename never exposes incomplete JSON. Replacing a
-            // directory entry cannot write through a substituted destination link.
-            lock (state.RenameGate)
+            if (revision != Volatile.Read(ref state.Revision)) return;
+            published = storage.Commit(staged, publish =>
             {
-                if (revision != state.Revision) return;
-                File.Move(temporary, path, overwrite: true);
-            }
+                // Flush and metadata preparation stay outside the admission lock.
+                lock (state.RenameGate)
+                {
+                    if (revision != state.Revision) return false;
+                    publish();
+                    return true;
+                }
+            });
         }
-        finally
-        {
-            try { File.Delete(temporary); }
-            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
-        }
+        finally { if (!published) UninstallPathGuard.DiscardStagedFile(staged); }
     }
 
     private static FavoritesCacheSnapshot Copy(FavoritesCacheSnapshot snapshot) => snapshot with
@@ -254,16 +277,21 @@ internal sealed class FavoritesCacheStore
         }
         try
         {
-            if (!GetFileInformationByHandle(handle, out var info)) throw new IOException("Не удалось проверить файл кэша.", new Win32Exception(Marshal.GetLastWin32Error()));
-            if ((info.Attributes & FileAttributes.ReparsePoint) != 0 || ((info.Attributes & FileAttributes.Directory) != 0) != directory
-                || !directory && info.NumberOfLinks != 1) throw new IOException("Путь кэша содержит перенаправление.");
-            var final = new StringBuilder(32768);
-            var length = GetFinalPathNameByHandleW(handle, final, (uint)final.Capacity, 0);
-            if (length == 0 || length >= final.Capacity || !string.Equals(NormalizePath(final.ToString()), NormalizePath(path), StringComparison.OrdinalIgnoreCase))
-                throw new IOException("Путь кэша изменился.");
+            ValidateChecked(handle, path, directory);
             return handle;
         }
         catch { handle.Dispose(); throw; }
+    }
+
+    private static void ValidateChecked(SafeFileHandle handle, string path, bool directory)
+    {
+        if (!GetFileInformationByHandle(handle, out var info)) throw new IOException("Не удалось проверить файл кэша.", new Win32Exception(Marshal.GetLastWin32Error()));
+        if ((info.Attributes & FileAttributes.ReparsePoint) != 0 || ((info.Attributes & FileAttributes.Directory) != 0) != directory
+            || !directory && info.NumberOfLinks != 1) throw new IOException("Путь кэша содержит перенаправление.");
+        var final = new StringBuilder(32768);
+        var length = GetFinalPathNameByHandleW(handle, final, (uint)final.Capacity, 0);
+        if (length == 0 || length >= final.Capacity || !string.Equals(NormalizePath(final.ToString()), NormalizePath(path), StringComparison.OrdinalIgnoreCase))
+            throw new IOException("Путь кэша изменился.");
     }
 
     private static string NormalizePath(string path)

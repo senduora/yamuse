@@ -113,7 +113,7 @@ internal static partial class Program
             MiniPlayerWindow? mini = null;
             try
             {
-                mini = new MiniPlayerWindow(); mini.Update("Трек для локальной проверки", "Исполнитель", true, true, true);
+                mini = new MiniPlayerWindow(); mini.Update("Трек для локальной проверки", "Исполнитель", true, true, true, canPlay: true);
                 Assert(mini.AllowsTransparency && mini.WindowStyle == WindowStyle.None && mini.ResizeMode == ResizeMode.CanResize
                     && mini.Background is SolidColorBrush { Color.A: 0 } && !mini.IsVisible,
                     "mini player has an opaque rectangular native backing or lost resizing");

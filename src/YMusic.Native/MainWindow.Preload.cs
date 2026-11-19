@@ -14,7 +14,8 @@ public partial class MainWindow
 
     private sealed record PreloadIdentity(long QueueVersion, long? CurrentOccurrence, long? NextOccurrence,
         int PlaybackGeneration, int AccountGeneration, AudioQuality Quality, LocalAudioSource? LocalSource);
-    private sealed record PreparedPlayback(PreloadIdentity Identity, TrackRow Track, Uri Source, string QualityLabel, bool Offline);
+    private sealed record PreparedPlayback(PreloadIdentity Identity, TrackRow Track, Uri Source, string QualityLabel, bool Offline,
+        LocalAudioSource? OpenedLocalSource = null);
 
     private PreloadIdentity NextPreloadIdentity(LocalAudioSource? localSource, bool naturalEnd = true) => new(
         _playbackQueue.Version, _playbackQueue.CurrentOccurrenceToken, _playbackQueue.PeekNextOccurrenceToken(naturalEnd),
@@ -76,6 +77,19 @@ public partial class MainWindow
                     return;
                 }
                 try { await PrepareSourceAsync(audio, localSource); }
+                catch (LocalAudioIntegrityException) when (audio is null && !cts.IsCancellationRequested
+                    && _preloadIdentity == identity && NextPreloadIdentity(identity.LocalSource) == identity
+                    && CanStreamAfterLocalIntegrityFailure(next))
+                {
+                    _diagnostics.LastErrorType = nameof(LocalAudioIntegrityException);
+                    _preloadIdentity = identity = NextPreloadIdentity(_offline.ResolvePlaybackSource(next));
+                    var session = await EnsureSessionAsync(cts.Token);
+                    var stream = await _api.ResolveAudioAsync(session, next.RequestId, identity.Quality, cts.Token);
+                    cts.Token.ThrowIfCancellationRequested();
+                    if (_preloadIdentity != identity || NextPreloadIdentity(identity.LocalSource) != identity
+                        || !CanStreamAfterLocalIntegrityFailure(next)) return;
+                    await PrepareSourceAsync(stream, null);
+                }
                 catch (Exception error) when (audio is not null && localSource is not null && CanFallbackFromOnlineOpen(error)
                     && !cts.IsCancellationRequested && _preloadIdentity == identity && NextPreloadIdentity(localSource) == identity
                     && !IsAudioOutputUnavailable && !BlocksOfflineOpen(next.Id))
@@ -92,17 +106,26 @@ public partial class MainWindow
 
                 async Task PrepareSourceAsync(AudioDescriptor? stream, LocalAudioSource? local)
                 {
-                    _preparedPlayback = new(identity, next, stream?.Uri ?? new Uri(local!.Path),
-                        stream?.QualityLabel ?? local!.Quality, stream is null);
-                    if (stream is null) await _player.PrepareLocalNextAsync(local!, cts.Token);
-                    else
+                    if (stream is null)
                     {
-                        await _player.PrepareNextAsync(stream, cts.Token);
-                        if (local is not null && _preloadIdentity == identity && LooksLikePreview(next, _player.PreparedDuration))
+                        await OpenLocalPlaybackVariantAsync(next, local!, requireExactOfflineVariant: false, cts.Token, candidate =>
                         {
-                            _player.DiscardPrepared();
-                            throw PreviewDurationError();
-                        }
+                            cts.Token.ThrowIfCancellationRequested();
+                            if (_preloadIdentity != identity || NextPreloadIdentity(identity.LocalSource) != identity)
+                                throw new OperationCanceledException(cts.Token);
+                            _preloadIdentity = identity = NextPreloadIdentity(_offline.ResolvePlaybackSource(next));
+                            _preparedPlayback = new(identity, next, PlaybackInput.FileUri(candidate.Path), candidate.Quality, Offline: true,
+                                OpenedLocalSource: candidate);
+                            return _player.PrepareLocalNextAsync(candidate, cts.Token);
+                        });
+                        return;
+                    }
+                    _preparedPlayback = new(identity, next, stream.Uri, stream.QualityLabel, Offline: false);
+                    await _player.PrepareNextAsync(stream, cts.Token);
+                    if (local is not null && _preloadIdentity == identity && LooksLikePreview(next, _player.PreparedDuration))
+                    {
+                        _player.DiscardPrepared();
+                        throw PreviewDurationError();
                     }
                 }
             }
@@ -135,7 +158,10 @@ public partial class MainWindow
         if (next is null || !ReferenceEquals(next, prepared.Track)
             || NextPreloadIdentity(prepared.Identity.LocalSource, naturalEnd) != prepared.Identity
             || LooksLikePreview(next, _player.PreparedDuration)) return null;
-        if (RefreshLocalPlaybackSource(next) == prepared.Identity.LocalSource) return prepared;
+        var preferred = RefreshLocalPlaybackSource(next);
+        if (preferred == prepared.Identity.LocalSource
+            && (prepared.OpenedLocalSource is not { } opened || opened == preferred
+                || preferred is not null && _offline.ResolveAlternatePlaybackSources(next, preferred).Contains(opened))) return prepared;
         CancelNextPreparation();
         return null;
     }
@@ -149,6 +175,12 @@ public partial class MainWindow
             || LooksLikePreview(track, _player.PreparedDuration)) return false;
         var remaining = Math.Max(0, (_player.Duration - _player.Position).TotalSeconds / _player.SpeedRatio);
         var fade = _player.IsPlaying ? Math.Min(automatic ? CrossfadeSeconds : CrossfadeSeconds > 0 ? .22 : 0, remaining) : 0;
+        if (automatic && HasMinuteSleepExpired())
+        {
+            // The transition can be due before the sleep dispatcher tick runs.
+            FinishSleepTimer();
+            return false;
+        }
         if (!_player.TryPlayPrepared(prepared.Source, TimeSpan.FromSeconds(fade))) return false;
         if (fade > 0)
         {
@@ -168,7 +200,7 @@ public partial class MainWindow
 
     private void TryAutomaticTransition()
     {
-        if (_closed || _loadingStream || _advancingPlayback || !_player.IsPlaying || !CanAutoAdvancePlaybackOptions()
+        if (_closed || _loadingStream || _advancingPlayback || !_player.IsPlaying || _player.OutputRouteChanging || !CanAutoAdvancePlaybackOptions()
             || _seekDragging || _expandedSeekDragging || _shell?.IsSeeking == true || _pendingSeek is not null) return;
         var duration = _player.Duration.TotalSeconds;
         var remaining = (duration - _player.Position.TotalSeconds) / _player.SpeedRatio;

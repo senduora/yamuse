@@ -2,6 +2,8 @@ using System.IO;
 using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using YMusic.Native;
@@ -46,13 +48,76 @@ internal static partial class Program
             Assert(f.Writes.Single() == ("remove", "shared:album-a") && !SaField<HashSet<string>>(f.Window, "_favoriteTrackIds").Contains("shared"),
                 "menu removed the new selection's like rather than the unavailable captured row");
         });
+        await Run("TrackActions0317: a keyboard context menu captures the focused occurrence", () =>
+        {
+            using var f = new Library017Fixture("actions-keyboard");
+            var selected = f.Row("shared", "album-a");
+            var focused = f.Row("shared", "album-b");
+            SaInvoke(f.Window, "ShowRows", (object)new[] { selected, focused });
+            var list = Control<ListView>(f.Window, "TracksList");
+            list.SelectedItem = selected;
+            list.ScrollIntoView(focused);
+            f.Window.UpdateLayout();
+            var row = (ListViewItem)list.ItemContainerGenerator.ContainerFromIndex(1);
+            Ta0317RaiseOpening(row);
+            var menu = list.ContextMenu!;
+            Ta0317Open(menu);
+            Ta0317Item(menu, "Enqueue").RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            var queue = SaField<PlaybackQueue>(f.Window, "_playbackQueue");
+            Assert(ReferenceEquals(list.SelectedItem, selected) && queue.Items.Count == 1 && queue.Items[0].RequestId == focused.RequestId,
+                "keyboard context menu enqueued another edition or changed selection");
+            menu.RaiseEvent(new RoutedEventArgs(ContextMenu.ClosedEvent));
+            var down = new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Right)
+                { RoutedEvent = Mouse.PreviewMouseDownEvent };
+            row.RaiseEvent(down);
+            Assert(list.SelectedItems.Count == 1 && ReferenceEquals(list.SelectedItem, selected),
+                "right-button down changed the group before the context target was known");
+            var routed = 0;
+            row.AddHandler(UIElement.MouseRightButtonDownEvent,
+                new MouseButtonEventHandler((_, args) => { if (args.ChangedButton == MouseButton.Right) routed++; }), true);
+            Ta0317RaiseOpening(row, 10, 10);
+            Ta0317Open(menu);
+            Assert(ReferenceEquals(list.SelectedItem, focused) && routed == 1,
+                "mouse context menu did not give the confirmed row its WPF range anchor event");
+            menu.RaiseEvent(new RoutedEventArgs(ContextMenu.ClosedEvent));
+            Ta0317RaiseOpening(list, 10, 10);
+            Ta0317Open(menu);
+            Assert(!Ta0317Item(menu, "Enqueue").IsEnabled, "mouse context menu over empty space retained a row target");
+            return Task.CompletedTask;
+        });
+        await Run("TrackActions0317: reopening the player button menu uses the newly current track", async () =>
+        {
+            using var f = new Library017Fixture("actions-reopen");
+            var first = f.Row("101", "1");
+            var second = f.Row("102", "2");
+            var anchor = Control<Button>(f.Window, "PlayerMoreButton");
+            Library017Set(f.Window, "_current", first);
+            anchor.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            var menu = anchor.ContextMenu!;
+            await Until(() => menu.IsOpen && Ta0317Item(menu, "Enqueue").IsEnabled);
+            var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            menu.Closed += (_, _) => closed.TrySetResult();
+            menu.IsOpen = false;
+            await closed.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+            Library017Set(f.Window, "_current", second);
+            Ta0317Open(menu); // The native context-menu route opens the existing menu without invoking Click.
+            Ta0317Item(menu, "Enqueue").RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            var queue = SaField<PlaybackQueue>(f.Window, "_playbackQueue");
+            Assert(queue.Items.Single().RequestId == second.RequestId, "reopening the button menu targeted the previous track");
+            menu.Placement = PlacementMode.Center;
+            anchor.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Assert(menu.Placement == PlacementMode.Bottom, "the button inherited placement from a keyboard context menu");
+        });
         await Run("TrackActions0317: queue actions retain the opened player target and closed or stale menus have no authority", () =>
         {
             using var f = new Library017Fixture("actions-queue"); var a = f.Row("101", "1"); var b = f.Row("102", "2");
             var current = a; var menu = Ta0317Menu(f.Window, Control<Button>(f.Window, "PlayerMoreButton"), () => current);
             Ta0317Open(menu); current = b; Ta0317Item(menu, "Next").RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
             var queue = SaField<PlaybackQueue>(f.Window, "_playbackQueue");
-            Assert(queue.Items.Count == 1 && ReferenceEquals(queue.Items[0], a), "a changing player redirected an already opened menu");
+            Assert(queue.Items.Count == 1 && queue.Items[0].Id == a.Id && queue.Items[0].RequestId == a.RequestId
+                && queue.Items[0].AlbumId == a.AlbumId, "a changing player redirected an already opened menu");
+            Assert(!ReferenceEquals(queue.Items[0], a), "adding the captured track reused its presentation object");
             menu.RaiseEvent(new RoutedEventArgs(ContextMenu.ClosedEvent)); Ta0317Item(menu, "Enqueue").RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
             Assert(queue.Items.Count == 1, "closed menu still changed the queue");
             Ta0317Open(menu); Library017Set(f.Window, "_accountGeneration", SaField<int>(f.Window, "_accountGeneration") + 1);
@@ -118,5 +183,11 @@ internal static partial class Program
     private static ContextMenu Ta0317Menu(MainWindow window, FrameworkElement anchor, Func<TrackRow?> track)
         => (ContextMenu)typeof(MainWindow).GetMethod("CreateTrackActionsMenu", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(window, [anchor, track, false])!;
     private static void Ta0317Open(ContextMenu menu) => menu.RaiseEvent(new RoutedEventArgs(ContextMenu.OpenedEvent));
+    private static void Ta0317RaiseOpening(FrameworkElement source, double x = -1, double y = -1)
+    {
+        var opening = (ContextMenuEventArgs)Activator.CreateInstance(typeof(ContextMenuEventArgs),
+            BindingFlags.Instance | BindingFlags.NonPublic, null, [source, true, x, y], null)!;
+        source.RaiseEvent(opening);
+    }
     private static MenuItem Ta0317Item(ContextMenu menu, string action) => menu.Items.OfType<MenuItem>().Single(item => item.Name == "TrackAction" + action);
 }

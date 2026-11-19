@@ -35,7 +35,7 @@ internal static partial class Program
             SortChoose(w,ListSortField.Title);list.SelectedItem=f.Queue.Entries.Single(e=>e.Track.Id=="ul-error");
             var dead=f.Queue.Entries.Single(e=>e.Track.Id=="ul-dead");list.ScrollIntoView(dead);w.UpdateLayout();await Task.Delay(80);
             var container=(ListViewItem)list.ItemContainerGenerator.ContainerFromItem(dead);
-            Assert(container is not null,"unavailable row is not realized");SaInvoke(w,"SelectDownloadContextRow",container!);
+            Assert(container is not null,"unavailable row is not realized");Ta0317RaiseOpening(container!,10,10);Ta0317Open(list.ContextMenu!);
             Assert(ReferenceEquals(list.SelectedItem,dead)&&f.Unlike.IsEnabled&&f.Menu.IsEnabled,"right click retained the previously selected row");
             var before=f.FileHashes();f.HoldWrite=true;
             f.Menu.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent,f.Menu));await f.WriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));

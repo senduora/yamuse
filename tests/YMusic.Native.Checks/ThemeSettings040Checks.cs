@@ -202,6 +202,7 @@ internal static partial class Program
         var store = new PreferencesStore(directory);
         var saved = new PlayerPreferences { Theme = "Light", Volume = .31, PlaybackSpeed = 1.25,
             CrossfadeSeconds = 6.5, ConcurrentDownloads = 7, UpdateCheckFrequency = UpdateCheckFrequency.Off };
+        var merged = saved with { PlaybackSpeed = 1.5 };
         store.Save(saved);
         var originalBytes = File.ReadAllBytes(store.FilePath);
 
@@ -229,24 +230,26 @@ internal static partial class Program
                     if (edit)
                     {
                         SetSpeed(window, 1.5);
-                        Assert(File.ReadAllBytes(store.FilePath).SequenceEqual(originalBytes), "live save overwrote settings that were unreadable at startup");
+                        Assert(store.Load() == merged, "live save did not merge its single edit with the recovered settings");
                     }
                 }
                 finally { window.Close(); }
-                Assert(File.ReadAllBytes(store.FilePath).SequenceEqual(originalBytes), "shutdown overwrote settings that were unreadable at startup");
+                Assert(edit ? store.Load() == merged : File.ReadAllBytes(store.FilePath).SequenceEqual(originalBytes),
+                    "shutdown overwrote settings that were unreadable at startup");
             }
 
             var restarted = OpenWindow();
+            var mergedBytes = File.ReadAllBytes(store.FilePath);
             try
             {
                 Assert(ThemeManager.Mode == saved.Theme && Control<Slider>(restarted, "VolumeSlider").Value == 31
-                    && SaField<NativePlayer>(restarted, "_player").SpeedRatio == saved.PlaybackSpeed, "restart did not restore saved settings");
-                using (LockSettings()) SetSpeed(restarted, 1.5);
+                    && SaField<NativePlayer>(restarted, "_player").SpeedRatio == merged.PlaybackSpeed, "restart did not restore saved settings");
+                using (LockSettings()) SetSpeed(restarted, 2);
                 Assert(SaField<Diagnostics>(restarted, "_diagnostics").LastErrorType == "PreferencesSave:IOException", "the save did not observe the sharing failure");
-                Assert(File.ReadAllBytes(store.FilePath).SequenceEqual(originalBytes), "a sharing failure during save damaged the file");
+                Assert(File.ReadAllBytes(store.FilePath).SequenceEqual(mergedBytes), "a sharing failure during save damaged the file");
             }
             finally { restarted.Close(); }
-            Assert(store.Load() == (saved with { PlaybackSpeed = 1.5 }), "shutdown retry lost the change or an unrelated setting after a successful startup load");
+            Assert(store.Load() == (saved with { PlaybackSpeed = 2 }), "shutdown retry lost the change or an unrelated setting after a successful startup load");
         }
         finally { ThemeManager.SetMode(previousMode); }
         return Task.CompletedTask;

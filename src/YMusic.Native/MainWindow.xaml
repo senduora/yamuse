@@ -2,6 +2,7 @@
         Title="Yamuse" Style="{StaticResource {x:Type Window}}" Width="1280" Height="860" MinWidth="1050" MinHeight="680" WindowStartupLocation="CenterScreen" UseLayoutRounding="True" PreviewKeyDown="Window_KeyDown" PreviewMouseDown="Window_PreviewMouseDown">
 
   <Window.Resources>
+    <Geometry x:Key="PlaybackContextGeometry">M 3,4 H 15 M 3,8 H 12 M 3,12 H 9 M 15,11 V 19 M 11,15 L 15,11 L 19,15</Geometry>
     <local:CatalogGroupLabel x:Key="CatalogGroupLabel"/>
     <local:TrackRowPlaybackHighlight x:Key="TrackRowPlaybackHighlight"/>
     <Style x:Key="ArtistLink" TargetType="Button" BasedOn="{StaticResource TextLink}">
@@ -34,16 +35,16 @@
         <Border x:Name="CoverKeyboardFocus" CornerRadius="6" BorderThickness="1" BorderBrush="{DynamicResource AccentBrush}" Opacity="0" IsHitTestVisible="False"/>
       </Grid><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="TrackCoverPlayGlyph" Property="local:Motion.Opacity" Value="1"/></Trigger><Trigger Property="local:InputFeedback.KeyboardFocusVisible" Value="True"><Setter TargetName="CoverKeyboardFocus" Property="Opacity" Value="1"/></Trigger><Trigger Property="IsEnabled" Value="False"><Setter TargetName="TrackCoverPlayGlyph" Property="Visibility" Value="Collapsed"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
     </Style>
-    <DataTemplate x:Key="TrackCover"><Button x:Name="TrackCoverPlayButton" Tag="{Binding}" Click="TrackCoverPlay_Click" Style="{StaticResource TrackCoverButton}"><Border Width="34" Height="34" Background="{DynamicResource CoverPlaceholderBrush}" CornerRadius="6"><Grid><TextBlock Text="&#xE8D6;" FontFamily="Segoe MDL2 Assets" Foreground="{StaticResource MutedBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"/><Image Width="34" Height="34" Stretch="UniformToFill" local:Artwork.SourceUri="{Binding CoverUri}" local:Artwork.PixelSize="64"><Image.Clip><RectangleGeometry Rect="0,0,34,34" RadiusX="6" RadiusY="6"/></Image.Clip></Image></Grid></Border></Button></DataTemplate>
+    <DataTemplate x:Key="TrackCover"><Button x:Name="TrackCoverPlayButton" Tag="{Binding}" Click="TrackCoverPlay_Click" Style="{StaticResource TrackCoverButton}" AutomationProperties.Name="{Binding Title, StringFormat='Слушать «{0}»'}"><Border Width="34" Height="34" Background="{DynamicResource CoverPlaceholderBrush}" CornerRadius="6"><Grid><TextBlock Text="&#xE8D6;" FontFamily="Segoe MDL2 Assets" Foreground="{StaticResource MutedBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"/><Image Width="34" Height="34" Stretch="UniformToFill" local:Artwork.SourceUri="{Binding CoverUri}" local:Artwork.PixelSize="64"><Image.Clip><RectangleGeometry Rect="0,0,34,34" RadiusX="6" RadiusY="6"/></Image.Clip></Image></Grid></Border></Button></DataTemplate>
     <DataTemplate x:Key="TrackArtistLinks">
-      <Grid VerticalAlignment="Center" ClipToBounds="True" ContextMenuOpening="TrackArtists_ContextMenuOpening">
+      <Grid VerticalAlignment="Center" ClipToBounds="True" DataContextChanged="TrackArtists_DataContextChanged" ContextMenuOpening="TrackArtists_ContextMenuOpening">
         <ItemsControl ItemsSource="{Binding Artists}" AlternationCount="2147483647"><ItemsControl.ItemsPanel><ItemsPanelTemplate><DockPanel LastChildFill="False"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
           <ItemsControl.ItemTemplate><DataTemplate><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
             <TextBlock Text=", " Foreground="{StaticResource MutedBrush}" FontSize="13" VerticalAlignment="Center"><TextBlock.Style><Style TargetType="TextBlock"><Style.Triggers><DataTrigger Binding="{Binding (ItemsControl.AlternationIndex), RelativeSource={RelativeSource AncestorType=ContentPresenter}}" Value="0"><Setter Property="Visibility" Value="Collapsed"/></DataTrigger></Style.Triggers></Style></TextBlock.Style></TextBlock>
             <Button Grid.Column="1" Tag="{Binding}" Style="{StaticResource ArtistLink}" Click="ArtistName_Click"><TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis"/></Button>
           </Grid></DataTemplate></ItemsControl.ItemTemplate>
         </ItemsControl>
-        <Button Tag="{Binding}" Click="ArtistName_Click" HorizontalAlignment="Left">
+        <Button Tag="{Binding}" Click="ArtistName_Click" DataContextChanged="TrackArtists_DataContextChanged" HorizontalAlignment="Left">
           <Button.Style><Style TargetType="Button" BasedOn="{StaticResource ArtistLink}"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding Artists.Count}" Value="0"><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers></Style></Button.Style>
           <TextBlock Text="{Binding Artist}" TextTrimming="CharacterEllipsis"/>
         </Button>
@@ -52,7 +53,7 @@
     <DataTemplate x:Key="CatalogResultRow">
       <Border x:Name="ResultSurface" Padding="8,5" MinHeight="58" CornerRadius="9" Background="Transparent" Margin="0,1">
         <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="46"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="56"/><ColumnDefinition Width="38"/></Grid.ColumnDefinitions>
-          <Grid Width="34" Height="34" HorizontalAlignment="Left" VerticalAlignment="Center"><Button x:Name="CatalogCoverLink" Tag="{Binding}" Click="CatalogTitle_Click" Style="{StaticResource ArtistLink}" Padding="0" Width="34" Height="34" ToolTip="Открыть альбом или подборку"><Border Width="34" Height="34" CornerRadius="7" Background="{DynamicResource CoverPlaceholderBrush}" HorizontalAlignment="Left" VerticalAlignment="Center"><Grid>
+          <Grid Width="34" Height="34" HorizontalAlignment="Left" VerticalAlignment="Center"><Button x:Name="CatalogCoverLink" Tag="{Binding}" Click="CatalogTitle_Click" Style="{StaticResource ArtistLink}" Padding="0" Width="34" Height="34" ToolTip="Открыть альбом или подборку" AutomationProperties.Name="{Binding Title, StringFormat='Открыть «{0}»'}"><Border Width="34" Height="34" CornerRadius="7" Background="{DynamicResource CoverPlaceholderBrush}" HorizontalAlignment="Left" VerticalAlignment="Center"><Grid>
             <TextBlock Text="♪" Foreground="{StaticResource MutedBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
             <Image Width="34" Height="34" Stretch="UniformToFill" local:Artwork.SourceUri="{Binding CoverUri}" local:Artwork.PixelSize="64"><Image.Clip><RectangleGeometry Rect="0,0,34,34" RadiusX="7" RadiusY="7"/></Image.Clip></Image>
           </Grid></Border></Button><ContentControl x:Name="CatalogTrackCover" Content="{Binding Track}" ContentTemplate="{StaticResource TrackCover}" Visibility="Collapsed"/></Grid>
@@ -63,11 +64,11 @@
           </StackPanel>
           <ContentControl x:Name="CatalogTrackMarks" Grid.Column="2" Content="{Binding Track}" ContentTemplate="{StaticResource TrackStatusBadges}" Visibility="Collapsed" Margin="0,0,10,0" VerticalAlignment="Center"/>
           <TextBlock Grid.Column="3" Text="{Binding Track.Duration}" Foreground="{StaticResource MutedBrush}" FontSize="12" HorizontalAlignment="Right" VerticalAlignment="Center"/>
-          <Button x:Name="ResultOpenButton" Grid.Column="4" Content="→" Click="CatalogOpen_Click" Style="{StaticResource PlayerButton}" ToolTip="Открыть"/>
+          <Button x:Name="ResultOpenButton" Grid.Column="4" Content="→" Click="CatalogOpen_Click" Style="{StaticResource PlayerButton}" ToolTip="Открыть" AutomationProperties.Name="{Binding Title, StringFormat='Открыть «{0}»'}"/>
         </Grid>
       </Border>
       <DataTemplate.Triggers>
-        <DataTrigger Binding="{Binding Kind}" Value="track"><Setter TargetName="ResultSurface" Property="MinHeight" Value="46"/><Setter TargetName="CatalogSubtitle" Property="Visibility" Value="Collapsed"/><Setter TargetName="CatalogArtists" Property="Visibility" Value="Visible"/><Setter TargetName="CatalogTrackMarks" Property="Visibility" Value="Visible"/><Setter TargetName="CatalogCoverLink" Property="Visibility" Value="Collapsed"/><Setter TargetName="CatalogTrackCover" Property="Visibility" Value="Visible"/><Setter TargetName="ResultOpenButton" Property="Content" Value="▶"/><Setter TargetName="ResultOpenButton" Property="ToolTip" Value="Слушать трек"/></DataTrigger>
+        <DataTrigger Binding="{Binding Kind}" Value="track"><Setter TargetName="ResultSurface" Property="MinHeight" Value="46"/><Setter TargetName="CatalogSubtitle" Property="Visibility" Value="Collapsed"/><Setter TargetName="CatalogArtists" Property="Visibility" Value="Visible"/><Setter TargetName="CatalogTrackMarks" Property="Visibility" Value="Visible"/><Setter TargetName="CatalogCoverLink" Property="Visibility" Value="Collapsed"/><Setter TargetName="CatalogTrackCover" Property="Visibility" Value="Visible"/><Setter TargetName="ResultOpenButton" Property="Content" Value="▶"/><Setter TargetName="ResultOpenButton" Property="ToolTip" Value="Слушать трек"/><Setter TargetName="ResultOpenButton" Property="AutomationProperties.Name" Value="{Binding Title, StringFormat='Слушать «{0}»'}"/></DataTrigger>
       </DataTemplate.Triggers>
     </DataTemplate>
     <DataTemplate x:Key="MusicCard">
@@ -409,7 +410,7 @@
               <StackPanel Grid.Column="2" VerticalAlignment="Center"><Button Tag="{Binding}" Click="TrackAlbum_Click" Style="{StaticResource TrackTitleLink}" FontSize="12" ToolTip="Открыть альбом"><TextBlock Text="{Binding Title}" FontSize="12" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/></Button><ContentControl Content="{Binding}" ContentTemplate="{StaticResource TrackArtistLinks}"/></StackPanel>
               <ContentControl Grid.Column="3" Content="{Binding}" ContentTemplate="{StaticResource TrackStatusBadges}" VerticalAlignment="Center"/>
               <TextBlock Grid.Column="4" Text="{Binding Duration}" Foreground="{StaticResource MutedBrush}" FontSize="12" VerticalAlignment="Center" HorizontalAlignment="Right"/>
-              <Button Grid.Column="5" Content="▶" Style="{StaticResource PlayerButton}" Tag="{Binding}" Click="ArtistTrackPlay_Click" ToolTip="Слушать трек"/>
+              <Button Grid.Column="5" Content="▶" Style="{StaticResource PlayerButton}" Tag="{Binding}" Click="ArtistTrackPlay_Click" ToolTip="Слушать трек" AutomationProperties.Name="{Binding Title, StringFormat='Слушать «{0}»'}"/>
             </Grid></DataTemplate></ListBox.ItemTemplate>
             <ListBox.ItemContainerStyle><Style TargetType="ListBoxItem" BasedOn="{StaticResource FlatListItem}"/></ListBox.ItemContainerStyle>
           </ListBox>
@@ -418,7 +419,7 @@
           <TextBlock x:Name="ArtistDescription" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" LineHeight="22" Margin="8,24,8,12" Visibility="Collapsed"/>
         </StackPanel>
       </ScrollViewer>
-      <TextBlock x:Name="ArtistStatus" Grid.Row="2" Foreground="{StaticResource MutedBrush}" FontSize="12" TextTrimming="CharacterEllipsis" Margin="0,12,0,0"/>
+      <TextBlock x:Name="ArtistStatus" Grid.Row="2" Foreground="{StaticResource MutedBrush}" FontSize="12" TextTrimming="CharacterEllipsis" Margin="0,12,0,0" Visibility="Collapsed"/>
     </Grid>
     <Grid x:Name="WavePanel" Grid.Column="1" Margin="28,24,28,14" Visibility="Collapsed">
       <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
@@ -461,9 +462,9 @@
             <TextBlock x:Name="LyricsNote" Foreground="{StaticResource MutedBrush}" FontSize="12" TextWrapping="Wrap"/>
             <WrapPanel Margin="0,8,0,0"><Button x:Name="LyricsSourceButton" Content="Открыть на Genius ↗" Style="{StaticResource QuietButton}" Click="LyricsSource_Click" Padding="10,6" Margin="0,0,6,0" FontSize="12" Visibility="Collapsed"/><Button Content="Обновить текст" Style="{StaticResource QuietButton}" Click="LyricsRetry_Click" Padding="10,6" FontSize="12"/></WrapPanel>
           </StackPanel>
-          <ListBox x:Name="LyricsList" local:SmoothScroll.Enabled="True" Grid.Row="1" Background="Transparent" Foreground="{StaticResource MutedBrush}" BorderThickness="0" FontSize="22" HorizontalContentAlignment="Stretch" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.VerticalScrollBarVisibility="Auto" VirtualizingPanel.ScrollUnit="Pixel" ScrollViewer.CanContentScroll="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" PreviewMouseLeftButtonUp="LyricsLine_Click" AutomationProperties.Name="Текст текущей песни">
-            <ListBox.ItemContainerStyle><Style TargetType="ListBoxItem"><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Padding" Value="8,9"/><Setter Property="Background" Value="Transparent"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBoxItem"><Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}" CornerRadius="7"><ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"/></Border></ControlTemplate></Setter.Value></Setter><Style.Triggers><Trigger Property="IsSelected" Value="True"><Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Background" Value="{DynamicResource AccentSelectionBrush}"/></Trigger><Trigger Property="IsKeyboardFocused" Value="True"><Setter Property="Background" Value="{DynamicResource CoverPlaceholderBrush}"/></Trigger></Style.Triggers></Style></ListBox.ItemContainerStyle>
-            <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding}" TextWrapping="Wrap"/></DataTemplate></ListBox.ItemTemplate>
+          <ListBox x:Name="LyricsList" local:SmoothScroll.Enabled="True" Grid.Row="1" Background="Transparent" Foreground="{StaticResource MutedBrush}" BorderThickness="0" FontSize="22" HorizontalContentAlignment="Stretch" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ScrollViewer.VerticalScrollBarVisibility="Auto" VirtualizingPanel.ScrollUnit="Pixel" ScrollViewer.CanContentScroll="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" AutomationProperties.Name="Текст текущей песни">
+            <ListBox.ItemContainerStyle><Style TargetType="ListBoxItem"><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Padding" Value="8,9"/><Setter Property="Background" Value="Transparent"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBoxItem"><Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}" CornerRadius="7"><ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"/></Border></ControlTemplate></Setter.Value></Setter><Style.Triggers><Trigger Property="IsKeyboardFocused" Value="True"><Setter Property="Background" Value="{DynamicResource CoverPlaceholderBrush}"/></Trigger><DataTrigger Binding="{Binding IsCurrent}" Value="True"><Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Background" Value="{DynamicResource AccentSelectionBrush}"/></DataTrigger></Style.Triggers></Style></ListBox.ItemContainerStyle>
+            <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Text}" TextWrapping="Wrap"/></DataTemplate></ListBox.ItemTemplate>
           </ListBox>
         </Grid>
       </Grid>
@@ -541,7 +542,7 @@
         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="252"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <Grid x:Name="NowPlayingPanel" VerticalAlignment="Center" Margin="0,0,18,0">
           <Grid.ColumnDefinitions><ColumnDefinition Width="64"/><ColumnDefinition Width="*"/><ColumnDefinition Width="30"/><ColumnDefinition Width="36"/></Grid.ColumnDefinitions>
-          <Button x:Name="PlayerCoverButton" Click="TrackAlbum_Click" Style="{StaticResource ArtistLink}" Padding="0" Width="56" Height="56" ToolTip="Открыть альбом"><Border Background="{DynamicResource AccentSoftBrush}" Width="56" Height="56" CornerRadius="10"><Grid><TextBlock Text="&#xE8D6;" FontFamily="Segoe MDL2 Assets" Foreground="{DynamicResource AccentTextBrush}" FontSize="20" HorizontalAlignment="Center" VerticalAlignment="Center"/><Image x:Name="PlayerCover" Width="56" Height="56" Stretch="UniformToFill" local:Artwork.PixelSize="256"><Image.Clip><RectangleGeometry Rect="0,0,56,56" RadiusX="10" RadiusY="10"/></Image.Clip></Image></Grid></Border></Button>
+          <Button x:Name="PlayerCoverButton" Click="TrackAlbum_Click" Style="{StaticResource ArtistLink}" Padding="0" Width="56" Height="56" ToolTip="Открыть альбом" AutomationProperties.Name="Открыть альбом текущего трека"><Border Background="{DynamicResource AccentSoftBrush}" Width="56" Height="56" CornerRadius="10"><Grid><TextBlock Text="&#xE8D6;" FontFamily="Segoe MDL2 Assets" Foreground="{DynamicResource AccentTextBrush}" FontSize="20" HorizontalAlignment="Center" VerticalAlignment="Center"/><Image x:Name="PlayerCover" Width="56" Height="56" Stretch="UniformToFill" local:Artwork.PixelSize="256"><Image.Clip><RectangleGeometry Rect="0,0,56,56" RadiusX="10" RadiusY="10"/></Image.Clip></Image></Grid></Border></Button>
           <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="11,0,0,0">
             <Button x:Name="PlayerTitleButton" Click="TrackAlbum_Click" Style="{StaticResource TrackTitleLink}" Padding="0" ToolTip="Открыть альбом"><TextBlock x:Name="TrackTitle" Text="Выберите трек" FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/></Button>
             <Grid Margin="0,3,0,0">
@@ -570,7 +571,7 @@
           <StackPanel Orientation="Horizontal" VerticalAlignment="Top">
             <Button x:Name="PlaybackContextButton" Width="30" Height="34" Click="PlaybackContext_Click" Visibility="Collapsed" IsEnabled="False" ToolTip="Источник очереди неизвестен" AutomationProperties.Name="Источник очереди неизвестен">
               <Button.Style><Style TargetType="Button" BasedOn="{StaticResource PlayerButton}"><Style.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}"/></Trigger></Style.Triggers></Style></Button.Style>
-              <Path Data="M 3,4 H 15 M 3,8 H 12 M 3,12 H 9 M 15,11 V 19 M 11,15 L 15,11 L 19,15" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Stretch="Uniform" Width="17" Height="17"/>
+              <Path Data="{StaticResource PlaybackContextGeometry}" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Stretch="Uniform" Width="17" Height="17"/>
             </Button>
             <Button x:Name="PlayerQueueButton" Style="{StaticResource PlayerButton}" Width="30" Click="PlayerQueue_Click" ToolTip="Очередь воспроизведения" AutomationProperties.Name="Очередь воспроизведения">
               <Path Data="M 3,4 H 14 M 3,8 H 14 M 3,12 H 9 M 12,12 L 12,20 L 19,16 Z" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.4" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Stretch="Uniform" Width="17" Height="17"/>

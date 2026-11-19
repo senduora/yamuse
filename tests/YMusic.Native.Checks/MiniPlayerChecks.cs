@@ -47,7 +47,7 @@ internal static partial class Program
         try
         {
             var cover = MiniCover();
-            window.Update("Трек с очень длинным названием для компактного окна", "Исполнитель · альбом", true, true, false);
+            window.Update("Трек с очень длинным названием для компактного окна", "Исполнитель · альбом", true, true, false, canPlay: true);
             window.UpdateDetails(cover, 61, 237, true, true, true, 64);
             await Task.Delay(30); window.UpdateLayout();
             Assert(window.Title.Contains(AppBranding.Name) && window.TitleText.Text.StartsWith("Трек с очень")
@@ -64,11 +64,11 @@ internal static partial class Program
                     && rect.Right <= window.ActualWidth + 1 && rect.Bottom <= window.ActualHeight + 1, "mini control is clipped: " + element.GetType().Name);
             }
             MiniCapture(window, "mini-playing.png");
-            window.Update("Новый трек", "Другой исполнитель", false, false, true);
+            window.Update("Новый трек", "Другой исполнитель", false, false, true, canPlay: true);
             Assert(window.CoverImage.Source is null, "changed metadata retained the previous track cover");
             window.UpdateDetails(null, 0, 0, false, false, false, 64);
             Assert(AutomationProperties.GetName(window.PlayButton) == "Играть" && !window.SeekSlider.IsEnabled && !window.LikeButton.IsEnabled, "new track readiness differs");
-            window.Update("", "", false, true, true); window.UpdateDetails(cover, 7, 180, true, true, true, 64);
+            window.Update("", "", false, false, false, canPlay: false); window.UpdateDetails(cover, 7, 180, true, true, true, 64);
             Assert(window.CoverImage.Source is null && !window.PlayButton.IsEnabled && !window.SeekSlider.IsEnabled
                 && !window.LikeButton.IsEnabled && !MiniButton(window, "Следующий трек").IsEnabled, "empty mini retained a playable track");
             window.UpdateLayout(); MiniCapture(window, "mini-empty.png");
@@ -81,7 +81,7 @@ internal static partial class Program
         var window = MiniFixtureWindow();
         try
         {
-            window.Update("Seek fixture", "Fixture", false, true, true);
+            window.Update("Seek fixture", "Fixture", false, true, true, canPlay: true);
             var commits = new List<double>(); window.SeekRequested += commits.Add;
             window.UpdateDetails(null, 25, 200, true, false, true, 70);
             window.UpdateDetails(null, 60, 200, true, false, true, 70);
@@ -101,7 +101,7 @@ internal static partial class Program
             MiniDragStart(window); window.SeekSlider.Value = 100; window.UpdateDetails(null, 68, 200, false, false, true, 70); MiniDragEnd(window, false);
             Assert(commits.Count == 2 && !window.SeekSlider.IsEnabled && window.SeekSlider.Value == 68, "disabled seek committed or retained its drag");
             window.UpdateDetails(null, 69, 200, true, false, true, 70); MiniDragStart(window); window.SeekSlider.Value = 110;
-            window.Update("Different track", "Fixture", false, true, true); window.UpdateDetails(null, 10, 120, true, false, true, 70); MiniDragEnd(window, false);
+            window.Update("Different track", "Fixture", false, true, true, canPlay: true); window.UpdateDetails(null, 10, 120, true, false, true, 70); MiniDragEnd(window, false);
             Assert(commits.Count == 2 && window.SeekSlider.Value == 10 && !window.IsSeeking, "old track drag sought the replacement track");
             window.UpdateDetails(null, double.NaN, double.PositiveInfinity, true, false, true, 70);
             Assert(!window.SeekSlider.IsEnabled && window.SeekSlider.Value == 0 && commits.Count == 2, "non-finite duration/position passed the guard");
@@ -124,7 +124,7 @@ internal static partial class Program
         var window = MiniFixtureWindow();
         try
         {
-            window.Update("Same title", "Same artist", true, true, true);
+            window.Update("Same title", "Same artist", true, true, true, canPlay: true);
             var commits = new List<double>(); window.SeekRequested += commits.Add;
             window.UpdateDetails(null, 20, 180, true, false, true, 70, "1:request-42");
             MiniDragStart(window); window.SeekSlider.Value = 100;
@@ -156,7 +156,7 @@ internal static partial class Program
         var window = MiniFixtureWindow();
         try
         {
-            window.Update("Commands fixture", "Fixture", false, true, true);
+            window.Update("Commands fixture", "Fixture", false, true, true, canPlay: true);
             var volume = new List<double>(); var commands = new List<ShellAction>(); var opened = 0;
             window.VolumeRequested += volume.Add; window.Command += commands.Add; window.ShowMainRequested += () => opened++;
             window.UpdateDetails(null, 0, 180, true, false, true, 30); window.UpdateDetails(null, 1, 180, true, false, true, 35);
@@ -168,8 +168,17 @@ internal static partial class Program
             Assert(commands.SequenceEqual(new[] { ShellAction.PlayPause, ShellAction.Previous, ShellAction.Next, ShellAction.ToggleLike }), "mini button command sequence differs");
             MiniClick(MiniButton(window, "Открыть основное окно")); Assert(opened == 1, "open main action missing");
             window.PinButton.IsChecked = true; Assert(window.Topmost, "pin did not enable topmost"); window.PinButton.IsChecked = false; Assert(!window.Topmost, "pin did not disable topmost");
-            window.Update("", "", false, false, false); MiniClick(window.PlayButton); MiniClick(window.LikeButton);
+            window.Update("", "", false, false, false, canPlay: false); MiniClick(window.PlayButton); MiniClick(window.LikeButton);
             Assert(commands.Count == 4, "disabled no-track button dispatched an action");
+            window.Update("", "", false, true, false, canPlay: true);
+            MiniClick(window.PlayButton);
+            Assert(window.PlayButton.IsEnabled && commands.Count == 5 && commands[^1] == ShellAction.PlayPause,
+                "mini player did not start ready playback from an empty player");
+            MiniClick(MiniButton(window, "Следующий трек"));
+            Assert(commands.Count == 6 && commands[^1] == ShellAction.Next, "mini player ignored Next while the queue was ready");
+            window.Update("Opening fixture", "", false, false, false, canPlay: false);
+            MiniClick(window.PlayButton);
+            Assert(!window.PlayButton.IsEnabled && commands.Count == 6, "mini player dispatched Play while the main command was disabled");
             await Task.CompletedTask;
         }
         finally { window.Close(); }
@@ -184,7 +193,7 @@ internal static partial class Program
         {
             var commands = new List<ShellAction>(); var seeks = new List<double>(); var volumes = new List<double>();
             shell.Command += commands.Add; shell.SeekRequested += seeks.Add; shell.VolumeRequested += volumes.Add;
-            shell.Update("Shell fixture", "Artist", false, true, true); var cover = MiniCover(); shell.UpdateDetails(cover, 20, 180, true, true, true, 50, "shell-1:request-42");
+            shell.Update("Shell fixture", "Artist", false, true, true, canPlay: true); var cover = MiniCover(); shell.UpdateDetails(cover, 20, 180, true, true, true, 50, "shell-1:request-42");
             shell.ShowMiniPlayer(); await Task.Delay(20); var first = MiniShellWindow(shell) ?? throw new InvalidOperationException("mini did not open");
             Assert(ReferenceEquals(first.CoverImage.Source, cover) && first.SeekSlider.Value == 20, "shell did not supply stored detail state on first show");
             shell.ShowMiniPlayer(); Assert(ReferenceEquals(first, MiniShellWindow(shell)), "repeated ShowMiniPlayer created another window");
@@ -193,7 +202,7 @@ internal static partial class Program
             MiniDragStart(first); first.SeekSlider.Value = 100; shell.UpdateDetails(cover, 5, 180, true, true, true, 82, "shell-2:request-42"); MiniDragEnd(first, false);
             Assert(seeks.Count == 1 && !first.IsSeeking && first.SeekSlider.Value == 5, "shell did not forward an occurrence-key change");
             MiniClick(MiniButton(first, "Закрыть мини-плеер")); Assert(MiniShellWindow(shell) is null && owner.IsVisible, "closing mini hid or closed the main window");
-            shell.Update("Reopened fixture", "Artist", true, false, true); shell.UpdateDetails(cover, 45, 180, true, false, true, 82); shell.ShowMiniPlayer(); await Task.Delay(20);
+            shell.Update("Reopened fixture", "Artist", true, false, true, canPlay: true); shell.UpdateDetails(cover, 45, 180, true, false, true, 82); shell.ShowMiniPlayer(); await Task.Delay(20);
             var second = MiniShellWindow(shell)!; Assert(!ReferenceEquals(first, second) && second.TitleText.Text == "Reopened fixture" && second.SeekSlider.Value == 45, "mini reopen state differs");
             MiniClick(second.PlayButton); Assert(commands.Count == 2, "reopen duplicated the command subscription");
             var icon = (AppBranding.OwnedIcon)typeof(DesktopShell).GetField("_icon", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(shell)!;

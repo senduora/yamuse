@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http;
@@ -45,12 +46,14 @@ internal sealed partial class MusicApi : IDisposable
             Content = Form(("client_id", ClientId), ("device_id", deviceId), ("device_name", "Yamuse"), ("scope", RequiredScopes))
         };
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+        // The server has already issued the code. Reading its body uses part of that lifetime.
+        var receivedAt = Stopwatch.GetTimestamp();
         if (response.StatusCode == HttpStatusCode.Unauthorized) throw ApiAuthenticationFailure();
         if (!response.IsSuccessStatusCode && response.StatusCode != HttpStatusCode.BadRequest)
             throw new MusicException("Яндекс не выдал код входа. Попробуйте позже.");
-        using var json = await ReadJsonAsync(response, timeout.Token).ConfigureAwait(false);
+        using var json = await ReadJsonAsync(response, timeout.Token, allowDuplicateProperties: false).ConfigureAwait(false);
         var root = json.RootElement;
-        if (!response.IsSuccessStatusCode || !root.TryGetProperty("device_code", out _))
+        if (!response.IsSuccessStatusCode || !root.TryGetProperty("device_code", out _) || root.TryGetProperty("error", out _))
             throw new MusicException("Яндекс не выдал код входа. Попробуйте позже. OAuth: " + SafeError(root));
         if (!Uri.TryCreate(JsonString(root, "verification_url"), UriKind.Absolute, out var verification))
             throw new MusicException("Получен неожиданный адрес страницы входа.");
@@ -62,38 +65,101 @@ internal sealed partial class MusicApi : IDisposable
         var code = JsonString(root, "device_code");
         var userCode = JsonString(root, "user_code");
         if (!IsOAuthValue(code) || !IsOAuthValue(userCode)) throw new MusicException("Яндекс вернул некорректный код входа.");
-        return new(code, userCode, verification, Math.Clamp(Int(root, "interval", 5), 1, 60), Math.Clamp(Int(root, "expires_in", 600), 1, 3600));
+        var interval = 5;
+        if (root.TryGetProperty("interval", out _) && !int.TryParse(Text(root, "interval"), out interval)) throw UnexpectedJson();
+        return new(code, userCode, verification, Math.Max(1, interval), Math.Clamp(Int(root, "expires_in", 600), 1, 3600))
+        { ReceivedAtTimestamp = receivedAt };
     }
 
-    public async Task<Session> CompleteLoginAsync(DeviceCode code, string deviceId, CancellationToken cancellationToken)
+    internal enum DevicePollDelay { Normal, SlowDown, TemporaryFailure }
+    internal readonly record struct DeviceTokenPoll(Session? Session, DevicePollDelay Delay = DevicePollDelay.Normal, TimeSpan RetryAfter = default);
+
+    public async Task<Session> CompleteLoginAsync(DeviceCode code, string deviceId, CancellationToken cancellationToken,
+        Func<Func<CancellationToken, Task<DeviceTokenPoll>>, CancellationToken, Task<DeviceTokenPoll>>? admitPoll = null)
     {
-        var interval = code.IntervalSeconds;
-        using var expiry = new CancellationTokenSource(TimeSpan.FromSeconds(code.ExpiresInSeconds));
+        long interval = code.IntervalSeconds;
+        var delay = TimeSpan.FromSeconds(interval);
+        cancellationToken.ThrowIfCancellationRequested();
+        var remaining = code.RemainingLifetime;
+        if (remaining <= TimeSpan.Zero) throw DeviceCodeExpired();
+        using var expiry = new CancellationTokenSource(remaining);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(expiry.Token, cancellationToken);
         try
         {
             while (true)
             {
-                await Task.Delay(TimeSpan.FromSeconds(interval), linked.Token).ConfigureAwait(false);
-                using var request = new HttpRequestMessage(HttpMethod.Post, "https://oauth.yandex.ru/token")
-                {
-                    Content = Form(("grant_type", "device_code"), ("code", code.Code), ("client_id", ClientId), ("client_secret", PublicClientSecret))
-                };
-                using var timeout = RequestTimeout(linked.Token);
-                using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
-                if (response.StatusCode == HttpStatusCode.Unauthorized) throw ApiAuthenticationFailure();
-                if (!response.IsSuccessStatusCode && response.StatusCode != HttpStatusCode.BadRequest) throw OAuthFailure("");
-                using var json = await ReadJsonAsync(response, timeout.Token).ConfigureAwait(false);
-                var error = Text(json.RootElement, "error");
-                if (error == "authorization_pending") continue;
-                if (error == "slow_down") { interval = Math.Min(interval + 5, 120); continue; }
-                if (!response.IsSuccessStatusCode || json.RootElement.TryGetProperty("error", out _)) throw OAuthFailure(error);
-                return ParseSession(json.RootElement, deviceId);
+                // A retry that cannot fit should wait only for cancellation, without an independent wake-up.
+                var wait = delay < code.RemainingLifetime ? delay : Timeout.InfiniteTimeSpan;
+                // A UI owner may serialize admission with closing on its dispatcher.
+                await Task.Delay(wait, linked.Token).ConfigureAwait(admitPoll is not null);
+                linked.Token.ThrowIfCancellationRequested();
+                if (code.RemainingLifetime <= TimeSpan.Zero) throw DeviceCodeExpired();
+                var reply = admitPoll is null
+                    ? await PollDeviceTokenAsync(code, deviceId, linked.Token).ConfigureAwait(false)
+                    : await admitPoll(token => PollDeviceTokenAsync(code, deviceId, token), linked.Token);
+                if (reply.Session is { } session) return session;
+                interval = NextDevicePollIntervalSeconds(interval, reply.Delay);
+                delay = TimeSpan.FromSeconds(interval);
+                if (reply.RetryAfter > delay) delay = reply.RetryAfter;
             }
         }
         catch (OperationCanceledException) when (expiry.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            throw new MusicException("Время действия кода истекло. Нажмите «Войти» ещё раз.");
+            throw DeviceCodeExpired();
+        }
+    }
+
+    internal static MusicException DeviceCodeExpired() => new("Время действия кода истекло. Нажмите «Войти» ещё раз.");
+
+    internal static long NextDevicePollIntervalSeconds(long interval, DevicePollDelay backoff) => backoff switch
+    {
+        DevicePollDelay.SlowDown => interval + 5,
+        DevicePollDelay.TemporaryFailure => Math.Max(interval * 2, 1),
+        _ => interval
+    };
+
+    private async Task<DeviceTokenPoll> PollDeviceTokenAsync(DeviceCode code, string deviceId, CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://oauth.yandex.ru/token")
+        {
+            Content = Form(("grant_type", "device_code"), ("code", code.Code), ("client_id", ClientId), ("client_secret", PublicClientSecret))
+        };
+        using var timeout = RequestTimeout(cancellationToken);
+        var receivedHeaders = false;
+        var receivedSuccess = false;
+        try
+        {
+            using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+            receivedHeaders = true;
+            receivedSuccess = response.IsSuccessStatusCode;
+            if (response.StatusCode is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests
+                || (int)response.StatusCode is >= 500 and <= 599)
+            {
+                var retry = response.Headers.RetryAfter;
+                var retryAfter = retry?.Delta ?? (retry?.Date - DateTimeOffset.UtcNow) ?? TimeSpan.Zero;
+                return new(null, DevicePollDelay.TemporaryFailure, retryAfter);
+            }
+            if (response.StatusCode == HttpStatusCode.Unauthorized) throw ApiAuthenticationFailure();
+            if (!response.IsSuccessStatusCode && response.StatusCode != HttpStatusCode.BadRequest) throw OAuthFailure("");
+            using var json = await ReadJsonAsync(response, timeout.Token, allowDuplicateProperties: false).ConfigureAwait(false);
+            var root = json.RootElement;
+            var error = JsonString(root, "error");
+            if (root.TryGetProperty("error", out _) && HasIssuedToken(root)) throw UnexpectedJson();
+            if (error == "authorization_pending") return new(null);
+            if (error == "slow_down") return new(null, DevicePollDelay.SlowDown);
+            if (!response.IsSuccessStatusCode || root.TryGetProperty("error", out _)) throw OAuthFailure(error);
+            return new(ParseSession(root, deviceId));
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            if (receivedSuccess) throw new MusicException("Не удалось прочитать результат обмена. Получите новый код входа.");
+            return new(null, DevicePollDelay.TemporaryFailure);
+        }
+        catch (HttpRequestException error) when (!receivedHeaders && !timeout.IsCancellationRequested && error.StatusCode is null
+            && error.HttpRequestError is HttpRequestError.NameResolutionError or HttpRequestError.ConnectionError)
+        {
+            // These are connection establishment failures. An interrupted response may follow an accepted exchange.
+            return new(null, DevicePollDelay.TemporaryFailure);
         }
     }
 
@@ -107,22 +173,32 @@ internal sealed partial class MusicApi : IDisposable
             Content = Form(("grant_type", "refresh_token"), ("refresh_token", session.RefreshToken), ("client_id", ClientId), ("client_secret", PublicClientSecret))
         };
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
-        if (response.StatusCode == HttpStatusCode.TooManyRequests || (int)response.StatusCode is >= 500 and <= 599)
-            throw new MusicException("Сервис входа Яндекса временно недоступен. Повторите попытку позже.");
-        if (!response.IsSuccessStatusCode) throw new MusicException("Не удалось продлить вход. Войдите заново.", true);
-        using var json = await ReadJsonAsync(response, timeout.Token).ConfigureAwait(false);
-        if (json.RootElement.TryGetProperty("error", out _))
-            throw new MusicException("Не удалось продлить вход. Войдите заново.", true);
-        var renewed = ParseSession(json.RootElement, session.DeviceId);
-        renewed = renewed with { RefreshToken = renewed.RefreshToken ?? session.RefreshToken };
+        var grantErrorStatus = response.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.Unauthorized;
+        if (!response.IsSuccessStatusCode && !grantErrorStatus)
+            throw RefreshUnavailable();
+        using var json = await ReadJsonAsync(response, timeout.Token, allowDuplicateProperties: false).ConfigureAwait(false);
+        var root = json.RootElement;
+        if (grantErrorStatus && JsonString(root, "error") == "invalid_grant" && !HasIssuedToken(root))
+            throw new RefreshGrantRejectedException();
+        if (!response.IsSuccessStatusCode || root.TryGetProperty("error", out _))
+            throw RefreshUnavailable();
+        var renewed = ParseSession(root, session.DeviceId, refreshing: true);
+        renewed = renewed with
+        {
+            RefreshToken = renewed.RefreshToken ?? session.RefreshToken,
+            DeviceProfilePending = session.DeviceProfilePending
+        };
         cancellationToken.ThrowIfCancellationRequested();
         _waveOwners.Add(renewed, WaveOwner(session));
         return renewed;
     }
 
+    private static MusicException RefreshUnavailable() => new("Сервис входа Яндекса временно недоступен. Повторите попытку позже.");
+
     public async Task<Account> GetAccountAsync(Session session, CancellationToken cancellationToken, bool includeAvatar = true)
     {
-        using var json = await ApiAsync(HttpMethod.Get, "/account/status", session, null, cancellationToken).ConfigureAwait(false);
+        using var json = await SendApiRequestAsync<JsonDocument>(HttpMethod.Get, "/account/status", session, null, cancellationToken,
+            static (response, token) => ReadApiAsync(response, token, allowDuplicateProperties: false)).ConfigureAwait(false);
         var result = Result(json);
         if (result.ValueKind != JsonValueKind.Object || !result.TryGetProperty("account", out var account))
             throw new MusicException("В ответе Яндекса нет данных учётной записи.");
@@ -156,11 +232,14 @@ internal sealed partial class MusicApi : IDisposable
         return ids;
     }
 
-    public async Task<IReadOnlyList<TrackRow>> GetTracksAsync(Session session, IReadOnlyList<LikedId> ids, int offset, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<TrackRow>> GetTracksAsync(Session session, IReadOnlyList<LikedId> ids, int offset,
+        CancellationToken cancellationToken, bool allowPartialMetadata = false)
     {
         if (ids.Count == 0) return [];
-        using var json = await ApiAsync(HttpMethod.Post, "/tracks", session,
-            Form(("track-ids", string.Join(',', ids.Select(t => t.RequestId))), ("with-positions", "True")), cancellationToken).ConfigureAwait(false);
+        foreach (var reference in ids) CatalogTrackReference(reference, requireAlbum: false);
+        using var json = await SendApiRequestAsync<JsonDocument>(HttpMethod.Post, "/tracks", session,
+            Form(("track-ids", string.Join(',', ids.Select(t => t.RequestId))), ("with-positions", "True")), cancellationToken,
+            allowPartialMetadata ? ReadOptionalPlaylistMetadataAsync : ReadApiAsync).ConfigureAwait(false);
         var result = Result(json);
         if (result.ValueKind != JsonValueKind.Array) throw new MusicException("Изменился формат списка треков.");
         var requested = ids.Select(reference => reference.Id).ToHashSet(StringComparer.Ordinal);
@@ -252,8 +331,7 @@ internal sealed partial class MusicApi : IDisposable
         {
             if (album.ValueKind != JsonValueKind.Object) continue;
             first ??= album;
-            var candidate = Text(album, "id");
-            if (!IsTrackReferencePart(candidate)) continue;
+            if (!TryReadTrackReferencePart(album, "id", out var candidate)) continue;
             selected ??= album;
             if (candidate == preferredId) { selected = album; break; }
         }
@@ -355,22 +433,35 @@ internal sealed partial class MusicApi : IDisposable
     {
         if (response.StatusCode == HttpStatusCode.Unauthorized) throw ApiAuthenticationFailure();
         if (response.StatusCode == HttpStatusCode.Forbidden) throw new MusicException("Яндекс отказал в доступе. Проверьте аккаунт, подписку и доступность сервиса.");
-        if (!response.IsSuccessStatusCode) throw new MusicException($"Сервис временно недоступен (HTTP {(int)response.StatusCode}).");
+        if (!response.IsSuccessStatusCode)
+        {
+            var retry = response.Headers.RetryAfter;
+            throw new MusicException($"Сервис временно недоступен (HTTP {(int)response.StatusCode}).")
+            {
+                ApiStatusCode = response.StatusCode,
+                ApiRetryAfter = retry?.Delta ?? (retry?.Date is { } date ? date - DateTimeOffset.UtcNow : null)
+            };
+        }
     }
 
-    private static async Task<JsonDocument> ReadApiAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    private static Task<JsonDocument> ReadApiAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+        => ReadApiAsync(response, cancellationToken, allowDuplicateProperties: true);
+
+    private static async Task<JsonDocument> ReadApiAsync(HttpResponseMessage response, CancellationToken cancellationToken, bool allowDuplicateProperties)
     {
         RequireApiSuccess(response);
-        var json = await ReadJsonAsync(response, cancellationToken).ConfigureAwait(false);
+        var json = await ReadJsonAsync(response, cancellationToken, allowDuplicateProperties).ConfigureAwait(false);
         if (json.RootElement.TryGetProperty("error", out _)) { json.Dispose(); throw new MusicException("Яндекс вернул ошибку API. Попробуйте повторить действие позже."); }
         return json;
     }
 
-    private static async Task<JsonDocument> ReadJsonAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    private static async Task<JsonDocument> ReadJsonAsync(HttpResponseMessage response, CancellationToken cancellationToken,
+        bool allowDuplicateProperties = true)
     {
         try
         {
-            var json = JsonDocument.Parse(await ReadBoundedTextAsync(response, MaximumApiResponseBytes, cancellationToken).ConfigureAwait(false), new JsonDocumentOptions { MaxDepth = 48 });
+            var text = await ReadBoundedTextAsync(response, MaximumApiResponseBytes, cancellationToken).ConfigureAwait(false);
+            var json = JsonDocument.Parse(text, new JsonDocumentOptions { MaxDepth = 48, AllowDuplicateProperties = allowDuplicateProperties });
             if (json.RootElement.ValueKind == JsonValueKind.Object) return json;
             json.Dispose();
             throw UnexpectedJson();
@@ -414,13 +505,13 @@ internal sealed partial class MusicApi : IDisposable
         "expired_token" or "invalid_grant" => "Код входа истёк. Нажмите «Войти» ещё раз.",
         _ => "Не удалось завершить вход. Попробуйте получить новый код."
     });
-    private static Session ParseSession(JsonElement root, string deviceId)
+    private static Session ParseSession(JsonElement root, string deviceId, bool refreshing = false)
     {
         var token = JsonString(root, "access_token");
         var refresh = JsonString(root, "refresh_token");
         if (!IsOAuthValue(token) || root.TryGetProperty("refresh_token", out var field) && field.ValueKind != JsonValueKind.Null && !IsOAuthValue(refresh))
-            throw new MusicException("Яндекс не вернул действующий токен.", true);
-        return new(token, refresh.Length > 0 ? refresh : null, DateTimeOffset.UtcNow.AddSeconds(Math.Max(1, Int(root, "expires_in", 86400))), deviceId, GrantedPlayerScope(root));
+            throw new MusicException("Яндекс не вернул действующий токен.", authentication: !refreshing);
+        return new(token, refresh.Length > 0 ? refresh : null, DateTimeOffset.UtcNow.AddSeconds(Math.Max(1, Int(root, "expires_in", 86400))), deviceId, GrantedPlayerScope(root, refreshing));
     }
     public void Dispose() { ResetWaveState(); _http.Dispose(); }
 }

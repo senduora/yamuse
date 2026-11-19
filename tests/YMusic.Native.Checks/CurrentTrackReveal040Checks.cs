@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using YMusic.Native;
@@ -19,6 +20,10 @@ internal static partial class Program
         await Run("CurrentTrackReveal040: deferred source return follows live cursor and rejects newer navigation or late page IO", Cr040SourceRaces);
         await Run("CurrentTrackReveal040: ordinary queue reveals the current duplicate and preserves sorting filter and manual browsing", Cr040Queue);
         await Run("CurrentTrackReveal040: fullscreen queue opens around the live paused cursor and refresh never follows manual browsing", Cr040FullscreenQueue);
+        await Run("CurrentTrackReveal040: manual main-list input owns scrolling between the two reveal passes", Cr040ManualMainReveal);
+        await Run("CurrentTrackReveal040: pending fullscreen reveal accepts append and rejects queue replacement", Cr040FullscreenMutation);
+        await Run("CurrentTrackReveal040: ordinary pending reveal uses the live occurrence after append", Cr040OrdinaryQueueAppend);
+        await Run("CurrentTrackReveal040: delayed wave append preserves queue choices before and after reveal", Cr040PassiveAppendSelection);
         await Run("CurrentTrackReveal040: empty removed replaced account closed and rapid requests reject stale reveal", Cr040Lifetime);
     }
 
@@ -65,6 +70,27 @@ internal static partial class Program
         Pc0317Invoke(f.Window, "ShowPlaylist", new PlaylistDetails("owner", "sorted", "Удалённый current", "", 3, [freshFirst]));
         f.Playlist("other", f.Rows(1, "other")); f.Return(); await Cr040Idle(f.Window);
         Assert(f.List.Items.Count == 1 && f.List.SelectedIndex == -1, "removed ambiguous duplicate selected another occurrence");
+        var token = f.Queue.CurrentOccurrenceToken;
+        var replacement = f.Row("same-id", title: "Новый дубль");
+        Pc0317Invoke(f.Window, "ShowPlaylist", new PlaylistDetails("owner", "sorted", "Снова два вхождения", "", 4, [freshFirst, replacement]));
+        f.Playlist("other", f.Rows(1, "other")); f.Return(); await Cr040Idle(f.Window);
+        Assert(f.Queue.CurrentOccurrenceToken == token && f.List.Items.Count == 2 && f.List.SelectedIndex == -1
+            && f.Window.QueuePlayingIndex == -1 && !replacement.IsPlaying,
+            "restoring the same ordered references after a removal revived the ambiguous source occurrence");
+
+        var originalFirst = f.Row("reordered-copy", title: "Первый");
+        var originalSecond = f.Row("reordered-copy", title: "Второй");
+        f.Playlist("reordered", [originalFirst, originalSecond, f.Row("separator")]);
+        await f.Play(originalSecond);
+        token = f.Queue.CurrentOccurrenceToken;
+        var freshOrder = new[] { f.Row("reordered-copy"), f.Row("separator"), f.Row("reordered-copy") };
+        Pc0317Invoke(f.Window, "ShowPlaylist", new PlaylistDetails("owner", "reordered", "Другой порядок", "", 2, freshOrder));
+        Assert(f.Window.QueuePlayingIndex == -1, "a changed order with the same duplicate count kept the old ordinal");
+        var restoredOrder = new[] { f.Row("reordered-copy"), f.Row("reordered-copy"), f.Row("separator") };
+        Pc0317Invoke(f.Window, "ShowPlaylist", new PlaylistDetails("owner", "reordered", "Исходный порядок", "", 3, restoredOrder));
+        f.Playlist("other", f.Rows(1, "other")); f.Return(); await Cr040Idle(f.Window);
+        Assert(f.Queue.CurrentOccurrenceToken == token && f.Window.QueuePlayingIndex == -1 && f.List.SelectedIndex == -1
+            && restoredOrder.All(row => !row.IsPlaying), "restoring the original order after an equal-count reorder revived the stale occurrence");
     }
 
     private static async Task Cr040SourceRaces()
@@ -124,15 +150,229 @@ internal static partial class Program
         Assert(Math.Abs(viewer.VerticalOffset - manual) < .1 && list.SelectedIndex == 999, "fullscreen refresh scrolled the manually viewed queue");
         Pc0317Invoke(f.Window, "SetExpandedQueueVisible", false, false);
         Pc0317Invoke(f.Window, "SetExpandedQueueVisible", true, true);
-        f.Queue.SelectAt(3000); await f.Window.PlayTrackAsync(rows[3000]); await Cr040Idle(f.Window);
-        await Task.Delay(380); await Cr040Idle(f.Window);
+        f.Queue.SelectAt(3000); await f.Window.PlayTrackAsync(rows[3000]);
+        await Until(() => !Pc0317Get<bool>(f.Window, "_expandedQueueRevealPending"));
+        await Cr040Idle(f.Window);
         Assert(list.SelectedIndex == 3000, "animated reopen used an old cursor"); Cr040Visible(list, 3000, "fullscreen-reopen-live-cursor");
         Assert(!SmoothScroll.IsAnimating(Cr040Viewer(list)), "explicit fullscreen reveal animated through thousands of rows");
+        var panel = Pc0317Get<Grid>(f.Window, "_expandedQueuePanel");
+        var current = f.Queue.CurrentOccurrenceToken;
+        foreach (var input in new[] { "wheel", "list press", "scrollbar press", "navigation key" })
+        {
+            viewer = Cr040Viewer(list);
+            viewer.ScrollToTop(); await Cr040Idle(f.Window);
+            var scrollbar = EpVisuals<ScrollBar>(viewer).Single(bar => bar.Orientation == Orientation.Vertical);
+            Pc0317Invoke(f.Window, "SetExpandedQueueVisible", false, false);
+            // For the wheel case the reveal is already queued. The other cases can interrupt pane animation.
+            Pc0317Invoke(f.Window, "SetExpandedQueueVisible", true, input != "wheel");
+            Assert(Pc0317Get<bool>(f.Window, "_expandedQueueRevealPending"), "reopening did not start a current-track reveal");
+            if (input == "wheel")
+                list.RaiseEvent(new MouseWheelEventArgs(Mouse.PrimaryDevice, Environment.TickCount, 120)
+                    { RoutedEvent = Mouse.PreviewMouseWheelEvent });
+            else if (input == "navigation key")
+                list.RaiseEvent(new KeyEventArgs(new Pk040Keyboard(ModifierKeys.None), new Pk040Source(list), Environment.TickCount, Key.Home)
+                    { RoutedEvent = Keyboard.PreviewKeyDownEvent });
+            else
+                (input == "scrollbar press" ? (UIElement)scrollbar : list).RaiseEvent(
+                    new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left)
+                    { RoutedEvent = Mouse.PreviewMouseDownEvent });
+            Assert(!Pc0317Get<bool>(f.Window, "_expandedQueueRevealPending"), "manual input left the opening reveal in control: " + input);
+            viewer.ScrollToTop();
+            await Until(() => panel.Width == (double)panel.GetAnimationBaseValue(FrameworkElement.WidthProperty));
+            await Cr040Idle(f.Window);
+            Assert(f.Queue.CurrentOccurrenceToken == current && viewer.VerticalOffset < 1,
+                "the opening reveal moved the viewport after manual input: " + input);
+        }
         Pc0317Invoke(f.Window, "SetExpandedQueueVisible", false, false);
         Assert(list.ItemsSource is null, "closing fullscreen queue retained its source");
         Pc0317Invoke(f.Window, "SetExpandedQueueVisible", true, false); f.Window.SignOut(); await Cr040Idle(f.Window);
         Assert(list.ItemsSource is null && f.Queue.Items.Count == 0 && Pc0317Get<object?>(f.Window, "_expandedFullscreenHost") is null,
             "late fullscreen reveal restored signed-out queue bindings or its closed host");
+    }
+
+    private static async Task Cr040ManualMainReveal()
+    {
+        using var f = new Pc0317Fixture("reveal040-manual-between-passes"); var rows = f.Rows(1200);
+        f.Playlist("origin", rows); await f.Play(rows[999]); Cr040Show(f.Window);
+        var current = f.Queue.CurrentOccurrenceToken;
+        foreach (var source in new[] { true, false })
+        {
+            f.Playlist("other", f.Rows(1, "other"));
+            if (source) f.Return();
+            else Pc0317Invoke(f.Window, "ShowQueue");
+            await Dispatcher.CurrentDispatcher.InvokeAsync(() =>
+            {
+                var viewer = Cr040Viewer(f.List);
+                Assert(viewer.VerticalOffset > 100 && f.List.SelectedIndex == 999, "the first reveal pass did not run before simulated input");
+                viewer.ScrollToTop(); f.Window.UpdateLayout();
+                f.List.RaiseEvent(new MouseWheelEventArgs(Mouse.PrimaryDevice, Environment.TickCount, 120)
+                    { RoutedEvent = Mouse.PreviewMouseWheelEvent });
+                f.List.SelectedIndex = 0;
+            }, DispatcherPriority.Input);
+            await Cr040Idle(f.Window);
+            Assert(f.List.SelectedIndex == 0 && Cr040Viewer(f.List).VerticalOffset < 1 && f.Queue.CurrentOccurrenceToken == current,
+                "the second reveal pass displaced the manual viewport or choice");
+        }
+    }
+
+    private static async Task Cr040FullscreenMutation()
+    {
+        using var f = new Pc0317Fixture("reveal040-fullscreen-mutation"); var rows = f.Rows(160);
+        f.Playlist("origin", rows); await f.Play(rows[120]); Cr040Show(f.Window);
+        var current = f.Queue.CurrentOccurrenceToken;
+        Pc0317Invoke(f.Window, "SetExpandedPlayerVisible", true, false);
+        Pc0317Invoke(f.Window, "SetExpandedQueueVisible", true, false);
+        var list = Pc0317Get<ListBox>(f.Window, "_expandedQueueList");
+        var priorItems = f.Queue.Items;
+        f.Queue.Append([f.Row("added-during-reveal")]);
+        Assert(!ReferenceEquals(priorItems, f.Queue.Items) && f.Queue.CurrentOccurrenceToken == current, "append did not change only the queue snapshot");
+        await Until(() => !Pc0317Get<bool>(f.Window, "_expandedQueueRevealPending"));
+        await Cr040Idle(f.Window);
+        Assert(list.Items.Count == 161 && list.SelectedIndex == 120, "same-queue append lost the live cursor or bound an outdated list");
+        Cr040Visible(list, 120, "fullscreen-appended-before-reveal");
+
+        var viewer = Cr040Viewer(list);
+        viewer.ScrollToTop(); await Cr040Idle(f.Window);
+        Pc0317Invoke(f.Window, "SetExpandedQueueVisible", false, false);
+        Pc0317Invoke(f.Window, "SetExpandedQueueVisible", true, false);
+        list.RaiseEvent(new MouseWheelEventArgs(Mouse.PrimaryDevice, Environment.TickCount, 120) { RoutedEvent = Mouse.PreviewMouseWheelEvent });
+        Pc0317Invoke(f.Window, "LayoutExpandedPanes", false);
+        await Cr040Idle(f.Window);
+        Assert(viewer.VerticalOffset < 1 && !Pc0317Get<bool>(f.Window, "_expandedQueueRevealPending"), "re-layout reinstated manual reveal");
+
+        Pc0317Invoke(f.Window, "SetExpandedQueueVisible", false, false);
+        Pc0317Invoke(f.Window, "SetExpandedQueueVisible", true, false);
+        f.Queue.SetItems(rows, rows[120]);
+        Pc0317Invoke(f.Window, "RefreshExpandedQueue");
+        await Cr040Idle(f.Window);
+        Assert(viewer.VerticalOffset < 1 && !Pc0317Get<bool>(f.Window, "_expandedQueueRevealPending"), "an old opening scrolled a replacement queue");
+    }
+
+    private static async Task Cr040OrdinaryQueueAppend()
+    {
+        using var f = new Pc0317Fixture("reveal040-ordinary-queue-append"); var rows = f.Rows(160);
+        rows[8] = rows[120];
+        f.Playlist("origin", rows);
+        f.List.SelectedIndex = 120;
+        await Pc0317Call(f.Window, "PlaySelectedAsync"); Cr040Show(f.Window);
+        var current = f.Queue.CurrentOccurrenceToken;
+        Assert(current is not null && f.Queue.CurrentIndex == 120, "the fixture did not start the second shared occurrence");
+        foreach (var betweenPasses in new[] { false, true })
+        {
+            var items = f.Queue.Items;
+            var count = items.Count;
+            Pc0317Invoke(f.Window, "ShowQueue");
+            if (betweenPasses)
+            {
+                await Dispatcher.CurrentDispatcher.InvokeAsync(() =>
+                {
+                    var viewer = Cr040Viewer(f.List);
+                    Assert(viewer.VerticalOffset > 100, "the first reveal pass did not run before append");
+                    Append();
+                    viewer.ScrollToTop(); f.Window.UpdateLayout();
+                }, DispatcherPriority.Input);
+            }
+            else
+            {
+                Cr040Viewer(f.List).ScrollToTop(); f.Window.UpdateLayout();
+                Append();
+            }
+            await Cr040Idle(f.Window);
+            Assert(f.List.Items.Count == count + 1 && f.List.SelectedIndex == 120 && f.Queue.CurrentOccurrenceToken == current,
+                "a same-queue append lost the live duplicate or published stale rows");
+            Cr040Visible(f.List, 120, "ordinary-queue-append-" + betweenPasses);
+
+            void Append()
+            {
+                f.Queue.Append([f.Row($"appended-{betweenPasses}")]);
+                Assert(!ReferenceEquals(f.Queue.Items, items), "append did not publish a replacement Items array");
+                Pc0317Invoke(f.Window, "RefreshPlaybackView");
+            }
+        }
+        Pc0317Invoke(f.Window, "ShowQueue");
+        f.Queue.SetItemsAt(rows, 120);
+        Pc0317Invoke(f.Window, "RefreshPlaybackView");
+        Cr040Viewer(f.List).ScrollToTop(); f.Window.UpdateLayout(); await Cr040Idle(f.Window);
+        Assert(f.Queue.CurrentOccurrenceToken != current && Cr040Viewer(f.List).VerticalOffset < 1,
+            "an old ordinary reveal moved the viewport after queue replacement");
+    }
+
+    private static async Task Cr040PassiveAppendSelection()
+    {
+        foreach (var fullscreen in new[] { false, true })
+        foreach (var beforeIdle in new[] { false, true })
+        {
+            using var f = new TwFixture($"reveal040-selection-{fullscreen}-{beforeIdle}");
+            var w = f.Window;
+            await Call(w, "OpenTrackWaveAsync", TwSeed("1234", "Волна", true)); await f.Ready("1234");
+            Cr040Show(w);
+            var queue = Pc0317Get<PlaybackQueue>(w, "_playbackQueue");
+            var source = queue.Current!;
+            var next = queue.Items[1];
+            var previous = Enumerable.Range(1, 22).Select(i => new TrackRow
+                { Id = $"prior-{i}", RequestId = $"prior-{i}:1", Title = $"Прослушанный трек {i}", Available = true }).ToArray();
+            queue.SetItems([.. previous, source, next]);
+            for (var i = 0; i < previous.Length; i++) queue.Next();
+            var cursor = queue.CurrentOccurrenceToken;
+            var expired = queue.OccurrenceTokenAt(0);
+            var selected = queue.OccurrenceTokenAt(5);
+            var second = queue.OccurrenceTokenAt(6);
+            Assert(ReferenceEquals(queue.Current, source), "fixture dropped the playing wave source before the refill");
+            f.HoldMore = true;
+            var refill = Call(w, "ExtendWaveQueueAsync");
+            try
+            {
+                await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                ListBox list;
+                if (fullscreen)
+                {
+                    Pc0317Invoke(w, "SetExpandedPlayerVisible", true, false);
+                    Pc0317Invoke(w, "SetExpandedQueueVisible", true, false);
+                    list = Pc0317Get<ListBox>(w, "_expandedQueueList");
+                }
+                else
+                {
+                    Pc0317Invoke(w, "ShowQueue");
+                    list = Control<ListView>(w, "TracksList");
+                }
+                if (!beforeIdle) await Cr040Idle(w);
+                await Dispatcher.CurrentDispatcher.InvokeAsync(() =>
+                {
+                    var presentation = PresentationSource.FromVisual(list) ?? PresentationSource.FromVisual(w)!;
+                    list.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, presentation, Environment.TickCount, Key.Down)
+                        { RoutedEvent = Keyboard.PreviewKeyDownEvent });
+                    list.SelectedIndex = 5;
+                    if (fullscreen) return;
+                    list.SelectedItems.Add(previous[0]);
+                    list.SelectedItems.Add(previous[6]);
+                }, DispatcherPriority.Input);
+
+                f.Release.TrySetResult();
+                await refill.WaitAsync(TimeSpan.FromSeconds(5)); await Cr040Idle(w);
+                Assert(queue.CurrentOccurrenceToken == cursor && queue.Items.Any(row => row.Id == "901")
+                    && Enumerable.Range(0, queue.Items.Count).All(i => queue.OccurrenceTokenAt(i) != expired),
+                    "held refill did not publish an append with a shifted queue cursor");
+                if (fullscreen)
+                    Assert(list.SelectedIndex == 3 && queue.OccurrenceTokenAt(list.SelectedIndex) == selected,
+                        "fullscreen append moved the manual choice to a different occurrence");
+                else
+                {
+                    Assert(list.SelectedItems.OfType<TrackRow>().ToHashSet().SetEquals([previous[5], previous[6]]),
+                        "ordinary append kept an evicted selection or replaced the surviving selected occurrences");
+                    await Call(w, "RemoveSelectedQueueAsync");
+                    Assert(queue.CurrentOccurrenceToken == cursor && Enumerable.Range(0, queue.Items.Count)
+                        .Select(queue.OccurrenceTokenAt).All(token => token != selected && token != second),
+                        "ordinary removal did not use the preserved choice");
+                }
+
+                list.UnselectAll();
+                queue.Append([new TrackRow { Id = "another", RequestId = "another:1", Title = "Ещё один трек", Available = true }]);
+                if (fullscreen) Pc0317Invoke(w, "RefreshExpandedQueue");
+                else Pc0317Invoke(w, "RefreshPlaybackView");
+                Assert(list.SelectedItems.Count == 0 && queue.CurrentOccurrenceToken == cursor, "same-cursor redraw filled an explicit empty selection");
+            }
+            finally { f.Release.TrySetResult(); }
+        }
     }
 
     private static async Task Cr040Lifetime()

@@ -17,18 +17,19 @@ public partial class MainWindow
     private void TrackMore_Click(object sender, RoutedEventArgs e)
     {
         e.Handled = true;
-        if (sender is FrameworkElement anchor && anchor.Tag is TrackRow track) OpenTrackActionsMenu(anchor, track);
+        if (sender is FrameworkElement { Tag: TrackRow } anchor) OpenTrackActionsMenu(anchor, () => anchor.Tag as TrackRow);
     }
     private void PlayerMore_Click(object sender, RoutedEventArgs e)
     {
         e.Handled = true;
-        if (sender is FrameworkElement anchor && _current is { } track) OpenTrackActionsMenu(anchor, track);
+        if (sender is FrameworkElement anchor && _current is not null) OpenTrackActionsMenu(anchor, () => _current);
     }
-    private void OpenTrackActionsMenu(FrameworkElement anchor, TrackRow track)
+    private void OpenTrackActionsMenu(FrameworkElement anchor, Func<TrackRow?> getTrack)
     {
         if (_closed) return;
-        var menu = CreateTrackActionsMenu(anchor, () => track, useSelection: false);
-        anchor.ContextMenu = menu;
+        AttachTrackActionsMenu(anchor, getTrack);
+        var menu = anchor.ContextMenu!;
+        menu.Placement = PlacementMode.Bottom;
         menu.IsOpen = true;
     }
     private void AttachTrackActionsMenu(FrameworkElement anchor, Func<TrackRow?> selectedTrack)
@@ -41,8 +42,10 @@ public partial class MainWindow
         var menu = new ContextMenu { PlacementTarget = anchor, Placement = PlacementMode.Bottom };
         menu.Resources["YamuseTrackActions"] = true;
         TrackActionTarget? target = null;
-        TrackRow? pointerTarget = null;
-        var hasPointerTarget = false;
+        TrackRow? openingTrack = null;
+        var hasOpeningTrack = false;
+        static TrackRow? TrackFrom(ListBoxItem? container) => container?.DataContext switch
+        { TrackRow row => row, CatalogItem { Kind: "track", Track: { } row } => row, DownloadEntry entry => entry.Track, _ => null };
         bool Current(TrackActionTarget state) => !_closed && state.AccountGeneration == _accountGeneration && state.AccountUid == _account?.Uid;
         MenuItem Action(string key, string title, string geometry, Func<TrackActionTarget, Task> perform, bool download = false)
         {
@@ -92,8 +95,8 @@ public partial class MainWindow
         });
         menu.Opened += (_, _) =>
         {
-            var track = hasPointerTarget ? pointerTarget : selectedTrack();
-            hasPointerTarget = false; pointerTarget = null;
+            var track = hasOpeningTrack ? openingTrack : selectedTrack();
+            hasOpeningTrack = false; openingTrack = null;
             target = track is null || _closed ? null : new(track, _accountGeneration, _account?.Uid,
                 !_favoriteTrackIds.Contains(track.Id), useSelection && TracksList.SelectedItems.Contains(track)
                     ? TracksList.SelectedItems.OfType<TrackRow>().Where(row => row.Available && row.LocalPath is null).ToArray()
@@ -108,7 +111,7 @@ public partial class MainWindow
             ((ShapePath)like.Icon).SetResourceReference(ShapePath.StrokeProperty, state.LikeDesired ? "MutedBrush" : "AccentTextBrush");
             wave.IsEnabled = online && MusicApi.IsTrackWaveSeed(track!.Id);
             next.IsEnabled = enqueue.IsEnabled = track!.CanPlay;
-            playlist.IsEnabled = online && _account is not null && !_catalogWriting && track.LocalPath is null && TrackReference(track).AlbumId is not null;
+            playlist.IsEnabled = online && _account is not null && !_catalogWriting && track.LocalPath is null && TryTrackReference(track)?.AlbumId is not null;
             download.IsEnabled = _offline.IsAvailable && online && state.Downloads.Length > 0 && !_offlineMaintenance && _downloadCts is null;
             download.Header = state.Downloads.Length > 1 ? $"Скачать выбранные · {state.Downloads.Length}" : "Скачать для офлайн";
             remove.IsEnabled = _offline.IsAvailable && track.IsDownloaded && !_offlineMaintenance;
@@ -128,22 +131,33 @@ public partial class MainWindow
             artists.IsEnabled = online && artists.Items.Count > 0;
             link.IsEnabled = TrackShareUri(track) is not null;
         };
-        menu.Closed += (_, _) => { target = null; pointerTarget = null; hasPointerTarget = false; artists.Items.Clear(); };
+        menu.Closed += (_, _) => { target = null; openingTrack = null; hasOpeningTrack = false; artists.Items.Clear(); };
         if (anchor is ListBox list)
         {
-            list.AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler((_, e) =>
+            list.ContextMenuOpening += (_, e) =>
             {
-                if (e.ChangedButton != MouseButton.Right) { hasPointerTarget = false; return; }
-                var container = ItemsControl.ContainerFromElement(list, e.OriginalSource as DependencyObject) as ListBoxItem;
-                hasPointerTarget = true;
-                pointerTarget = container?.DataContext switch
-                { TrackRow row => row, CatalogItem { Kind: "track", Track: { } row } => row, DownloadEntry entry => entry.Track, _ => null };
-                if (container is null) { list.SelectedIndex = -1; return; }
-                if (!container.IsSelected) list.SelectedItem = container.DataContext;
-            }), handledEventsToo: true);
-            list.PreviewKeyDown += (_, _) => hasPointerTarget = false;
+                var source = e.OriginalSource as DependencyObject;
+                var keyboard = e.CursorLeft == -1 && e.CursorTop == -1;
+                var container = source is null ? null : ItemsControl.ContainerFromElement(list, source) as ListBoxItem;
+                hasOpeningTrack = !keyboard || source is not null && !ReferenceEquals(source, list);
+                openingTrack = TrackFrom(container);
+                if (keyboard) return;
+                if (container is null) list.SelectedIndex = -1;
+                else
+                {
+                    if (!container.IsSelected) list.SelectedItem = container.DataContext;
+                    if (ReferenceEquals(list, TracksList)) MoveContextRangeAnchor(container);
+                }
+            };
         }
         return menu;
+    }
+
+    private static void MoveContextRangeAnchor(ListBoxItem container)
+    {
+        // Extended-selection lists suppress the original down until the context target is known.
+        container.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Right)
+        { RoutedEvent = UIElement.MouseRightButtonDownEvent });
     }
     private ShapePath TrackActionIcon(string geometry, bool download = false)
     {
@@ -162,7 +176,7 @@ public partial class MainWindow
     private void EnqueueActionTrack(TrackRow track, bool next)
     {
         if (!track.CanPlay || _closed) return;
-        _playbackQueue.Enqueue(track, next);
+        _playbackQueue.Enqueue(CopyTrackForQueue(track), next);
         if (_section == "queue") ShowQueue();
         SetStatus(next ? "Трек будет играть следующим" : "Трек добавлен в конец очереди"); UpdateControls();
     }

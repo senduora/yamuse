@@ -11,19 +11,25 @@ namespace YMusic.Native;
 internal sealed class LoudnessCache(string directory)
 {
     private const int MaximumFileBytes = 256 * 1024;
+    private const int MaximumEntries = 512;
     private static readonly ConcurrentDictionary<string, CacheState> States = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _path = Path.GetFullPath(Path.Combine(directory, "loudness-v1.json"));
     private readonly CacheState _state = States.GetOrAdd(Path.GetFullPath(Path.Combine(directory, "loudness-v1.json")), _ => new());
     private object _gate => _state.Gate;
-    private Dictionary<string, LoudnessResult>? _values { get => _state.Values; set => _state.Values = value; }
+    private OrderedDictionary<string, LoudnessResult>? _values { get => _state.Values; set => _state.Values = value; }
 
-    internal async Task<LoudnessResult?> MeasureAsync(string path, CancellationToken token)
+    internal async Task<LoudnessResult?> MeasureAsync(string path, CancellationToken token, string? verifiedDigest = null)
     {
         long generation;
         lock (_gate) generation = _state.Generation;
-        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        var length = stream.Length; var written = File.GetLastWriteTimeUtc(path);
-        var key = Convert.ToHexString(await SHA256.HashDataAsync(stream, token).ConfigureAwait(false));
+        // The indexed playback slot keeps the already verified file pinned
+        // throughout analysis, so its digest is a safe cache key.
+        await using var stream = verifiedDigest is null
+            ? new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan)
+            : null;
+        var length = stream?.Length ?? new FileInfo(path).Length;
+        var written = File.GetLastWriteTimeUtc(path);
+        var key = verifiedDigest ?? Convert.ToHexString(await SHA256.HashDataAsync(stream!, token).ConfigureAwait(false));
         lock (_gate)
         {
             Load();
@@ -42,7 +48,8 @@ internal sealed class LoudnessCache(string directory)
             // The result may still serve the playing slot, but cannot recreate
             // a cache entry from a generation that the user just cleared.
             if (_state.Generation != generation) return result;
-            _state.Pending[key] = result;
+            _state.Pending.Remove(key);
+            _state.Pending.Add(key, result);
             Trim(_state.Pending);
             Save();
         }
@@ -60,62 +67,70 @@ internal sealed class LoudnessCache(string directory)
             _state.Generation++;
             _values = new(StringComparer.Ordinal);
             _state.Pending.Clear();
+            var preserved = 0;
             try
             {
                 _ = UninstallPathGuard.Canonical(Path.GetDirectoryName(_path)!);
                 using var writer = GuardedStoreFile.HoldWriteGate(_path);
                 using var ancestors = UninstallPathGuard.HoldAncestors(_path);
-                if (!ancestors.Complete || !File.Exists(_path)) return new CacheCleanupResult(0, 0, 0, 0);
-                var attributes = File.GetAttributes(_path);
-                if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0) return new(0, 1, 0, 0);
-                if ((attributes & FileAttributes.ReadOnly) != 0) return new(0, 0, 1, 0);
-                using var handle = UninstallPathGuard.OpenOwnedFile(_path, read: true);
-                using var file = new FileStream(handle, FileAccess.Read, 16 * 1024, isAsync: false);
-                if (file.Length is <= 0 or > MaximumFileBytes) return new(0, 1, 0, 0);
-                using var document = JsonDocument.Parse(file);
-                if (!ValidDocument(document.RootElement)) return new(0, 1, 0, 0);
+                if (!ancestors.Complete) return new CacheCleanupResult(0, 0, 0, 0);
+                var recovery = new GuardedStoreRecovery(_path, GuardedStoreKind.Loudness);
+                preserved = recovery.CountConflictArchives();
+                using var handle = GuardedStoreFile.OpenCacheForCleanupUnderWriteGate(_path, GuardedStoreKind.Loudness, out var recovered);
+                if (recovered.ArchivedPrevious) preserved++;
+                if (recovered.PreserveCurrent) return new(0, preserved + 1, 0, 0);
+                if (handle is null) return new(0, preserved, 0, 0);
+                if ((File.GetAttributes(handle) & FileAttributes.ReadOnly) != 0) return new(0, preserved, 1, 0);
+                if (GuardedStoreFile.ReadFromHandle(handle, MaximumFileBytes) is not { } bytes) return new(0, preserved + 1, 0, 0);
+                using var document = JsonDocument.Parse(bytes);
+                if (!ValidDocument(document.RootElement)) return new(0, preserved + 1, 0, 0);
                 token.ThrowIfCancellationRequested();
-                var bytes = file.Length;
-                UninstallPathGuard.DeleteByHandle(file.SafeFileHandle);
-                return new(1, 0, 0, bytes);
+                if (FileSecurityPreservation.HasNamedStreamsOrExtendedAttributes(handle)) return new(0, preserved + 1, 0, 0);
+                token.ThrowIfCancellationRequested();
+                UninstallPathGuard.DeleteByHandle(handle);
+                return new(1, preserved, 0, bytes.Length);
             }
-            catch (JsonException) { return new(0, 1, 0, 0); }
-            catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception) { return new(0, 0, 1, 0); }
+            catch (JsonException) { return new(0, preserved + 1, 0, 0); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception) { return new(0, preserved, 1, 0); }
         }
     }, token);
 
     private static bool ValidDocument(JsonElement root)
     {
-        if (root.ValueKind != JsonValueKind.Object) return false;
-        var values = root.EnumerateObject().ToArray();
-        if (values.Length > 512 || values.Select(p => p.Name).Distinct(StringComparer.Ordinal).Count() != values.Length) return false;
-        foreach (var value in values)
+        try
         {
-            if (value.Name.Length != 64 || !value.Name.All(Uri.IsHexDigit) || value.Value.ValueKind != JsonValueKind.Object) return false;
-            var numbers = value.Value.EnumerateObject().ToArray();
-            if (numbers.Length != 2 || !numbers.Any(p => p.Name == "IntegratedLufs") || !numbers.Any(p => p.Name == "Peak")
-                || !value.Value.TryGetProperty("IntegratedLufs", out var lufs) || lufs.ValueKind != JsonValueKind.Number || !lufs.TryGetDouble(out var loudness)
-                || !value.Value.TryGetProperty("Peak", out var peak) || peak.ValueKind != JsonValueKind.Number || !peak.TryGetDouble(out var maximum)
-                || !Valid(new(loudness, maximum))) return false;
+            if (root.ValueKind != JsonValueKind.Object) return false;
+            var values = root.EnumerateObject().ToArray();
+            if (values.Length > MaximumEntries || values.Select(p => p.Name).Distinct(StringComparer.Ordinal).Count() != values.Length) return false;
+            foreach (var value in values)
+            {
+                if (value.Name.Length != 64 || !value.Name.All(Uri.IsHexDigit) || value.Value.ValueKind != JsonValueKind.Object) return false;
+                var numbers = value.Value.EnumerateObject().ToArray();
+                if (numbers.Length != 2 || !numbers.Any(p => p.Name == "IntegratedLufs") || !numbers.Any(p => p.Name == "Peak")
+                    || !value.Value.TryGetProperty("IntegratedLufs", out var lufs) || lufs.ValueKind != JsonValueKind.Number || !lufs.TryGetDouble(out var loudness)
+                    || !value.Value.TryGetProperty("Peak", out var peak) || peak.ValueKind != JsonValueKind.Number || !peak.TryGetDouble(out var maximum)
+                    || !Valid(new(loudness, maximum))) return false;
+            }
+            return true;
         }
-        return true;
+        catch (InvalidOperationException) { return false; } // Decoding a JSON property name can reject malformed Unicode.
     }
 
     private sealed class CacheState
     {
         internal object Gate { get; } = new();
         internal long Generation;
-        internal Dictionary<string, LoudnessResult>? Values;
-        internal Dictionary<string, LoudnessResult> Pending { get; } = new(StringComparer.Ordinal);
+        internal OrderedDictionary<string, LoudnessResult>? Values;
+        internal OrderedDictionary<string, LoudnessResult> Pending { get; } = new(StringComparer.Ordinal);
     }
     private void Load()
     {
         if (_values is not null) return;
         try
         {
-            _values = Parse(GuardedStoreFile.Read(_path, MaximumFileBytes));
+            _values = Parse(GuardedStoreFile.Read(_path, MaximumFileBytes, GuardedStoreKind.Loudness));
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { }
     }
     private void Save()
     {
@@ -124,8 +139,10 @@ internal sealed class LoudnessCache(string directory)
         {
             // A previous Load may have failed temporarily. Merge only the
             // unsaved measurements into the latest disk data inside the writer lease.
-            using var storage = GuardedStoreFile.BeginWrite(_path);
-            var merged = Parse(storage.ReadExisting(MaximumFileBytes));
+            using var storage = GuardedStoreFile.BeginWrite(_path, kind: GuardedStoreKind.Loudness);
+            var bytes = storage.ReadExisting(MaximumFileBytes);
+            if (bytes is null && storage.Exists) return;
+            var merged = Parse(bytes);
             foreach (var (key, result) in _state.Pending)
             {
                 merged.Remove(key);
@@ -136,27 +153,20 @@ internal sealed class LoudnessCache(string directory)
             _values = merged;
             _state.Pending.Clear();
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { }
     }
 
-    private static Dictionary<string, LoudnessResult> Parse(byte[]? bytes)
+    private static OrderedDictionary<string, LoudnessResult> Parse(byte[]? bytes)
     {
-        var values = new Dictionary<string, LoudnessResult>(StringComparer.Ordinal);
-        if (bytes is null) return values;
-        try
-        {
-            var stored = JsonSerializer.Deserialize<Dictionary<string, LoudnessResult>>(bytes);
-            if (stored is not null)
-                foreach (var (key, result) in stored.Take(512))
-                    if (key.Length == 64 && key.All(Uri.IsHexDigit) && Valid(result)) values[key] = result;
-        }
-        catch (JsonException) { }
-        return values;
+        if (bytes is null) return new(StringComparer.Ordinal);
+        using var document = JsonDocument.Parse(bytes);
+        if (!ValidDocument(document.RootElement)) throw new JsonException("Не подтверждён формат кэша анализа громкости.");
+        return document.RootElement.Deserialize<OrderedDictionary<string, LoudnessResult>>() ?? throw new JsonException();
     }
 
-    private static void Trim(Dictionary<string, LoudnessResult> values)
+    private static void Trim(OrderedDictionary<string, LoudnessResult> values)
     {
-        while (values.Count > 512) values.Remove(values.Keys.First());
+        while (values.Count > MaximumEntries) values.RemoveAt(0);
     }
     private static bool Valid(LoudnessResult? result) => result is not null
         && double.IsFinite(result.IntegratedLufs) && result.IntegratedLufs is >= -120 and <= 20

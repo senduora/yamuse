@@ -1,7 +1,9 @@
 using System.ComponentModel;
+using System.Globalization;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -27,6 +29,12 @@ internal sealed record AppUpdateState(AppUpdateStatus Status, bool FeedConfigure
     internal bool CheckSucceeded { get; init; }
 }
 
+internal sealed record UpdateRateLimitCheckpoint(DateTimeOffset RetryNotBeforeUtc, int SecondaryLimitCount = 0,
+    TimeSpan? SecondaryLimitDelay = null)
+{
+    internal const int MaximumSecondaryLimitCount = 7;
+}
+
 // The window owns scheduling and all user interactions. This service has no
 // timer, automatic download/application, or account storage access.
 internal sealed class UpdateSupport
@@ -34,28 +42,81 @@ internal sealed class UpdateSupport
     internal static readonly Uri OfficialRepository = new("https://github.com/senduora/yamuse");
     internal static readonly Uri OfficialLatestRelease = new("https://api.github.com/repos/senduora/yamuse/releases/latest");
     private static readonly Lazy<UpdateSupport> Instance = new(() => new(
-        Path.Combine(AppContext.BaseDirectory, "update-feed.json")));
+        Path.Combine(AppContext.BaseDirectory, "update-feed.json"),
+        recoveryBackend: Program.RecoverInstalledUpdateLocator ? uri => new VelopackUpdateBackend(uri, Program.CreateRecoveredUpdateLocator()) : null));
     internal static UpdateSupport Current => Instance.Value;
 
     private readonly SemaphoreSlim _operation = new(1, 1);
     private readonly Func<Uri, IAppUpdateBackend> _backendFactory;
+    private readonly Func<bool>? _installedAdmission;
     private readonly Uri? _repository;
     private readonly Func<CancellationToken, Task<string?>> _portableCheck;
+    private readonly TimeProvider _clock;
+    private sealed record RateLimit(UpdateRateLimitCheckpoint Checkpoint, long Started, TimeSpan Delay);
+    private RateLimit? _rateLimit;
     private IAppUpdateBackend? _backend;
     private volatile AppUpdateState _state;
     internal AppUpdateState State => _state;
     internal bool HasPortableCheckOverride { get; }
+    internal UpdateRateLimitCheckpoint? RateLimitCheckpoint => Volatile.Read(ref _rateLimit)?.Checkpoint;
+    internal TimeSpan RemainingRateLimit => Volatile.Read(ref _rateLimit) is { } limit
+        ? limit.Delay - _clock.GetElapsedTime(limit.Started) : TimeSpan.Zero;
+
+    internal void RestoreRateLimit(UpdateRateLimitCheckpoint? checkpoint)
+    {
+        if (checkpoint is null) return;
+        while (true)
+        {
+            var current = Volatile.Read(ref _rateLimit);
+            if (current is not null && (current.Checkpoint == checkpoint
+                || current.Checkpoint.RetryNotBeforeUtc > checkpoint.RetryNotBeforeUtc)) return;
+            if (current is not null && current.Checkpoint.RetryNotBeforeUtc == checkpoint.RetryNotBeforeUtc)
+            {
+                if (ReferenceEquals(Interlocked.CompareExchange(ref _rateLimit, current with { Checkpoint = checkpoint }, current), current)) return;
+                continue;
+            }
+            var started = _clock.GetTimestamp();
+            var delay = checkpoint.RetryNotBeforeUtc - _clock.GetUtcNow();
+            if (current is not null)
+            {
+                // Adopting a later saved deadline must also preserve the current monotonic wait after a clock change.
+                var remaining = current.Delay - _clock.GetElapsedTime(current.Started, started);
+                if (remaining > delay) delay = remaining;
+            }
+            if (ReferenceEquals(Interlocked.CompareExchange(ref _rateLimit, new(checkpoint, started, delay), current), current)) return;
+        }
+    }
+
+    internal void ObserveRateLimitAtAdmission(UpdateRateLimitCheckpoint? checkpoint)
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _rateLimit);
+            if (current?.Checkpoint == checkpoint) return;
+            var started = _clock.GetTimestamp();
+            if (current is not null && current.Delay > _clock.GetElapsedTime(current.Started, started))
+            {
+                RestoreRateLimit(checkpoint);
+                return;
+            }
+            var replacement = checkpoint is null ? null : new RateLimit(checkpoint, started, checkpoint.RetryNotBeforeUtc - _clock.GetUtcNow());
+            if (ReferenceEquals(Interlocked.CompareExchange(ref _rateLimit, replacement, current), current)) return;
+        }
+    }
 
     // Injection is limited to deterministic fixtures; production uses only the public Yamuse release.
     internal UpdateSupport(string? configurationPath, bool? installed = null,
         Func<Uri, IAppUpdateBackend>? backendFactory = null,
-        Func<CancellationToken, Task<string?>>? portableCheck = null)
+        Func<CancellationToken, Task<string?>>? portableCheck = null,
+        Func<Uri, IAppUpdateBackend>? recoveryBackend = null, TimeProvider? clock = null, Func<bool>? installedAdmission = null)
     {
-        _backendFactory = backendFactory ?? (uri => new VelopackUpdateBackend(uri));
-        var isInstalled = installed ?? DetectInstalled();
+        _backendFactory = backendFactory ?? recoveryBackend ?? (uri => new VelopackUpdateBackend(uri));
+        _installedAdmission = installed is null && recoveryBackend is null ? installedAdmission ?? DetectInstalled : null;
+        var isInstalled = installed ?? (recoveryBackend is not null || _installedAdmission!());
         var currentVersion = AppBranding.CurrentVersion;
         var (repository, invalid) = ReadRepository(configurationPath);
         _repository = repository;
+        _clock = clock ?? TimeProvider.System;
         _portableCheck = portableCheck ?? (token => CheckPortableReleaseAsync(currentVersion, token));
         HasPortableCheckOverride = portableCheck is not null;
         _state = new(invalid ? AppUpdateStatus.Error : repository is null ? AppUpdateStatus.NotConfigured
@@ -67,8 +128,8 @@ internal sealed class UpdateSupport
             : "Обновления проверяются при запуске. Можно проверить их вручную.");
     }
 
-    internal Task<AppUpdateState> CheckAsync(CancellationToken cancellationToken = default)
-        => _repository is not null ? CheckCoreAsync(cancellationToken) : Task.FromResult(State);
+    internal Task<AppUpdateState> CheckAsync(CancellationToken cancellationToken = default, Func<Task<bool>>? onCheckStarting = null)
+        => _repository is not null ? CheckCoreAsync(cancellationToken, onCheckStarting) : Task.FromResult(State);
 
     internal Task<AppUpdateState> DownloadAsync(IProgress<int>? progress = null,
         CancellationToken cancellationToken = default)
@@ -76,13 +137,27 @@ internal sealed class UpdateSupport
 
     private bool CanUseUpdates => _repository is not null && State.IsInstalled;
 
-    private async Task<AppUpdateState> CheckCoreAsync(CancellationToken cancellationToken)
+    private async Task<AppUpdateState> CheckCoreAsync(CancellationToken cancellationToken, Func<Task<bool>>? onCheckStarting)
     {
         await _operation.WaitAsync(cancellationToken).ConfigureAwait(false);
         var before = State;
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (RemainingRateLimit > TimeSpan.Zero) return SetRateLimited(before);
+            var admitted = onCheckStarting is null || await onCheckStarting().ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (RemainingRateLimit > TimeSpan.Zero) return SetRateLimited(before);
+            if (!admitted) return before with { CheckSucceeded = false };
+            var installation = _backend is null ? _installedAdmission?.Invoke() : null;
+            if (installation is bool isInstalled && isInstalled != before.IsInstalled)
+            {
+                before = _state = before with
+                {
+                    IsInstalled = isInstalled, Status = isInstalled ? AppUpdateStatus.Ready : AppUpdateStatus.Portable,
+                    AvailableVersion = null, ProgressPercent = null, CheckSucceeded = false
+                };
+            }
             if (!State.IsInstalled)
             {
                 // Portable previews never create the installer backend. The
@@ -90,6 +165,7 @@ internal sealed class UpdateSupport
                 Set(AppUpdateStatus.Checking, "Проверяем обновления…");
                 var release = await _portableCheck(cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
+                Volatile.Write(ref _rateLimit, null);
                 return release is null ? Set(AppUpdateStatus.NoUpdate, "Используется последняя доступная версия.", checkSucceeded: true)
                     : Set(AppUpdateStatus.Available, "Доступна новая версия. Откройте официальный выпуск для скачивания.", release, checkSucceeded: true);
             }
@@ -97,6 +173,7 @@ internal sealed class UpdateSupport
             Set(AppUpdateStatus.Checking, "Проверяем обновления…");
             // The backend commits the selected candidate under the same operation lock.
             var version = await _backend.CheckAsync(cancellationToken).ConfigureAwait(false);
+            Volatile.Write(ref _rateLimit, null);
             if (version is not null && _backend.PendingVersion == version)
                 return Set(AppUpdateStatus.Downloaded, "Обновление загружено. Установите его, когда закончите слушать.", version, 100, checkSucceeded: true);
             return version is null
@@ -107,6 +184,30 @@ internal sealed class UpdateSupport
         {
             _state = before with { Message = "Проверка обновлений отменена.", CheckSucceeded = false };
             return State;
+        }
+        catch (LatestReleaseRateLimitException limit)
+        {
+            var started = _clock.GetTimestamp();
+            var now = _clock.GetUtcNow();
+            var delay = limit.GetRetryDelay(now);
+            var prior = RateLimitCheckpoint;
+            var count = limit.IsSecondary ? Math.Min((prior?.SecondaryLimitCount ?? 0) + 1,
+                UpdateRateLimitCheckpoint.MaximumSecondaryLimitCount) : 0;
+            if (count > 1)
+            {
+                var minimum = TimeSpan.FromMinutes(1 << (count - 1));
+                if (prior?.SecondaryLimitDelay is { } previous)
+                {
+                    var maximumDefault = TimeSpan.FromMinutes(1 << (UpdateRateLimitCheckpoint.MaximumSecondaryLimitCount - 1));
+                    var doubled = previous >= maximumDefault ? previous
+                        : TimeSpan.FromTicks(Math.Min(previous.Ticks * 2, maximumDefault.Ticks));
+                    if (doubled > minimum) minimum = doubled;
+                }
+                if (minimum > delay) delay = minimum;
+            }
+            var until = delay <= DateTimeOffset.MaxValue - now ? now + delay : DateTimeOffset.MaxValue;
+            Volatile.Write(ref _rateLimit, new(new(until, count, count > 0 ? delay : null), started, delay));
+            return SetRateLimited(before);
         }
         catch (Exception error) when (before.Status == AppUpdateStatus.Downloaded && IsTemporaryCheckFailure(error)
             && _backend?.PendingVersion == before.AvailableVersion)
@@ -121,8 +222,16 @@ internal sealed class UpdateSupport
         finally { _operation.Release(); }
     }
 
+    private AppUpdateState SetRateLimited(AppUpdateState before)
+    {
+        const string message = "GitHub временно ограничил проверку обновлений.";
+        if (before.Status == AppUpdateStatus.Downloaded && _backend?.PendingVersion == before.AvailableVersion)
+            return _state = before with { Message = message + " Ранее загруженная версия доступна.", CheckSucceeded = false };
+        return Set(AppUpdateStatus.Error, message + " Повторите позже.");
+    }
+
     private static bool IsTemporaryCheckFailure(Exception error)
-        => error is OperationCanceledException
+        => error is OperationCanceledException or IncompleteReleaseFeedException
             || error is HttpRequestException request && (request.StatusCode is null or HttpStatusCode.TooManyRequests
                 or HttpStatusCode.RequestTimeout || (int)request.StatusCode.GetValueOrDefault() >= 500);
 
@@ -175,13 +284,18 @@ internal sealed class UpdateSupport
         if (!_operation.Wait(0)) throw new InvalidOperationException("Дождитесь завершения проверки или скачивания.");
         try
         {
-            if (!CanUseUpdates || State.Status != AppUpdateStatus.Downloaded || _backend is null)
+            var before = State;
+            if (!CanUseUpdates || before.Status != AppUpdateStatus.Downloaded || _backend is null)
                 throw new InvalidOperationException("Обновление ещё не загружено.");
             try { _backend.ApplyAndRestart(); }
             catch (Exception)
             {
-                Set(AppUpdateStatus.Error, "Не удалось применить обновление. Повторите позже.", State.AvailableVersion);
-                throw new InvalidOperationException("Не удалось применить обновление. Повторите позже.");
+                const string message = "Не удалось применить обновление. Повторите позже.";
+                // The backend restores PendingVersion only after verifying the package again on a held file.
+                if (before.AvailableVersion is { } version && _backend.PendingVersion == version)
+                    _state = before with { Message = message, CheckSucceeded = false };
+                else Set(AppUpdateStatus.Error, message, before.AvailableVersion);
+                throw new InvalidOperationException(message);
             }
         }
         finally { _operation.Release(); }
@@ -191,19 +305,7 @@ internal sealed class UpdateSupport
         => _state = State with { Status = status, Message = message, AvailableVersion = version, ProgressPercent = percent, CheckSucceeded = checkSucceeded };
 
     private static bool DetectInstalled()
-    {
-        try
-        {
-            var locator = VelopackLocator.Current;
-            return locator.CurrentlyInstalledVersion is not null && !locator.IsPortable;
-        }
-        catch (InvalidOperationException)
-        {
-            // A host/test which bypasses Program has no locator. Fail closed:
-            // such a process must never create an installer backend.
-            return false;
-        }
-    }
+        => VelopackLocator.IsCurrentSet && Program.CanUseInstalledUpdateLocator(VelopackLocator.Current);
 
     private static (Uri? Repository, bool Invalid) ReadRepository(string? path)
     {
@@ -246,6 +348,7 @@ internal sealed class UpdateSupport
         request.Headers.UserAgent.ParseAdd("Yamuse-Update-Check/1.0");
         request.Headers.Accept.ParseAdd("application/vnd.github+json");
         using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+        await CheckLatestRateLimitAsync(response, timeout.Token).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
         if (response.Content.Headers.ContentLength is > 65536) throw new InvalidDataException("Release metadata exceeds its bound.");
         using var stream = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
@@ -275,10 +378,104 @@ internal sealed class UpdateSupport
             throw new InvalidDataException("Release version is invalid.");
         return (text, version);
     }
+
+    internal static async Task CheckLatestRateLimitAsync(HttpResponseMessage response, CancellationToken token)
+    {
+        if (response.StatusCode is not (HttpStatusCode.Forbidden or HttpStatusCode.TooManyRequests)) return;
+        var primary = response.Headers.TryGetValues("x-ratelimit-remaining", out var remaining)
+            && remaining.Any(value => value.Trim() == "0");
+        var retryAfter = response.Headers.RetryAfter;
+        if (!primary && retryAfter is null && response.StatusCode == HttpStatusCode.Forbidden
+            && !await HasSecondaryRateLimitMessageAsync(response, token).ConfigureAwait(false)) return;
+
+        DateTimeOffset? reset = null;
+        if (primary && response.Headers.TryGetValues("x-ratelimit-reset", out var timestamps))
+        {
+            var lastUnixSecond = DateTimeOffset.MaxValue.ToUnixTimeSeconds();
+            foreach (var timestamp in timestamps)
+                if (long.TryParse(timestamp, NumberStyles.Integer, CultureInfo.InvariantCulture, out var seconds)
+                    && seconds >= 0 && seconds <= lastUnixSecond)
+                {
+                    var date = DateTimeOffset.FromUnixTimeSeconds(seconds);
+                    if (!reset.HasValue || date > reset.Value) reset = date;
+                }
+        }
+        throw new LatestReleaseRateLimitException(retryAfter, reset, secondary: !primary);
+    }
+
+    private static async Task<bool> HasSecondaryRateLimitMessageAsync(HttpResponseMessage response, CancellationToken token)
+    {
+        // Secondary limits can have a positive primary quota and no Retry-After.
+        try
+        {
+            var body = await ReadMetadataBodyAsync(response, 16 * 1024, token).ConfigureAwait(false);
+            using var document = JsonDocument.Parse(body, new JsonDocumentOptions { MaxDepth = 16 });
+            return document.RootElement.ValueKind == JsonValueKind.Object
+                && document.RootElement.TryGetProperty("message", out var message) && message.ValueKind == JsonValueKind.String
+                && message.GetString()!.StartsWith("You have exceeded a secondary rate limit", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception error) when (error is JsonException or InvalidDataException) { return false; }
+    }
+
+    internal static async Task<byte[]> ReadMetadataBodyAsync(HttpResponseMessage response, int maximumBytes, CancellationToken token)
+    {
+        var length = response.Content.Headers.ContentLength;
+        if (length > maximumBytes) throw new InvalidDataException("Метаданные обновления слишком велики.");
+        Stream body;
+        try { body = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false); }
+        catch (Exception error) when (IsMetadataBodyInterruption(error)) { throw MetadataBodyInterrupted(error, token); }
+        await using (body)
+        {
+            using var data = new MemoryStream();
+            var buffer = new byte[8192];
+            while (true)
+            {
+                int read;
+                try { read = await body.ReadAsync(buffer, token).ConfigureAwait(false); }
+                catch (Exception error) when (IsMetadataBodyInterruption(error)) { throw MetadataBodyInterrupted(error, token); }
+                if (read == 0) break;
+                if (read > maximumBytes - data.Length) throw new InvalidDataException("Метаданные обновления слишком велики.");
+                data.Write(buffer, 0, read);
+            }
+            if (length is { } expected && data.Length != expected)
+                throw new HttpRequestException("Соединение оборвалось при чтении метаданных обновления.");
+            return data.ToArray();
+        }
+    }
+
+    private static bool IsMetadataBodyInterruption(Exception error) => error switch
+    {
+        HttpIOException wire => wire.HttpRequestError is HttpRequestError.ResponseEnded or HttpRequestError.ConnectionError,
+        InvalidDataException => false,
+        _ => error is IOException or SocketException
+    };
+
+    private static HttpRequestException MetadataBodyInterrupted(Exception error, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        return new HttpRequestException("Соединение оборвалось при чтении метаданных обновления.", error);
+    }
 }
+
+internal sealed class LatestReleaseRateLimitException(RetryConditionHeaderValue? retryAfter, DateTimeOffset? reset, bool secondary)
+    : HttpRequestException("Достигнут лимит проверок обновлений.", null, HttpStatusCode.TooManyRequests)
+{
+    internal bool IsSecondary => secondary;
+    internal TimeSpan GetRetryDelay(DateTimeOffset now)
+    {
+        var delay = retryAfter?.Delta;
+        if (retryAfter?.Date is { } retryAt && retryAt >= now) delay = retryAt - now;
+        if (reset is { } next && next >= now && (delay is null || next - now > delay.Value)) delay = next - now;
+        return delay ?? TimeSpan.FromMinutes(1);
+    }
+}
+
+internal sealed class IncompleteReleaseFeedException()
+    : IOException("В последнем официальном выпуске отсутствует полный пакет обновления.");
 
 internal interface IAppUpdateBackend
 {
+    // A failed apply may retain the pending version only when local revalidation succeeded and the updater did not start.
     string? PendingVersion { get; }
     // Cancellation before committing the selection must leave the previous selection intact.
     Task<string?> CheckAsync(CancellationToken cancellationToken);
@@ -305,12 +502,20 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
     private readonly Func<HttpMessageHandler> _packageHandler;
     private readonly TimeSpan _metadataDeadline;
     private readonly Func<SafeFileHandle, FileSecurityPreservation.FileRevision?> _packageRevision;
+    private readonly Func<string> _localAppDataFolder;
+    private readonly Func<Stream, CancellationToken, byte[]> _retiredPackageHash;
+    private readonly Action<SafeFileHandle> _deleteRetiredPackage;
+    private readonly object _maintenanceGate = new();
+    private PackageMaintenanceRequest? _activeMaintenance;
+    private PackageMaintenanceRequest? _queuedMaintenance;
+    private Task? _maintenanceWorker;
     private OfficialPackage? _selected;
     private bool _prepared;
 
     internal VelopackUpdateBackend(Uri repository, IVelopackLocator? locator = null, Func<HttpMessageHandler>? metadataHandler = null,
         Func<HttpMessageHandler>? packageHandler = null, TimeSpan? metadataDeadline = null,
-        Func<SafeFileHandle, FileSecurityPreservation.FileRevision?>? packageRevision = null)
+        Func<SafeFileHandle, FileSecurityPreservation.FileRevision?>? packageRevision = null, Func<string>? localAppDataFolder = null,
+        Func<Stream, CancellationToken, byte[]>? retiredPackageHash = null, Action<SafeFileHandle>? deleteRetiredPackage = null)
     {
         if (repository != UpdateSupport.OfficialRepository)
             throw new ArgumentException("Источник обновлений не поддерживается.", nameof(repository));
@@ -322,6 +527,9 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
             : () => throw new InvalidOperationException("Для тестового источника пакета требуется тестовый HTTP-обработчик."));
         _metadataDeadline = metadataDeadline ?? TimeSpan.FromSeconds(30);
         _packageRevision = packageRevision ?? FileSecurityPreservation.GetPersistentRevision;
+        _localAppDataFolder = localAppDataFolder ?? (() => Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+        _retiredPackageHash = retiredPackageHash ?? HashRetiredPackage;
+        _deleteRetiredPackage = deleteRetiredPackage ?? UninstallPathGuard.DeleteByHandle;
     }
 
     public string? PendingVersion => _prepared ? _selected?.Asset.Version.ToString() : null;
@@ -336,7 +544,6 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
         var candidate = await CheckLatestReleaseAsync(metadataClient, current, deadline.Token).ConfigureAwait(false);
         deadline.Token.ThrowIfCancellationRequested();
         var prepared = false;
-        PackageReceipt? receipt = null;
         if (candidate is not null)
         {
             var asset = candidate.Asset;
@@ -349,7 +556,8 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
                 if (prepared)
                 {
                     ValidateManifest(file!, asset);
-                    receipt = ObserveVerifiedPackage(file!, asset);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    RecordVerifiedPackage(file!, asset);
                 }
             }
         }
@@ -357,8 +565,7 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
         cancellationToken.ThrowIfCancellationRequested();
         _selected = candidate;
         _prepared = prepared;
-        // A completed check can retire a few known old archives without scanning the package directory.
-        await Task.Run(() => MaintainPackageReceipts(receipt, current, cancellationToken)).ConfigureAwait(false);
+        QueuePackageMaintenance(current, cancellationToken);
         return candidate?.Asset.Version.ToString();
     }
 
@@ -368,48 +575,54 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
         var package = selected.Asset;
         var path = GetPackagePath(package);
         using var parents = UninstallPathGuard.HoldAncestors(path, create: true);
-        using (var cached = TryOpenPackage(path))
+        using var cached = TryOpenPackage(path);
+        if (cached is not null && await MatchesHashAsync(cached, package, cancellationToken).ConfigureAwait(false))
         {
-            if (cached is not null && await MatchesHashAsync(cached, package, cancellationToken).ConfigureAwait(false))
-            {
-                ValidateManifest(cached, package);
-                cancellationToken.ThrowIfCancellationRequested();
-                CommitPreparedPackage(cached, package);
-                return;
-            }
+            ValidateManifest(cached, package);
+            cancellationToken.ThrowIfCancellationRequested();
+            CommitPreparedPackage(cached, package);
+            return;
         }
 
         _prepared = false;
+        FileSecurityPreservation.FileRevision? revision = null;
+        if (cached is not null)
+        {
+            FileSecurityPreservation.CheckReplacementMetadata(cached.SafeFileHandle);
+            revision = FileSecurityPreservation.GetRevision(cached.SafeFileHandle);
+        }
         var temporary = Path.Combine(Path.GetDirectoryName(path)!, $".yamuse-update-{Guid.NewGuid():N}.tmp");
-        using var handle = UninstallPathGuard.CreateStagedFile(temporary, asynchronous: true);
+        using var handle = UninstallPathGuard.CreateStagedFile(temporary, asynchronous: true, writeDacl: cached is not null);
         var published = false;
         FileStream? staged = null;
         try
         {
             UninstallPathGuard.SetDeleteDisposition(handle, delete: true);
             staged = new FileStream(handle, FileAccess.ReadWrite, 65536, isAsync: true);
+            FileSecurityPreservation.CheckReplacementMetadata(handle);
+            if (cached is not null) FileSecurityPreservation.PrepareReplacement(cached.SafeFileHandle, handle);
             await DownloadOfficialPackageAsync(selected, staged, progress, cancellationToken).ConfigureAwait(false);
             await staged.FlushAsync(cancellationToken).ConfigureAwait(false);
             staged.Position = 0;
             if (!await MatchesHashAsync(staged, package, cancellationToken).ConfigureAwait(false))
                 throw new InvalidDataException("Контрольная сумма обновления не совпадает.");
             ValidateManifest(staged, package);
-            cancellationToken.ThrowIfCancellationRequested();
-            using (var replaced = TryOpenPackage(path, deleteAccess: true))
+            if (revision is { } expected)
             {
-                if (replaced is not null)
-                {
-                    if (await MatchesHashAsync(replaced, package, cancellationToken).ConfigureAwait(false))
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        CommitPreparedPackage(replaced, package);
-                        return;
-                    }
-                    cancellationToken.ThrowIfCancellationRequested();
-                    UninstallPathGuard.DeleteByHandle(replaced.SafeFileHandle);
-                }
+                using var current = TryOpenPackage(path);
+                if (current is null || FileSecurityPreservation.GetRevision(current.SafeFileHandle) != expected)
+                    throw new IOException("Кэш обновления изменился во время скачивания.");
+                FileSecurityPreservation.CheckReplacementMetadata(current.SafeFileHandle);
+                FileSecurityPreservation.PreserveBasicInformation(current.SafeFileHandle, handle);
+                staged.Flush(flushToDisk: true);
+                if (FileSecurityPreservation.GetRevision(current.SafeFileHandle) != expected)
+                    throw new IOException("Кэш обновления изменился во время скачивания.");
             }
-            ManagedCacheCleanup.RenameByHandle(handle, path, releaseDeleteDisposition: true);
+            else staged.Flush(flushToDisk: true);
+            cancellationToken.ThrowIfCancellationRequested();
+            // Windows requires closing readers of the checked old directory entry just before the atomic replacement.
+            cached?.Dispose();
+            ManagedCacheCleanup.RenameByHandle(handle, path, replace: revision is not null, releaseDeleteDisposition: true);
             published = true;
             CommitPreparedPackage(staged, package);
         }
@@ -422,91 +635,178 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
 
     private void CommitPreparedPackage(FileStream file, VelopackAsset package)
     {
+        RecordVerifiedPackage(file, package);
         _prepared = true;
-        if (ObserveVerifiedPackage(file, package) is { } receipt) MaintainPackageReceipts(receipt);
     }
 
-    private PackageReceipt? ObserveVerifiedPackage(FileStream file, VelopackAsset package)
+    private void QueuePackageMaintenance(SemanticVersion installed, CancellationToken token)
+    {
+        if (token.IsCancellationRequested) return;
+        lock (_maintenanceGate)
+        {
+            var request = new PackageMaintenanceRequest(installed, token);
+            if (_queuedMaintenance is null && _activeMaintenance == request) return;
+            _queuedMaintenance = request;
+            _maintenanceWorker ??= Task.Run(RunPackageMaintenance);
+        }
+    }
+
+    private void RunPackageMaintenance()
     {
         try
         {
-            if (package.SHA256 is not { } hash || GetPackageIdentity(file) is not { } identity) return null;
-            var receipt = new PackageReceipt(package.Version.ToString(), package.FileName, package.Size, hash.ToUpperInvariant(),
-                identity);
-            return IsValidReceipt(receipt) ? receipt : null;
+            while (true)
+            {
+                PackageMaintenanceRequest request;
+                lock (_maintenanceGate)
+                {
+                    if (_queuedMaintenance is not { } next) return;
+                    request = next;
+                    _activeMaintenance = request;
+                    _queuedMaintenance = null;
+                }
+
+                if (!request.Token.IsCancellationRequested) RetirePreviousPackages(request.Installed, request.Token);
+            }
         }
-        catch (Exception error) when (IsReceiptFailure(error)) { return null; }
+        finally
+        {
+            lock (_maintenanceGate)
+            {
+                _activeMaintenance = null;
+                _maintenanceWorker = _queuedMaintenance is null ? null : Task.Run(RunPackageMaintenance);
+            }
+        }
     }
 
-    private void MaintainPackageReceipts(PackageReceipt? verified, SemanticVersion? installed = null, CancellationToken token = default)
+    internal async Task WaitForPackageMaintenanceAsync()
+    {
+        while (true)
+        {
+            Task? worker;
+            lock (_maintenanceGate) worker = _maintenanceWorker;
+            if (worker is null) return;
+            await worker.ConfigureAwait(false);
+        }
+    }
+
+    private void RecordVerifiedPackage(FileStream file, VelopackAsset package)
+    {
+        try
+        {
+            if (package.SHA256 is not { } hash || GetPackageIdentity(file) is not { } identity) return;
+            var verified = new PackageReceipt(package.Version.ToString(), package.FileName, package.Size, hash.ToUpperInvariant(), identity);
+            if (!IsValidReceipt(verified)) return;
+            var path = Path.Combine(GetPackagesDirectory(), ReceiptFileName);
+            var entropy = ReceiptEntropy(path);
+            using var transaction = GuardedStoreFile.BeginWrite(path, createParents: false);
+            var storedReceipts = ReadStoredReceipts(transaction, entropy, out var damaged);
+            if (storedReceipts is null && damaged is null) return;
+            List<PackageReceipt> receipts = [.. (storedReceipts ?? [])];
+            var index = receipts.FindIndex(item => item.FileName.Equals(verified.FileName, StringComparison.OrdinalIgnoreCase));
+            if (index < 0)
+            {
+                if (receipts.Count == MaximumReceipts) ForgetOldestReceipt(receipts);
+                receipts.Add(verified);
+            }
+            else
+            {
+                if (receipts[index] == verified) return;
+                receipts[index] = verified;
+            }
+            if (ProtectReceipts(receipts, entropy, verified) is not { } stored) return;
+            if (damaged is null) transaction.Write(stored);
+            else ArchiveDamagedReceipts(transaction, path, damaged, stored);
+        }
+        catch (Exception error) when (IsReceiptFailure(error) || error is JsonException)
+        {
+            // Saving a receipt is best-effort. An unrecorded package remains usable and cannot be retired on that basis.
+        }
+    }
+
+    private void RetirePreviousPackages(SemanticVersion installed, CancellationToken token)
     {
         try
         {
             var directory = GetPackagesDirectory();
-            var path = Path.Combine(directory, ReceiptFileName);
-            var entropy = SHA256.HashData(Encoding.UTF8.GetBytes("Yamuse.VerifiedUpdatePackages.1\0" + path.ToUpperInvariant()));
-            using var transaction = GuardedStoreFile.BeginWrite(path, createParents: false);
-            List<PackageReceipt> receipts = [];
-            if (transaction.Exists)
+            var ledger = Path.Combine(directory, ReceiptFileName);
+            var entropy = ReceiptEntropy(ledger);
+            PackageReceipt[]? snapshot;
+            using (var transaction = GuardedStoreFile.BeginWrite(ledger, createParents: false))
+                snapshot = ReadStoredReceipts(transaction, entropy, out _);
+            if (snapshot is null) return;
+            foreach (var receipt in snapshot.Where(item => SemanticVersion.Parse(item.Version) < installed).Take(2))
             {
-                var stored = transaction.ReadExisting(MaximumProtectedReceiptBytes);
-                if (stored is null) return;
-                var raw = ProtectedData.Unprotect(stored, entropy, DataProtectionScope.CurrentUser);
-                if (raw.Length > MaximumReceiptBytes
-                    || JsonSerializer.Deserialize<PackageReceiptLedger>(raw, ReceiptJson) is not { Schema: 1, Packages: { } packages }
-                    || packages.Length > MaximumReceipts || packages.Any(receipt => !IsValidReceipt(receipt))
-                    || packages.Select(receipt => receipt.FileName).Distinct(StringComparer.OrdinalIgnoreCase).Count() != packages.Length)
-                    return;
-                receipts.AddRange(packages);
-            }
-
-            var changed = false;
-            if (installed is not null)
-            {
-                foreach (var receipt in receipts.Where(receipt => SemanticVersion.Parse(receipt.Version) < installed).Take(2).ToArray())
-                {
-                    if (token.IsCancellationRequested) break;
-                    var removed = TryRetirePackage(directory, receipt, token);
-                    // Rotate blocked or changed files so one inaccessible entry cannot starve the next check.
-                    if (removed || receipts[^1] != receipt)
-                    {
-                        receipts.Remove(receipt);
-                        if (!removed) receipts.Add(receipt);
-                        changed = true;
-                    }
-                }
-            }
-
-            if (verified is { } observed)
-            {
-                var previous = receipts.FindIndex(item => item.FileName.Equals(observed.FileName, StringComparison.OrdinalIgnoreCase));
-                if (previous < 0)
-                {
-                    if (receipts.Count == MaximumReceipts) ForgetOldestReceipt(receipts);
-                    receipts.Add(observed);
-                    changed = true;
-                }
-                else if (previous >= 0 && receipts[previous] != observed)
-                {
-                    receipts[previous] = observed;
-                    changed = true;
-                }
-            }
-
-            if (changed)
-            {
-                var data = JsonSerializer.SerializeToUtf8Bytes(new PackageReceiptLedger(1, [.. receipts]), ReceiptJson);
-                while (data.Length > MaximumReceiptBytes && verified is not null && ForgetOldestReceipt(receipts, verified))
-                    data = JsonSerializer.SerializeToUtf8Bytes(new PackageReceiptLedger(1, [.. receipts]), ReceiptJson);
-                if (data.Length > MaximumReceiptBytes) return;
-                var stored = ProtectedData.Protect(data, entropy, DataProtectionScope.CurrentUser);
-                if (stored.Length <= MaximumProtectedReceiptBytes) transaction.Write(stored);
+                token.ThrowIfCancellationRequested();
+                try { RetirePackage(directory, receipt, ledger, entropy, token); }
+                catch (Exception error) when (IsReceiptFailure(error) || error is JsonException) { }
             }
         }
-        catch (Exception error) when (IsReceiptFailure(error) || error is JsonException)
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception error) when (IsReceiptFailure(error) || error is JsonException) { }
+    }
+
+    private static byte[] ReceiptEntropy(string path)
+        => SHA256.HashData(Encoding.UTF8.GetBytes("Yamuse.VerifiedUpdatePackages.1\0" + path.ToUpperInvariant()));
+
+    private static PackageReceipt[]? ReadStoredReceipts(GuardedStoreFile.WriteTransaction transaction, byte[] entropy, out byte[]? damaged)
+    {
+        damaged = null;
+        if (!transaction.Exists) return [];
+        if (transaction.ReadExisting(MaximumProtectedReceiptBytes) is not { } stored) return null;
+        var raw = ProtectedData.Unprotect(stored, entropy, DataProtectionScope.CurrentUser);
+        var receipts = ReadAuthenticatedReceipts(raw, out var unknownSchema);
+        if (receipts is null && !unknownSchema) damaged = stored;
+        return receipts;
+    }
+
+    private static byte[]? ProtectReceipts(List<PackageReceipt> receipts, byte[] entropy, PackageReceipt? keep = null)
+    {
+        var data = JsonSerializer.SerializeToUtf8Bytes(new PackageReceiptLedger(1, [.. receipts]), ReceiptJson);
+        while (data.Length > MaximumReceiptBytes && keep is not null && ForgetOldestReceipt(receipts, keep))
+            data = JsonSerializer.SerializeToUtf8Bytes(new PackageReceiptLedger(1, [.. receipts]), ReceiptJson);
+        if (data.Length > MaximumReceiptBytes) return null;
+        var stored = ProtectedData.Protect(data, entropy, DataProtectionScope.CurrentUser);
+        return stored.Length <= MaximumProtectedReceiptBytes ? stored : null;
+    }
+
+    private static PackageReceipt[]? ReadAuthenticatedReceipts(byte[] raw, out bool unknownSchema)
+    {
+        unknownSchema = false;
+        try
         {
-            // Receipt or cleanup failure leaves the verified package and update outcome usable.
+            using var document = JsonDocument.Parse(raw, new JsonDocumentOptions { MaxDepth = ReceiptJson.MaxDepth });
+            var root = document.RootElement;
+            unknownSchema = root.ValueKind == JsonValueKind.Object && root.TryGetProperty("Schema", out var schema)
+                && schema.ValueKind == JsonValueKind.Number && schema.TryGetInt32(out var number) && number > 1;
+            if (unknownSchema || raw.Length > MaximumReceiptBytes
+                || root.Deserialize<PackageReceiptLedger>(ReceiptJson) is not { Schema: 1, Packages: { } packages }
+                || packages.Length > MaximumReceipts || packages.Any(receipt => !IsValidReceipt(receipt))
+                || packages.Select(receipt => receipt.FileName).Distinct(StringComparer.OrdinalIgnoreCase).Count() != packages.Length)
+                return null;
+            return packages;
         }
+        catch (JsonException) { return null; }
+    }
+
+    private static void ArchiveDamagedReceipts(GuardedStoreFile.WriteTransaction transaction, string path, byte[] damaged, byte[] fresh)
+    {
+        // DPAPI must authenticate the bytes before this path is reachable. Failed Unprotect leaves the opaque ledger in place.
+        using var archive = transaction.CreateStage($"{path}.corrupt-{Guid.NewGuid():N}.bak");
+        var committed = false;
+        try
+        {
+            using (var original = transaction.OpenExisting() ?? throw new IOException("Журнал пакетов изменился."))
+            {
+                RandomAccess.Write(archive, damaged, 0);
+                FileSecurityPreservation.PreserveBasicInformation(original, archive);
+                RandomAccess.FlushToDisk(archive);
+            }
+            UninstallPathGuard.KeepFileOnClose(archive);
+            transaction.Write(fresh);
+            committed = true;
+        }
+        finally { if (!committed) UninstallPathGuard.DiscardStagedFile(archive); }
     }
 
     private static bool ForgetOldestReceipt(List<PackageReceipt> receipts, PackageReceipt? keep = null)
@@ -516,21 +816,89 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
         return oldest is not null && receipts.Remove(oldest);
     }
 
-    private bool TryRetirePackage(string directory, PackageReceipt receipt, CancellationToken token)
+    private void RetirePackage(string directory, PackageReceipt receipt, string ledger, byte[] entropy, CancellationToken token)
     {
+        var path = Path.Combine(directory, receipt.FileName);
+        using var parents = UninstallPathGuard.HoldAncestors(path);
+        if (!parents.Complete) return;
+        FileStream? file = null;
         try
         {
-            // The receipt transaction pins this directory and all ancestors for the entire operation.
-            using var file = TryOpenPackage(Path.Combine(directory, receipt.FileName), deleteAccess: true);
-            if (file is null) return true;
-            if (file.Length != receipt.Size || GetPackageIdentity(file) != receipt.Identity) return false;
-            FileSecurityPreservation.CheckReplacementMetadata(file.SafeFileHandle);
-            if (!Convert.ToHexString(SHA256.HashData(file)).Equals(receipt.Sha256, StringComparison.OrdinalIgnoreCase)
-                || token.IsCancellationRequested) return false;
-            UninstallPathGuard.DeleteByHandle(file.SafeFileHandle);
-            return true;
+            var mayRetire = false;
+            try
+            {
+                file = TryOpenPackage(path, deleteAccess: true);
+                if (file is null) mayRetire = true;
+                else if (file.Length == receipt.Size && GetPackageIdentity(file) == receipt.Identity)
+                {
+                    FileSecurityPreservation.CheckReplacementMetadata(file.SafeFileHandle);
+                    mayRetire = Convert.ToHexString(_retiredPackageHash(file, token)).Equals(receipt.Sha256, StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch (Exception error) when (IsReceiptFailure(error)) { }
+
+            // Large archive reads run outside the ledger mutex. Keep the archive pinned until the exact receipt is rechecked.
+            token.ThrowIfCancellationRequested();
+            using var transaction = GuardedStoreFile.BeginWrite(ledger, createParents: false);
+            if (ReadStoredReceipts(transaction, entropy, out _) is not { } stored) return;
+            var index = Array.IndexOf(stored, receipt);
+            if (index < 0) return;
+            if (mayRetire)
+            {
+                try
+                {
+                    if (file is null) mayRetire = !UninstallPathGuard.EntryExists(path);
+                    else FileSecurityPreservation.CheckReplacementMetadata(file.SafeFileHandle);
+                }
+                catch (Exception error) when (IsReceiptFailure(error)) { mayRetire = false; }
+            }
+            var receipts = stored.ToList();
+            receipts.RemoveAt(index);
+            if (mayRetire && PublishRetirementReceipts(transaction, receipts, entropy, token, file?.SafeFileHandle)) return;
+            if (index == stored.Length - 1) return;
+            // Keep the exact receipt and rotate it after any file-specific failure, including a late refusal to delete.
+            receipts.Add(receipt);
+            PublishRetirementReceipts(transaction, receipts, entropy, token);
         }
-        catch (Exception error) when (IsReceiptFailure(error)) { return false; }
+        finally { file?.Dispose(); }
+    }
+
+    private bool PublishRetirementReceipts(GuardedStoreFile.WriteTransaction transaction, List<PackageReceipt> receipts,
+        byte[] entropy, CancellationToken token, SafeFileHandle? delete = null)
+    {
+        if (ProtectReceipts(receipts, entropy) is not { } protectedReceipts) return false;
+        using var staged = transaction.Stage(protectedReceipts);
+        var committed = false;
+        try
+        {
+            committed = transaction.Commit(staged, publish =>
+            {
+                token.ThrowIfCancellationRequested();
+                if (delete is not null)
+                {
+                    try { _deleteRetiredPackage(delete); }
+                    catch (Exception error) when (IsReceiptFailure(error)) { return false; }
+                }
+                publish();
+                return true;
+            });
+            return committed;
+        }
+        finally { if (!committed) UninstallPathGuard.DiscardStagedFile(staged); }
+    }
+
+    internal static byte[] HashRetiredPackage(Stream source, CancellationToken token)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[65536];
+        while (true)
+        {
+            token.ThrowIfCancellationRequested();
+            var read = source.Read(buffer, 0, buffer.Length);
+            token.ThrowIfCancellationRequested();
+            if (read == 0) return hash.GetHashAndReset();
+            hash.AppendData(buffer, 0, read);
+        }
     }
 
     private static bool IsReceiptFailure(Exception error) => error is IOException or UnauthorizedAccessException or Win32Exception
@@ -549,6 +917,7 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
     private sealed record PackageFileIdentity(ulong Volume, ulong Low, ulong High, long Created);
     private sealed record PackageReceipt(string Version, string FileName, long Size, string Sha256, PackageFileIdentity Identity);
     private sealed record PackageReceiptLedger(int Schema, PackageReceipt[] Packages);
+    private sealed record PackageMaintenanceRequest(SemanticVersion Installed, CancellationToken Token);
 
     public void ApplyAndRestart()
     {
@@ -562,19 +931,22 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
         if (file.Length != package.Size || !HashEquals(SHA256.HashData(file), package))
             throw new InvalidDataException("Контрольная сумма обновления не совпадает.");
         ValidateManifest(file, package);
+        RecordVerifiedPackage(file, package);
         _prepared = true;
         PrepareUpdaterAndStart(file, package);
+        _prepared = false;
         _locator.Process.Exit(0);
     }
 
     private void PrepareUpdaterAndStart(FileStream packageFile, VelopackAsset package)
     {
-        var updater = UninstallPathGuard.Canonical(_locator.UpdateExePath
-            ?? throw new IOException("Программа установки обновлений недоступна."));
         var root = UninstallPathGuard.Canonical(_locator.RootAppDir
             ?? throw new IOException("Папка установки обновлений недоступна."));
-        if (!updater.Equals(Path.Combine(root, "Update.exe"), StringComparison.OrdinalIgnoreCase))
-            throw new IOException("Расположение программы установки обновлений некорректно.");
+        var updater = Program.CheckedUpdateExecutable(_locator, root, _localAppDataFolder);
+        var primary = Path.Combine(root, "Update.exe");
+        var isFallback = !updater.Equals(primary, StringComparison.OrdinalIgnoreCase);
+        var updaterDirectory = Path.GetDirectoryName(updater)!;
+        using var installationParents = isFallback ? UninstallPathGuard.HoldExistingAncestors(primary) : null;
         using var parents = UninstallPathGuard.HoldExistingAncestors(updater);
 
         packageFile.Position = 0;
@@ -583,20 +955,31 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
         if (entry is null || entry.Length is <= 0 or > 64 * 1024 * 1024)
             throw new InvalidDataException("В пакете отсутствует корректная программа установки обновлений.");
 
-        using var current = TryOpenPackage(updater) ?? throw new IOException("Программа установки обновлений отсутствует.");
+        byte[] checksum;
+        using (var contents = entry.Open()) checksum = CopyUpdater(contents, null, entry.Length);
+        using var existing = TryOpenPackage(updater);
+        if (existing is null && !isFallback) throw new IOException("Программа установки обновлений отсутствует.");
+        var created = existing is null ? PublishMissingFallback(updater, entry, checksum) : null;
+        using var reopened = existing is null ? TryOpenPackage(updater) : null;
+        var current = existing ?? reopened ?? throw new IOException("Программа установки обновлений отсутствует.");
+        if (created is not null)
+        {
+            if (GetPackageIdentity(current) != created)
+                throw new InvalidDataException("Программа установки обновлений изменилась.");
+            FileSecurityPreservation.CheckReplacementMetadata(current.SafeFileHandle);
+        }
         if (current.Length is <= 0 or > 64 * 1024 * 1024)
             throw new InvalidDataException("Некорректный размер установленной программы обновлений.");
 
-        byte[] checksum;
-        using (var contents = entry.Open()) checksum = CopyUpdater(contents, null, entry.Length);
         if (MatchesUpdater(current, entry.Length, checksum))
         {
             _manager.WaitExitThenApplyUpdates(package);
             return;
         }
+        if (created is not null) throw new InvalidDataException("Программа установки обновлений изменилась.");
 
         FileSecurityPreservation.CheckReplacementMetadata(current.SafeFileHandle);
-        using var stagedHandle = UninstallPathGuard.CreateStagedFile(UpdaterTemporaryPath(root), writeThrough: true, writeDacl: true);
+        using var stagedHandle = UninstallPathGuard.CreateStagedFile(UpdaterTemporaryPath(updaterDirectory), writeThrough: true, writeDacl: true);
         var published = false;
         FileStream? staged = null;
         try
@@ -610,7 +993,7 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
             FileSecurityPreservation.PreserveBasicInformation(current.SafeFileHandle, stagedHandle);
             staged.Flush(flushToDisk: true);
 
-            using var backupHandle = UninstallPathGuard.CreateStagedFile(UpdaterTemporaryPath(root), writeThrough: true, writeDacl: true);
+            using var backupHandle = UninstallPathGuard.CreateStagedFile(UpdaterTemporaryPath(updaterDirectory), writeThrough: true, writeDacl: true);
             FileStream? backup = null;
             var preserveBackup = false;
             try
@@ -655,6 +1038,24 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
             if (!published) UninstallPathGuard.DiscardStagedFile(stagedHandle);
             staged?.Dispose();
         }
+    }
+
+    private PackageFileIdentity? PublishMissingFallback(string updater, ZipArchiveEntry entry, byte[] checksum)
+    {
+        using var handle = UninstallPathGuard.CreateStagedFile(UpdaterTemporaryPath(Path.GetDirectoryName(updater)!),
+            writeThrough: true, deleteOnClose: true);
+        using var staged = new FileStream(handle, FileAccess.ReadWrite);
+        FileSecurityPreservation.CheckReplacementMetadata(handle);
+        using (var contents = entry.Open())
+            if (!CopyUpdater(contents, staged, entry.Length).AsSpan().SequenceEqual(checksum))
+                throw new InvalidDataException("Программа установки обновлений изменилась.");
+        staged.Flush(flushToDisk: true);
+        var identity = GetPackageIdentity(staged) ?? throw new IOException("Не удалось подтвердить идентичность программы установки обновлений.");
+        // An entry created in the meantime is handled by the existing-file path and its metadata checks.
+        try { ManagedCacheCleanup.RenameByHandle(handle, updater); }
+        catch (Win32Exception) when (UninstallPathGuard.EntryExists(updater)) { return null; }
+        UninstallPathGuard.KeepFileOnClose(handle);
+        return identity;
     }
 
     private static string UpdaterTemporaryPath(string root) => Path.Combine(root, $".yamuse-updater-{Guid.NewGuid():N}.tmp");
@@ -735,48 +1136,100 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
     }
 
     private sealed record OfficialPackage(VelopackAsset Asset, Uri DownloadUri);
+    private sealed record ReleaseAsset(Uri DownloadUri, long? Size, string? Sha256, bool IsStarter)
+    {
+        internal void Verify(long size, string? sha256)
+        {
+            if ((Size is { } expectedSize && expectedSize != size)
+                || (Sha256 is { } expectedHash && !expectedHash.Equals(sha256, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidDataException("Размер или контрольная сумма файла не совпадают с официальным выпуском.");
+        }
+    }
 
     private async Task<OfficialPackage?> CheckLatestReleaseAsync(HttpClient client, SemanticVersion current, CancellationToken token)
     {
         using var latest = await OpenResponseAsync(client, UpdateSupport.OfficialLatestRelease, _ => false, token).ConfigureAwait(false);
         if (latest.StatusCode == HttpStatusCode.NotFound) return null;
-        if (latest.StatusCode == HttpStatusCode.Forbidden && (latest.Headers.RetryAfter is not null
-            || latest.Headers.TryGetValues("x-ratelimit-remaining", out var remaining) && remaining.Any(value => value.Trim() == "0")))
-            throw new HttpRequestException("Достигнут лимит проверок обновлений.", null, HttpStatusCode.TooManyRequests);
+        await UpdateSupport.CheckLatestRateLimitAsync(latest, token).ConfigureAwait(false);
         var metadataBytes = await ReadMetadataAsync(latest, token).ConfigureAwait(false);
         using var document = JsonDocument.Parse(metadataBytes, new JsonDocumentOptions { MaxDepth = 32 });
         var root = document.RootElement;
         var (tag, version) = UpdateSupport.ParseStableRelease(root);
         if (version <= current) return null;
-        var feedUri = GetReleaseAsset(root, tag, $"releases.{_locator.Channel ?? "win"}.json");
+        var feedAsset = GetReleaseAsset(root, tag, $"releases.{_locator.Channel ?? "win"}.json");
+        if (feedAsset is null || feedAsset.IsStarter) throw IncompleteRelease(version);
+        var feedUri = feedAsset.DownloadUri;
         using var response = await OpenResponseAsync(client, feedUri, target => IsAssetRedirect(feedUri, target), token).ConfigureAwait(false);
+        if (response.StatusCode == HttpStatusCode.NotFound) throw IncompleteRelease(version);
         var feedBytes = await ReadMetadataAsync(response, token).ConfigureAwait(false);
-        var feed = VelopackAssetFeed.FromJson(Encoding.UTF8.GetString(feedBytes).TrimStart('\uFEFF'));
+        feedAsset.Verify(feedBytes.LongLength, feedAsset.Sha256 is null ? null : Convert.ToHexString(SHA256.HashData(feedBytes)));
+        var feedText = Encoding.UTF8.GetString(feedBytes).TrimStart('\uFEFF');
+        using (var feedDocument = JsonDocument.Parse(feedText, new JsonDocumentOptions { MaxDepth = 32 }))
+        {
+            var index = feedDocument.RootElement;
+            if (index.ValueKind != JsonValueKind.Object || !index.TryGetProperty("Assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
+                throw new InvalidDataException("Список пакетов официального выпуска некорректен.");
+        }
+        var feed = VelopackAssetFeed.FromJson(feedText);
         var fullAssets = feed.Assets.Where(asset => asset.Type == VelopackAssetType.Full).ToArray();
-        if (fullAssets.Length == 0) return null;
+        if (fullAssets.Length == 0) throw IncompleteRelease(version);
         var candidate = fullAssets.SingleOrDefault(asset => string.Equals(asset.Version?.ToString(), version.ToString(), StringComparison.Ordinal))
             ?? throw new InvalidDataException("Версия пакета не совпадает с последним официальным выпуском.");
         ValidateRelease(candidate);
-        return new(candidate, GetReleaseAsset(root, tag, candidate.FileName));
+        var packageAsset = GetReleaseAsset(root, tag, candidate.FileName);
+        if (packageAsset is null) throw IncompleteRelease(version);
+        packageAsset.Verify(candidate.Size, candidate.SHA256);
+        if (packageAsset.IsStarter) throw IncompleteRelease(version);
+        return new(candidate, packageAsset.DownloadUri);
     }
 
-    private static Uri GetReleaseAsset(JsonElement release, string tag, string fileName)
+    private Exception IncompleteRelease(SemanticVersion latest) => _prepared && _selected is { Asset.Version: { } pending } && latest <= pending
+        ? new InvalidDataException("Ранее выбранный полный пакет больше не опубликован в официальном выпуске.")
+        : new IncompleteReleaseFeedException();
+
+    private static ReleaseAsset? GetReleaseAsset(JsonElement release, string tag, string fileName)
     {
         if (!release.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
             throw new InvalidDataException("Список файлов официального выпуска отсутствует.");
         var expectedUri = new Uri($"{UpdateSupport.OfficialRepository.AbsoluteUri}/releases/download/{Uri.EscapeDataString(tag)}/{Uri.EscapeDataString(fileName)}");
-        Uri? selected = null;
+        ReleaseAsset? selected = null;
         foreach (var asset in assets.EnumerateArray())
         {
             if (asset.ValueKind != JsonValueKind.Object || !asset.TryGetProperty("name", out var name) || name.ValueKind != JsonValueKind.String
                 || !string.Equals(name.GetString(), fileName, StringComparison.Ordinal)) continue;
-            if (selected is not null || !asset.TryGetProperty("browser_download_url", out var url) || url.ValueKind != JsonValueKind.String
-                || !Uri.TryCreate(url.GetString(), UriKind.Absolute, out var uri) || !IsSecure(uri)
-                || !uri.AbsoluteUri.Equals(expectedUri.AbsoluteUri, StringComparison.Ordinal))
-                throw new InvalidDataException("Адрес файла не совпадает с последним официальным выпуском.");
-            selected = expectedUri;
+            if (selected is not null) throw new InvalidDataException("Файл повторяется в последнем официальном выпуске.");
+            var starter = false;
+            if (asset.TryGetProperty("state", out var state) && state.ValueKind != JsonValueKind.Null)
+            {
+                if (state.ValueKind != JsonValueKind.String || state.GetString() is not ("uploaded" or "starter"))
+                    throw new InvalidDataException("Состояние официального файла некорректно.");
+                starter = state.GetString() == "starter";
+            }
+            if (asset.TryGetProperty("browser_download_url", out var url) && url.ValueKind != JsonValueKind.Null)
+            {
+                if (url.ValueKind != JsonValueKind.String || !Uri.TryCreate(url.GetString(), UriKind.Absolute, out var uri)
+                    || !IsSecure(uri) || !uri.AbsoluteUri.Equals(expectedUri.AbsoluteUri, StringComparison.Ordinal))
+                    throw new InvalidDataException("Адрес файла не совпадает с последним официальным выпуском.");
+            }
+            else if (!starter) throw new InvalidDataException("Адрес файла отсутствует в последнем официальном выпуске.");
+            long? size = null;
+            if (asset.TryGetProperty("size", out var length) && length.ValueKind != JsonValueKind.Null)
+            {
+                if (length.ValueKind != JsonValueKind.Number || !length.TryGetInt64(out var value) || value < 0 || value == 0 && !starter)
+                    throw new InvalidDataException("Размер официального файла некорректен.");
+                if (value > 0) size = value;
+            }
+            string? sha256 = null;
+            if (asset.TryGetProperty("digest", out var digest) && digest.ValueKind != JsonValueKind.Null)
+            {
+                if (digest.ValueKind != JsonValueKind.String || digest.GetString() is not { Length: 71 } value
+                    || !value.StartsWith("sha256:", StringComparison.Ordinal) || !value[7..].All(Uri.IsHexDigit))
+                    throw new InvalidDataException("Контрольная сумма официального файла некорректна.");
+                sha256 = value[7..];
+            }
+            selected = new(expectedUri, size, sha256, starter);
         }
-        return selected ?? throw new InvalidDataException("Файл отсутствует в последнем официальном выпуске.");
+        return selected;
     }
 
     private static HttpClient OfficialClient(HttpMessageHandler handler)
@@ -811,45 +1264,10 @@ internal sealed class VelopackUpdateBackend : IAppUpdateBackend
         throw new InvalidDataException("Цепочка адресов источника обновлений слишком длинная.");
     }
 
-    private static async Task<byte[]> ReadMetadataAsync(HttpResponseMessage response, CancellationToken token)
+    private static Task<byte[]> ReadMetadataAsync(HttpResponseMessage response, CancellationToken token)
     {
-        const int maximumBytes = 2 * 1024 * 1024;
         response.EnsureSuccessStatusCode();
-        var length = response.Content.Headers.ContentLength;
-        if (length is > maximumBytes) throw new InvalidDataException("Метаданные обновления слишком велики.");
-        Stream body;
-        try { body = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false); }
-        catch (Exception error) when (IsMetadataBodyInterruption(error)) { throw MetadataBodyInterrupted(error, token); }
-        await using (body)
-        {
-            using var data = new MemoryStream();
-            var buffer = new byte[8192];
-            while (true)
-            {
-                int read;
-                try { read = await body.ReadAsync(buffer, token).ConfigureAwait(false); }
-                catch (Exception error) when (IsMetadataBodyInterruption(error)) { throw MetadataBodyInterrupted(error, token); }
-                if (read == 0) break;
-                if (read > maximumBytes - data.Length) throw new InvalidDataException("Метаданные обновления слишком велики.");
-                data.Write(buffer, 0, read);
-            }
-            if (length is { } expected && data.Length != expected)
-                throw new HttpRequestException("Соединение оборвалось при чтении метаданных обновления.");
-            return data.ToArray();
-        }
-    }
-
-    private static bool IsMetadataBodyInterruption(Exception error) => error switch
-    {
-        HttpIOException wire => wire.HttpRequestError is HttpRequestError.ResponseEnded or HttpRequestError.ConnectionError,
-        InvalidDataException => false,
-        _ => error is IOException or SocketException
-    };
-
-    private static HttpRequestException MetadataBodyInterrupted(Exception error, CancellationToken token)
-    {
-        token.ThrowIfCancellationRequested();
-        return new HttpRequestException("Соединение оборвалось при чтении метаданных обновления.", error);
+        return UpdateSupport.ReadMetadataBodyAsync(response, 2 * 1024 * 1024, token);
     }
 
     private async Task DownloadOfficialPackageAsync(OfficialPackage selected, FileStream destination,

@@ -8,11 +8,15 @@ namespace YMusic.Native;
 
 public partial class MainWindow
 {
-    private sealed record QueueDrag(string Nonce, long Version, int Account, string? Uid, int[] Indices);
+    private readonly record struct QueueInputStamp(long Version, int View, long Presentation, int Account, string? Uid);
+    private sealed record QueuePress(Point Origin, int Index, long Token, QueueInputStamp Stamp, bool DelaySelection, int[]? Selection)
+    {
+        internal QueueInputStamp? ReleaseStamp { get; init; }
+    }
+    private sealed record QueueDrag(string Nonce, QueueInputStamp Stamp, int[] Indices);
     private QueueDrag? _activeQueueDrag;
-    private Point? _queueDragOrigin;
-    private int _queueDragRow = -1;
-    private bool _queueDelaySelection;
+    private QueuePress? _queuePress;
+    private long _queuePresentationGeneration;
     private QueueDropLine? _queueDropLine;
     private AdornerLayer? _queueDropLayer;
     private bool CanDragQueue => _section == "queue" && _query.Length == 0 && CurrentListSort.Field == ListSortField.Original;
@@ -20,19 +24,19 @@ public partial class MainWindow
     private void InitializeQueueEditing()
     {
         TracksList.AllowDrop = true;
+        _view.CollectionChanged += (_, _) => _queuePresentationGeneration++;
         TracksList.PreviewMouseLeftButtonDown += QueueDragDown;
-        TracksList.PreviewMouseLeftButtonUp += (_, _) =>
-        {
-            if (_queueDelaySelection && _queueDragRow >= 0) TracksList.SelectedIndex = _queueDragRow;
-            _queueDelaySelection = false; _queueDragOrigin = null;
-        };
+        TracksList.AddHandler(Mouse.MouseDownEvent, new MouseButtonEventHandler(QueueDragSelectionSettled), true);
+        TracksList.PreviewMouseLeftButtonUp += QueueDragUp;
         TracksList.PreviewMouseMove += QueueDragMove;
         TracksList.DragOver += QueueDragOver;
         TracksList.Drop += QueueDrop;
         TracksList.DragLeave += (_, _) => ClearQueueDropLine();
     }
 
-    private int[] SelectedQueueIndices()
+    private int[] SelectedQueueIndices() => ReadSelectedQueueIndices(_queue);
+
+    private int[] ReadSelectedQueueIndices(IReadOnlyList<TrackRow> queue)
     {
         var visible = _view.Cast<TrackRow>().ToArray();
         var selectedCounts = new Dictionary<TrackRow, int>(ReferenceEqualityComparer.Instance);
@@ -61,15 +65,15 @@ public partial class MainWindow
             }
             return true;
         })) return []; // Never perform a partial destructive edit if layout is unavailable.
-        var queueSelection = new bool[_queue.Count];
-        foreach (var occurrence in VisibleQueueOccurrences())
+        var queueSelection = new bool[queue.Count];
+        foreach (var occurrence in VisibleQueueOccurrences(queue))
             if (selected[occurrence.ViewIndex]) queueSelection[occurrence.QueueIndex] = true;
         return Enumerable.Range(0, queueSelection.Length).Where(index => queueSelection[index]).ToArray();
     }
 
-    private IEnumerable<(int ViewIndex, int QueueIndex, TrackRow Row, bool Repeated)> VisibleQueueOccurrences()
+    private IEnumerable<(int ViewIndex, int QueueIndex, TrackRow Row, bool Repeated)> VisibleQueueOccurrences(IReadOnlyList<TrackRow>? snapshot = null)
     {
-        var queue = _queue;
+        var queue = snapshot ?? _queue;
         var positions = new Dictionary<TrackRow, Queue<int>>(ReferenceEqualityComparer.Instance);
         var repeats = new HashSet<TrackRow>(ReferenceEqualityComparer.Instance);
         for (var i = 0; i < queue.Count; i++)
@@ -185,22 +189,64 @@ public partial class MainWindow
 
     private void QueueDragDown(object sender, MouseButtonEventArgs e)
     {
-        _queueDragOrigin = null; _queueDelaySelection = false;
+        _queuePress = null;
         if (!CanDragQueue || e.ClickCount != 1 || FromButton(e.OriginalSource as DependencyObject)) return;
         if (ItemsControl.ContainerFromElement(TracksList, e.OriginalSource as DependencyObject) is not ListViewItem row) return;
-        _queueDragRow = TracksList.ItemContainerGenerator.IndexFromContainer(row); _queueDragOrigin = e.GetPosition(TracksList);
-        if (row.IsSelected && TracksList.SelectedItems.Count > 1 && Keyboard.Modifiers == ModifierKeys.None)
-        { _queueDelaySelection = true; e.Handled = true; }
+        var index = TracksList.ItemContainerGenerator.IndexFromContainer(row);
+        if (index < 0 || index >= _queue.Count || !ReferenceEquals(row.Content, _queue[index])) return;
+        var delayed = row.IsSelected && TracksList.SelectedItems.Count > 1 && Keyboard.Modifiers == ModifierKeys.None;
+        var stamp = CaptureQueueInputStamp();
+        _queuePress = new(e.GetPosition(TracksList), index, _playbackQueue.OccurrenceTokenAt(index), stamp, delayed,
+            delayed ? SelectedQueueIndices() : null);
+        if (delayed) e.Handled = true;
+    }
+
+    private void QueueDragSelectionSettled(object sender, MouseButtonEventArgs e)
+    {
+        // ListViewItem has now processed the same physical mouse down, so the
+        // snapshot includes WPF's exact single/range/toggle selection.
+        if (e.ChangedButton != MouseButton.Left || _queuePress is not { DelaySelection: false, Selection: null } press || !OwnsQueuePress(press)) return;
+        int[] selection = TracksList.SelectedItems.Count == 1 && TracksList.SelectedIndex >= 0
+            ? [TracksList.SelectedIndex] : SelectedQueueIndices();
+        _queuePress = press with { Selection = selection };
+    }
+
+    private void QueueDragUp(object sender, MouseButtonEventArgs e)
+    {
+        var press = _queuePress;
+        _queuePress = null;
+        if (press is not { DelaySelection: true } || !OwnsQueueInput(press.ReleaseStamp ?? press.Stamp)) return;
+        var index = TrackRowIndex(e.OriginalSource as DependencyObject);
+        if (index < 0 || index >= _queue.Count || _playbackQueue.OccurrenceTokenAt(index) != press.Token
+            || TracksList.ItemContainerGenerator.ContainerFromIndex(index) is not ListViewItem row
+            || !ReferenceEquals(row.Content, _queue[index])) return;
+
+        // ListBox updates its range anchor on selection changes in Single mode.
+        // Restore Extended before the next Shift gesture.
+        var mode = TracksList.SelectionMode;
+        TracksList.SetCurrentValue(ListBox.SelectionModeProperty, SelectionMode.Single);
+        try
+        {
+            TracksList.SelectedIndex = -1;
+            TracksList.SelectedIndex = index;
+        }
+        finally { TracksList.SetCurrentValue(ListBox.SelectionModeProperty, mode); }
+        if (row.IsSelected && ReferenceEquals(TracksList.ItemContainerGenerator.ContainerFromIndex(index), row)) row.Focus();
     }
 
     private void QueueDragMove(object sender, MouseEventArgs e)
     {
-        if (_queueDragOrigin is not { } origin || e.LeftButton != MouseButtonState.Pressed || !CanDragQueue) return;
+        if (_queuePress is not { } press) return;
+        if (e.LeftButton != MouseButtonState.Pressed) { _queuePress = null; return; }
         var point = e.GetPosition(TracksList);
-        if (Math.Abs(point.X - origin.X) < SystemParameters.MinimumHorizontalDragDistance && Math.Abs(point.Y - origin.Y) < SystemParameters.MinimumVerticalDragDistance) return;
-        _queueDragOrigin = null; _queueDelaySelection = false;
-        var indices = SelectedQueueIndices(); if (indices.Length == 0) return;
-        var drag = _activeQueueDrag = new QueueDrag(Guid.NewGuid().ToString("N"), _playbackQueue.Version, _accountGeneration, _account?.Uid, indices);
+        if (Math.Abs(point.X - press.Origin.X) < SystemParameters.MinimumHorizontalDragDistance
+            && Math.Abs(point.Y - press.Origin.Y) < SystemParameters.MinimumVerticalDragDistance)
+        {
+            if (!OwnsQueueInput(press.ReleaseStamp ?? press.Stamp)) _queuePress = null;
+            return;
+        }
+        if (TakeQueueDrag() is not { } drag) return;
+        _activeQueueDrag = drag;
         // Only a string capability crosses OLE; never deserialize an object
         // supplied by another process. Queue indices remain private to this window.
         try { DragDrop.DoDragDrop(TracksList, new DataObject(DataFormats.UnicodeText, drag.Nonce), DragDropEffects.Move); }
@@ -208,12 +254,37 @@ public partial class MainWindow
         e.Handled = true;
     }
 
+    private QueueInputStamp CaptureQueueInputStamp() => new(_playbackQueue.Version, _viewGeneration, _queuePresentationGeneration, _accountGeneration, _account?.Uid);
+
+    private void RetainDelayedQueueClick(QueueInputStamp beforeAppend)
+    {
+        if (_queuePress is not { DelaySelection: true } press || (press.ReleaseStamp ?? press.Stamp) != beforeAppend) return;
+        var now = CaptureQueueInputStamp();
+        // Only the click may survive a passive refill. A drag still owns its original pointer-down stamp.
+        _queuePress = beforeAppend with { Version = now.Version, Presentation = now.Presentation } == now && OwnsQueueInput(now)
+            && Enumerable.Range(0, _queue.Count).Any(index => _playbackQueue.OccurrenceTokenAt(index) == press.Token)
+            ? press with { ReleaseStamp = now } : null;
+    }
+
+    private bool OwnsQueueInput(QueueInputStamp stamp) => CanDragQueue && HasTrackListPlaybackView && !IsExpandedPlayerOpen
+        && stamp == CaptureQueueInputStamp();
+
+    private bool OwnsQueuePress(QueuePress press) => OwnsQueueInput(press.Stamp)
+        && press.Index < _queue.Count && _playbackQueue.OccurrenceTokenAt(press.Index) == press.Token;
+
+    private QueueDrag? TakeQueueDrag()
+    {
+        var press = _queuePress;
+        _queuePress = null;
+        return press is { Selection: { Length: > 0 } selection } && OwnsQueuePress(press)
+            ? new(Guid.NewGuid().ToString("N"), press.Stamp, selection) : null;
+    }
+
     private QueueDrag? ValidQueueDrag(DragEventArgs e)
     {
         if (!CanDragQueue || _activeQueueDrag is not { } d || !e.Data.GetDataPresent(DataFormats.UnicodeText, false)
             || e.Data.GetData(DataFormats.UnicodeText, false) is not string nonce || nonce != d.Nonce) return null;
-        return d.Version == _playbackQueue.Version
-            && d.Account == _accountGeneration && d.Uid == _account?.Uid ? d : null;
+        return OwnsQueueInput(d.Stamp) ? d : null;
     }
 
     private int QueueDropGap(DragEventArgs e, bool showLine)

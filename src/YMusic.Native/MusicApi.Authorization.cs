@@ -29,12 +29,18 @@ internal sealed partial class MusicApi
     internal static bool IsOAuthValue([NotNullWhen(true)] string? value) =>
         !string.IsNullOrEmpty(value) && !value.Any(character => char.IsWhiteSpace(character) || char.IsControl(character));
 
-    private static string GrantedPlayerScope(JsonElement root)
+    private static bool HasIssuedToken(JsonElement root)
+        => root.TryGetProperty("access_token", out _) || root.TryGetProperty("refresh_token", out _);
+
+    private static string GrantedPlayerScope(JsonElement root, bool refreshing)
     {
         // Yandex documents scope as optional when the requested rights were granted.
         // A reported grant must contain exactly our requested music permissions.
-        if (root.TryGetProperty("scope", out var scope) && !IsPlayerScope(JsonString(scope)))
-            throw ScopeFailure();
+        if (root.TryGetProperty("scope", out var scope))
+        {
+            if (refreshing && scope.ValueKind != JsonValueKind.String) throw UnexpectedJson();
+            if (!IsPlayerScope(JsonString(scope))) throw ScopeFailure();
+        }
         return RequiredScopes;
     }
 
@@ -57,8 +63,9 @@ internal sealed partial class MusicApi
         {
             using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode) throw RevokeFailure();
-            using var json = await ReadJsonAsync(response, timeout.Token).ConfigureAwait(false);
-            if (JsonString(json.RootElement, "status") != "ok" || json.RootElement.TryGetProperty("error", out _))
+            using var json = await ReadJsonAsync(response, timeout.Token, allowDuplicateProperties: false).ConfigureAwait(false);
+            var root = json.RootElement;
+            if (JsonString(root, "status") != "ok" || root.TryGetProperty("error", out _))
                 throw RevokeFailure();
         }
         catch (MusicException error) when (!error.Authentication) { throw RevokeFailure(); }

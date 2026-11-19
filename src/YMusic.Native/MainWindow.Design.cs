@@ -90,6 +90,22 @@ public partial class MainWindow
 
     private void CommitSeek(double seconds)
     {
+        if (AutomaticTrackStartPending && double.IsFinite(seconds) && _playbackQueue.CurrentOccurrenceToken is { } occurrence)
+        {
+            var duration = _player.Duration;
+            if (!_player.HasSource || duration <= TimeSpan.Zero) return;
+            // The pending decoder may close on cancellation. Keep the native
+            // bounds and accepted position for this occurrence's next Play.
+            _restoredPlaybackOccurrence = occurrence;
+            _restoredPlaybackSeconds = Math.Clamp(seconds, 0, duration.TotalSeconds);
+            _restoredPlaybackNativeDuration = duration;
+            RememberPausedDesktopOccurrence();
+            CancelPendingWavePlayback();
+            _diagnostics.Stage = "paused";
+            UpdateControls(); UpdateProgress();
+            SavePlaybackState();
+            return;
+        }
         var canceledAdvance = !_player.IsPlaying && PlaybackTransportActive || _waveStartCts is { IsCancellationRequested: false };
         CancelPendingWavePlayback();
         if (!_player.HasSource || !double.IsFinite(seconds))
@@ -104,7 +120,14 @@ public partial class MainWindow
         try
         {
             _pendingSeek = target; _seekClock.Restart();
-            _player.Seek(TimeSpan.FromSeconds(target));
+            if (!_player.Seek(TimeSpan.FromSeconds(target)))
+            {
+                _pendingSeek = null;
+                _seekClock.Reset();
+                UpdateProgress();
+                SetStatus("Windows не удалось перемотать трек. Попробуйте ещё раз.", true);
+                return;
+            }
             SeekSlider.Value = target;
             PositionText.Text = FormatTime(TimeSpan.FromSeconds(target));
             UpdateLyrics(target); RefreshExpandedPlayer(); UpdateShellState(); SavePlaybackState();
@@ -124,12 +147,14 @@ public partial class MainWindow
         _volumeSaveTimer.Stop(); SavePreferences();
     }
 
+    private bool CanAdvanceVisiblePlaybackPosition => _player.IsCurrentAudioAdvancing && _pendingSeek is null && !_loadingStream && !_closed;
+
     private TimeSpan RefreshPlaybackDisplay()
     {
         var duration = RestoredPlaybackDuration ?? _player.Duration;
         var position = DisplayPosition(_player.Position);
         if (!_seekDragging) PlaybackTimeline.Update(SeekSlider, position.TotalSeconds, duration.TotalSeconds,
-            _player.IsPlaying && _pendingSeek is null && !_loadingStream && !_closed, _player.SpeedRatio);
+            CanAdvanceVisiblePlaybackPosition, _player.SpeedRatio);
         PositionText.Text = FormatTime(_seekDragging ? TimeSpan.FromSeconds(SeekSlider.Value) : position);
         DurationText.Text = FormatTime(duration);
         return position;

@@ -17,7 +17,7 @@ internal sealed class SessionStore(string directory)
         {
             using var parents = UninstallPathGuard.HoldAncestors(_path);
             if (!parents.Complete) return null;
-            using var handle = TryOpenSessionFile();
+            using var handle = GuardedStoreFile.OpenForRead(_path);
             if (handle is null) return null;
             using var file = new FileStream(handle, FileAccess.Read);
             var length = file.Length;
@@ -26,6 +26,11 @@ internal sealed class SessionStore(string directory)
             file.ReadExactly(encrypted);
         }
         catch (Win32Exception error) { throw new IOException("Не удалось прочитать сохранённый вход.", error); }
+        return Decode(encrypted);
+    }
+
+    private static Session Decode(byte[] encrypted)
+    {
         var bytes = Unprotect(encrypted);
         try
         {
@@ -34,14 +39,31 @@ internal sealed class SessionStore(string directory)
         }
         finally { CryptographicOperations.ZeroMemory(bytes); }
     }
-    public void Save(Session session)
+
+    internal static bool IsOwnedFile(SafeFileHandle file)
+    {
+        if (GuardedStoreFile.ReadFromHandle(file, MaximumEncryptedBytes) is not { Length: > 0 } bytes) return false;
+        try { _ = Decode(bytes); return true; }
+        catch (Exception error) when (error is CryptographicException or JsonException) { return false; }
+    }
+    public void Save(Session session) => GuardedStoreFile.Write(_path, Encode(session));
+
+    internal bool SaveIfMatches(Session session, Session? expected)
+    {
+        using var storage = GuardedStoreFile.BeginWrite(_path);
+        if (expected is null ? storage.Exists : !Matches(storage, expected)) return false;
+        storage.Write(Encode(session));
+        return true;
+    }
+
+    private static byte[] Encode(Session session)
     {
         var plain = JsonSerializer.SerializeToUtf8Bytes(session);
         byte[] encrypted;
         try { encrypted = Protect(plain); }
         finally { CryptographicOperations.ZeroMemory(plain); }
         if (encrypted.Length > MaximumEncryptedBytes) throw new CryptographicException();
-        GuardedStoreFile.Write(_path, encrypted);
+        return encrypted;
     }
 
     public void Clear()
@@ -54,10 +76,22 @@ internal sealed class SessionStore(string directory)
         catch (Win32Exception error) { throw new IOException("Не удалось удалить сохранённый вход.", error); }
     }
 
-    private SafeFileHandle? TryOpenSessionFile()
+    internal bool ClearIfMatches(Session expected)
     {
-        try { return UninstallPathGuard.OpenOwnedFile(_path, read: true, deleteAccess: false); }
-        catch (Win32Exception error) when (error.NativeErrorCode == 2) { return null; }
+        using var storage = GuardedStoreFile.BeginWrite(_path, createParents: false, deleteAccess: true);
+        if (!storage.Exists) return true;
+        if (!Matches(storage, expected)) return false;
+        storage.Delete();
+        return true;
+    }
+
+    private static bool Matches(GuardedStoreFile.WriteTransaction storage, Session expected)
+    {
+        try
+        {
+            return storage.ReadExisting(MaximumEncryptedBytes) is { } bytes && Decode(bytes) == expected;
+        }
+        catch (Exception error) when (error is CryptographicException or JsonException) { return false; }
     }
 
     // CRYPTPROTECT_UI_FORBIDDEN, CurrentUser scope. No plaintext token fallback.

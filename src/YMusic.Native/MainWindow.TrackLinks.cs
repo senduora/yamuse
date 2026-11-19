@@ -8,16 +8,38 @@ public partial class MainWindow
     private readonly Dictionary<string, CatalogItem> _resolvedTrackAlbums = new(StringComparer.Ordinal);
     private int _resolvedAlbumGeneration = -1;
     private long _trackLinkLookup;
+    private CancellationTokenSource? _trackLinkLookupCts;
+    private bool HasPendingTrackLinkNavigation => _trackLinkLookupCts is { IsCancellationRequested: false };
 
-    private (CancellationToken Token, Func<bool> IsCurrent) BeginTrackLinkLookup()
+    private void CancelTrackLinkLookup()
     {
-        var request = ++_trackLinkLookup;
+        var lookup = _trackLinkLookupCts;
+        _trackLinkLookupCts = null;
+        lookup?.Cancel();
+    }
+
+    private (CancellationToken Token, Func<bool> IsCurrent, Action Finish) BeginTrackLinkLookup()
+    {
+        var previous = _trackLinkLookupCts;
+        _trackLinkLookup++;
         var generation = _accountGeneration;
         var uid = _account?.Uid;
         var view = _viewGeneration;
-        var token = _accountCts.Token;
-        return (token, () => !_closed && !token.IsCancellationRequested && request == _trackLinkLookup
-            && generation == _accountGeneration && uid == _account?.Uid && view == _viewGeneration);
+        var lookup = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, _accountCts.Token);
+        _trackLinkLookupCts = lookup;
+        previous?.Cancel();
+        CancelPlaylistChooser();
+        if (HasPendingOfflineNavigation) _offlineNavigation?.Cancel();
+        var token = lookup.Token;
+        bool IsCurrent() => !_closed && !token.IsCancellationRequested && ReferenceEquals(_trackLinkLookupCts, lookup)
+            && generation == _accountGeneration && uid == _account?.Uid && view == _viewGeneration;
+        return (token, IsCurrent, () =>
+        {
+            var current = ReferenceEquals(_trackLinkLookupCts, lookup);
+            if (current) _trackLinkLookupCts = null;
+            lookup.Dispose();
+            if (current) ResumeDeletedPlaylistFallback();
+        });
     }
 
     private void UpdatePlayerArtistLinks()
@@ -29,22 +51,24 @@ public partial class MainWindow
         var visible = _current is { } track && (track.Artists.Count > 0 || !string.IsNullOrWhiteSpace(track.Artist));
         if (!ReferenceEquals(PlayerArtistLinks.Content, _current))
         {
+            ClearTrackArtistsMenu(PlayerArtistPanel);
             PlayerArtistLinks.Content = _current;
-            PlayerArtistPanel.ContextMenu = _current is { Artists.Count: > 0 } current ? CreateTrackArtistsMenu(PlayerArtistPanel, current.Artists) : null;
+            if (_current is { Artists.Count: > 0 } current)
+                PlayerArtistPanel.ContextMenu = CreateTrackArtistsMenu(PlayerArtistPanel, current.Artists, () => ReferenceEquals(_current, current));
         }
         PlayerArtistPanel.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
         PlayerArtistPanel.IsEnabled = _session is not null;
         TrackArtist.Visibility = visible ? Visibility.Collapsed : Visibility.Visible;
     }
 
-    private void ShowTrackArtistsMenu(Button button, IReadOnlyList<ArtistReference> artists)
+    private void ShowTrackArtistsMenu(Button button, TrackRow track, IReadOnlyList<ArtistReference> artists)
     {
-        var menu = CreateTrackArtistsMenu(button, artists);
+        var menu = CreateTrackArtistsMenu(button, artists, () => ReferenceEquals(button.Tag, track));
         button.ContextMenu = menu;
         menu.IsOpen = true;
     }
 
-    private ContextMenu CreateTrackArtistsMenu(FrameworkElement anchor, IReadOnlyList<ArtistReference> artists)
+    private ContextMenu CreateTrackArtistsMenu(FrameworkElement anchor, IReadOnlyList<ArtistReference> artists, Func<bool> ownsTrack)
     {
         var generation = _accountGeneration;
         var menu = new ContextMenu { PlacementTarget = anchor };
@@ -53,7 +77,7 @@ public partial class MainWindow
             var item = new MenuItem { Header = artist.Name };
             item.Click += async (_, _) =>
             {
-                if (generation != _accountGeneration || _closed) return;
+                if (generation != _accountGeneration || _closed || _session is null || !ownsTrack()) return;
                 if (IsExpandedPlayerOpen && _expandedPlayerArtistLinks is not null
                     && (ReferenceEquals(anchor, _expandedPlayerArtistLinks) || anchor.IsDescendantOf(_expandedPlayerArtistLinks))) CloseExpandedPlayer();
                 await OpenArtistAsync(artist.Id, artist.Name);
@@ -63,11 +87,23 @@ public partial class MainWindow
         return menu;
     }
 
+    private void TrackArtists_DataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (sender is FrameworkElement anchor) ClearTrackArtistsMenu(anchor);
+    }
+
+    private static void ClearTrackArtistsMenu(FrameworkElement anchor)
+    {
+        if (anchor.ContextMenu is not { } old) return;
+        old.IsOpen = false;
+        anchor.ContextMenu = null;
+    }
+
     private void TrackArtists_ContextMenuOpening(object sender, ContextMenuEventArgs e)
     {
         if (_session is null || sender is not FrameworkElement { DataContext: TrackRow { Artists.Count: > 0 } track } anchor) return;
         e.Handled = true;
-        var menu = CreateTrackArtistsMenu(anchor, track.Artists);
+        var menu = CreateTrackArtistsMenu(anchor, track.Artists, () => ReferenceEquals(anchor.DataContext, track));
         anchor.ContextMenu = menu;
         menu.IsOpen = true;
     }
@@ -122,5 +158,6 @@ public partial class MainWindow
             await OpenCatalogAsync(new(albumId, "album", string.IsNullOrWhiteSpace(title) ? "Альбом" : title, track.Artist, CoverUri: track.CoverUri));
         }
         catch (Exception ex) { if (lookup.IsCurrent()) ShowError(ex); }
+        finally { lookup.Finish(); }
     }
 }

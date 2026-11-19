@@ -15,9 +15,10 @@ public partial class MainWindow
         && (_waveViewMode != WaveMode.Track || _waveBatch.TrackSeedId == _waveSeedTrack?.Id)
         && (_waveViewMode != WaveMode.Album || _waveBatch.AlbumSeedId == _waveSeedAlbum?.Id);
     private bool IsWaveTrackInView(TrackRow track) => _waveSources.TryGetValue(track, out var source) && source.Mode == _waveViewMode
+        && ReferenceEquals(source.Station, _waveBatch?.Station)
         && (_waveViewMode != WaveMode.Track || source.TrackSeedId == _waveSeedTrack?.Id)
         && (_waveViewMode != WaveMode.Album || source.AlbumSeedId == _waveSeedAlbum?.Id);
-    private string WaveSourceLabel(TrackRow track) => _waveSources[track].Mode switch
+    private string WaveSourceLabel(TrackRow track) => !_waveSources.TryGetValue(track, out var source) ? "" : source.Mode switch
     { WaveMode.Track => "Волна по треку · рекомендации Яндекса", WaveMode.Album => "Волна по альбому · рекомендации Яндекса", WaveMode.Collection => "Волна по коллекции · персональные рекомендации", _ => "Моя волна · персональные рекомендации" };
 
     private void SelectWaveView(WaveMode mode, TrackRow? seed) => SelectSeededWaveView(mode, seed, null);
@@ -71,10 +72,11 @@ public partial class MainWindow
             Icon = new System.Windows.Shapes.Path { Data = (System.Windows.Media.Geometry)FindResource("MenuWaveGeometry"), Style = (Style)FindResource("MenuGlyph") } };
         BindTrackActionGlyph(action);
         menu.Items.Add(action);
-        TrackRow? target = null, pointerTarget = null; var account = -1; var hasPointerTarget = false;
+        TrackRow? target = null, openingTarget = null; var account = -1; var hasOpeningTarget = false;
         menu.Opened += (_, _) =>
         {
-            target = hasPointerTarget ? pointerTarget : selectedTrack(); hasPointerTarget = false; account = _accountGeneration;
+            target = hasOpeningTarget ? openingTarget : selectedTrack();
+            openingTarget = null; hasOpeningTarget = false; account = _accountGeneration;
             action.IsEnabled = _session is not null && !_closed && MusicApi.IsTrackWaveSeed(target?.Id);
         };
         action.Click += async (_, e) =>
@@ -84,22 +86,16 @@ public partial class MainWindow
             if (IsExpandedPlayerOpen) CloseExpandedPlayer();
             await OpenTrackWaveAsync(target);
         };
-        menu.Closed += (_, _) => { target = pointerTarget = null; hasPointerTarget = false; };
+        menu.Closed += (_, _) => { target = openingTarget = null; hasOpeningTarget = false; };
         if (anchor is ListBox list)
         {
-            list.AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler((_, e) =>
+            list.ContextMenuOpening += (_, e) =>
             {
-                if (e.ChangedButton != MouseButton.Right) { hasPointerTarget = false; return; }
-                // The selected item can differ from the row under the pointer,
-                // especially after sorting. Blank space must not reuse it.
-                var container = ItemsControl.ContainerFromElement(list, e.OriginalSource as DependencyObject) as ListBoxItem;
-                hasPointerTarget = true;
-                pointerTarget = container?.DataContext switch
-                { TrackRow row => row, CatalogItem { Kind: "track", Track: { } row } => row, DownloadEntry entry => entry.Track, _ => null };
-                if (container is null) { list.SelectedIndex = -1; return; }
-                if (!container.IsSelected) list.SelectedItem = container.DataContext;
-            }), handledEventsToo: true);
-            list.PreviewKeyDown += (_, _) => hasPointerTarget = false;
+                var source = e.OriginalSource as DependencyObject;
+                hasOpeningTarget = e.CursorLeft != -1 || e.CursorTop != -1 || !ReferenceEquals(source, list);
+                openingTarget = source is not null && ItemsControl.ContainerFromElement(list, source) is ListBoxItem { DataContext: DownloadEntry entry }
+                    ? entry.Track : null;
+            };
         }
     }
 }

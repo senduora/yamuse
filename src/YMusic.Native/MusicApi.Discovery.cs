@@ -74,16 +74,16 @@ internal sealed partial class MusicApi
             try
             {
                 var path = $"/tracks/{escapedTrackId}/lyrics?format={format}&timeStamp={timestamp}&sign={Uri.EscapeDataString(signature)}";
-                using var json = await DiscoveryJsonAsync(session, path, true, cancellationToken).ConfigureAwait(false);
-                var result = DiscoveryResult(json);
-                var url = Text(result, "downloadUrl");
-                if (!Uri.TryCreate(url, UriKind.Absolute, out var download)) throw new DiscoveryUnavailable($"Сервис не выдал адрес {format}.", false);
-                var text = await DownloadDiscoveryLyricsAsync(download, cancellationToken).ConfigureAwait(false);
-                if (format == "LRC") return ParseDiscoveryLrc(text);
-                var plain = NormalizeDiscoveryLines(text).TrimStart('\uFEFF');
-                if (string.IsNullOrWhiteSpace(plain)) throw new DiscoveryUnavailable("Источник TEXT не выдал текст.", false);
-                return new(plain, [], false, "Синхронизация недоступна. " + failures[0].Message,
-                    RetrySynchronizedLyrics: failures[0].Transient);
+                using var json = await DiscoveryJsonAsync(session, path, true, cancellationToken, retryUncertain: true).ConfigureAwait(false);
+                var result = DiscoveryResult(json, retryUncertain: true);
+                if (!result.TryGetProperty("downloadUrl", out var url) || url.ValueKind == JsonValueKind.Null)
+                    throw new DiscoveryUnavailable($"Сервис не выдал адрес {format}.", false);
+                if (!Uri.TryCreate(JsonString(url), UriKind.Absolute, out var download))
+                    throw new DiscoveryUnavailable($"Сервис вернул неподдерживаемый адрес {format}.", true);
+                var rendition = await DownloadDiscoveryLyricsAsync(download, format, cancellationToken).ConfigureAwait(false);
+                if (rendition.Synchronized) return rendition;
+                return rendition with { Note = "Синхронизация недоступна. " + failures[0].Message,
+                    RetryPreferredLyrics = failures[0].Transient || failures[0].Denied };
             }
             catch (DiscoveryUnavailable error) { failures.Add(error); }
             catch (HttpRequestException) { failures.Add(new($"Сервис {format} не ответил по сети.", true)); }
@@ -91,25 +91,27 @@ internal sealed partial class MusicApi
 
         try
         {
-            using var json = await DiscoveryJsonAsync(session, $"/tracks/{escapedTrackId}/supplement", false, cancellationToken).ConfigureAwait(false);
-            var result = DiscoveryResult(json);
+            using var json = await DiscoveryJsonAsync(session, $"/tracks/{escapedTrackId}/supplement", false, cancellationToken, retryUncertain: true).ConfigureAwait(false);
+            var result = DiscoveryResult(json, retryUncertain: true);
             var note = "Синхронизация недоступна. " + string.Join(" ", failures.Select(error => error.Message));
+            var retryPreferred = failures.Any(error => error.Transient || error.Denied);
             if (!result.TryGetProperty("lyrics", out var lyrics) || lyrics.ValueKind is JsonValueKind.Null)
             {
-                if (failures.Any(error => error.Transient || error.Denied)) throw new MusicException("Не удалось загрузить текст: источник временно недоступен или отказал в доступе; резервный источник не выдал текст.");
+                if (retryPreferred) throw new MusicException("Не удалось загрузить текст: источник временно недоступен или отказал в доступе; резервный источник не выдал текст.");
                 return new("", [], false, note + " Обычный текст для трека не предоставлен.");
             }
-            if (lyrics.ValueKind != JsonValueKind.Object) throw new DiscoveryUnavailable("Изменился формат обычного текста.", false);
-            var fullAllowed = Bool(lyrics, "hasRights");
-            var plain = fullAllowed ? Text(lyrics, "fullLyrics") : "";
+            if (lyrics.ValueKind != JsonValueKind.Object) throw new DiscoveryUnavailable("Изменился формат обычного текста.", true);
+            var rights = lyrics.TryGetProperty("hasRights", out var hasRights) ? hasRights.ValueKind : JsonValueKind.Undefined;
+            var uncertain = rights is not (JsonValueKind.True or JsonValueKind.False or JsonValueKind.Null or JsonValueKind.Undefined);
+            var plain = rights == JsonValueKind.True ? ReadDiscoveryLyricFragment(lyrics, "fullLyrics", ref uncertain) : "";
             var mayBePartial = string.IsNullOrWhiteSpace(plain);
-            if (mayBePartial) plain = Text(lyrics, "lyrics");
+            if (mayBePartial) plain = ReadDiscoveryLyricFragment(lyrics, "lyrics", ref uncertain);
             if (string.IsNullOrWhiteSpace(plain)) plain = "";
-            if (string.IsNullOrWhiteSpace(plain) && failures.Any(error => error.Transient || error.Denied))
+            if (plain.Length == 0 && (uncertain || retryPreferred))
                 throw new MusicException("Не удалось загрузить текст: источник временно недоступен или отказал в доступе; резервный источник не выдал текст.");
             if (plain.Length == 0) note += " Обычный текст недоступен.";
-            return new(NormalizeDiscoveryLines(plain).TrimStart('\uFEFF'), [], false, note, MayBePartial: mayBePartial && plain.Length > 0,
-                RetrySynchronizedLyrics: failures[0].Transient);
+            return new(plain, [], false, note, MayBePartial: mayBePartial && plain.Length > 0,
+                RetryPreferredLyrics: uncertain || retryPreferred);
         }
         catch (DiscoveryUnavailable error)
         {
@@ -120,7 +122,20 @@ internal sealed partial class MusicApi
         catch (HttpRequestException) { throw new MusicException("Не удалось загрузить текст по сети."); }
     }
 
-    private async Task<JsonDocument> DiscoveryJsonAsync(Session session, string path, bool android, CancellationToken cancellationToken)
+    private static string ReadDiscoveryLyricFragment(JsonElement lyrics, string name, ref bool uncertain)
+    {
+        if (!lyrics.TryGetProperty(name, out var fragment) || fragment.ValueKind == JsonValueKind.Null) return "";
+        if (fragment.ValueKind == JsonValueKind.String)
+        {
+            try { return NormalizeDiscoveryLines(fragment.GetString() ?? "").TrimStart('\uFEFF'); }
+            catch (InvalidOperationException) { /* The present string could not be decoded. */ }
+        }
+        uncertain = true;
+        return "";
+    }
+
+    private async Task<JsonDocument> DiscoveryJsonAsync(Session session, string path, bool android, CancellationToken cancellationToken,
+        bool retryUncertain = false)
     {
         RequirePlayerScopes(session);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -136,18 +151,18 @@ internal sealed partial class MusicApi
             }
             using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
             if (response.StatusCode == HttpStatusCode.Unauthorized) throw new MusicException("Вход больше не действует. Войдите в аккаунт заново.", true);
-            CheckDiscoveryStatus(response);
-            var bytes = await ReadDiscoveryBodyAsync(response, DiscoveryJsonLimit, timeout.Token).ConfigureAwait(false);
+            CheckDiscoveryStatus(response, retryUncertain);
+            var bytes = await ReadDiscoveryBodyAsync(response, DiscoveryJsonLimit, timeout.Token, retryUncertain).ConfigureAwait(false);
             timeout.Token.ThrowIfCancellationRequested();
             try { return JsonDocument.Parse(StripDiscoveryBom(bytes), new JsonDocumentOptions { MaxDepth = 48 }); }
-            catch (JsonException) { throw new DiscoveryUnavailable("Сервис вернул неподдерживаемый формат данных.", false); }
+            catch (JsonException) { throw new DiscoveryUnavailable("Сервис вернул неподдерживаемый формат данных.", retryUncertain); }
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         { throw new DiscoveryUnavailable("Сервис не ответил вовремя.", true); }
         catch (IOException) { throw new DiscoveryUnavailable("Не удалось дочитать данные сервиса по сети.", true); }
     }
 
-    private async Task<string> DownloadDiscoveryLyricsAsync(Uri source, CancellationToken cancellationToken)
+    private async Task<LyricsResult> DownloadDiscoveryLyricsAsync(Uri source, string format, CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(25));
@@ -181,9 +196,14 @@ internal sealed partial class MusicApi
                 catch (DecoderFallbackException) { throw new DiscoveryUnavailable("Кодировка текста не поддерживается.", false); }
                 if (IsDiscoveryDocument(text))
                     throw new DiscoveryUnavailable("Вместо текста песни сервис вернул страницу или структурированные данные.", false);
-                return text;
+                if (format == "LRC") return ParseDiscoveryLrc(text);
+                var plain = NormalizeDiscoveryLines(text).TrimStart('\uFEFF');
+                if (string.IsNullOrWhiteSpace(plain)) throw new DiscoveryUnavailable("Источник TEXT не выдал текст.", true);
+                return new(plain, [], false, null);
             }
         }
+        // A rendition already advertised by the service is still unconfirmed when its file cannot be read.
+        catch (DiscoveryUnavailable error) when (!error.Transient) { throw new DiscoveryUnavailable(error.Message, true, error.Denied); }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         { throw new DiscoveryUnavailable("Сервис текста не ответил вовремя.", true); }
         catch (IOException) { throw new DiscoveryUnavailable("Не удалось дочитать текст по сети.", true); }
@@ -205,24 +225,29 @@ internal sealed partial class MusicApi
         try { return ValidateMediaUri(uri); }
         catch (MusicException) { throw new DiscoveryUnavailable("Сервис вернул неподдерживаемый адрес текста.", false); }
     }
-    private static void CheckDiscoveryStatus(HttpResponseMessage response)
+    private static void CheckDiscoveryStatus(HttpResponseMessage response, bool retryUncertain = false)
     {
         if (response.StatusCode == HttpStatusCode.PartialContent || response.Content.Headers.NonValidated.Contains("Content-Range"))
-            throw new DiscoveryUnavailable("Сервис вернул только часть данных.", false);
+            throw new DiscoveryUnavailable("Сервис вернул только часть данных.", true);
         if (!response.IsSuccessStatusCode)
-            throw new DiscoveryUnavailable($"Источник недоступен (HTTP {(int)response.StatusCode}).", (int)response.StatusCode >= 500 || (int)response.StatusCode == 429,
-                response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden);
+        {
+            var denied = response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
+            var absent = response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Gone;
+            throw new DiscoveryUnavailable($"Источник недоступен (HTTP {(int)response.StatusCode}).",
+                (int)response.StatusCode >= 500 || response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.RequestTimeout
+                    || retryUncertain && !absent && !denied, denied);
+        }
     }
-    private static async Task<byte[]> ReadDiscoveryBodyAsync(HttpResponseMessage response, int limit, CancellationToken cancellationToken)
+    private static async Task<byte[]> ReadDiscoveryBodyAsync(HttpResponseMessage response, int limit, CancellationToken cancellationToken, bool retryUncertain = false)
     {
-        if (response.Content.Headers.ContentLength > limit) throw new DiscoveryUnavailable("Превышен размер данных прототипа.", false);
+        if (response.Content.Headers.ContentLength > limit) throw new DiscoveryUnavailable("Превышен размер данных прототипа.", retryUncertain);
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         using var body = new MemoryStream();
         var buffer = new byte[8192];
         int count;
         while ((count = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
         {
-            if (body.Length + count > limit) throw new DiscoveryUnavailable("Превышен размер данных прототипа.", false);
+            if (body.Length + count > limit) throw new DiscoveryUnavailable("Превышен размер данных прототипа.", retryUncertain);
             body.Write(buffer, 0, count);
         }
         if (response.Content.Headers.ContentLength is { } length && length != body.Length)
@@ -231,15 +256,16 @@ internal sealed partial class MusicApi
     }
     private static ReadOnlyMemory<byte> StripDiscoveryBom(byte[] bytes)
         => bytes.Length >= 3 && bytes[0] == 239 && bytes[1] == 187 && bytes[2] == 191 ? bytes.AsMemory(3) : bytes;
-    private static JsonElement DiscoveryResult(JsonDocument json)
+    private static JsonElement DiscoveryResult(JsonDocument json, bool retryUncertain = false)
     {
         var root = json.RootElement;
         if (root.ValueKind != JsonValueKind.Object || root.TryGetProperty("error", out var error) && error.ValueKind is not (JsonValueKind.Null or JsonValueKind.False)
+            || root.TryGetProperty("success", out var rootSuccess) && rootSuccess.ValueKind == JsonValueKind.False
             || !root.TryGetProperty("result", out var result) || result.ValueKind != JsonValueKind.Object)
-            throw new DiscoveryUnavailable("Источник не выдал поддерживаемых данных.", false);
+            throw new DiscoveryUnavailable("Источник не выдал поддерживаемых данных.", retryUncertain);
         if (result.TryGetProperty("error", out var nested) && nested.ValueKind is not (JsonValueKind.Null or JsonValueKind.False)
             || result.TryGetProperty("success", out var success) && success.ValueKind == JsonValueKind.False)
-            throw new DiscoveryUnavailable("Сервис не подтвердил данные.", false);
+            throw new DiscoveryUnavailable("Сервис не подтвердил данные.", retryUncertain);
         return result;
     }
 
@@ -344,6 +370,7 @@ internal sealed partial class MusicApi
         var id = Text(row, kind == "playlist" ? "kind" : "id");
         var title = Text(row, kind == "artist" ? "name" : "title");
         if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(title)) return null;
+        if ((kind is "track" or "album") && !TryReadTrackReferencePart(row, "id", out id)) return null;
         var subtitle = row.TryGetProperty("artists", out var artists) && artists.ValueKind == JsonValueKind.Array
             ? string.Join(", ", artists.EnumerateArray().Select(artist => Text(artist, "name")).Where(name => name.Length > 0)) : "";
         if (kind == "playlist")
@@ -354,10 +381,9 @@ internal sealed partial class MusicApi
             if (owner.Length == 0) owner = uid;
             return string.IsNullOrWhiteSpace(owner) ? null : new(id, kind, title, Text(row, "description"), owner, id, CoverUri: EntityArtwork(row, kind), OwnerName: CatalogPlaylistOwnerName(row));
         }
-        string? albumId = null;
-        if (kind == "track" && row.TryGetProperty("albums", out var albums) && albums.ValueKind == JsonValueKind.Array && albums.GetArrayLength() > 0)
-            albumId = Text(albums[0], "id") is { Length: > 0 } value ? value : null;
-        return new(id, kind, title, kind == "artist" ? "Исполнитель" : subtitle, AlbumId: albumId, CoverUri: EntityArtwork(row, kind));
+        var albumId = kind == "track" ? TrackAlbum(row).Id : null;
+        var cover = kind == "track" ? TrackArtwork(row, albumId) : EntityArtwork(row, kind);
+        return new(id, kind, title, kind == "artist" ? "Исполнитель" : subtitle, AlbumId: albumId, CoverUri: cover);
     }
 
     private static LyricsResult ParseDiscoveryLrc(string source)

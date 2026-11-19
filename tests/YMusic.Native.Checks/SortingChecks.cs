@@ -173,12 +173,12 @@ internal static partial class Program
         await Run("Sorting: bounded preference store roundtrip, malformed recovery and atomic failure preserve prior data", () =>
         {
             var directory=Path.Combine(_directory,"sorting-store");var store=new ListSortStore(directory);
-            store.Save(new Dictionary<string,ListSortRule>{{"tracks:favorites",new(ListSortField.Title,true)},{"catalog:albums",new(ListSortField.Artist)},{"downloads",new(ListSortField.Size,true)},{"unknown/account/path",new(ListSortField.Album)}});
+            store.SaveChanges(new Dictionary<string,ListSortRule>{{"tracks:favorites",new(ListSortField.Title,true)},{"catalog:albums",new(ListSortField.Artist)},{"downloads",new(ListSortField.Size,true)},{"unknown/account/path",new(ListSortField.Album)}});
             var saved=new ListSortStore(directory).Load();Assert(saved.Count==3 && saved["tracks:favorites"]==new ListSortRule(ListSortField.Title,true),"store changed known rules or retained arbitrary keys");
             var path=Path.Combine(directory,"list-sorting.json");var bytes=File.ReadAllBytes(path);
             using(var locked=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.Read))
             {
-                try { store.Save(new Dictionary<string,ListSortRule>()); throw new InvalidOperationException("locked replace succeeded"); } catch(IOException) { }
+                try { store.SaveChanges(new Dictionary<string,ListSortRule>()); throw new InvalidOperationException("locked replace succeeded"); } catch(IOException) { }
             }
             Assert(File.ReadAllBytes(path).SequenceEqual(bytes),"failed replacement destroyed previous sorting");
             File.WriteAllText(path,"{broken");Assert(store.Load().Count==0 && File.ReadAllText(path)=="{broken","corrupt load modified data");
@@ -192,7 +192,7 @@ internal static partial class Program
             var store = new ListSortStore(directory);
             Assert(store.Load().Count == 0 && !Directory.Exists(directory), "read created the missing sorting directory");
             var rules = new Dictionary<string, ListSortRule> { ["tracks:favorites"] = new(ListSortField.Title) };
-            store.Save(rules);
+            store.SaveChanges(rules);
             var file = new FileInfo(Path.Combine(directory, "list-sorting.json"));
             var security = file.GetAccessControl(AccessControlSections.Access);
             security.SetAccessRuleProtection(isProtected: true, preserveInheritance: true);
@@ -201,22 +201,72 @@ internal static partial class Program
             file.SetAccessControl(security);
             var expected = file.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access);
             rules["tracks:favorites"] = new(ListSortField.Artist, true);
-            store.Save(rules);
+            store.SaveChanges(rules);
             Assert(store.Load()["tracks:favorites"] == rules["tracks:favorites"]
                 && file.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access) == expected,
                 "sorting replacement changed the DACL or lost the new rule");
+            return Task.CompletedTask;
+        });
+        await Run("Sorting: a new rule merges with rules that were busy at startup", () =>
+        {
+            using var f = new SaFixture("sorting-busy-load");
+            var directory = Path.Combine(_directory, "sorting-busy-store");
+            var store = new ListSortStore(directory);
+            var favorites = new ListSortRule(ListSortField.Title, true);
+            var albums = new ListSortRule(ListSortField.Artist);
+            store.SaveChanges(new Dictionary<string, ListSortRule>
+            {
+                ["tracks:favorites"] = favorites,
+                ["catalog:albums"] = albums
+            });
+            U317Set(f.Window, "_listSortStore", store);
+            using (var held = new FileStream(Path.Combine(directory, "list-sorting.json"), FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                var unavailable = store.Load();
+                Assert(unavailable.Count == 0, "fixture did not prevent the initial read");
+                U317Set(f.Window, "_listSorts", unavailable);
+            }
+            SaInvoke(f.Window, "SetSection", "offline", "Скачанное");
+            var offline = new ListSortRule(ListSortField.Duration);
+            SaInvoke(f.Window, "ChangeListSort", offline);
+            var restored = store.Load();
+            Assert(restored.Count == 3 && restored["tracks:favorites"] == favorites
+                && restored["catalog:albums"] == albums && restored["tracks:offline"] == offline,
+                "changing a sort rule destroyed another section's saved preference");
+            return Task.CompletedTask;
+        });
+        await Run("Sorting: closing retries the pending change after the store is released", () =>
+        {
+            using var fixture = new SaFixture("sorting-close");
+            var directory = Path.Combine(_directory, "sorting-close-store");
+            var store = new ListSortStore(directory);
+            var existing = new ListSortRule(ListSortField.Title);
+            store.SaveChanges(new Dictionary<string, ListSortRule> { ["tracks:favorites"] = existing });
+            U317Set(fixture.Window, "_listSortStore", store);
+            SaInvoke(fixture.Window, "SetSection", "offline", "Скачанное");
+            var pending = new ListSortRule(ListSortField.Duration, true);
+            using (var held = new FileStream(Path.Combine(directory, "list-sorting.json"), FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                SaInvoke(fixture.Window, "ChangeListSort", pending);
+                Assert(SaInvokeResult(fixture.Window, "SaveStateBeforeClosing") is string failure
+                    && failure.Contains("сортировку", StringComparison.Ordinal), "closing missed the pending and still busy rule");
+            }
+            Assert(SaInvokeResult(fixture.Window, "SaveStateBeforeClosing") is null, "closing did not retry the pending sort");
+            var rules = store.Load();
+            Assert(rules["tracks:favorites"] == existing && rules["tracks:offline"] == pending,
+                "the retry did not merge the pending sort into existing preferences");
             return Task.CompletedTask;
         });
         await Run("Sorting: explicit Play uses visible offline order and changing a playing list preserves the active queue", async () =>
         {
             var directory=Path.Combine(_directory,"sorting-playback");Directory.CreateDirectory(directory);
             var music=Path.Combine(directory,"music");Directory.CreateDirectory(music);
-            var wave=WriteWave("sorting-offline.wav",12);var sourceBytes=File.ReadAllBytes(wave);
+            var sourceBytes=SilentMp3Seconds(12,320);
             var rows=new[]{SortTrack("501","Бета","Исполнитель","Альбом",12000),SortTrack("502","Альфа","Исполнитель","Альбом",12000)};
             var indexed=rows.Select(row=>
             {
                 var name=row.Id+".mp3";File.WriteAllBytes(Path.Combine(music,name),sourceBytes);
-                return new OfflineItem(row.Id,row.RequestId,row.Title,row.Artist,row.Album,row.DurationMs,name,"mp3",320,sourceBytes.Length,Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(sourceBytes)),DateTimeOffset.UtcNow);
+                return new OfflineItem(row.Id,row.RequestId,row.Title,row.Artist,row.Album,row.DurationMs,name,"mp3",320,sourceBytes.Length,Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(sourceBytes)),DateTimeOffset.UtcNow, ConfirmedBitrate: 320);
             }).ToArray();
             File.WriteAllText(Path.Combine(music,"library.index.json"),JsonSerializer.Serialize(indexed));
             var handler=new FakeHandler((_,_)=>throw new InvalidOperationException("sorted offline playback opened network"));

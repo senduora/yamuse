@@ -46,6 +46,7 @@ public partial class MainWindow
             window.Closing += ExpandedFullscreenClosing;
             window.Closed += CachedExpandedFullscreenClosed;
             Closed += DestroyExpandedFullscreenWindow;
+            AttachMediaCommands(window);
         }
         // Keep one native source alive for this main window. WPF's tooltip
         // safe area can outlive a visual's move between these two windows.

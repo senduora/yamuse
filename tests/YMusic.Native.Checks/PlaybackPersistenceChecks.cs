@@ -46,6 +46,39 @@ internal static partial class Program
             return Task.CompletedTask;
         });
 
+        await Run("Playback persistence: two explicit Play Next occurrences keep their order after shuffle restart", () =>
+        {
+            var directory = PersistenceDirectory("play-next-order");
+            var store = new PlaybackStateStore(directory);
+            var queue = new PlaybackQueue(new Random(41));
+            queue.SetItems([PersistenceTrack("101"), PersistenceTrack("102")]);
+            queue.Shuffle = true;
+            var repeated = PersistenceTrack("103", "103:12");
+            queue.Enqueue(repeated, playNext: true);
+            queue.Enqueue(repeated, playNext: true);
+            queue.MoveMany([1], 3);
+            var snapshot = PlaybackStateStore.Capture("12345", queue, 29);
+            Assert(snapshot.PlayNextIndices?.SequenceEqual([2, 1]) == true, "checkpoint did not record exact priority positions");
+
+            // A tombstone left after clearing is a valid existing state to replace.
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, PlaybackStateStore.FileName), """{"version":0}""");
+            store.SaveVerifiedCheckpoint(snapshot);
+            var saved = store.Load("12345")!;
+            using var offline = new OfflineLibrary(Path.Combine(directory, "music"));
+            var restored = PlaybackStateStore.RestoreQueue(saved, offline);
+            var replay = new PlaybackQueue(new Random(99));
+            replay.RestoreItems(restored.Tracks, restored.CurrentIndex, saved.Shuffle, saved.Repeat, restored.PlayNextIndices);
+            var first = replay.OccurrenceTokenAt(2);
+            var second = replay.OccurrenceTokenAt(1);
+            Assert(replay.CurrentIndex == 0 && replay.PeekNextOccurrenceToken() == first, "restore changed current or lost latest Play Next priority");
+            _ = replay.Next();
+            Assert(replay.CurrentOccurrenceToken == first && replay.PeekNextOccurrenceToken() == second, "shuffle reordered the identical priority occurrences");
+            _ = replay.Next();
+            Assert(replay.CurrentOccurrenceToken == second && replay.Next()?.Id == "102" && replay.Next() is null,
+                "restored priorities reappeared in the ordinary shuffle bag");
+            return Task.CompletedTask;
+        });
         await Run("Playback persistence: position clamps to metadata duration and unavailable current stays exact", () =>
         {
             var directory = PersistenceDirectory("position");
@@ -59,6 +92,27 @@ internal static partial class Program
             var path = Path.Combine(directory, PlaybackStateStore.FileName);
             var json = JsonNode.Parse(File.ReadAllText(path))!; json["positionSeconds"] = 99999; File.WriteAllText(path, json.ToJsonString());
             Assert(store.Load("12345") is { PositionSeconds: 180 }, "overshooting loaded position was not clamped");
+            var duplicate = PersistenceTrack("103");
+            queue.SetItemsAt([duplicate, duplicate], 1);
+            var staleToken = queue.OccurrenceTokenAt(0);
+            var currentToken = queue.OccurrenceTokenAt(1);
+            var native = TimeSpan.FromSeconds(240);
+            var stale = PlaybackStateStore.Capture("12345", queue, 210, observedDuration: (staleToken, native));
+            var exact = PlaybackStateStore.Capture("12345", queue, 210, observedDuration: (currentToken, native));
+            Assert(stale.PositionSeconds == 180 && exact.CurrentIndex == 1 && exact.PositionSeconds == 210
+                && stale.PositionDurationMs is null && exact.PositionDurationMs == 240000
+                && exact.Tracks[0].DurationMs == 180000 && exact.Tracks[1].DurationMs == 180000,
+                "an observed duration was lost, propagated to another occurrence or stored as catalogue metadata");
+            var sample = PlaybackStateStore.Capture("12345", queue, 44, observedDuration: (currentToken, TimeSpan.FromSeconds(45)));
+            store.Save(sample);
+            var reopened = store.Load("12345") ?? throw new InvalidOperationException("missing preview checkpoint fixture");
+            using var offline = new OfflineLibrary(Path.Combine(directory, "preview-library"));
+            var restored = PlaybackStateStore.RestoreQueue(reopened, offline);
+            var resumed = restored.Tracks[restored.CurrentIndex];
+            var looksLikePreview = typeof(MainWindow).GetMethod("LooksLikePreview", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+            Assert(restored.PositionSeconds == 44 && restored.PositionDurationMs == 45000 && resumed.DurationMs == 180000
+                && looksLikePreview.Invoke(null, [resumed, TimeSpan.FromSeconds(30)]) is true,
+                "reopening an accepted source disabled the catalogue preview check");
             var empty = new PlaybackQueue();
             Assert(PlaybackStateStore.Capture("12345", empty, 100).PositionSeconds == 0, "empty queue retained position");
             return Task.CompletedTask;
@@ -105,8 +159,9 @@ internal static partial class Program
             Assert(store.Load(null) is null && store.LastReadStatus == PlaybackStateReadStatus.Disabled, "unknown account received queue metadata");
             Assert(store.Load("12345", enabled: false) is null && store.LastReadStatus == PlaybackStateReadStatus.Disabled, "disabled restore read a snapshot");
             Assert(original.SequenceEqual(File.ReadAllBytes(path)), "isolation checks modified another account's snapshot");
-            store.Clear(); Assert(!File.Exists(path) && store.Load("12345") is null, "logout snapshot survived");
-            store.Clear();
+            store.Clear("12345", out _);
+            Assert(!File.Exists(path) && store.Load("12345") is null, "logout snapshot survived");
+            store.Clear("12345", out _);
             return Task.CompletedTask;
         });
 

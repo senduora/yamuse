@@ -1,9 +1,11 @@
-﻿using System.Security.Cryptography;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Collections.Concurrent;
 using System.Buffers;
 using System.ComponentModel;
+using Microsoft.Win32.SafeHandles;
 
 namespace YMusic.Native;
 
@@ -12,9 +14,20 @@ internal sealed record OfflineItem([property: JsonRequired] string Id, [property
     [property: JsonRequired] long DurationMs, [property: JsonRequired] string FileName, [property: JsonRequired] string Codec,
     [property: JsonRequired] int Bitrate, [property: JsonRequired] long Bytes, [property: JsonRequired] string Sha256,
     [property: JsonRequired] DateTimeOffset SavedUtc, string? CoverUri = null, IReadOnlyList<ArtistReference>? Artists = null, string? AlbumId = null,
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PrimaryArtistName = null);
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? PrimaryArtistName = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? ConfirmedBitrate = null)
+{
+    // Bitrate is the service's rendition identifier, including for legacy rows.
+    internal int QualityBitrate => ConfirmedBitrate.GetValueOrDefault();
+}
 
-internal sealed record OfflineRemovalResult(int Removed, int Preserved, int Failed, int Forgotten);
+internal sealed record OfflineRemovalResult(int Removed, int Preserved, int Failed, int Forgotten)
+{
+    internal bool HasRetainedIndexEntries => Failed > 0;
+}
+
+internal sealed class OfflinePlaylistIndexFormatException()
+    : MusicException("Не удалось прочитать индекс офлайн-плейлистов. Аудиофайлы и повреждённый индекс сохранены.");
 
 internal sealed partial class OfflineLibrary : IDisposable
 {
@@ -27,7 +40,11 @@ internal sealed partial class OfflineLibrary : IDisposable
     internal Action<string>? SaveCheckpoint { get; set; }
     internal Action<string>? TemporaryPublicationCheckpoint { get; set; }
     internal int? FileIdentityErrorForChecks { get; set; }
+    internal bool RemovalAudioIdentityUnavailableForChecks { get; set; }
+    internal Action<string>? BeforeRemovalAttributesForChecks { get; set; }
+    internal Action<string>? BeforeVerifySavedAudioForChecks { get; set; }
     private readonly AudioBuffer _downloader;
+    private readonly Action? _beforeRecoveryProbeForChecks;
     // Coordinate multiple library instances in this process, including playlist snapshots.
     private static readonly ConcurrentDictionary<string, DirectoryState> DirectoryLocks = new(StringComparer.OrdinalIgnoreCase);
     private readonly DirectoryState _directoryState;
@@ -45,10 +62,11 @@ internal sealed partial class OfflineLibrary : IDisposable
     private LibraryCache? _libraryCache;
     private PlaylistCache? _playlistCache;
     private static readonly JsonSerializerOptions LibraryJson = new()
-    { UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, MaxDepth = 48, WriteIndented = true };
+    { UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, AllowDuplicateProperties = false, MaxDepth = 48, WriteIndented = true };
     private static readonly JsonSerializerOptions PlaylistJson = new()
-    { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, MaxDepth = 48, WriteIndented = true };
-    internal OfflineLibrary(string? directory = null, AudioBuffer? downloader = null, BrandPaths? knownPaths = null)
+    { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, AllowDuplicateProperties = false, MaxDepth = 48, WriteIndented = true };
+    internal OfflineLibrary(string? directory = null, AudioBuffer? downloader = null, BrandPaths? knownPaths = null,
+        Action? beforeRecoveryProbeForChecks = null)
     {
         var root = directory is null ? (knownPaths ?? BrandPaths.Current).AvailableMusicDirectory
             : Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
@@ -56,6 +74,7 @@ internal sealed partial class OfflineLibrary : IDisposable
         _directoryState = root is not null ? DirectoryLocks.GetOrAdd(root, _ => new DirectoryState()) : new DirectoryState();
         _writeLock = _directoryState.Gate;
         _downloader = downloader ?? new AudioBuffer();
+        _beforeRecoveryProbeForChecks = beforeRecoveryProbeForChecks;
         if (IsAvailable) _ = ScheduleRecoveryIfNeeded();
     }
     private sealed class StoragePaths(string directory)
@@ -73,18 +92,164 @@ internal sealed partial class OfflineLibrary : IDisposable
         ArgumentNullException.ThrowIfNull(track);
         return IsAvailable ? Find(track, LoadLibrary()) : null;
     }
-    public IReadOnlyList<TrackRow> Tracks()
+
+    // A single reviewed metadata snapshot for a batch forecast. Each
+    // decision to reuse the actual audio still needs FindVerifiedAsync.
+    internal Func<TrackRow, OfflineItem?> CaptureTrackLookup()
+    {
+        if (!IsAvailable) return static _ => null;
+        var snapshot = LoadLibrary();
+        return track => Find(track, snapshot);
+    }
+
+    internal async Task<OfflineItem?> FindVerifiedAsync(TrackRow track, CancellationToken cancellationToken,
+        Func<OfflineItem, bool>? accept = null, bool failIfUnavailable = false)
+    {
+        ArgumentNullException.ThrowIfNull(track);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!IsAvailable) return null;
+        var snapshot = LoadLibrary();
+        IOException? unavailable = null;
+        foreach (var candidate in VerifiedCandidates(track, snapshot))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (accept is not null && !accept(candidate)) continue;
+            VerifiedSavedFile? verifiedFile;
+            try { verifiedFile = await HoldExpectedHashAsync(candidate, cancellationToken, failIfUnavailable).ConfigureAwait(false); }
+            catch (IOException error) when (failIfUnavailable) { unavailable ??= error; continue; }
+            using var verified = verifiedFile;
+            if (verified is null) continue;
+            cancellationToken.ThrowIfCancellationRequested();
+            if (LoadLibrary().ById.TryGetValue(candidate.Id, out var current)
+                && current.Any(item => SameOfflineItem(item, candidate))) return candidate;
+        }
+        if (unavailable is not null) throw unavailable;
+        return null;
+    }
+
+    private static IEnumerable<OfflineItem> VerifiedCandidates(TrackRow track, LibraryCache snapshot)
+    {
+        var exact = string.IsNullOrEmpty(track.RequestId) ? null : snapshot.ByRequest.GetValueOrDefault(track.RequestId);
+        var variants = string.IsNullOrEmpty(track.Id) ? null : snapshot.ById.GetValueOrDefault(track.Id);
+        return (exact ?? []).Concat((variants ?? []).Where(item => item.RequestId != track.RequestId || exact is null));
+    }
+
+    internal const int DownloadVerificationBatchSize = 128;
+    internal sealed record DownloadCacheRequest(TrackRow Track, Func<OfflineItem, bool>? Accept = null);
+    internal readonly record struct DownloadCacheResult(OfflineItem? Item, IOException? Unavailable,
+        IReadOnlyList<OfflineItem>? VerifiedCopies = null, IReadOnlyList<LocalAudioSource>? RefusedCopies = null);
+    // Only a batch check can describe every variant. A failed guarded open
+    // records a refusal for its exact source without classifying other copies.
+    internal sealed record OfflineCopyCheck(TrackRow Track, IReadOnlyList<OfflineItem>? VerifiedCopies, bool RetryOnNavigation = false,
+        IReadOnlyList<LocalAudioSource>? RefusedCopies = null);
+
+    internal sealed class OfflineCopyChecks : System.Collections.ObjectModel.ReadOnlyDictionary<string, OfflineCopyCheck>
+    {
+        private readonly HashSet<(string Path, long Bytes, string Digest)> _refused;
+
+        internal OfflineCopyChecks(Dictionary<string, OfflineCopyCheck> checks) : base(checks)
+        {
+            _refused = checks.Values.SelectMany(check => check.RefusedCopies ?? [])
+                .Where(source => source.Bytes is not null && source.Digest is not null)
+                .Select(source => PhysicalKey(source.Path, source.Bytes!.Value, source.Digest!)).ToHashSet();
+        }
+
+        internal bool HasRefusals => _refused.Count > 0;
+        internal bool Refuses(string path, long bytes, string digest) => _refused.Count > 0 && _refused.Contains(PhysicalKey(path, bytes, digest));
+        internal bool Refuses(LocalAudioSource source) => source.Bytes is { } bytes && source.Digest is { } digest && Refuses(source.Path, bytes, digest);
+
+        private static (string Path, long Bytes, string Digest) PhysicalKey(string path, long bytes, string digest)
+            => (path.ToUpperInvariant(), bytes, digest.ToUpperInvariant());
+    }
+
+    // The checked index and ready audio remain pinned until the dispatcher applies
+    // these results. Dispose the batch before a worker can write new audio.
+    internal sealed class VerifiedDownloadBatch(DownloadCacheResult[] results, Action release) : IDisposable
+    {
+        private Action? _release = release;
+        internal DownloadCacheResult this[int position] => results[position];
+        public void Dispose() => Interlocked.Exchange(ref _release, null)?.Invoke();
+    }
+
+    internal async Task<VerifiedDownloadBatch> HoldDownloadCacheBatchAsync(IReadOnlyList<DownloadCacheRequest> requests, CancellationToken token,
+        bool verifyAllVariants = false)
+    {
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(requests.Count, DownloadVerificationBatchSize);
+        EnsureRecoveryReadReady();
+        await _writeLock.WaitAsync(token).ConfigureAwait(false);
+        UninstallPathGuard.AncestorLease? parents = null;
+        SafeFileHandle? index = null;
+        var files = new Dictionary<(string Path, long Bytes, string Sha256), VerifiedSavedFile>();
+        try
+        {
+            parents = HoldStorageParents(_indexPath);
+            lock (_directoryState.IndexPublicationSync) index = parents.Complete ? OpenIndex(_indexPath) : null;
+            LibraryCache snapshot;
+            lock (_cacheLock) snapshot = LoadLibrarySnapshot(ReadIndexSnapshot(index), force: false);
+            var results = new DownloadCacheResult[requests.Count];
+            for (var i = 0; i < requests.Count; i++)
+            {
+                token.ThrowIfCancellationRequested();
+                var request = requests[i];
+                IOException? unavailable = null;
+                List<OfflineItem>? verifiedCopies = verifyAllVariants ? [] : null;
+                List<LocalAudioSource>? refusedCopies = null;
+                foreach (var candidate in VerifiedCandidates(request.Track, snapshot))
+                {
+                    if (request.Accept is not null && !request.Accept(candidate)) continue;
+                    var key = (candidate.FileName, candidate.Bytes, candidate.Sha256);
+                    if (!files.ContainsKey(key))
+                    {
+                        VerifiedSavedFile? file;
+                        try { file = await HoldExpectedHashAsync(candidate, token, failIfUnavailable: true, parentsAlreadyHeld: true).ConfigureAwait(false); }
+                        catch (IOException error)
+                        {
+                            unavailable ??= error;
+                            if (verifyAllVariants) (refusedCopies ??= []).Add(IndexedPlaybackSource(candidate, selected: false));
+                            continue;
+                        }
+                        if (file is null) continue;
+                        files.Add(key, file);
+                    }
+                    if (results[i].Item is null) results[i] = new(candidate, null);
+                    verifiedCopies?.Add(candidate);
+                    if (!verifyAllVariants) break;
+                }
+                if (results[i].Item is null) results[i] = new(null, unavailable);
+                if (verifiedCopies is not null)
+                    results[i] = results[i] with { VerifiedCopies = verifiedCopies, RefusedCopies = refusedCopies };
+            }
+            return new(results, Release);
+        }
+        catch { Release(); throw; }
+
+        void Release()
+        {
+            try { foreach (var file in files.Values) file.Dispose(); }
+            finally
+            {
+                index?.Dispose(); parents?.Dispose();
+                _writeLock.Release();
+            }
+        }
+    }
+    public IReadOnlyList<TrackRow> Tracks(OfflineCopyChecks? verifiedCopies = null)
         => Read().Select((item, i) =>
         {
-            var valid = ValidFile(item);
-            var path = valid ? ResolvePath(item.FileName) : null;
+            var path = ValidFile(item) ? ResolvePath(item.FileName) : null;
+            var valid = path is not null && AllowsVerifiedProjection(verifiedCopies, item)
+                && !IsRejectedPlaybackSource(path, item.Sha256, item.Bytes);
             var quality = QualityLabel(item);
             return new TrackRow
             {
             Number = i + 1, Id = item.Id, RequestId = item.RequestId, Title = item.Title, Artist = item.Artist, Artists = CopyArtists(item.Artists),
             PrimaryArtistName = item.PrimaryArtistName,
             Album = item.Album, AlbumId = item.AlbumId, DurationMs = item.DurationMs, CoverUri = item.CoverUri, Available = valid,
-            IsOfflineLibraryRow = true, LocalPath = path, LocalQuality = quality, DownloadedPath = path, DownloadedQuality = valid ? quality : null
+            IsOfflineLibraryRow = true, LocalPath = path, LocalQuality = quality, LocalSourceRequestId = item.RequestId,
+            LocalSourceCodec = item.Codec, LocalSourceBitrate = item.Bitrate,
+            LocalSourceConfirmedBitrate = item.ConfirmedBitrate,
+            LocalSourceSha256 = item.Sha256,
+            DownloadedPath = valid ? path : null, DownloadedQuality = valid ? quality : null
             };
         }).ToArray();
 
@@ -116,7 +281,8 @@ internal sealed partial class OfflineLibrary : IDisposable
     public OfflinePlaylistStatus GetPlaylistStatus(string owner, string kind, IReadOnlyList<TrackRow>? currentTracks = null)
         => InspectPlaylistStatus(owner, kind, currentTracks, CancellationToken.None);
 
-    internal OfflinePlaylistStatus InspectPlaylistStatus(string owner, string kind, IReadOnlyList<TrackRow>? currentTracks, CancellationToken token)
+    internal OfflinePlaylistStatus InspectPlaylistStatus(string owner, string kind, IReadOnlyList<TrackRow>? currentTracks, CancellationToken token,
+        OfflineCopyChecks? verifiedCopies = null)
     {
         token.ThrowIfCancellationRequested();
         var snapshot = GetPlaylists().FirstOrDefault(p => p.Owner == owner && p.Kind == kind);
@@ -125,20 +291,56 @@ internal sealed partial class OfflineLibrary : IDisposable
         var changed = tracks.Count != snapshot.Tracks.Count
             || !tracks.Zip(snapshot.Tracks).All(pair => SameTrackMetadata(pair.First, pair.Second));
         var library = LoadLibrary();
-        var downloaded = tracks.Count(t => { token.ThrowIfCancellationRequested(); return t.Available && Find(ToRow(t), library) is not null; });
+        var downloaded = tracks.Count(t =>
+        {
+            token.ThrowIfCancellationRequested();
+            return FindProjectedPlaylistItem(ToRow(t), library, verifiedCopies) is not null;
+        });
         // Quality is retained as requested metadata. Completion uses actual valid files,
         // independently of the UI's currently selected quality or codec fallback.
         return new(tracks.Count, downloaded, tracks.Count > 0 && !changed && downloaded == tracks.Count, changed, true);
     }
 
-    public IReadOnlyList<TrackRow> GetPlaylistTracks(string owner, string kind)
+    private bool AllowsVerifiedProjection(OfflineCopyChecks? checks, OfflineItem item)
+        => checks is null || !(checks.HasRefusals && checks.Refuses(ResolvePath(item.FileName), item.Bytes, item.Sha256))
+            && (checks.GetValueOrDefault(item.Id)?.VerifiedCopies is not { } verified || verified.Any(candidate => SameOfflineItem(candidate, item)));
+
+    internal bool AllowsVerifiedCopy(OfflineCopyChecks checks, string trackId, LocalAudioSource source)
+        => !checks.Refuses(source)
+            && (checks.GetValueOrDefault(trackId)?.VerifiedCopies is not { } verified || verified.Any(candidate => MatchesOfflineCopy(source, candidate)));
+
+    internal bool MatchesOfflineCopy(LocalAudioSource source, OfflineItem copy)
+        => MatchesPhysicalCopy(source, copy)
+            && source.Variant is { } variant && variant.RequestId == copy.RequestId && variant.Codec == copy.Codec
+            && variant.Bitrate == copy.Bitrate && variant.ConfirmedBitrate == copy.ConfirmedBitrate;
+
+    internal bool MatchesPhysicalCopy(LocalAudioSource source, OfflineItem copy)
+        => source.Bytes == copy.Bytes && StringComparer.OrdinalIgnoreCase.Equals(source.Digest, copy.Sha256)
+            && StringComparer.OrdinalIgnoreCase.Equals(source.Path, ResolvePath(copy.FileName));
+
+    internal static bool SamePhysicalCopy(LocalAudioSource left, LocalAudioSource right)
+        => left.Bytes == right.Bytes && StringComparer.OrdinalIgnoreCase.Equals(left.Digest, right.Digest)
+            && StringComparer.OrdinalIgnoreCase.Equals(left.Path, right.Path);
+
+    internal static bool SameOfflineCopy(LocalAudioSource left, LocalAudioSource right)
+        => SamePhysicalCopy(left, right) && left.Variant is { } chosen && right.Variant is { } other
+            && chosen.RequestId == other.RequestId && chosen.Codec == other.Codec && chosen.Bitrate == other.Bitrate
+            && chosen.ConfirmedBitrate == other.ConfirmedBitrate;
+
+    private OfflineItem? FindProjectedPlaylistItem(TrackRow track, LibraryCache library, OfflineCopyChecks? checks)
+        => checks is not null && (checks.HasRefusals || checks.ContainsKey(track.Id))
+            ? VerifiedCandidates(track, library).FirstOrDefault(item => AllowsVerifiedProjection(checks, item) && ValidFile(item)
+                && !IsRejectedPlaybackSource(ResolvePath(item.FileName), item.Sha256, item.Bytes))
+            : FindPlaylistPlaybackItem(track, library);
+
+    public IReadOnlyList<TrackRow> GetPlaylistTracks(string owner, string kind, OfflineCopyChecks? verifiedCopies = null)
     {
         var snapshot = GetPlaylists().FirstOrDefault(p => p.Owner == owner && p.Kind == kind);
         if (snapshot is null) return [];
         var library = LoadLibrary();
         return snapshot.Tracks.Select((track, index) =>
         {
-            var local = Find(ToRow(track), library);
+            var local = FindProjectedPlaylistItem(ToRow(track), library, verifiedCopies);
             var path = local is null ? null : ResolvePath(local.FileName);
             var quality = local is null ? null : QualityLabel(local);
             return new TrackRow
@@ -146,12 +348,17 @@ internal sealed partial class OfflineLibrary : IDisposable
                 Number = index + 1, Id = track.Id, RequestId = track.RequestId, Title = track.Title, Artist = track.Artist, Artists = CopyArtists(track.Artists),
                 PrimaryArtistName = track.PrimaryArtistName,
                 Album = track.Album, AlbumId = track.AlbumId, DurationMs = track.DurationMs, CoverUri = track.CoverUri, Available = local is not null,
-                IsOfflineLibraryRow = true, LocalPath = path, LocalQuality = quality, DownloadedPath = path, DownloadedQuality = quality
+                IsOfflineLibraryRow = true, LocalPath = path, LocalQuality = quality, LocalSourceRequestId = local?.RequestId,
+                LocalSourceCodec = local?.Codec, LocalSourceBitrate = local?.Bitrate,
+                LocalSourceConfirmedBitrate = local?.ConfirmedBitrate,
+                LocalSourceSha256 = local?.Sha256,
+                DownloadedPath = path, DownloadedQuality = quality
             };
         }).ToArray();
     }
 
-    public async Task<OfflineItem> SaveAsync(TrackRow track, AudioDescriptor audio, CancellationToken cancellationToken, IProgress<AudioProgress>? progress = null)
+    public async Task<OfflineItem> SaveAsync(TrackRow track, AudioDescriptor audio, CancellationToken cancellationToken,
+        IProgress<AudioProgress>? progress = null, bool recheckQuality = false)
     {
         ArgumentNullException.ThrowIfNull(track); ArgumentNullException.ThrowIfNull(audio);
         if (string.IsNullOrWhiteSpace(track.Id) || string.IsNullOrWhiteSpace(track.RequestId)
@@ -186,21 +393,49 @@ internal sealed partial class OfflineLibrary : IDisposable
                 savedVariants = LoadLibrary(force: true, recovering: true).Items.Where(IsSameVariant).ToArray();
             }
             finally { _writeLock.Release(); }
-            foreach (var existing in savedVariants)
+            async Task<bool> IsStillIndexedAsync(OfflineItem item)
             {
-                if (!await HasExpectedHashAsync(existing, cancellationToken).ConfigureAwait(false)) continue;
                 await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
                     await RecoverIfPendingUnderGateAsync().ConfigureAwait(false);
                     if (_directoryState.Generation != generation) throw DownloadInvalidated();
-                    if (LoadLibrary(force: true, recovering: true).Items.Any(item => SameOfflineItem(item, existing)) && ValidFile(existing)) return existing;
+                    return LoadLibrary(force: true, recovering: true).Items.Any(current => SameOfflineItem(current, item));
                 }
                 finally { _writeLock.Release(); }
             }
+            IOException? unavailable = null;
+            var retainedVariants = new List<OfflineItem>();
+            foreach (var existing in savedVariants)
+            {
+                VerifiedSavedFile? verifiedFile;
+                try { verifiedFile = await HoldExpectedHashAsync(existing, cancellationToken, failIfUnavailable: true).ConfigureAwait(false); }
+                catch (IOException error) { unavailable ??= error; continue; }
+                using var verified = verifiedFile;
+                if (verified is null) continue;
+                if (recheckQuality && AudioQualityPolicy.IsBetter(audio.Codec, audio.Bitrate, existing.Codec, existing.QualityBitrate))
+                {
+                    retainedVariants.Add(existing);
+                    continue;
+                }
+                SaveCheckpoint?.Invoke("save-existing-verified");
+                if (await IsStillIndexedAsync(existing).ConfigureAwait(false)) return existing;
+            }
+            if (unavailable is not null) throw unavailable;
+            int? confirmedBitrate;
             using (await _directoryState.EnterDownloadAsync(cancellationToken).ConfigureAwait(false))
-                buffered = await _downloader.DownloadAsync(audio, cancellationToken, progress).ConfigureAwait(false);
+            {
+                var candidate = await _downloader.DownloadAsync(audio, cancellationToken, progress).ConfigureAwait(false);
+                (buffered, confirmedBitrate) = await OfflineAudioProbe.VerifyAsync(candidate, audio, track.DurationMs, cancellationToken,
+                    SaveCheckpoint is { } checkpoint ? () => checkpoint("save-before-audio-probe") : null).ConfigureAwait(false);
+            }
             cancellationToken.ThrowIfCancellationRequested();
+            var previous = retainedVariants.OrderByDescending(item => item.QualityBitrate).FirstOrDefault();
+            if (previous is not null && previous.QualityBitrate >= confirmedBitrate.GetValueOrDefault())
+            {
+                using var retained = await HoldExpectedHashAsync(previous, cancellationToken, failIfUnavailable: true).ConfigureAwait(false);
+                if (retained is not null && await IsStillIndexedAsync(previous).ConfigureAwait(false)) return previous;
+            }
             using var parents = HoldStorageParents(_indexPath, create: true);
             // Stage under a unique name before taking the short index commit gate.
             var partial = ResolvePath(".ym-audio-" + Guid.NewGuid().ToString("N") + ".partial");
@@ -226,6 +461,10 @@ internal sealed partial class OfflineLibrary : IDisposable
                 output.Position = 0;
                 var persistedHash = Convert.ToHexString(await SHA256.HashDataAsync(output, cancellationToken).ConfigureAwait(false)).ToLowerInvariant();
                 if (originalHash != persistedHash) throw new MusicException("Не совпала контрольная сумма сохранённого аудио. Файл не добавлен в библиотеку.");
+                var sameBytes = retainedVariants.FirstOrDefault(item => item.Bytes == output.Length
+                    && item.Sha256.Equals(persistedHash, StringComparison.OrdinalIgnoreCase));
+                using var sameFile = sameBytes is null ? null
+                    : await HoldExpectedHashAsync(sameBytes, cancellationToken, failIfUnavailable: true).ConfigureAwait(false);
                 await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
                 holdsWriteLock = true;
                 SetStorageMutationActive(true);
@@ -236,13 +475,23 @@ internal sealed partial class OfflineLibrary : IDisposable
                 var currentVariants = latest.Items.Where(IsSameVariant).ToArray();
                 if (currentVariants.Length != savedVariants.Length
                     || !currentVariants.Zip(savedVariants).All(pair => SameOfflineItem(pair.First, pair.Second))) throw IndexChanged();
+                if (sameBytes is not null && sameFile is not null)
+                {
+                    var observed = sameBytes with { ConfirmedBitrate = confirmedBitrate };
+                    var updated = latest.Items.Select(item => SameOfflineItem(item, sameBytes) ? observed : item).ToList();
+                    await WriteIndexAsync(_indexPath, updated, LibraryJson, latest.Stamp, cancellationToken).ConfigureAwait(false);
+                    committed = true;
+                    lock (_cacheLock) _libraryCache = null;
+                    SaveCheckpoint?.Invoke("save-after-index-commit");
+                    return observed;
+                }
                 var filename = preferredName;
                 var destination = preferredPath;
                 if (UninstallPathGuard.EntryExists(destination) || latest.Items.Any(i => i.FileName.Equals(filename, StringComparison.OrdinalIgnoreCase)))
                 { filename = $"{title} [{id}-{Guid.NewGuid():N}]{audio.Extension}"; destination = ResolvePath(filename); }
                 var item = new OfflineItem(track.Id, track.RequestId, track.Title, track.Artist, track.Album, track.DurationMs, filename,
                     audio.Codec, audio.Bitrate, output.Length, persistedHash, DateTimeOffset.UtcNow, track.CoverUri, artists, track.AlbumId,
-                    track.PrimaryArtistNameToPersist);
+                    track.PrimaryArtistNameToPersist, confirmedBitrate);
                 SaveCheckpoint?.Invoke("save-before-receipt");
                 var identity = GetStorageFileIdentity(stage);
                 journal = CreateSaveJournal(partial, item, identity, latest.Stamp);
@@ -250,15 +499,16 @@ internal sealed partial class OfflineLibrary : IDisposable
                 SaveCheckpoint?.Invoke("save-before-audio-publish");
                 ManagedCacheCleanup.RenameByHandle(stage, destination, releaseDeleteDisposition: true);
                 SaveCheckpoint?.Invoke("save-after-audio-publish");
-                // Replace prior metadata for this quality only. A missing or
-                // modified old file is never a target of this save operation.
-                var items = latest.Items.Where(i => !IsSameVariant(i)).ToList();
+                // Keep verified earlier realizations indexed even when the service
+                // reported the same nominal rate for a different, improved file.
+                var items = latest.Items.Where(i => !IsSameVariant(i)
+                    || retainedVariants.Any(previousItem => SameOfflineItem(i, previousItem))).ToList();
                 items.Insert(0, item);
                 await WriteIndexAsync(_indexPath, items, LibraryJson, latest.Stamp, cancellationToken).ConfigureAwait(false);
                 committed = true;
                 lock (_cacheLock) _libraryCache = null;
                 SaveCheckpoint?.Invoke("save-after-index-commit");
-                UninstallPathGuard.DeleteByHandle(journal.SafeFileHandle);
+                RetireJournal(journal, SaveRecoveryPath);
                 return item;
             }
             finally
@@ -268,11 +518,10 @@ internal sealed partial class OfflineLibrary : IDisposable
                 {
                     try
                     {
+                        RecoverIndexPublicationUnderGate();
                         // A live rollback can still use its exact handle on a
                         // filesystem that cannot provide a persistent file ID.
-                        if (unidentifiedDestination is not null && !LoadLibrary(force: true, recovering: true).Items
-                            .Any(row => row.FileName.Equals(unidentifiedDestination, StringComparison.OrdinalIgnoreCase)))
-                            UninstallPathGuard.DeleteByHandle(stage);
+                        if (unidentifiedDestination is not null) _ = RollbackUnindexedSaveAudio(stage, unidentifiedDestination);
                         await output.DisposeAsync().ConfigureAwait(false);
                         await RecoverSaveUnderGateAsync().ConfigureAwait(false);
                     }
@@ -324,31 +573,46 @@ internal sealed partial class OfflineLibrary : IDisposable
             var library = LoadLibrary(force: true);
             // Both indexes are preflighted before a single file is moved.
             var playlists = LoadPlaylists(force: true);
+            var clearPlaylists = trackId is null && playlists.Items.Count > 0;
+            if (clearPlaylists)
+            {
+                using var current = OpenIndex(_playlistIndexPath) ?? throw IndexChanged();
+                _ = RequireRemovalIndexIdentity(current);
+            }
             var selected = library.Items.Where(i => trackId is null || i.Id == trackId).ToArray();
             var remaining = library.Items.Where(i => trackId is not null && i.Id != trackId).ToList();
-            var candidates = selected.DistinctBy(i => i.FileName, StringComparer.OrdinalIgnoreCase).ToArray();
-            var referenced = remaining.Select(i => i.FileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var candidates = selected.GroupBy(i => i.FileName, StringComparer.OrdinalIgnoreCase).ToArray();
+            var referenced = remaining.ToLookup(i => i.FileName, StringComparer.OrdinalIgnoreCase);
             var verified = 0; long verifiedBytes = 0;
-            var totalBytes = candidates.Sum(i => i.Bytes);
+            var totalBytes = candidates.Sum(group => group.Max(row => row.Bytes));
             var resultGate = new object();
             void Report(string phase)
                 => progress?.Report(new(verified, candidates.Length, removed, preserved, failed, verifiedBytes, totalBytes, phase));
+            void RetainCandidate(IGrouping<string, OfflineItem> group, OfflineItem? verified)
+            {
+                lock (resultGate)
+                {
+                    failed++;
+                    retained.AddRange(verified is null ? group : group.Where(row => SameRecoveredAudio(row, verified)));
+                }
+            }
             Report("verify");
             _directoryState.Generation++; // An already running Save cannot republish after removal.
             // At most two simultaneous media reads. A single seek-limited disk
             // may not benefit from concurrency; avoiding a second full read is
             // the main saving on both HDD and SSD.
-            await Parallel.ForEachAsync(candidates, new ParallelOptions { MaxDegreeOfParallelism = 2, CancellationToken = cancellationToken }, async (item, token) =>
+            await Parallel.ForEachAsync(candidates, new ParallelOptions { MaxDegreeOfParallelism = 2, CancellationToken = cancellationToken }, async (group, token) =>
             {
                 token.ThrowIfCancellationRequested();
-                var path = ResolvePath(item.FileName);
+                var path = ResolvePath(group.Key);
                 FileStream? file = null;
+                OfflineItem? verifiedItem = null;
                 try
                 {
-                    if (!File.Exists(path) || referenced.Contains(item.FileName) || !ValidFile(item))
+                    BeforeRemovalAttributesForChecks?.Invoke(path);
+                    var attributes = File.GetAttributes(path);
+                    if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
                     { lock (resultGate) preserved++; return; }
-                    if ((File.GetAttributes(path) & FileAttributes.ReadOnly) != 0)
-                    { lock (resultGate) { failed++; retained.Add(item); } return; }
                     var quarantine = ResolvePath(".ym-delete-" + Guid.NewGuid().ToString("N") + ".pending");
                     var recovery = ResolvePath(".ym-recovered-" + Guid.NewGuid().ToString("N") + Path.GetExtension(path));
                     // READ|DELETE, FILE_SHARE_READ, OPEN_REPARSE_POINT. The
@@ -358,16 +622,29 @@ internal sealed partial class OfflineLibrary : IDisposable
                     var handle = UninstallPathGuard.OpenOwnedFile(path, read: true);
                     try { file = new FileStream(handle, FileAccess.Read, bufferSize: 1, isAsync: false); }
                     catch { handle.Dispose(); throw; }
-                    if (file.Length != item.Bytes
-                        || !await RemovalHashMatchesAsync(file, item.Sha256, token).ConfigureAwait(false))
+                    var length = file.Length;
+                    if (FileSecurityPreservation.HasNamedStreamsOrExtendedAttributes(handle) || !group.Any(row => row.Bytes == length))
                     { lock (resultGate) preserved++; return; }
+                    var digest = await HashRemovalAudioAsync(file, token).ConfigureAwait(false);
+                    var match = group.FirstOrDefault(row => row.Bytes == length && row.Sha256.Equals(digest, StringComparison.OrdinalIgnoreCase));
+                    if (match is null)
+                    { lock (resultGate) preserved++; return; }
+                    verifiedItem = match;
+                    if (referenced[group.Key].Any(row => SameRecoveredAudio(row, match)))
+                    { lock (resultGate) preserved++; return; }
+                    if ((attributes & FileAttributes.ReadOnly) != 0)
+                    { RetainCandidate(group, verifiedItem); return; }
                     token.ThrowIfCancellationRequested();
-                    staged.Add(new(item, path, quarantine, recovery, file, GetStorageFileIdentity(handle)));
+                    var identity = RemovalAudioIdentityUnavailableForChecks ? null : GetStorageFileIdentity(handle);
+                    staged.Add(new(verifiedItem, path, quarantine, recovery, file, identity));
                     file = null; // Ownership transfers to staged until final commit/rollback.
-                    lock (resultGate) verifiedBytes += item.Bytes;
+                    lock (resultGate) verifiedBytes += length;
                 }
+                catch (Exception ex) when (file is null && ex is (FileNotFoundException or DirectoryNotFoundException
+                    or UninstallPathGuard.UnsafeStoragePathException or Win32Exception { NativeErrorCode: 2 or 3 }))
+                { lock (resultGate) preserved++; }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
-                { lock (resultGate) { failed++; retained.Add(item); } }
+                { RetainCandidate(group, verifiedItem); }
                 finally
                 {
                     file?.Dispose();
@@ -378,7 +655,7 @@ internal sealed partial class OfflineLibrary : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             // The complete immutable mapping is durable before the first rename.
             // Verification retains the exact opened handles without moving files.
-            journal = CreateRecoveryJournal(staged.ToArray(), library, playlists, remaining, trackId is null);
+            journal = CreateRecoveryJournal(staged.ToArray(), library, playlists, remaining, clearPlaylists);
             foreach (var entry in staged)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -389,58 +666,54 @@ internal sealed partial class OfflineLibrary : IDisposable
             Report("commit");
             // Clear resets snapshots too; deleting one track retains snapshot metadata
             // and its completion is recomputed from actual remaining managed files.
-            IndexStamp? snapshotWritten = null;
-            try
+            if (journal.Data.PlaylistClearOperation is { } playlistOperation)
             {
-                if (trackId is null)
-                {
-                    snapshotWritten = await WriteIndexAsync(_playlistIndexPath, new OfflinePlaylistIndex(1, []), PlaylistJson, playlists.Stamp, cancellationToken).ConfigureAwait(false);
-                    RemovalCheckpoint?.Invoke("after-playlist-commit");
-                }
-                await WriteIndexAsync(_indexPath, remaining, LibraryJson, library.Stamp, cancellationToken).ConfigureAwait(false);
-                RemovalCheckpoint?.Invoke("before-removal-commit-marker");
-                CommitRecoveryJournal(journal);
+                await WriteIndexAsync(_playlistIndexPath, new OfflinePlaylistIndex(1, []), PlaylistJson, playlists.Stamp,
+                    cancellationToken, attestStage: (stage, _) => PublishRemovalIndexProof(playlistOperation, stage, playlists: true)).ConfigureAwait(false);
+                RemovalCheckpoint?.Invoke("after-playlist-commit");
             }
-            catch
-            {
-                if (snapshotWritten is not null)
-                {
-                    // Roll back our snapshot change only if no other writer replaced it.
-                    await WriteIndexAsync(_playlistIndexPath, new OfflinePlaylistIndex(1, playlists.Items), PlaylistJson, snapshotWritten, CancellationToken.None).ConfigureAwait(false);
-                }
-                throw;
-            }
+            var attestLibrary = journal.Data.LibraryRemovalOperation is { } libraryOperation
+                ? (Action<SafeFileHandle, IndexStamp>)((stage, _) => PublishRemovalIndexProof(libraryOperation, stage, playlists: false,
+                    required: journal.Data.Unstaged is { Count: > 0 })) : null;
+            await WriteIndexAsync(_indexPath, remaining, LibraryJson, library.Stamp, cancellationToken, attestStage: attestLibrary).ConfigureAwait(false);
+            RemovalCheckpoint?.Invoke("before-removal-commit-marker");
+            CommitRecoveryJournal(journal);
             RemovalCheckpoint?.Invoke("after-library-commit");
+            var failedAudio = new List<RecoveredAudio>();
             foreach (var entry in staged)
             {
+                var preserveMetadata = false;
                 try
                 {
                     EnsureSafeDirectory();
                     // Index commit is the cancellation boundary. After it, the
                     // small delete/restore phase completes with no audio reads.
-                    UninstallPathGuard.DeleteByHandle(entry.File.SafeFileHandle);
-                    entry.Deleted = true;
-                    entry.File.Dispose(); removed++;
+                    var handle = entry.File.SafeFileHandle;
+                    preserveMetadata = FileSecurityPreservation.HasNamedStreamsOrExtendedAttributes(handle);
+                    if (!preserveMetadata)
+                    {
+                        UninstallPathGuard.DeleteByHandle(handle);
+                        entry.Deleted = true;
+                        entry.File.Dispose(); removed++;
+                    }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
                 {
                     var restoredPath = RestoreStaged(entry); failed++;
                     // The same protected handle still proves the digest.
-                    retained.Add(entry.Item with { FileName = Path.GetFileName(restoredPath) });
+                    failedAudio.Add(new(entry.Item, Path.GetFileName(entry.Recovery), restoredPath));
                 }
-                finally { Report("delete"); }
+                if (preserveMetadata) { RestoreStaged(entry); preserved++; }
+                Report("delete");
             }
             // Failed managed files remain discoverable for a later retry. The
             // second commit merges fresh external/unrelated entries instead of
             // hiding a restored audio file behind an empty index.
-            if (retained.Count > 0)
+            if (failedAudio.Count > 0)
             {
-                var latest = LoadLibrary(force: true);
-                var repaired = latest.Items.ToList();
-                foreach (var item in retained)
-                    if (!repaired.Any(i => i.FileName.Equals(item.FileName, StringComparison.OrdinalIgnoreCase))) repaired.Add(item);
-                if (repaired.Count != latest.Items.Count)
-                    await WriteIndexAsync(_indexPath, repaired, LibraryJson, latest.Stamp, CancellationToken.None).ConfigureAwait(false);
+                await RepairRecoveredIndexAsync(failedAudio, journal).ConfigureAwait(false);
+                var failedNames = failedAudio.ToDictionary(audio => audio.Item.FileName, StringComparer.OrdinalIgnoreCase);
+                retained.AddRange(selected.Where(row => failedNames.TryGetValue(row.FileName, out var saved) && SameRecoveredAudio(row, saved.Item)));
             }
             DeleteRecoveryJournal(journal);
             completed = true;
@@ -453,9 +726,15 @@ internal sealed partial class OfflineLibrary : IDisposable
             {
                 if (!completed)
                 {
+                    RecoverIndexPublicationUnderGate();
                     var restored = new List<RecoveredAudio>();
                     foreach (var entry in staged)
-                        if (!entry.Deleted) restored.Add(new(entry.Item, Path.GetFileName(entry.Recovery), RestoreStaged(entry)));
+                    {
+                        if (entry.Deleted) continue;
+                        var target = RestoreStaged(entry);
+                        var preserveMetadata = FileSecurityPreservation.HasNamedStreamsOrExtendedAttributes(entry.File.SafeFileHandle);
+                        restored.Add(new(entry.Item, Path.GetFileName(entry.Recovery), preserveMetadata ? null : target));
+                    }
                     // A collision may change the pathname even before commit.
                     // Repair that exact mapping rather than indexing a foreign replacement.
                     if (journal is not null)
@@ -463,6 +742,7 @@ internal sealed partial class OfflineLibrary : IDisposable
                         await RestoreInterruptedPlaylistsAsync(journal).ConfigureAwait(false);
                         if (restored.Count > 0 || !journal.Committed && journal.Data.Unstaged is { Count: > 0 })
                             await RepairRecoveredIndexAsync(restored, journal).ConfigureAwait(false);
+                        RemovalCheckpoint?.Invoke("live-rollback-after-index");
                     }
                     if (journal is not null) DeleteRecoveryJournal(journal);
                 }
@@ -483,6 +763,9 @@ internal sealed partial class OfflineLibrary : IDisposable
     }
 
     private static async Task<bool> RemovalHashMatchesAsync(FileStream file, string expected, CancellationToken token)
+        => (await HashRemovalAudioAsync(file, token).ConfigureAwait(false)).Equals(expected, StringComparison.OrdinalIgnoreCase);
+
+    private static async Task<string> HashRemovalAudioAsync(FileStream file, CancellationToken token)
     {
         // Staged streams retain only their protected handle. A read buffer belongs
         // to one of the two active workers, never to every retained media file.
@@ -493,31 +776,80 @@ internal sealed partial class OfflineLibrary : IDisposable
             int read;
             while ((read = await file.ReadAsync(buffer.AsMemory(0, 256 * 1024), token).ConfigureAwait(false)) != 0)
                 digest.AppendData(buffer, 0, read);
-            return Convert.ToHexString(digest.GetHashAndReset()).Equals(expected, StringComparison.OrdinalIgnoreCase);
+            return Convert.ToHexString(digest.GetHashAndReset());
         }
         finally { ArrayPool<byte>.Shared.Return(buffer); }
     }
 
-    private async Task<bool> HasExpectedHashAsync(OfflineItem item, CancellationToken cancellationToken)
+    private long _downloadVerificationRejectionVersion;
+    internal long DownloadVerificationRejectionVersion => Interlocked.Read(ref _downloadVerificationRejectionVersion);
+
+    private async Task<VerifiedSavedFile?> HoldExpectedHashAsync(OfflineItem item, CancellationToken cancellationToken,
+        bool failIfUnavailable = false, bool parentsAlreadyHeld = false)
     {
         var path = ResolvePath(item.FileName);
+        UninstallPathGuard.AncestorLease? parents = null;
+        FileStream? file = null;
         try
         {
-            using var parents = HoldStorageParents(path);
-            if (!parents.Complete || !ValidFile(item)) return false;
-            using var handle = UninstallPathGuard.OpenOwnedFile(path, read: true, deleteAccess: false);
-            using var file = new FileStream(handle, FileAccess.Read, 65536, isAsync: false);
-            return file.Length == item.Bytes && Convert.ToHexString(await SHA256.HashDataAsync(file, cancellationToken).ConfigureAwait(false)).ToLowerInvariant() == item.Sha256;
+            if (!parentsAlreadyHeld) parents = HoldStorageParents(path);
+            if (parents is { Complete: false })
+            {
+                Interlocked.Increment(ref _downloadVerificationRejectionVersion);
+                return null;
+            }
+            BeforeVerifySavedAudioForChecks?.Invoke(path);
+            var handle = UninstallPathGuard.OpenOwnedFile(path, read: true, deleteAccess: false);
+            try { file = new FileStream(handle, FileAccess.Read, bufferSize: 1, isAsync: false); }
+            catch { handle.Dispose(); throw; }
+            if (file.Length != item.Bytes)
+            {
+                Interlocked.Increment(ref _downloadVerificationRejectionVersion);
+                return null;
+            }
+            var revision = LocalAudioSource.TryReadRevision(file.SafeFileHandle);
+            if (!await RemovalHashMatchesAsync(file, item.Sha256, cancellationToken).ConfigureAwait(false))
+            {
+                if (revision is not null && revision == LocalAudioSource.TryReadRevision(file.SafeFileHandle)
+                    && RememberRejectedPlaybackSource(IndexedPlaybackSource(item, selected: false), new LocalAudioIntegrityException(revision)))
+                    Interlocked.Increment(ref _downloadVerificationRejectionVersion);
+                return null;
+            }
+            var verified = new VerifiedSavedFile(parents, file);
+            parents = null;
+            file = null;
+            return verified;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception) { return false; }
+        catch (Exception error) when (file is null && error is (FileNotFoundException or DirectoryNotFoundException
+            or Win32Exception { NativeErrorCode: 2 or 3 }))
+        {
+            Interlocked.Increment(ref _downloadVerificationRejectionVersion);
+            return null;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception)
+        {
+            if (!failIfUnavailable) return null;
+            if (error is IOException) throw;
+            throw new IOException("Не удалось проверить сохранённый аудиофайл. Файл сохранён.", error);
+        }
+        finally { file?.Dispose(); parents?.Dispose(); }
     }
+
+    private sealed class VerifiedSavedFile(UninstallPathGuard.AncestorLease? parents, FileStream file) : IDisposable
+    {
+        public void Dispose() { file.Dispose(); parents?.Dispose(); }
+    }
+
+    private static string RestoreDestination(StorageFileIdentity? identity, string original, string recovery)
+        => identity is null || UninstallPathGuard.EntryExists(original) ? recovery : original;
+
     private string RestoreStaged(StagedRemoval entry)
     {
         if (entry.RestoredPath is { } restored) return restored;
         if (!entry.Moved) return entry.Original;
         try
         {
-            var recovered = UninstallPathGuard.EntryExists(entry.Original) ? entry.Recovery : entry.Original;
+            var recovered = RestoreDestination(entry.Identity, entry.Original, entry.Recovery);
             ManagedCacheCleanup.RenameByHandle(entry.File.SafeFileHandle, recovered); return entry.RestoredPath = recovered;
         }
         catch (Win32Exception error)
@@ -586,35 +918,49 @@ internal sealed partial class OfflineLibrary : IDisposable
         lock (_cacheLock)
         {
             EnsureSafeDirectory();
-            var stamp = Stamp(_indexPath);
-            if (!force && _libraryCache is { } cached && cached.Stamp == stamp) return cached;
-            try
-            {
-                using var parents = HoldStorageParents(_indexPath);
-                stamp = parents.Complete ? Stamp(_indexPath) : new(false, 0, 0);
-                var items = stamp.Exists ? JsonSerializer.Deserialize<List<OfflineItem>>(ReadIndexText(_indexPath), LibraryJson) ?? throw new JsonException() : [];
-                foreach (var item in items)
-                {
-                    if (item is null || string.IsNullOrWhiteSpace(item.Id) || string.IsNullOrWhiteSpace(item.RequestId)
-                        || item.Title is null || item.Artist is null || !TrackRow.ValidPrimaryArtistName(item.PrimaryArtistName)
-                        || item.Album is null || string.IsNullOrWhiteSpace(item.Codec)
-                        || item.DurationMs < 0 || item.Bitrate < 0 || item.Bytes <= 0 || item.SavedUtc == default
-                        || item.Sha256 is null || item.Sha256.Length != 64 || !item.Sha256.All(Uri.IsHexDigit)) throw new JsonException();
-                    ValidateArtists(item.Artists);
-                    ValidateAlbumId(item.AlbumId);
-                    _ = ResolvePath(item.FileName);
-                }
-                if (Stamp(_indexPath) != stamp) throw IndexChanged();
-                var ordered = items.OrderByDescending(i => i.Codec.StartsWith("flac", StringComparison.OrdinalIgnoreCase))
-                    .ThenByDescending(i => i.Codec.StartsWith("flac", StringComparison.OrdinalIgnoreCase) ? 0 : i.Bitrate)
-                    .ThenByDescending(i => i.SavedUtc).ToArray();
-                _libraryCache = new(stamp, Array.AsReadOnly(items.ToArray()),
-                    ordered.GroupBy(i => i.RequestId, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.ToArray(), StringComparer.Ordinal),
-                    ordered.GroupBy(i => i.Id, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.ToArray(), StringComparer.Ordinal));
-                return _libraryCache;
-            }
-            catch (JsonException) { throw new MusicException("Не удалось прочитать индекс офлайн-библиотеки. Аудиофайлы сохранены; index не перезаписывался."); }
+            return LoadLibrarySnapshot(ReadIndexSnapshot(_indexPath), force);
         }
+    }
+
+    private LibraryCache LoadLibrarySnapshot((IndexStamp Stamp, byte[]? Bytes) snapshot, bool force)
+    {
+        try
+        {
+            var (stamp, bytes) = snapshot;
+            if (!force && _libraryCache is { } cached && cached.Stamp == stamp) return cached;
+            var items = stamp.Exists ? ParseLibraryIndex(bytes!) : [];
+            var ordered = items.Select(item => (Item: item, Rank: AudioQualityPolicy.Rank(item.Codec, item.QualityBitrate)))
+                .OrderByDescending(entry => entry.Rank)
+                .ThenByDescending(entry => entry.Rank == 3 ? 0 : entry.Item.QualityBitrate)
+                .ThenByDescending(entry => entry.Item.SavedUtc)
+                .ThenBy(entry => entry.Item.FileName, StringComparer.Ordinal)
+                .Select(entry => entry.Item).ToArray();
+            _libraryCache = new(stamp, Array.AsReadOnly(items.ToArray()),
+                ordered.GroupBy(i => i.RequestId, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.ToArray(), StringComparer.Ordinal),
+                ordered.GroupBy(i => i.Id, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.ToArray(), StringComparer.Ordinal));
+            return _libraryCache;
+        }
+        catch (JsonException) { throw new MusicException("Не удалось прочитать индекс офлайн-библиотеки. Аудиофайлы сохранены; index не перезаписывался."); }
+    }
+
+    internal IReadOnlyList<OfflineItem> ReadAudioIndex(SafeFileHandle handle)
+        => ParseLibraryIndex(ReadIndexSnapshot(handle).Bytes!);
+
+    private List<OfflineItem> ParseLibraryIndex(byte[] bytes)
+    {
+        var items = JsonSerializer.Deserialize<List<OfflineItem>>(DecodeIndex(bytes), LibraryJson) ?? throw new JsonException();
+        foreach (var item in items)
+        {
+            if (item is null || string.IsNullOrWhiteSpace(item.Id) || string.IsNullOrWhiteSpace(item.RequestId)
+                || item.Title is null || item.Artist is null || !TrackRow.ValidPrimaryArtistName(item.PrimaryArtistName)
+                || item.Album is null || string.IsNullOrWhiteSpace(item.Codec)
+                || item.DurationMs < 0 || item.Bitrate < 0 || item.ConfirmedBitrate is <= 0 || item.Bytes <= 0 || item.SavedUtc == default
+                || item.Sha256 is null || item.Sha256.Length != 64 || !item.Sha256.All(Uri.IsHexDigit)) throw new JsonException();
+            ValidateArtists(item.Artists);
+            ValidateAlbumId(item.AlbumId);
+            _ = ResolvePath(item.FileName);
+        }
+        return items;
     }
 
     private PlaylistCache LoadPlaylists(bool force = false, bool recovering = false)
@@ -623,41 +969,105 @@ internal sealed partial class OfflineLibrary : IDisposable
         lock (_cacheLock)
         {
             EnsureSafeDirectory();
-            var stamp = Stamp(_playlistIndexPath);
-            if (!force && _playlistCache is { } cached && cached.Stamp == stamp) return cached;
             try
             {
-                using var parents = HoldStorageParents(_playlistIndexPath);
-                stamp = parents.Complete ? Stamp(_playlistIndexPath) : new(false, 0, 0);
-                var data = stamp.Exists ? JsonSerializer.Deserialize<OfflinePlaylistIndex>(ReadIndexText(_playlistIndexPath), PlaylistJson) ?? throw new JsonException() : new(1, []);
-                if (data.SchemaVersion != 1 || data.Playlists is null) throw new JsonException();
-                foreach (var playlist in data.Playlists) ValidatePlaylist(playlist);
-                if (data.Playlists.GroupBy(p => (p.Owner, p.Kind)).Any(g => g.Count() > 1)) throw new JsonException();
-                if (Stamp(_playlistIndexPath) != stamp) throw IndexChanged();
+                var (stamp, bytes) = ReadIndexSnapshot(_playlistIndexPath);
+                if (!force && _playlistCache is { } cached && cached.Stamp == stamp) return cached;
+                var data = stamp.Exists ? ParsePlaylistIndex(bytes!) : new(1, []);
                 _playlistCache = new(stamp, Array.AsReadOnly(data.Playlists.Select(p => p with { Tracks = Array.AsReadOnly(p.Tracks.ToArray()) }).ToArray()));
                 return _playlistCache;
             }
-            catch (JsonException) { throw new MusicException("Не удалось прочитать индекс офлайн-плейлистов. Аудиофайлы и повреждённый index сохранены; перезапись не выполнялась."); }
+            catch (Exception error) when (error is JsonException or OfflineIndexSizeException)
+            { throw new OfflinePlaylistIndexFormatException(); }
         }
     }
 
-    private static string ReadIndexText(string path)
+    internal static bool IsSupportedPlaylistIndex(SafeFileHandle handle)
     {
         try
         {
-            using var handle = UninstallPathGuard.OpenOwnedFile(path, read: true, deleteAccess: false);
-            using var stream = new FileStream(handle, FileAccess.Read);
-            if (stream.Length > MaximumIndexBytes) throw new IOException("Индекс офлайн-библиотеки слишком большой. Файлы сохранены.");
-            using var reader = new StreamReader(stream);
-            return reader.ReadToEnd();
+            _ = ParsePlaylistIndex(ReadIndexSnapshot(handle).Bytes!);
+            return true;
         }
+        catch (Exception error) when (error is JsonException or OfflineIndexSizeException) { return false; }
+    }
+
+    private static OfflinePlaylistIndex ParsePlaylistIndex(byte[] bytes)
+    {
+        var data = JsonSerializer.Deserialize<OfflinePlaylistIndex>(DecodeIndex(bytes), PlaylistJson) ?? throw new JsonException();
+        if (data.SchemaVersion != 1 || data.Playlists is null) throw new JsonException();
+        foreach (var playlist in data.Playlists) ValidatePlaylist(playlist);
+        if (data.Playlists.GroupBy(p => (p.Owner, p.Kind)).Any(g => g.Count() > 1)) throw new JsonException();
+        return data;
+    }
+
+    private static SafeFileHandle? OpenIndex(string path, bool deleteAccess = false, bool writeAttributes = false)
+    {
+        try { return UninstallPathGuard.OpenOwnedFile(path, read: true, deleteAccess: deleteAccess, writeAttributes: writeAttributes); }
+        catch (Win32Exception error) when (error.NativeErrorCode is 2 or 3) { return null; }
         catch (Win32Exception error) { throw new IOException("Не удалось прочитать индекс офлайн-библиотеки.", error); }
     }
 
-    private async Task<IndexStamp> WriteIndexAsync<T>(string path, T data, JsonSerializerOptions options, IndexStamp expected,
-        CancellationToken cancellationToken, Action? beforePublication = null)
+    private (IndexStamp Stamp, byte[]? Bytes) ReadIndexSnapshot(string path)
+    {
+        using var parents = HoldStorageParents(path);
+        lock (_directoryState.IndexPublicationSync)
+        {
+            using var handle = parents.Complete ? OpenIndex(path) : null;
+            return ReadIndexSnapshot(handle);
+        }
+    }
+
+    private static (IndexStamp Stamp, byte[]? Bytes) ReadIndexSnapshot(SafeFileHandle? handle)
+    {
+        if (handle is null) return (new(0, null, null), null);
+        var revision = IndexRevision(handle);
+        var length = RandomAccess.GetLength(handle);
+        if (length > MaximumIndexBytes) throw new OfflineIndexSizeException();
+        byte[] bytes = length == 0 ? [] : GuardedStoreFile.ReadFromHandle(handle, MaximumIndexBytes) ?? throw IndexChanged();
+        if (IndexRevision(handle) != revision || bytes.LongLength != length) throw IndexChanged();
+        return (new(length, revision, Digest(bytes)), bytes);
+    }
+
+    private sealed class OfflineIndexSizeException() : IOException("Индекс офлайн-библиотеки слишком большой. Файлы сохранены.");
+
+    private static FileSecurityPreservation.FileRevision? IndexRevision(SafeFileHandle handle)
+        => FileSecurityPreservation.GetPersistentRevision(handle) is { Changed: > 0 } revision ? revision : null;
+
+    private static readonly Encoding StrictUtf8Index = new UTF8Encoding(false, true);
+    private static readonly Encoding StrictUtf16LeIndex = new UnicodeEncoding(false, false, true);
+    private static readonly Encoding StrictUtf16BeIndex = new UnicodeEncoding(true, false, true);
+    private static readonly Encoding StrictUtf32LeIndex = new UTF32Encoding(false, false, true);
+    private static readonly Encoding StrictUtf32BeIndex = new UTF32Encoding(true, false, true);
+
+    private static string DecodeIndex(byte[] bytes)
+    {
+        // Keep StreamReader's BOM formats without its lossy decoder fallback.
+        var (encoding, preamble) = bytes switch
+        {
+            [0xff, 0xfe, 0x00, 0x00, ..] => (StrictUtf32LeIndex, 4),
+            [0x00, 0x00, 0xfe, 0xff, ..] => (StrictUtf32BeIndex, 4),
+            [0xff, 0xfe, ..] => (StrictUtf16LeIndex, 2),
+            [0xfe, 0xff, ..] => (StrictUtf16BeIndex, 2),
+            [0xef, 0xbb, 0xbf, ..] => (StrictUtf8Index, 3),
+            _ => (StrictUtf8Index, 0)
+        };
+        try { return encoding.GetString(bytes.AsSpan(preamble)); }
+        catch (DecoderFallbackException error)
+        { throw new JsonException("Индекс офлайн-библиотеки содержит повреждённую кодировку.", error); }
+    }
+
+    private static void CheckIndexStamp(IndexStamp current, IndexStamp expected)
+    {
+        if (current.Hash != expected.Hash || expected.Revision is not null && current.Revision != expected.Revision) throw IndexChanged();
+    }
+
+    private async Task WriteIndexAsync<T>(string path, T data, JsonSerializerOptions options, IndexStamp expected,
+        CancellationToken cancellationToken, Action? beforePublication = null, Action<SafeFileHandle, IndexStamp>? attestStage = null,
+        StorageFileIdentity? requireIdentity = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        RecoverIndexPublicationUnderGate();
         var serialized = JsonSerializer.Serialize(data, options);
         if (expected.Length > MaximumIndexBytes || System.Text.Encoding.UTF8.GetByteCount(serialized) > MaximumIndexBytes)
             throw new IOException("Индекс офлайн-библиотеки слишком большой. Файлы сохранены.");
@@ -665,12 +1075,23 @@ internal sealed partial class OfflineLibrary : IDisposable
         var temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
         try
         {
-            using var handle = UninstallPathGuard.CreateStagedFile(temp, asynchronous: true, writeThrough: true);
+            using var original = OpenIndex(path);
+            if (requireIdentity is not null && (original is null || GetStorageFileIdentity(original) != requireIdentity)) throw IndexChanged();
+            CheckIndexStamp(ReadIndexSnapshot(original).Stamp, expected);
+            FileSecurityPreservation.FileRevision? originalRevision = null;
+            if (original is not null)
+            {
+                FileSecurityPreservation.CheckReplacementMetadata(original);
+                originalRevision = FileSecurityPreservation.GetRevision(original);
+            }
+            using var handle = UninstallPathGuard.CreateStagedFile(temp, asynchronous: true, writeThrough: true, writeDacl: original is not null);
             UninstallPathGuard.SetDeleteDisposition(handle, delete: true);
             await using var output = new FileStream(handle, FileAccess.ReadWrite, 4096, isAsync: true);
             var published = false;
             try
             {
+                if (original is not null) FileSecurityPreservation.PrepareReplacement(original, handle);
+                else FileSecurityPreservation.CheckReplacementMetadata(handle);
                 var bytes = System.Text.Encoding.UTF8.GetBytes(serialized);
                 await output.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
                 output.Flush(flushToDisk: true);
@@ -678,14 +1099,35 @@ internal sealed partial class OfflineLibrary : IDisposable
                 using var readback = new StreamReader(output, leaveOpen: true);
                 if (await readback.ReadToEndAsync(cancellationToken).ConfigureAwait(false) != serialized) throw new MusicException("Не прошла проверка сохранённого индекса офлайн-библиотеки.");
                 cancellationToken.ThrowIfCancellationRequested();
-                if (Stamp(path) != expected) throw IndexChanged();
+                if (original is not null) FileSecurityPreservation.PreserveBasicInformation(original, handle);
                 File.SetLastWriteTimeUtc(handle, DateTime.UtcNow);
-                var writtenStamp = new IndexStamp(true, output.Length, File.GetLastWriteTimeUtc(handle).Ticks);
+                output.Flush(flushToDisk: true);
+                var writtenStamp = new IndexStamp(output.Length, null, Digest(bytes));
                 beforePublication?.Invoke();
                 TemporaryPublicationCheckpoint?.Invoke("index-before-publish");
-                ManagedCacheCleanup.RenameByHandle(handle, path, replace: expected.Exists, releaseDeleteDisposition: true);
-                published = true;
-                return writtenStamp;
+                attestStage?.Invoke(handle, writtenStamp);
+                lock (_directoryState.IndexPublicationSync)
+                {
+                    try
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        if (original is not null)
+                        {
+                            FileSecurityPreservation.CheckReplacementMetadata(original);
+                            if (FileSecurityPreservation.GetRevision(original) != originalRevision) throw IndexChanged();
+                            original.Dispose(); // Recheck the revision after reopening with delete access.
+                            ReplaceIndexUnderPublicationLock(path, temp, handle, expected, writtenStamp, originalRevision!.Value,
+                                preservePreviousRevision: requireIdentity is not null, ref published);
+                        }
+                        else PublishStagedIndex(handle, path, ref published);
+                    }
+                    finally
+                    {
+                        // Keep the new name pinned through backup and receipt retirement.
+                        // The staging readback and flush left no pending writes.
+                        if (published) handle.Dispose();
+                    }
+                }
             }
             finally { if (!published) UninstallPathGuard.DiscardStagedFile(handle); }
         }
@@ -717,10 +1159,13 @@ internal sealed partial class OfflineLibrary : IDisposable
                 || string.IsNullOrWhiteSpace(artist.Name)) throw new JsonException();
     }
     private static bool SameTrackMetadata(OfflinePlaylistTrack left, OfflinePlaylistTrack right)
-        // Adding navigation metadata to a legacy snapshot does not mean that
-        // the playlist's content changed or its downloaded files are stale.
-        => left with { Artists = null, AlbumId = null, PrimaryArtistName = null }
-            == right with { Artists = null, AlbumId = null, PrimaryArtistName = null };
+    {
+        if (left.CoverUri != right.CoverUri && ArtworkUri.Metadata(left.CoverUri) != ArtworkUri.Metadata(right.CoverUri)) return false;
+        // Navigation metadata and online availability do not change the
+        // playlist's saved track order or the validity of its local files.
+        return left with { Artists = null, AlbumId = null, PrimaryArtistName = null, CoverUri = null, Available = false }
+            == right with { Artists = null, AlbumId = null, PrimaryArtistName = null, CoverUri = null, Available = false };
+    }
     private static bool SameOfflineItem(OfflineItem left, OfflineItem right)
         // Persisted identity still includes AlbumId: an external metadata write
         // must invalidate a pending deduplication readback just like other fields.
@@ -744,26 +1189,18 @@ internal sealed partial class OfflineLibrary : IDisposable
             ValidateAlbumId(track.AlbumId);
         }
     }
-    private static string QualityLabel(OfflineItem item)
-        => item.Codec.StartsWith("flac", StringComparison.OrdinalIgnoreCase) ? "Lossless · FLAC" : item.Codec.ToUpperInvariant() + (item.Bitrate > 0 ? $" · {item.Bitrate} кбит/с" : "");
-    private static IndexStamp Stamp(string path)
-    {
-        try
-        {
-            var file = new FileInfo(path);
-            var attributes = file.Exists ? file.Attributes : File.GetAttributes(path);
-            if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
-                throw new MusicException("Индекс офлайн-библиотеки является ссылкой или папкой. Операция остановлена.");
-            return new(true, file.Length, file.LastWriteTimeUtc.Ticks);
-        }
-        catch (FileNotFoundException) { return new(false, 0, 0); }
-        catch (DirectoryNotFoundException) { return new(false, 0, 0); }
-    }
-    private static MusicException IndexChanged() => new("Индекс офлайн-библиотеки изменился во время записи. Ничего не перезаписывалось; перечитайте библиотеку перед повтором.");
+    internal static string QualityLabel(OfflineItem item)
+        => item.Codec.StartsWith("flac", StringComparison.OrdinalIgnoreCase) ? "Lossless · FLAC" : item.Codec.ToUpperInvariant()
+            + (item.ConfirmedBitrate is { } bitrate ? $" · {bitrate} кбит/с" : "");
+    private static MusicException IndexChanged() => new("Индекс офлайн-библиотеки изменился во время записи. Ничего не перезаписывалось; перечитайте библиотеку перед повтором.")
+        { OfflineStorageRetryable = true };
     private sealed class DirectoryState
     {
         public SemaphoreSlim Gate { get; } = new(1);
         internal object RecoverySync { get; } = new();
+        // Readers deny replacement while their verified index handle is open.
+        // Serialize only this handle's lifetime against final publication.
+        internal object IndexPublicationSync { get; } = new();
         internal Task? RecoveryTask;
         internal bool StorageMutationActive;
         public long Generation;
@@ -840,7 +1277,10 @@ internal sealed partial class OfflineLibrary : IDisposable
             public void Dispose() => Interlocked.Exchange(ref _release, null)?.Invoke();
         }
     }
-    private sealed record IndexStamp(bool Exists, long Length, long LastWriteTicks);
+    private sealed record IndexStamp(long Length, FileSecurityPreservation.FileRevision? Revision, string? Hash)
+    {
+        internal bool Exists => Hash is not null;
+    }
     private sealed record LibraryCache(IndexStamp Stamp, IReadOnlyList<OfflineItem> Items,
         Dictionary<string, OfflineItem[]> ByRequest, Dictionary<string, OfflineItem[]> ById);
     private sealed record PlaylistCache(IndexStamp Stamp, IReadOnlyList<OfflinePlaylist> Items);

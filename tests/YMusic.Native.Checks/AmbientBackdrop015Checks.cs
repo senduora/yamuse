@@ -125,8 +125,7 @@ internal static partial class Program
     {
         using var fixture = new ExpandedFixture("ambient015"); await fixture.Play(); var window = fixture.Window;
         var queueVersion = fixture.Queue.Version; var token = fixture.Queue.CurrentOccurrenceToken; var player = fixture.Player;
-        var waveSources = EpField<Dictionary<TrackRow, (string SessionId, string BatchId, WaveMode Mode, string? TrackSeedId, string? AlbumSeedId)>>(window, "_waveSources");
-        waveSources[fixture.First] = ("ambient-session", "ambient-batch", WaveMode.Personal, null, null);
+        SaInvoke(window, "RememberWaveSource", fixture.First, new RadioBatch("ambient-session", "ambient-batch", [fixture.First]));
         EpField<List<TrackRow>>(window, "_waveTracks").Add(fixture.First);
         EpSet(window, "_waveBatch", new RadioBatch("ambient-session", "ambient-batch", [fixture.First]));
         EpInvoke(window, "SelectWaveView", WaveMode.Personal, null); EpInvoke(window, "UpdateWavePresentation");

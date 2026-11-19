@@ -3,11 +3,17 @@ namespace YMusic.Native;
 internal sealed partial class PlaybackQueue
 {
     private sealed record RemovedOccurrence(Entry Entry, int Index, bool Visited);
-    private sealed record RemovalEdit(Entry[] OriginalOrder, RemovedOccurrence[] Removed, Entry[] PlayNext, long ShuffleCycle);
+    private sealed record RemovalEdit(Entry[] OriginalOrder, RemovedOccurrence[] Removed, Entry[] PlayNext, long ShuffleCycle)
+    {
+        internal Dictionary<long, string>? Artwork { get; set; }
+    }
     private RemovalEdit? _removalUndo;
     private long _shuffleCycle;
     public bool CanUndoRemoval => _removalUndo is not null;
     internal long OccurrenceTokenAt(int index) { ValidateIndex(index); return _entries[index].Token; }
+
+    internal int[] IndicesOfOccurrences(IReadOnlySet<long> tokens)
+        => Enumerable.Range(0, _entries.Count).Where(index => tokens.Contains(_entries[index].Token)).ToArray();
 
     // insertionGap is in the original list, including its final gap. Occurrences,
     // current, shuffle reservations and navigation history retain their identity.
@@ -25,9 +31,27 @@ internal sealed partial class PlaybackQueue
         Touch(itemsChanged: true);
     }
 
+    internal (TrackRow Track, long Token)? PeekRemovalReplacement(int[] selected, IReadOnlySet<long> excluded)
+    {
+        var removed = selected.Select(index => _entries[index].Token).ToHashSet();
+        bool Eligible(Entry entry) => IsPlayable(entry) && !removed.Contains(entry.Token) && !excluded.Contains(entry.Token);
+        var replacement = _future.LastOrDefault(Eligible) ?? (_shuffle
+            ? _playNext.FirstOrDefault(Eligible) ?? _shuffleBag.FirstOrDefault(Eligible)
+                ?? (_repeat == RepeatMode.All ? ReservedShuffleCycle(null).FirstOrDefault(Eligible) : null)
+            : _entries.Skip(CurrentIndex + 1).FirstOrDefault(Eligible)
+                ?? (_repeat == RepeatMode.All ? _entries.FirstOrDefault(Eligible) : null));
+        return replacement is null ? null : (replacement.Track, replacement.Token);
+    }
+
     // Remove a batch atomically so the caller never starts another selected row
     // while it is about to be removed. Only the last batch can be undone.
-    public TrackRow? RemoveMany(IEnumerable<int> indices)
+    public TrackRow? RemoveMany(IEnumerable<int> indices, Func<TrackRow, bool>? canReplace = null)
+        => RemoveManyCore(indices, canReplace is null ? null : entry => canReplace(entry.Track));
+
+    internal TrackRow? RemoveManyWithReplacement(IEnumerable<int> indices, long? replacementOccurrence)
+        => RemoveManyCore(indices, entry => entry.Token == replacementOccurrence);
+
+    private TrackRow? RemoveManyCore(IEnumerable<int> indices, Predicate<Entry>? canReplace)
     {
         var selected = CheckedIndices(indices);
         if (selected.Length == 0) return Current;
@@ -40,9 +64,11 @@ internal sealed partial class PlaybackQueue
         if (removingCurrent)
         {
             _current = null;
-            _current = PopPlayable(_future) ?? (_shuffle ? TakeShuffle(_repeat == RepeatMode.All, null)
-                : original.Skip(currentIndex + 1).FirstOrDefault(IsPlayable)
-                    ?? (_repeat == RepeatMode.All ? _entries.FirstOrDefault(IsPlayable) : null));
+            _reservedShuffleCycle?.RemoveAll(entry => !_presentTokens.Contains(entry.Token));
+            bool Eligible(Entry entry) => IsPlayable(entry) && (canReplace is null || canReplace(entry));
+            _current = PopPlayable(_future, Eligible) ?? (_shuffle ? TakeShuffle(_repeat == RepeatMode.All, null, Eligible)
+                : original.Skip(currentIndex + 1).FirstOrDefault(Eligible)
+                    ?? (_repeat == RepeatMode.All ? _entries.FirstOrDefault(Eligible) : null));
             MarkVisited(_current);
         }
         _removalUndo = edit;
@@ -64,9 +90,10 @@ internal sealed partial class PlaybackQueue
             var anchor = edit.OriginalOrder.Skip(item.Index + 1).FirstOrDefault(e => _presentTokens.Contains(e.Token));
             _entries.Insert(anchor is null ? _entries.Count : _entries.IndexOf(anchor), item.Entry);
             _presentTokens.Add(item.Entry.Token);
+            if (edit.Artwork?.GetValueOrDefault(item.Entry.Token) is { } artwork) item.Entry.Track.SetMissingArtwork(artwork);
             if (!_shuffle) continue;
             if (sameCycle && item.Visited) _cycleVisited.Add(item.Entry.Token);
-            else if (IsPlayable(item.Entry) && originalPriorities.Contains(item.Entry))
+            else if (originalPriorities.Contains(item.Entry))
                 restoredPriorities.Add(item.Entry);
             else AddToShuffleBag(item.Entry);
         }
@@ -81,6 +108,17 @@ internal sealed partial class PlaybackQueue
         _removalUndo = null;
         Touch(itemsChanged: true);
         return true;
+    }
+
+    internal void RememberRemovalArtwork(Func<TrackRow, string?> resolve)
+    {
+        if (_removalUndo is not { } edit) return;
+        foreach (var item in edit.Removed)
+        {
+            var row = item.Entry.Track;
+            if (row.CoverUri is null && resolve(row) is { } artwork)
+                (edit.Artwork ??= [])[item.Entry.Token] = artwork;
+        }
     }
 
     private int[] CheckedIndices(IEnumerable<int> indices)

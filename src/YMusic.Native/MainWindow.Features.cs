@@ -10,8 +10,7 @@ public partial class MainWindow
 {
     private readonly List<TrackRow> _favoritesCache = [];
     private readonly List<TrackRow> _waveTracks = [];
-    private readonly Dictionary<TrackRow, (string SessionId, string BatchId, WaveMode Mode, string? TrackSeedId, string? AlbumSeedId)> _waveSources = new();
-    private readonly ConditionalWeakTable<TrackRow, object> _waveStations = new();
+    private readonly ConditionalWeakTable<TrackRow, WaveSource> _waveSources = new();
     private readonly OfflineLibrary _offline;
     private CancellationTokenSource? _featureCts;
     private CancellationTokenSource? _downloadCts;
@@ -32,11 +31,18 @@ public partial class MainWindow
     private Task? _waveExtensionTask;
     private int _waveExtensionPlaybackGeneration;
     private long _wavePauseRevision;
-    private CancellationTokenSource? _pendingWaveAdvance;
-    private bool PlaybackTransportActive => _player.IsPlaying || _automaticWaveCts is not null || _pendingWaveAdvance is not null
-        || _waveStartCts is { IsCancellationRequested: false };
+    private WaveAdvanceWait? _waveAdvanceWait;
+    private bool WaitingForWaveAdvance => _waveAdvanceWait is { Cancellation.IsCancellationRequested: false };
+    private bool PlaybackTransportActive => _player.IsPlaying || _automaticWaveCts is not null || WaitingForWaveAdvance
+        || ColdQueueContinuationPending || _waveStartCts is { IsCancellationRequested: false };
     private AudioQuality SelectedQuality => QualityCombo.SelectedIndex switch { 2 => AudioQuality.Economical, 1 => AudioQuality.Optimal, _ => AudioQuality.Excellent };
     private sealed record WaveListening(TrackRow Track, string SessionId, string BatchId, Stopwatch Clock);
+    private sealed record WaveSource(string SessionId, string BatchId, WaveMode Mode, string? TrackSeedId, string? AlbumSeedId, object? Station);
+    private sealed record WaveAdvanceWait(long Operation, bool Automatic, PendingQueuePlayback Owner)
+    {
+        internal CancellationTokenSource Cancellation => Owner.Request;
+        internal bool NaturalEndDuringWait { get; set; }
+    }
 
     private void InitializeFeatures()
     {
@@ -71,6 +77,13 @@ public partial class MainWindow
     }
     private static bool IsOfflineSection(string section) => section is "offline" or "offline-playlists" or "offline-playlist-detail";
     private void SetSection(string section, string title) => NavigateSection(section, title, remember: true);
+
+    private void AdvanceViewGeneration()
+    {
+        _viewGeneration++;
+        CancelTrackLinkLookup();
+        CancelPlaylistChooser();
+    }
     private void NavigateSection(string section, string title, bool remember)
     {
         if (remember && !_restoringBrowse && _featuresReady && section != _section
@@ -83,11 +96,13 @@ public partial class MainWindow
         if (closeSettings) SetSettingsVisible(false);
         SetLyricsVisible(false);
         _featureCts?.Cancel();
+        _initialCatalogRead = null;
         CancelArtistMembershipRead();
         HideCatalog();
         _viewedOfflinePlaylist = null;
         HideCollectionHero();
         _section = section;
+        if (section != "queue") StopQueueOfflineWatcher();
         FitTrackColumns();
         CollectionOptionsPopup.IsOpen = false;
         CollectionToolbar.Visibility = section is "search" or "download-center" ? Visibility.Collapsed : Visibility.Visible;
@@ -95,7 +110,7 @@ public partial class MainWindow
         TrackFilterPanel.Visibility = section is "search" or "download-center" ? Visibility.Collapsed : Visibility.Visible;
         PlaylistDownloadText.Text = "";
         UpdateMainContentVisibility();
-        _viewGeneration++;
+        AdvanceViewGeneration();
         QueueActions.Visibility = Visibility.Collapsed;
         CollectionTitle.Text = title;
         FilterBox.Clear(); _query = "";
@@ -127,10 +142,14 @@ public partial class MainWindow
         FilterBox.IsEnabled = _session is not null || IsOfflineSection(_section) || _demo;
         PlaySelectionButton.Content = "▶  Слушать";
         var snapshot = rows.ToArray();
-        if (_section == "favorites" && _libraryCts is not null)
+        if (IsOfflineSection(_section))
+        {
+            ApplyTrackLikeStates(snapshot.Where(row => row.IsOfflineLibraryRow));
+            ApplyOfflineStates(snapshot.Where(row => !row.IsOfflineLibraryRow));
+        }
+        else if (_section == "favorites" && _libraryCts is not null)
         { ApplyTrackLikeStates(snapshot); if (snapshot.Length > 0) QueueOfflineMarks(snapshot); }
         else ApplyOfflineStates(snapshot);
-        foreach (var row in snapshot) row.IsPlaying = _player.HasSource && _current?.RequestId == row.RequestId;
         _updatingTrackRows = true;
         try
         {
@@ -141,11 +160,13 @@ public partial class MainWindow
             }
         }
         finally { _updatingTrackRows = false; }
+        WatchOpenQueueOfflineCopies();
         UpdateCount();
         Motion.Enter(TracksList);
         PlaybackContextViewShown();
+        HighlightTrack(_player.HasSource ? _current : null);
     }
-    private Task ShowOffline() => ReadOfflineViewAsync(_ => _offline.Tracks(), rows =>
+    private Task ShowOffline() => ReadOfflineViewAsync((_, checks) => _offline.Tracks(checks), rows =>
     {
         if (_section != "offline") SetSection("offline", "Скачанное");
         ShowRows(rows);
@@ -154,12 +175,18 @@ public partial class MainWindow
     private async Task StartWaveViewAsync(bool renew)
     {
         if (_session is null) { SetStatus("Войдите в Яндекс, чтобы запустить персональную волну."); return; }
-        CancelPendingWavePlayback();
+        SetSection("wave", WaveViewTitle);
+        if (!renew && IsCurrentWaveView && _waveTracks.Count > 0) { ShowRows(_waveTracks); UpdateWavePresentation(); return; }
+        await StartWavePlaybackAsync(null);
+    }
+
+    private async Task StartWavePlaybackAsync(RadioBatch? cached)
+    {
+        if (_session is null) return;
         var mode = _waveViewMode;
         var seed = _waveSeedTrack?.Id;
         var albumSeed = _waveSeedAlbum?.Id;
-        SetSection("wave", WaveViewTitle);
-        if (!renew && IsCurrentWaveView && _waveTracks.Count > 0) { ShowRows(_waveTracks); UpdateWavePresentation(); return; }
+        CancelPendingWavePlayback();
         _featureCts?.Cancel();
         var cts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, _accountCts.Token);
         _featureCts = _waveStartCts = cts;
@@ -169,37 +196,63 @@ public partial class MainWindow
         _waveStartQueueVersion = _playbackQueue.Version;
         bool Current() => !_closed && !cts.IsCancellationRequested && account == _accountGeneration && uid == _account?.Uid
             && request == _waveRequestGeneration && ReferenceEquals(_featureCts, cts) && ReferenceEquals(_waveStartCts, cts);
-        bool CanAccept() => Current() && playback == _playbackGeneration && _waveStartQueueVersion == _playbackQueue.Version;
+        bool CanAccept() => Current() && playback == _playbackGeneration && _waveStartQueueVersion == _playbackQueue.Version
+            && (cached is null || IsCurrentWaveView && ReferenceEquals(cached.Station, _waveBatch?.Station));
         _waveStarting = true; Busy(true); UpdateControls();
+        WaveStartupAdmission? admission = null;
         try
         {
             if (!CanAccept()) return;
             SetStatus(mode switch { WaveMode.Track => "Подбираем волну по треку…", WaveMode.Album => "Подбираем волну по альбому…", _ => "Подбираем треки Моей волны…" });
-            var session = await EnsureSessionAsync(cts.Token);
-            if (!CanAccept()) return;
-            var candidate = await _api.RequestWaveAsync(session, cts.Token, mode, mode == WaveMode.Track ? seed : null,
-                mode == WaveMode.Album ? albumSeed : null);
-            if (!CanAccept()) return;
-            var playable = WavePlayableTracks(candidate.Batch.Tracks);
-            if (!CanAccept()) return;
-            if (playable.Length == 0)
+            MusicApi.WaveCandidate? candidate = null;
+            if (cached is null)
+            {
+                var session = await EnsureSessionAsync(cts.Token);
+                if (!CanAccept()) return;
+                candidate = await _api.RequestWaveAsync(session, cts.Token, mode, mode == WaveMode.Track ? seed : null,
+                    mode == WaveMode.Album ? albumSeed : null);
+                if (!CanAccept()) return;
+            }
+            var playable = WavePlayableTracks(candidate?.Batch.Tracks ?? _waveTracks);
+            TrackRow? first = null;
+            foreach (var track in playable)
+            {
+                if (!CanAccept()) return;
+                admission = await AdmitWaveStartupAsync(track, cts);
+                if (!CanAccept()) return;
+                if (admission is null) continue;
+                if (!CanUseWaveStartupAdmission(track, admission))
+                {
+                    admission.Dispose();
+                    admission = null;
+                    continue;
+                }
+                first = track;
+                break;
+            }
+            if (first is null || admission is null)
             {
                 SetStatus("Сервис не выдал доступных треков. Нажмите «Новая волна».", true);
                 return;
             }
-            var batch = _api.AcceptWave(candidate, cts.Token);
+            var batch = cached ?? _api.AcceptWave(candidate!, cts.Token);
             _waveStartCts = null;
-            _waveTracks.Clear();
-            AddWaveBatch(batch);
-            QueueWaveFeedback(batch.SessionId, batch.BatchId, "radioStarted", null, 0);
-            _playbackQueue.SetItems(playable);
-            if (_playbackQueue.Current is { } first) await PlayTrackAsync(first);
+            if (cached is null)
+            {
+                _waveTracks.Clear();
+                AddWaveBatch(batch);
+                QueueWaveFeedback(batch.SessionId, batch.BatchId, "radioStarted", null, 0);
+            }
+            _playbackQueue.SetItems(playable, first);
+            await PlayTrackWithSourceAsync(first, null, automatic: false, localAdmission: admission.Local,
+                streamOnly: admission.Online is not null, continueAfterEnd: true, waveFallback: admission.Online);
             if (!_closed && _section == "wave" && IsCurrentWaveView && ReferenceEquals(batch.Station, _waveBatch?.Station))
                 ShowRows(_waveTracks);
         }
         catch (Exception ex) { if (CanAccept()) ShowError(ex); }
         finally
         {
+            admission?.Dispose();
             if (ReferenceEquals(_featureCts, cts)) _featureCts = null;
             if (ReferenceEquals(_waveStartCts, cts)) _waveStartCts = null;
             var finishingCurrentStart = request == _waveRequestGeneration;
@@ -215,27 +268,39 @@ public partial class MainWindow
     private void AddWaveBatch(RadioBatch batch)
     {
         _waveBatch = batch;
-        foreach (var row in batch.Tracks)
-        {
-            _waveTracks.Add(row);
-            _waveSources[row] = (batch.SessionId, batch.BatchId, batch.Mode, batch.TrackSeedId, batch.AlbumSeedId);
-            if (batch.Station is { } station) _waveStations.AddOrUpdate(row, station);
-        }
-        while (_waveTracks.Count > 300)
-        {
-            var old = _waveTracks[0]; _waveTracks.RemoveAt(0);
-            if (!_queue.Contains(old) && !ReferenceEquals(_current, old)) _waveSources.Remove(old);
-        }
-        UpdateWavePresentation();
+        _waveTracks.AddRange(batch.Tracks);
+        foreach (var row in batch.Tracks) RememberWaveSource(row, batch);
+        if (_waveTracks.Count > 300) _waveTracks.RemoveRange(0, _waveTracks.Count - 300);
     }
+    // Queue Undo and history can still own a row after the wave view trims it.
+    // Keep provenance for that exact row without extending the row's lifetime.
+    private void RememberWaveSource(TrackRow row, RadioBatch batch)
+        => _waveSources.AddOrUpdate(row, new(batch.SessionId, batch.BatchId, batch.Mode, batch.TrackSeedId, batch.AlbumSeedId, batch.Station));
+
+    private TrackRow CopyTrackForQueue(TrackRow track)
+    {
+        var occurrence = track.CopyForQueueOccurrence();
+        if (_waveSources.TryGetValue(track, out var waveSource)) _waveSources.Add(occurrence, waveSource);
+        return occurrence;
+    }
+
     private bool IsContinuableWaveTrack(TrackRow? track) => track is not null && _waveBatch?.Station is { } station
-        && _waveStations.TryGetValue(track, out var owner) && ReferenceEquals(station, owner);
+        && _waveSources.TryGetValue(track, out var source) && ReferenceEquals(station, source.Station);
 
     private TrackRow[] WavePlayableTracks(IReadOnlyList<TrackRow> tracks)
     {
         var unavailable = tracks.Where(track => !track.CanPlay).ToArray();
         if (unavailable.Length > 0) ApplyOfflineStates(unavailable);
-        return tracks.Where(track => track.CanPlay).ToArray();
+        return tracks.Where(HasReadyWavePlaybackSource).ToArray();
+    }
+
+    private bool HasReadyWavePlaybackSource(TrackRow track)
+    {
+        if (!track.CanPlay) return false;
+        var canUseOnline = _session is not null && track.Available && !track.IsOfflineLibraryRow && track.LocalPath is null;
+        if (canUseOnline && !BlocksOfflineOpen(track.Id)) return true;
+        var source = RefreshLocalPlaybackSource(track);
+        return source is null ? canUseOnline : track.CanPlay && (source.Bytes is null || !BlocksOfflineOpen(track.Id));
     }
 
     private bool CancelExplicitWaveStart()
@@ -279,9 +344,10 @@ public partial class MainWindow
                 if (!OwnsWave()) return;
                 var playable = WavePlayableTracks(batch.Tracks);
                 if (!OwnsWave()) return;
+                var version = _playbackQueue.Version;
+                var queueInput = playable.Length > 0 && _section == "queue" ? CaptureQueueInputStamp() : (QueueInputStamp?)null;
                 if (playable.Length > 0)
                 {
-                    var version = _playbackQueue.Version;
                     _playbackQueue.Append(playable);
                     // Passive recommendations are compatible with the explicit
                     // request. Keep any earlier user edit visible to its guard.
@@ -292,8 +358,11 @@ public partial class MainWindow
                 previousBatch = batch;
                 AddWaveBatch(batch);
                 if (renewed) QueueWaveFeedback(batch.SessionId, batch.BatchId, "radioStarted", null, 0);
-                RefreshPlaybackView();
-                foreach (var old in _waveSources.Keys.Where(row => !_waveTracks.Contains(row) && !_queue.Contains(row) && !ReferenceEquals(row, _current)).ToArray()) _waveSources.Remove(old);
+                if (playable.Length > 0)
+                {
+                    RefreshExpandedQueueCore(version);
+                    RefreshPlaybackViewCore(queueInput);
+                }
                 if (_section == "wave" && IsCurrentWaveView) ShowRows(_waveTracks);
                 if (playable.Length > 0) return;
             }
@@ -361,7 +430,10 @@ public partial class MainWindow
     }
     private void Quality_Changed(object sender, SelectionChangedEventArgs e)
     {
-        if (_featuresReady) { SetStatus("Качество применится при следующем запуске трека. Фактический формат указан у плеера."); SavePreferences(); RefreshNextPreparation(); }
+        if (!_featuresReady) return;
+        if (QualityCombo.SelectedIndex is >= 0 and <= 2 && e.AddedItems.Count > 0) RememberPreferenceEdit(PreferenceField.Quality);
+        SetStatus("Качество применится при следующем запуске трека. Фактический формат указан у плеера.");
+        SavePreferences(); RefreshNextPreparation();
     }
     private async void Download_Click(object sender, RoutedEventArgs e) => await DownloadSelectedAsync();
     private async Task DownloadSelectedAsync()
@@ -396,6 +468,7 @@ public partial class MainWindow
     }
     private void CloseFeatures()
     {
+        StopQueueOfflineWatcher();
         _accountGeneration++; _featureCts?.Cancel(); _downloadCts?.Cancel(); _waveListening?.Clock.Stop();
         ResetBrowseState();
         _api.ResetWaveState(); _offline.Dispose();

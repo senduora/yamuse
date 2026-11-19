@@ -1,3 +1,5 @@
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -11,9 +13,10 @@ public partial class App : Application
     {
         base.OnStartup(e);
         var demo = e.Args.Contains("--demo", StringComparer.OrdinalIgnoreCase);
+        var uninstallRegistration = UninstallSupport.WindowsUninstallRegistration.Inapplicable;
         if (!demo)
         {
-            UninstallSupport.RegisterWindowsUninstall();
+            uninstallRegistration = UninstallSupport.CheckWindowsUninstallRegistration();
             try { BrandPaths.Current.MigrateLegacyData(); }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
             {
@@ -28,7 +31,7 @@ public partial class App : Application
         // normal launch migrates the user's existing account and settings.
         var window = demo ? CreateDemoWindow(Directory.CreateTempSubdirectory("Yamuse-demo-").FullName) : new MainWindow();
         MainWindow = window;
-        window.InitializeFullUninstall();
+        window.InitializeFullUninstall(uninstallRegistration);
         if (!demo && e.Args.Contains("--login", StringComparer.OrdinalIgnoreCase))
             window.ContentRendered += async (_, _) => await window.StartLoginAsync();
         var captureIndex = Array.IndexOf(e.Args, "--capture");
@@ -43,13 +46,66 @@ public partial class App : Application
         }
         window.Show();
     }
-    internal static Mutex? TryBeginNormalStartup(string mutexName, Func<bool> blocksStartup, Action showExistingInstance)
+    internal static InstanceLease? TryAcquireProfileInstance(string legacyName = BrandPaths.LegacyInstanceMutex, string? profileName = null)
     {
-        var mutex = new Mutex(true, mutexName, out var created);
-        if (!created)
+        var local = new Mutex(true, legacyName, out var createdLocal);
+        if (!createdLocal)
         {
-            // Another handle would keep the name alive even after the owner exits.
-            mutex.Dispose();
+            local.Dispose();
+            return null;
+        }
+
+        Mutex? shared = null;
+        var acquired = false;
+        try
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            var sid = identity.User ?? throw new UnauthorizedAccessException("Не удалось определить владельца профиля Yamuse.");
+            var security = new MutexSecurity();
+            security.SetOwner(sid);
+            security.AddAccessRule(new MutexAccessRule(sid, MutexRights.FullControl, AccessControlType.Allow));
+            shared = MutexAcl.Create(true, profileName ?? @"Global\Yamuse.Profile." + sid.Value, out acquired, security);
+            return acquired ? new InstanceLease(local, shared) : null;
+        }
+        finally
+        {
+            if (!acquired)
+            {
+                shared?.Dispose();
+                local.ReleaseMutex();
+                local.Dispose();
+            }
+        }
+    }
+
+    internal sealed class InstanceLease(Mutex local, Mutex shared) : IDisposable
+    {
+        private bool _released;
+
+        public void Dispose()
+        {
+            if (_released) return;
+            _released = true;
+            shared.ReleaseMutex();
+            shared.Dispose();
+            local.ReleaseMutex();
+            local.Dispose();
+        }
+    }
+
+    internal static InstanceLease? TryBeginNormalStartup(Func<bool> blocksStartup, Action showExistingInstance,
+        string legacyName = BrandPaths.LegacyInstanceMutex, string? profileName = null)
+    {
+        InstanceLease? instance;
+        try { instance = TryAcquireProfileInstance(legacyName, profileName); }
+        catch (Exception error) when (error is UnauthorizedAccessException or WaitHandleCannotBeOpenedException or System.ComponentModel.Win32Exception)
+        {
+            MessageBox.Show("Не удалось получить доступ к профилю Yamuse. Закройте другие экземпляры и повторите запуск.",
+                AppBranding.Name, MessageBoxButton.OK, MessageBoxImage.Warning);
+            return null;
+        }
+        if (instance is null)
+        {
             showExistingInstance();
             return null;
         }
@@ -58,16 +114,9 @@ public partial class App : Application
         try
         {
             admitted = !blocksStartup();
-            return admitted ? mutex : null;
+            return admitted ? instance : null;
         }
-        finally
-        {
-            if (!admitted)
-            {
-                mutex.ReleaseMutex();
-                mutex.Dispose();
-            }
-        }
+        finally { if (!admitted) instance.Dispose(); }
     }
     internal static MainWindow CreateDemoWindow(string directory)
     {

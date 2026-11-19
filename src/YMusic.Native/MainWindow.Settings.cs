@@ -7,10 +7,22 @@ namespace YMusic.Native;
 
 public partial class MainWindow
 {
-    private const string PreferencesReadError = "Не удалось прочитать настройки. Перезапустите Yamuse, чтобы снова сохранять изменения.";
+    private const string PreferencesReadError = "Не удалось прочитать настройки. Проверьте доступ к файлу и повторите сохранение.";
+    [Flags]
+    private enum PreferenceField
+    {
+        None = 0, Quality = 1 << 0, Volume = 1 << 1, PlaybackSpeed = 1 << 2, MinimizeToTray = 1 << 3,
+        OutputDevice = 1 << 4, AutoDownloadFavorites = 1 << 5, ConcurrentDownloads = 1 << 6,
+        Crossfade = 1 << 7, NormalizeVolume = 1 << 8, AccentFromCover = 1 << 9,
+        StaticAccentColor = 1 << 10, Theme = 1 << 11, UpdateFrequency = 1 << 12
+    }
     private PreferencesStore? _preferenceStore;
     private bool _preferencesReady;
     private bool _preferencesLoadFailed;
+    private bool _updateFrequencyRecovered;
+    private bool UpdateFrequencyKnown => !_preferencesLoadFailed || _updateFrequencyRecovered;
+    private UpdateCheckFrequency? _pendingUpdateFrequency;
+    private PreferenceField _pendingPreferenceEdits;
     private bool _minimizeToTray;
     private bool _autoFavoritesEnabled;
     private int _concurrentDownloads = PlayerPreferences.DefaultConcurrentDownloads;
@@ -23,6 +35,9 @@ public partial class MainWindow
     {
         _preferencesReady = false;
         _preferencesLoadFailed = false;
+        _updateFrequencyRecovered = false;
+        _pendingUpdateFrequency = null;
+        _pendingPreferenceEdits = PreferenceField.None;
         _settingsInitializing = true;
         if (_restore && !_demo) _preferenceStore ??= new PreferencesStore(_diagnosticsDirectory);
         try
@@ -56,28 +71,48 @@ public partial class MainWindow
             _preferencesReady = true;
         }
     }
+    private void RememberPreferenceEdit(PreferenceField field)
+    {
+        if (_preferencesReady && _preferencesLoadFailed && !_settingsInitializing && !_closed)
+            _pendingPreferenceEdits |= field;
+    }
+
     private void SavePreferences() => TrySavePreferences(out _);
 
     private bool TrySavePreferencesForUpdate(out string? detail)
     {
         detail = null;
-        return !_restore || _demo || TrySavePreferences(out detail);
+        if (!_restore || _demo) return true;
+        if (!_preferencesLoadFailed || _pendingPreferenceEdits != PreferenceField.None || _preferenceStore is not { } store)
+            return TrySavePreferences(out detail);
+        try
+        {
+            // The runtime defaults must not replace possibly different saved
+            // values. An untouched window only needs to verify those values.
+            _ = store.Load();
+            return true;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            detail = PreferencesReadError;
+            _diagnostics.LastErrorType = "PreferencesLoad:" + error.GetType().Name;
+            return false;
+        }
     }
 
     private bool TrySavePreferences(out string? detail, bool? autoDownloadFavorites = null)
     {
         detail = null;
-        if (_preferenceStore is not { } store) return true;
+        if (_preferenceStore is not { } store) { CommitUpdateFrequency(); return true; }
         if (!_preferencesReady) return false;
-        // A runtime snapshot has no safe basis for overwriting unread settings.
-        if (_preferencesLoadFailed)
-        {
-            SetStatus(PreferencesReadError, true);
-            return false;
-        }
+        // The auto-download toggle and offline clear only adopt their proposed
+        // setting if this write succeeds. A failed proposal must not be retried.
+        var edits = _pendingPreferenceEdits;
+        if (autoDownloadFavorites.HasValue) edits |= PreferenceField.AutoDownloadFavorites;
+        if (_preferencesLoadFailed && edits == PreferenceField.None) return true;
         try
         {
-            store.Save(new()
+            var runtime = new PlayerPreferences
             {
                 Quality = SelectedQuality,
                 Volume = VolumeSlider.Value / 100,
@@ -91,8 +126,16 @@ public partial class MainWindow
                 AccentFromCover = _accentFromCover,
                 StaticAccentColor = _staticAccentColor,
                 Theme = ThemeManager.Mode,
-                UpdateCheckFrequency = _updateCheckFrequency
-            });
+                UpdateCheckFrequency = _pendingUpdateFrequency ?? _updateCheckFrequency
+            };
+            // The window still contains fallback values for untouched fields,
+            // including after a successful merge. Continue using field edits.
+            if (_preferencesLoadFailed) store.Merge(saved => ApplyPreferenceEdits(saved, runtime, edits));
+            else store.Save(runtime);
+            _pendingPreferenceEdits = PreferenceField.None;
+            _settingsSavePending = false;
+            _settingsSaveTimer?.Stop();
+            CommitUpdateFrequency();
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -103,6 +146,24 @@ public partial class MainWindow
             return false;
         }
     }
+
+    private static PlayerPreferences ApplyPreferenceEdits(PlayerPreferences saved, PlayerPreferences runtime, PreferenceField fields)
+        => saved with
+        {
+            Quality = fields.HasFlag(PreferenceField.Quality) ? runtime.Quality : saved.Quality,
+            Volume = fields.HasFlag(PreferenceField.Volume) ? runtime.Volume : saved.Volume,
+            PlaybackSpeed = fields.HasFlag(PreferenceField.PlaybackSpeed) ? runtime.PlaybackSpeed : saved.PlaybackSpeed,
+            MinimizeToTray = fields.HasFlag(PreferenceField.MinimizeToTray) ? runtime.MinimizeToTray : saved.MinimizeToTray,
+            OutputDeviceId = fields.HasFlag(PreferenceField.OutputDevice) ? runtime.OutputDeviceId : saved.OutputDeviceId,
+            AutoDownloadFavorites = fields.HasFlag(PreferenceField.AutoDownloadFavorites) ? runtime.AutoDownloadFavorites : saved.AutoDownloadFavorites,
+            ConcurrentDownloads = fields.HasFlag(PreferenceField.ConcurrentDownloads) ? runtime.ConcurrentDownloads : saved.ConcurrentDownloads,
+            CrossfadeSeconds = fields.HasFlag(PreferenceField.Crossfade) ? runtime.CrossfadeSeconds : saved.CrossfadeSeconds,
+            NormalizeVolume = fields.HasFlag(PreferenceField.NormalizeVolume) ? runtime.NormalizeVolume : saved.NormalizeVolume,
+            AccentFromCover = fields.HasFlag(PreferenceField.AccentFromCover) ? runtime.AccentFromCover : saved.AccentFromCover,
+            StaticAccentColor = fields.HasFlag(PreferenceField.StaticAccentColor) ? runtime.StaticAccentColor : saved.StaticAccentColor,
+            Theme = fields.HasFlag(PreferenceField.Theme) ? runtime.Theme : saved.Theme,
+            UpdateCheckFrequency = fields.HasFlag(PreferenceField.UpdateFrequency) ? runtime.UpdateCheckFrequency : saved.UpdateCheckFrequency
+        };
     private void InitializeShell()
     {
         try
@@ -141,7 +202,8 @@ public partial class MainWindow
         SettingsDownloads.ItemsSource ??= Enumerable.Range(1, 10).ToArray();
         SettingsDownloads.SelectedItem = _concurrentDownloads;
         SettingsUpdates.Content ??= CreateUpdateSettingsPanel();
-        if (_updateFrequencyCombo is not null) _updateFrequencyCombo.SelectedValue = _updateCheckFrequency;
+        ShowCommittedUpdateFrequency();
+        RetryWindowsUninstallRegistration();
         RefreshFullUninstallAction();
         }
         finally { _settingsInitializing = false; }
@@ -174,7 +236,9 @@ public partial class MainWindow
     {
         ShowSettingsCrossfade();
         if (!CanApplySettingsControl) return;
+        var previous = _player.CrossfadeSeconds;
         _player.SetCrossfade(CrossfadeSetting.Value);
+        if (_player.CrossfadeSeconds != previous) RememberPreferenceEdit(PreferenceField.Crossfade);
         QueueSettingsSave();
     }
     private void ShowSettingsCrossfade()
@@ -197,19 +261,33 @@ public partial class MainWindow
         if (ReferenceEquals(sender, SettingsTheme))
         {
             if (SettingsTheme.SelectedValue is not string mode) return;
+            var previous = ThemeManager.Mode;
             ThemeManager.SetMode(mode);
+            if (ThemeManager.Mode != previous) RememberPreferenceEdit(PreferenceField.Theme);
         }
         else if (ReferenceEquals(sender, SettingsQuality))
         {
             if (SettingsQuality.SelectedIndex is < 0 or > 2) return;
+            var previous = SelectedQuality;
             var ready = _preferencesReady;
             try { _preferencesReady = false; QualityCombo.SelectedIndex = SettingsQuality.SelectedIndex; }
             finally { _preferencesReady = ready; }
+            if (SelectedQuality != previous) RememberPreferenceEdit(PreferenceField.Quality);
         }
         else if (ReferenceEquals(sender, SettingsSpeed))
-        { if (SettingsSpeed.SelectedItem is not double ratio) return; _player.SetSpeed(ratio); }
+        {
+            if (SettingsSpeed.SelectedItem is not double ratio) return;
+            var previous = _player.SpeedRatio;
+            _player.SetSpeed(ratio);
+            if (_player.SpeedRatio != previous) RememberPreferenceEdit(PreferenceField.PlaybackSpeed);
+        }
         else if (ReferenceEquals(sender, SettingsDownloads))
-        { if (SettingsDownloads.SelectedItem is not int count) return; _concurrentDownloads = Math.Clamp(count, 1, 10); }
+        {
+            if (SettingsDownloads.SelectedItem is not int count) return;
+            var previous = _concurrentDownloads;
+            _concurrentDownloads = Math.Clamp(count, 1, 10);
+            if (_concurrentDownloads != previous) RememberPreferenceEdit(PreferenceField.ConcurrentDownloads);
+        }
         else return;
         PersistSettingsImmediately();
     }
@@ -218,12 +296,24 @@ public partial class MainWindow
     {
         if (!CanApplySettingsControl) return;
         if (ReferenceEquals(sender, SettingsAccentFromCover))
-        { _accentFromCover = SettingsAccentFromCover.IsChecked == true; _coverAccent?.Configure(_accentFromCover, _staticAccentColor); }
-        else if (ReferenceEquals(sender, SettingsNormalizeVolume)) _player.SetNormalization(SettingsNormalizeVolume.IsChecked == true);
+        {
+            var previous = _accentFromCover;
+            _accentFromCover = SettingsAccentFromCover.IsChecked == true;
+            _coverAccent?.Configure(_accentFromCover, _staticAccentColor);
+            if (_accentFromCover != previous) RememberPreferenceEdit(PreferenceField.AccentFromCover);
+        }
+        else if (ReferenceEquals(sender, SettingsNormalizeVolume))
+        {
+            var previous = _player.NormalizeVolume;
+            _player.SetNormalization(SettingsNormalizeVolume.IsChecked == true);
+            if (_player.NormalizeVolume != previous) RememberPreferenceEdit(PreferenceField.NormalizeVolume);
+        }
         else if (ReferenceEquals(sender, SettingsTray))
         {
+            var previous = _minimizeToTray;
             _minimizeToTray = SettingsTray.IsChecked == true;
             if (_shell is not null) { _shell.MinimizeToTray = _minimizeToTray; _minimizeToTray = _shell.MinimizeToTray; }
+            if (_minimizeToTray != previous) RememberPreferenceEdit(PreferenceField.MinimizeToTray);
         }
         else if (ReferenceEquals(sender, SettingsAutoFavorites))
         {
@@ -231,7 +321,6 @@ public partial class MainWindow
             var changed = AutoFavoritesCheckBox.IsChecked != SettingsAutoFavorites.IsChecked;
             AutoFavoritesCheckBox.IsChecked = SettingsAutoFavorites.IsChecked == true;
             if (!changed) FlushSettingsSave();
-            _settingsSavePending = false; _settingsSaveTimer?.Stop();
             return;
         }
         else return;
@@ -292,8 +381,10 @@ public partial class MainWindow
     {
         UpdateAccentDraft();
         if (!CanApplySettingsControl || !PreferencesStore.IsAccentColor(SettingsAccentHex.Text)) return;
+        var previous = _staticAccentColor;
         _staticAccentColor = SettingsAccentHex.Text.ToUpperInvariant();
         _coverAccent?.Configure(_accentFromCover, _staticAccentColor);
+        if (_staticAccentColor != previous) RememberPreferenceEdit(PreferenceField.StaticAccentColor);
         PersistSettingsImmediately();
     }
     private void UpdateAccentDraft()

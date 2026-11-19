@@ -53,9 +53,12 @@ internal static partial class Program
         Search040Assert(w, "album", "album", false, "track query", 0, false, ["album-0"]);
         Assert(f.Searches.Length == requests, "history reissued the restored searches");
         NavMouse(w, MouseButton.XButton1); NavMouse(w, MouseButton.XButton1);
+        var draft = Control<TextBox>(w, "CatalogQuery");
+        draft.Text = "unsent track draft";
         SaClick(Control<Button>(w, "MoreCatalogButton")); await Search040Idle(w);
         Search040Assert(w, "track", "track", false, "track query", 1, false, ["track-0", "track-1"]);
-        Assert(f.Searches.Last() == new Search040Request("track", 1, "track query"), "restored More used the album category or wrong page");
+        Assert(f.Searches.Last() == new Search040Request("track", 1, "track query") && draft.Text == "unsent track draft",
+            "restored More used the draft, album category or wrong page");
         Assert(queue.Version == queueVersion && !f.Player.HasSource, "search history changed playback");
         Search040Facts(f, "back-forward");
     }
@@ -64,7 +67,12 @@ internal static partial class Program
     {
         using var f = new Search040Fixture("exhausted-page"); await f.Activate(); var w = f.Window;
         await Search040Start(f, "track", "exhausted query");
+        var draft = Control<TextBox>(w, "CatalogQuery");
+        draft.Clear();
         SaClick(Control<Button>(w, "MoreCatalogButton")); await Search040Idle(w);
+        Assert(draft.Text.Length == 0 && f.Searches.Last() == new Search040Request("track", 1, "exhausted query"),
+            "ordinary More did not continue the last submitted query with an empty draft");
+        draft.Text = "exhausted query";
         await Search040OpenArtist(f);
         SaClick(Control<Button>(w, "SearchNav")); SaClick(Search040Category(w, "album")); await Search040Idle(w);
         NavMouse(w, MouseButton.XButton1); NavMouse(w, MouseButton.XButton1);
@@ -81,6 +89,7 @@ internal static partial class Program
         await Search040Start(f, "album", "collections query");
         SaClick(Search040Category(w, "collections")); await Search040Idle(w);
         Search040Assert(w, "collections", "album", true, "collections query", 0, true, ["compilation-0", "editorial-0"]);
+        Control<TextBox>(w, "CatalogQuery").Clear();
         // Leave through a real sidebar route so the collections snapshot has its own category state.
         SaClick(Control<Button>(w, "FavoritesNav")); SaClick(Control<Button>(w, "SearchNav"));
         Control<TextBox>(w, "CatalogQuery").Text = "album query";
@@ -92,6 +101,7 @@ internal static partial class Program
         SaClick(Control<Button>(w, "MoreCatalogButton")); await Search040Idle(w);
         var continuation = f.Searches.Skip(before).ToArray();
         Assert(continuation.Length == 2 && continuation.All(r => r.Page == 1 && r.Text == "collections query")
+            && Control<TextBox>(w, "CatalogQuery").Text.Length == 0
             && continuation.Select(r => r.Type).Order().SequenceEqual(["album", "playlist"]), "restored collections More did not fetch both exact sources");
         Search040Assert(w, "collections", "album", true, "collections query", 1, false,
             ["compilation-0", "editorial-0", "compilation-1", "editorial-1"]);

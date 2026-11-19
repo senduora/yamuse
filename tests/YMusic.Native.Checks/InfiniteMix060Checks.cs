@@ -218,6 +218,221 @@ internal static partial class Program
             await Call(w, "AdvanceAsync", 1, true);
             Assert(f.Seeds.Single() == "track:" + final, "shuffle completion used physical list order or an unavailable row");
         });
+        await Run("InfiniteMix060: a newly playable occurrence or expired timer wins over a delayed reply", async () =>
+        {
+            foreach (var fail in new[] { false, true })
+            foreach (var scenario in new[] { "sequential", "shuffle", "minute-deadline" })
+            {
+                using var f = new TwFixture($"mix-late-tail-{scenario}-{fail}") { HoldNext = true, FailNext = fail }; var w = f.Window;
+                var last = TwSeed("1234", "Последний трек", true);
+                var tail = new TrackRow { Id = "802", RequestId = "802:91", Title = "Прежде недоступный трек", DurationMs = 30000 };
+                var queue = SaField<PlaybackQueue>(w, "_playbackQueue");
+                queue.SetItems([last, tail]); queue.Shuffle = scenario == "shuffle";
+                var source = queue.Items; var version = queue.Version; var lastToken = queue.CurrentOccurrenceToken; var tailToken = queue.OccurrenceTokenAt(1);
+                await w.PlayTrackAsync(last);
+                f.Player.Pause();
+                SaField<System.Windows.Threading.DispatcherTimer>(w, "_progressTimer").Stop();
+                var elapsed = TimeSpan.Zero;
+                if (scenario == "minute-deadline")
+                {
+                    w.SleepElapsedForChecks = () => elapsed;
+                    w.SetSleepTimer(SleepTimerMode.Minutes15);
+                    SaField<System.Windows.Threading.DispatcherTimer>(w, "_sleepTick").Stop();
+                }
+                var pending = Call(w, "AdvanceAsync", 1, true);
+                await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                f.IndexAudio(["802"]);
+                SaInvoke(w, "ApplyOfflineStates", (object)new[] { tail });
+                Assert(queue.Version == version && tail.CanPlayInQueue, "offline marks did not restore the exact pending occurrence");
+                if (scenario == "minute-deadline") elapsed = TimeSpan.FromMinutes(15);
+                f.Release.TrySetResult(); await pending;
+                Assert(ReferenceEquals(queue.Items, source) && SaField<RadioBatch?>(w, "_waveBatch") is null && f.Feedback.Count == 0,
+                    "delayed response replaced the ordinary queue or reported an unused station");
+                if (scenario == "minute-deadline")
+                {
+                    Assert(!f.Player.IsPlaying && queue.CurrentOccurrenceToken == lastToken
+                        && Control<TextBlock>(w, "StatusText").Text.Contains("Таймер сна", StringComparison.Ordinal),
+                        "delayed recommendation or offline tail overrode an expired minute timer");
+                }
+                else
+                {
+                    Assert(f.Player.IsPlaying && queue.CurrentOccurrenceToken == tailToken && ReferenceEquals(queue.Current, tail)
+                        && f.Player.SourceLocalPath?.EndsWith("802.mp3", StringComparison.OrdinalIgnoreCase) == true,
+                        "delayed station did not continue the original queue from its new local copy");
+                }
+            }
+        });
+        await Run("InfiniteMix060: a rejected local tail does not disown the held station request", async () =>
+        {
+            foreach (var manual in new[] { false, true })
+            {
+                using var f = new TwFixture("mix-rejected-tail-" + manual) { HoldNext = true };
+                var w = f.Window;
+                var last = TwSeed("1234", "Последний трек", true);
+                var tail = new TrackRow { Id = "802", RequestId = "802:91", Title = "Проверяемый хвост", DurationMs = 30000 };
+                var queue = SaField<PlaybackQueue>(w, "_playbackQueue");
+                queue.SetItems([last, tail]);
+                var occurrence = queue.CurrentOccurrenceToken;
+                await w.PlayTrackAsync(last);
+                PlaybackOptionsInvoke(f.Player, "OnMediaEnded", PlaybackOptionsField<object>(f.Player, "_current"));
+                await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                var operation = SaField<long>(w, "_advanceOperation");
+                f.IndexAudio(["802"]);
+                var library = SaField<OfflineLibrary>(w, "_offline");
+                var saved = library.Read().Single();
+                ReplaceWithSameLengthSilentWave(library.ResolvePath(saved.FileName), saved);
+                SaInvoke(w, "ApplyOfflineStates", (object)new[] { tail });
+                Assert(tail.CanPlayInQueue, "fixture did not expose the first-time local candidate");
+                if (manual)
+                {
+                    await Call(w, "AdvanceAsync", 1, false).WaitAsync(TimeSpan.FromSeconds(5));
+                    Assert(queue.CurrentOccurrenceToken == occurrence && SaField<long>(w, "_advanceOperation") == operation,
+                        "rejected manual Next consumed the occurrence or disowned the pending station");
+                }
+                f.Release.TrySetResult();
+                await Until(() => f.Player.IsPlaying && queue.Current?.Id == "801"
+                    && f.Feedback.Count(item => item.Type == "radioStarted") == 1);
+                Assert(f.Seeds.SequenceEqual(["track:1234"]) && !queue.History.Contains(tail),
+                    "rejected local tail generated duplicate station starts or a false transition");
+            }
+        });
+        await Run("InfiniteMix060: first station admission skips a damaged offline recommendation and stays cancellable", async () =>
+        {
+            foreach (var pause in new[] { false, true })
+            {
+                using var f = new TwFixture("mix-cold-first-" + pause) { StartAvailability = id => id != 801 };
+                var w = f.Window;
+                var queue = SaField<PlaybackQueue>(w, "_playbackQueue");
+                var first = TwSeed("1234", "Исходный", true);
+                await w.PlayTrackAsync(first);
+                var sourceToken = queue.CurrentOccurrenceToken;
+                f.IndexAudio(["801"]);
+                var library = SaField<OfflineLibrary>(w, "_offline");
+                var saved = library.Read().Single();
+                var path = library.ResolvePath(saved.FileName);
+                ReplaceWithSameLengthSilentWave(path, saved);
+                var checking = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                w.QueuePlaybackBeforeVerificationForChecks = token =>
+                {
+                    checking.TrySetResult();
+                    return release.Task.WaitAsync(token);
+                };
+                PlaybackOptionsInvoke(f.Player, "OnMediaEnded", PreloadGet<object>(f.Player, "_current"));
+                await checking.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                Assert(queue.CurrentOccurrenceToken == sourceToken && !f.Player.IsPlaying && f.Feedback.Count == 0,
+                    "station was published before cold admission of its first candidate");
+                if (pause) await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Pause);
+                release.TrySetResult();
+                await Until(() => !SaField<bool>(w, "_advancingPlayback"));
+                if (pause)
+                    Assert(queue.CurrentOccurrenceToken == sourceToken && !f.Player.IsPlaying && f.Feedback.Count == 0,
+                        "an abandoned station or its first candidate started after explicit Pause");
+                else
+                {
+                    await Until(() => f.Feedback.Contains(("trackStarted", "802")));
+                    Assert(queue.Current?.Id == "802" && queue.History.Count == 0 && f.Player.IsPlaying
+                        && f.Seeds.SequenceEqual(["track:1234"])
+                        && f.Feedback.Count(item => item.Type == "radioStarted") == 1
+                        && f.Feedback.Where(item => item.Type == "trackStarted").Select(item => item.Track).SequenceEqual(["802"]),
+                        "cold rejection displaced the station or prevented its next viable track from starting once");
+                }
+            }
+        });
+        await Run("InfiniteMix060: revoking a held station file during old queue admission chooses the next candidate", async () =>
+        {
+            using var f = new TwFixture("mix-revoked-first-file") { StartAvailability = id => id is not (801 or 955) };
+            var w = f.Window;
+            var q = SaField<PlaybackQueue>(w, "_playbackQueue");
+            var source = TwSeed("1234", "Исходный", true);
+            var first = TwSeed("801", "Первый кандидат волны", false);
+            var tail = TwSeed("955", "Следующий в очереди", false);
+            f.IndexAudio([first.Id, tail.Id]);
+            var library = SaField<OfflineLibrary>(w, "_offline");
+            var rows = library.Read().ToDictionary(item => item.Id);
+            var firstPath = library.ResolvePath(rows[first.Id].FileName);
+            ReplaceWithSameLengthSilentWave(library.ResolvePath(rows[tail.Id].FileName), rows[tail.Id]);
+            SaInvoke(w, "ApplyOfflineStates", (object)new[] { tail });
+            await w.PlayTrackAsync(source);
+            var occurrence = q.CurrentOccurrenceToken;
+            var verifyingFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var verifyingTail = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseTail = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            w.QueuePlaybackBeforeVerificationForChecks = token =>
+            {
+                var checking = SaField<(string TrackId, CancellationTokenSource Request)?>(w, "_pendingOfflinePlayback");
+                if (checking?.TrackId == first.Id)
+                {
+                    verifyingFirst.TrySetResult();
+                    return releaseFirst.Task.WaitAsync(token);
+                }
+                Assert(checking?.TrackId == tail.Id, "a different candidate was read");
+                verifyingTail.TrySetResult();
+                return releaseTail.Task.WaitAsync(token);
+            };
+            try
+            {
+                PlaybackOptionsInvoke(f.Player, "OnMediaEnded", PreloadGet<object>(f.Player, "_current"));
+                await verifyingFirst.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                SaInvoke(w, "EnqueueActionTrack", tail, true);
+                releaseFirst.TrySetResult();
+                await verifyingTail.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                var deletion = Call(w, "DeleteOfflineTrackAsync", first);
+                Assert(SaField<string?>(w, "_offlineRemovalTrackId") == first.Id && !deletion.IsCompleted
+                    && File.Exists(firstPath) && q.CurrentOccurrenceToken == occurrence && f.Feedback.Count == 0,
+                    "fixture did not revoke the uncommitted station file while its lease was retained");
+                releaseTail.TrySetResult();
+                await deletion.WaitAsync(TimeSpan.FromSeconds(5));
+                await Until(() => f.Player.IsPlaying && q.Current?.Id == "802" && f.Feedback.Contains(("trackStarted", "802")));
+                Assert(!File.Exists(firstPath) && q.History.Count == 0
+                    && f.Feedback.Count(item => item.Type == "radioStarted") == 1
+                    && f.Feedback.Where(item => item.Type == "trackStarted").Select(item => item.Track).SequenceEqual(["802"]),
+                    "the revoked file held deletion, published a false start, or stranded the station");
+            }
+            finally { releaseFirst.TrySetResult(); releaseTail.TrySetResult(); }
+        });
+        await Run("InfiniteMix060: Play Next in the same queue wins over a held station success or failure", async () =>
+        {
+            foreach (var fail in new[] { false, true })
+            {
+                using var f = new TwFixture("mix-play-next-tail-" + fail) { HoldNext = true, FailNext = fail };
+                var w = f.Window;
+                var first = TwSeed("1234", "Последний трек", true);
+                var incoming = TwSeed("1080", "Выбранный следующий", true);
+                await w.PlayTrackAsync(first);
+                var q = SaField<PlaybackQueue>(w, "_playbackQueue");
+                var firstToken = q.CurrentOccurrenceToken;
+                var queue = q.ReplacementVersion;
+                PlaybackOptionsInvoke(f.Player, "OnMediaEnded", PreloadGet<object>(f.Player, "_current"));
+                await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                SaInvoke(w, "EnqueueActionTrack", incoming, true);
+                var incomingToken = q.PeekNextOccurrenceToken();
+                Assert(incomingToken is not null && q.CurrentOccurrenceToken == firstToken && q.ReplacementVersion == queue,
+                    "fixture did not add a compatible Play Next occurrence");
+                f.Release.TrySetResult();
+                await Until(() => !SaField<bool>(w, "_advancingPlayback"));
+                Assert(q.CurrentOccurrenceToken == incomingToken && q.Current?.Id == incoming.Id
+                    && q.ReplacementVersion == queue && q.History.SequenceEqual([first]) && f.Player.IsPlaying
+                    && f.Feedback.All(item => item.Type != "radioStarted") && f.Seeds.SequenceEqual(["track:1234"]),
+                    "an unused station reply or failure displaced the exact queued successor");
+            }
+        });
+        await Run("InfiniteMix060: unavailable manual Next preserves pending automatic continuation", async () =>
+        {
+            using var f = new TwFixture("mix-unavailable-next") { HoldNext = true }; var w = f.Window;
+            var last = TwSeed("1234", "Последний трек", true);
+            await w.PlayTrackAsync(last); f.Player.Pause();
+            var pending = Call(w, "AdvanceAsync", 1, true);
+            await f.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var operation = SaField<long>(w, "_advanceOperation");
+            Assert(!Control<Button>(w, "NextButton").IsEnabled, "fixture offered a manual next track");
+            await w.HandleDesktopMediaCommandAsync(DesktopMediaAction.Next);
+            Assert(SaField<long>(w, "_advanceOperation") == operation && !pending.IsCompleted, "unavailable Next invalidated the active request");
+            f.Release.TrySetResult(); await pending;
+            Assert(f.Player.IsPlaying && SaField<TrackRow>(w, "_current").Id == "801" && f.Seeds.Count == 1,
+                "automatic continuation failed after an unavailable Next command");
+        });
         await Run("InfiniteMix060: late autoplay cannot override queue, pause, seek, repeat, sleep, account or explicit wave", async () =>
         {
             foreach (var action in new[] { "queue", "pause", "seek", "repeat", "sleep", "logout", "wave" })

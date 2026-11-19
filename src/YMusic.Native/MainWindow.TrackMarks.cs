@@ -42,7 +42,7 @@ public partial class MainWindow
             var index = TracksList.ItemContainerGenerator.IndexFromContainer(item);
             if (index < 0 || !ReferenceEquals(TracksList.Items[index], row)) return;
             TracksList.SelectedIndex = index;
-            await PlaySelectedAsync();
+            await ActivateTrackRowAsync(index);
             return;
         }
         if (ItemsControl.ContainerFromElement(ArtistTopTracks, button) is ListBoxItem)

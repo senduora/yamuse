@@ -25,7 +25,8 @@ internal sealed class WindowsIntegration : IDisposable
     public event Action<DesktopMediaAction>? Command;
     public event Action<string>? Failed;
     public bool IsAvailable { get; private set; }
-    internal bool HandlesMediaKeys => IsAvailable && _hasMedia;
+    private bool HasMediaSession => IsAvailable && _hasMedia && Volatile.Read(ref _disposed) == 0;
+    internal bool HandlesMediaKeys => WindowHandle != 0 && HasMediaSession;
     public string? FailureReason { get; private set; }
     internal nint WindowHandle { get; }
 
@@ -70,13 +71,18 @@ internal sealed class WindowsIntegration : IDisposable
 
     private void UpdateCore(string title, string artist, string album, bool isPlaying, bool canNext, bool canPrevious)
     {
-        if (!IsAvailable || _controls is null || Volatile.Read(ref _disposed) != 0) return;
+        if (!IsAvailable || Volatile.Read(ref _disposed) != 0) return;
         if (string.IsNullOrWhiteSpace(title)) { ClearCore(); return; }
+        var metadataChanged = !_hasMedia || _title != title || _artist != artist || _album != album;
+        _canNext = canNext;
+        _canPrevious = canPrevious;
+        _title = title;
+        _artist = artist;
+        _album = album;
+        _hasMedia = true;
+        if (_controls is null) return;
         try
         {
-            var metadataChanged = !_hasMedia || _title != title || _artist != artist || _album != album;
-            _canNext = canNext;
-            _canPrevious = canPrevious;
             _controls.IsPlayEnabled = true;
             _controls.IsPauseEnabled = true;
             _controls.IsStopEnabled = true;
@@ -90,11 +96,7 @@ internal sealed class WindowsIntegration : IDisposable
                 display.MusicProperties.Artist = artist;
                 display.MusicProperties.AlbumTitle = album;
                 display.Update();
-                _title = title;
-                _artist = artist;
-                _album = album;
             }
-            _hasMedia = true;
             _controls.PlaybackStatus = isPlaying ? MediaPlaybackStatus.Playing : MediaPlaybackStatus.Paused;
             _controls.IsEnabled = true;
         }
@@ -111,7 +113,7 @@ internal sealed class WindowsIntegration : IDisposable
 
     private void DispatchButton(SystemMediaTransportControlsButton button)
     {
-        if (Volatile.Read(ref _disposed) != 0 || !HandlesMediaKeys) return;
+        if (!HasMediaSession) return;
         DesktopMediaAction? action = button switch
         {
             SystemMediaTransportControlsButton.Play => DesktopMediaAction.Play,

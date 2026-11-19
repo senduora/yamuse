@@ -166,11 +166,13 @@ internal static partial class Program
             var directory = Path.Combine(_directory, "rapid-skip-0317-" + name); var music = Path.Combine(directory, "music"); Directory.CreateDirectory(music);
             Rows = Enumerable.Range(0, 7).Select(i =>
             {
-                var path = Path.Combine(music, "synthetic-" + i + ".wav"); Rs0317Wave(path);
+                var path = Path.Combine(music, "synthetic-" + i + (bitrate is null ? ".wav" : ".mp3"));
+                if (bitrate is null) Rs0317Wave(path);
+                else File.WriteAllBytes(path, SilentMp3Seconds(2, bitrate(i)));
                 return new TrackRow { Id = "synthetic-" + i, RequestId = "synthetic-" + i, Title = "Synthetic " + i, Artist = "Fixture",
-                    Available = true, DurationMs = 2000, LocalPath = path, LocalQuality = "Generated local WAV" };
+                    Available = true, DurationMs = 2000, LocalPath = path, LocalQuality = bitrate is null ? "Generated local WAV" : "Generated local MP3" };
             }).ToArray();
-            WriteFixtureAudioIndex(music, Rows, bitrate);
+            WriteFixtureAudioIndex(music, Rows, bitrate, confirmedMp3: bitrate is not null);
             if (repeated) Rows[2] = Rows[0];
             Player = new NativePlayer(new AudioBuffer(Path.Combine(directory, "audio"), Handler));
             Window = new MainWindow(api: new MusicApi(Handler), store: new SessionStore(Path.Combine(directory, "session")), restore: false,

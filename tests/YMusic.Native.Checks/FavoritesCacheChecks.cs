@@ -22,6 +22,8 @@ internal static partial class Program
         await Run("FavoritesCache: composite album changes and reordered IDs fetch only missing metadata", FcChangedIds);
         await Run("FavoritesCache: stale and explicit refresh keep the old view until replacement metadata arrives", FcRevalidation);
         await Run("FavoritesCache: failed ID and metadata refresh preserve the complete visible and persisted snapshot", FcFailures);
+        await Run("FavoritesCache: reopening retries an unavailable cache but skips a previously invalid file", FcCacheReadRecovery);
+        await Run("FavoritesCache: failed refresh keeps deferred downloads until verified IDs change", FcDeferredDownloads);
         await Run("FavoritesCache: superseded refresh signout and late account cache reads cannot restore obsolete rows", FcRaces);
         await Run("FavoritesCache: confirmed unlike survives late cache ID and metadata responses", FcUnlike);
         await Run("FavoritesCache: confirmed like preserves canonical order despite failed follow-up refresh", FcLike);
@@ -255,6 +257,79 @@ internal static partial class Program
         }
     }
 
+    private static async Task FcCacheReadRecovery()
+    {
+        using (var f = await FcFixture.Create("cache-read-retry", 3))
+        {
+            var path = f.Store.FilePath(f.Uid);
+            var prior = f.CacheHash();
+            f.Http.FailIds = true;
+            using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                Assert(f.Store.Read(f.Uid).Status == FavoritesCacheReadStatus.Unavailable, "a sharing violation was treated as a bad snapshot");
+                await FcComplete(f.Window.RefreshLibraryAsync());
+                Assert(f.Source.Count == 0 && !SaField<bool>(f.Window, "_favoritesCacheRead"), "an unavailable first read exhausted cache recovery");
+            }
+
+            var ids = f.Http.HoldIds();
+            SaClick(Control<Button>(f.Window, "FavoritesNav"));
+            await FcEntered(ids);
+            Assert(f.Source.Select(row => row.RequestId).SequenceEqual(f.Http.Likes.Select(like => like.RequestId))
+                && SaField<bool>(f.Window, "_favoritesCacheRead") && f.Http.MetadataBatches.IsEmpty,
+                "reopening did not recover the unlocked snapshot before the API responded");
+            ids.Release.TrySetResult();
+            await FcUntil(() => SaField<CancellationTokenSource?>(f.Window, "_libraryCts") is null);
+            Assert(f.Source.Count == 3 && f.CacheHash() == prior, "the unavailable API altered the recovered snapshot");
+        }
+
+        using (var f = await FcFixture.Create("cache-read-invalid", []))
+        {
+            Assert(f.Store.Read(f.Uid).Status == FavoritesCacheReadStatus.Missing, "a missing cache was treated as an error");
+            var path = f.Store.FilePath(f.Uid);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, "{ Invalid fixture cache");
+            Assert(f.Store.Read(f.Uid).Status == FavoritesCacheReadStatus.Invalid, "corrupt JSON was marked retryable");
+            f.Http.FailIds = true;
+            await FcComplete(f.Window.RefreshLibraryAsync());
+            Assert(SaField<bool>(f.Window, "_favoritesCacheRead"), "invalid cache was left eligible for repeated reads");
+
+            await f.Store.SaveInBackgroundAsync(FavoritesCacheStore.Capture(f.Uid, [FcRow(0)], DateTimeOffset.UtcNow));
+            var ids = f.Http.HoldIds();
+            SaClick(Control<Button>(f.Window, "FavoritesNav"));
+            await FcEntered(ids);
+            Assert(f.Source.Count == 0, "reopening retried the invalid cache instead of refreshing from the server");
+            ids.Release.TrySetResult();
+            await FcUntil(() => SaField<CancellationTokenSource?>(f.Window, "_libraryCts") is null);
+        }
+    }
+
+    private static async Task FcDeferredDownloads()
+    {
+        using var f = await FcFixture.Create("deferred-auto-refresh", 3);
+        await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+        var pending = new PlaylistDetails("local:favorites", "liked", "Мне нравится", "", 0, f.Source.ToArray());
+        FcSet(f.Window, "_pendingAutoFavorites", pending);
+
+        foreach (var mode in new[] { "ids-failed", "metadata-failed", "order-changed" })
+        {
+            var idsFailed = mode == "ids-failed";
+            var orderChanged = mode == "order-changed";
+            if (orderChanged) f.Http.Likes = f.Http.Likes.Reverse().ToArray();
+            f.Http.FailIds = idsFailed;
+            f.Http.FailMetadata = !idsFailed;
+            var gate = idsFailed ? f.Http.HoldIds() : f.Http.HoldMetadata();
+            var refresh = f.Window.RefreshLibraryAsync(refreshMetadata: true);
+            await FcEntered(gate);
+            var expected = orderChanged ? null : pending;
+            Assert(ReferenceEquals(expected, SaField<PlaylistDetails?>(f.Window, "_pendingAutoFavorites")),
+                "deferred downloads were cleared before verification or kept after the order changed");
+            gate.Release.TrySetResult();
+            await FcComplete(refresh);
+            Assert(ReferenceEquals(expected, SaField<PlaylistDetails?>(f.Window, "_pendingAutoFavorites")),
+                "a failed refresh changed the disposition of deferred downloads");
+        }
+    }
+
     private static async Task FcRaces()
     {
         foreach (var mode in new[] { "supersede", "signout-ids", "signout-cache", "account-cache" })
@@ -330,6 +405,8 @@ internal static partial class Program
             var existing = new[] { FcRow(0), FcRow(1) };
             using var f = await FcFixture.Create("like-" + mode, existing);
             await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+            var deferred = new PlaylistDetails("local:favorites", "liked", "Мне нравится", "", 0, f.Source.ToArray());
+            FcSet(f.Window, "_pendingAutoFavorites", deferred);
 
             var liked = FcRow(2, albumInRequest: mode != "canonical", localPath: mode == "offline" ? @"C:\fixture\local.wav" : null);
             var readback = new List<LikedId> { FcLiked(liked), FcLiked(existing[1]), FcLiked(existing[0]) };
@@ -353,6 +430,10 @@ internal static partial class Program
                 "confirmed readback order was lost or incomplete metadata replaced a complete snapshot");
             Assert(SaField<bool>(f.Window, "_favoritesSnapshotReady") == !missing,
                 "collection actions lost a verified snapshot or became available for an incomplete one");
+            var rebuilt = SaField<PlaylistDetails?>(f.Window, "_pendingAutoFavorites");
+            Assert(missing ? rebuilt is null : rebuilt is not null && !ReferenceEquals(deferred, rebuilt)
+                && rebuilt.Tracks.Select(row => row.RequestId).SequenceEqual(expected),
+                "confirmed like did not rebuild the deferred download from the complete readback");
             if (missing) Assert(f.CacheHash() == before, "incomplete readback rewrote the previous complete snapshot");
 
             gate.Release.TrySetResult();
@@ -360,6 +441,7 @@ internal static partial class Program
             await f.Saved();
             Assert(SaField<Diagnostics>(f.Window, "_diagnostics").Stage == "library_partial_or_error"
                 && SaField<bool>(f.Window, "_favoritesSnapshotReady") == !missing
+                && ReferenceEquals(rebuilt, SaField<PlaylistDetails?>(f.Window, "_pendingAutoFavorites"))
                 && f.Source.Select(row => row.RequestId).SequenceEqual(expected)
                 && f.Store.Load(f.Uid)!.Tracks.Select(track => track.RequestId).SequenceEqual(expected),
                 "failed follow-up refresh replaced the confirmed complete snapshot");

@@ -34,6 +34,7 @@ internal sealed partial class PlaybackQueue
     public long? CurrentOccurrenceToken => _current?.Token;
     public int CurrentIndex => _current is null ? -1 : _entries.IndexOf(_current);
     public long Version { get; private set; }
+    internal long ItemsVersion { get; private set; }
     // A queue replacement starts a new source; edits keep the existing source.
     public long ReplacementVersion { get; private set; }
     public bool CanPrevious => Current is not null || _past.Any(IsPlayable);
@@ -108,11 +109,15 @@ internal sealed partial class PlaybackQueue
 
     // Restore an exact occurrence without playing, skipping an unavailable current
     // row, or treating equal IDs as the same entry. Navigation history is ephemeral.
-    public void RestoreItems(IEnumerable<TrackRow> tracks, int currentIndex, bool shuffle, RepeatMode repeat)
+    public void RestoreItems(IEnumerable<TrackRow> tracks, int currentIndex, bool shuffle, RepeatMode repeat,
+        IReadOnlyList<int>? playNextIndices = null)
     {
         var rows = Materialize(tracks);
         if (currentIndex < -1 || currentIndex >= rows.Length) throw new ArgumentOutOfRangeException(nameof(currentIndex));
         if (!Enum.IsDefined(repeat)) throw new ArgumentOutOfRangeException(nameof(repeat));
+        if (playNextIndices is { Count: > 0 } && (!shuffle || playNextIndices.Any(index => index < 0 || index >= rows.Length || index == currentIndex)
+            || playNextIndices.Distinct().Count() != playNextIndices.Count))
+            throw new ArgumentException("Некорректная очерёдность следующих треков.", nameof(playNextIndices));
         _removalUndo = null;
         _entries.Clear(); _presentTokens.Clear(); _past.Clear(); _future.Clear();
         _shuffleBag.Clear(); _playNext.Clear(); _cycleVisited.Clear();
@@ -120,9 +125,20 @@ internal sealed partial class PlaybackQueue
         _current = currentIndex < 0 ? null : _entries[currentIndex];
         _shuffle = shuffle; _repeat = repeat;
         MarkVisited(_current);
-        if (_shuffle) BuildShuffleBag();
+        if (_shuffle)
+        {
+            if (playNextIndices is not null) _playNext.AddRange(playNextIndices.Select(index => _entries[index]));
+            BuildShuffleBag();
+        }
         ReplacementVersion++;
         Touch(itemsChanged: true);
+    }
+
+    internal int[]? CapturePlayNextIndices()
+    {
+        if (_playNext.Count == 0) return null;
+        var indices = _entries.Select((entry, index) => (entry.Token, index)).ToDictionary(item => item.Token, item => item.index);
+        return _playNext.Select(entry => indices[entry.Token]).ToArray();
     }
 
     public bool Select(TrackRow track)
@@ -153,7 +169,7 @@ internal sealed partial class PlaybackQueue
         {
             _entries.Insert(_current is null ? 0 : CurrentIndex + 1, entry);
             _future.Clear();
-            if (_shuffle && IsPlayable(entry)) _playNext.Insert(0, entry);
+            if (_shuffle) _playNext.Insert(0, entry);
         }
         else
         {
@@ -215,26 +231,29 @@ internal sealed partial class PlaybackQueue
 
     // Does not navigate, change Version/history, or deduplicate equal TrackRows.
     // A shuffle repeat boundary reserves the next cycle for the following Next.
-    public TrackRow? PeekNext(bool naturalEnd = false) => PeekNextEntry(naturalEnd)?.Track;
-    public long? PeekNextOccurrenceToken(bool naturalEnd = false) => PeekNextEntry(naturalEnd)?.Token;
-    private Entry? PeekNextEntry(bool naturalEnd)
+    public TrackRow? PeekNext(bool naturalEnd = false, IReadOnlySet<long>? excluded = null) => PeekNextEntry(naturalEnd, excluded)?.Track;
+    public long? PeekNextOccurrenceToken(bool naturalEnd = false, IReadOnlySet<long>? excluded = null) => PeekNextEntry(naturalEnd, excluded)?.Token;
+
+    private Entry? PeekNextEntry(bool naturalEnd, IReadOnlySet<long>? excluded)
     {
-        if (naturalEnd && _repeat == RepeatMode.One && _current is not null && IsPlayable(_current)) return _current;
-        var future = _future.LastOrDefault(IsPlayable);
+        bool Eligible(Entry entry) => IsPlayable(entry) && excluded?.Contains(entry.Token) != true;
+        if (naturalEnd && _repeat == RepeatMode.One && _current is not null && Eligible(_current)) return _current;
+        var future = _future.LastOrDefault(Eligible);
         if (future is not null) return future;
-        if (!_shuffle) return FindSequential(_current is null ? 0 : CurrentIndex + 1, _repeat == RepeatMode.All);
-        var next = _playNext.FirstOrDefault(IsPlayable) ?? _shuffleBag.FirstOrDefault(IsPlayable);
+        if (!_shuffle) return FindSequential(_current is null ? 0 : CurrentIndex + 1, _repeat == RepeatMode.All, Eligible);
+        var next = _playNext.FirstOrDefault(Eligible) ?? _shuffleBag.FirstOrDefault(Eligible);
         if (next is not null || _repeat != RepeatMode.All) return next;
-        return ReservedShuffleCycle(_current).FirstOrDefault(IsPlayable);
+        return ReservedShuffleCycle(_current).FirstOrDefault(Eligible);
     }
 
-    public TrackRow? Next(bool naturalEnd = false)
+    public TrackRow? Next(bool naturalEnd = false, IReadOnlySet<long>? excluded = null)
     {
-        if (naturalEnd && _repeat == RepeatMode.One && _current is not null && IsPlayable(_current))
+        bool Eligible(Entry entry) => IsPlayable(entry) && excluded?.Contains(entry.Token) != true;
+        if (naturalEnd && _repeat == RepeatMode.One && _current is not null && Eligible(_current))
             return Current;
-        var next = PopPlayable(_future)
-            ?? (_shuffle ? TakeShuffle(_repeat == RepeatMode.All, _current)
-                : FindSequential(_current is null ? 0 : CurrentIndex + 1, _repeat == RepeatMode.All));
+        var next = PopPlayable(_future, Eligible, deferred: excluded)
+            ?? (_shuffle ? TakeShuffle(_repeat == RepeatMode.All, _current, Eligible)
+                : FindSequential(_current is null ? 0 : CurrentIndex + 1, _repeat == RepeatMode.All, Eligible));
         // Off/explicit Next under Repeat.One: preserve the final Current so a wave
         // can append to its tail. null means stop/obtain more, not a fabricated track.
         if (next is null) return null;
@@ -243,13 +262,19 @@ internal sealed partial class PlaybackQueue
         return Current;
     }
 
+    private Entry? PeekPreviousEntry() => _past.LastOrDefault(IsPlayable) ?? _current;
+    internal TrackRow? PeekPrevious() => PeekPreviousEntry()?.Track;
+    internal long? PeekPreviousOccurrenceToken() => PeekPreviousEntry()?.Token;
+
     public TrackRow? Previous(double positionSeconds = 0)
     {
         if (!double.IsFinite(positionSeconds) || positionSeconds < 0)
             throw new ArgumentOutOfRangeException(nameof(positionSeconds));
         if (positionSeconds > 3 && _current is not null) return Current;
-        var previous = PopPlayable(_past);
-        if (previous is null) return Current; // Restart first; do not invent unplayed history.
+        var previousIndex = _past.FindLastIndex(IsPlayable);
+        if (previousIndex < 0) return Current; // Restart first; do not consume history on a restart.
+        var previous = _past[previousIndex];
+        _past.RemoveRange(previousIndex, _past.Count - previousIndex);
         if (_current is not null) _future.Add(_current);
         _current = previous;
         MarkVisited(previous);
@@ -268,6 +293,8 @@ internal sealed partial class PlaybackQueue
         if (_current is not null) protectedTokens.Add(_current.Token);
         if (_shuffle)
             foreach (var entry in _shuffleBag.Concat(_playNext)) protectedTokens.Add(entry.Token);
+        else
+            foreach (var entry in _entries.Skip(CurrentIndex + 1)) protectedTokens.Add(entry.Token);
         var evict = _past.Take(Math.Max(0, _past.Count - 20)).Select(e => e.Token)
             .Where(token => !protectedTokens.Contains(token)).ToHashSet();
         var survivingCount = _entries.Count(e => !evict.Contains(e.Token));
@@ -322,7 +349,7 @@ internal sealed partial class PlaybackQueue
         _playNext.RemoveAll(e => e.Token == entry.Token);
     }
 
-    private Entry? FindSequential(int start, bool wrap)
+    private Entry? FindSequential(int start, bool wrap, Predicate<Entry>? eligible = null)
     {
         if (_entries.Count == 0) return null;
         for (var step = 0; step < _entries.Count; step++)
@@ -333,21 +360,25 @@ internal sealed partial class PlaybackQueue
                 if (!wrap) return null;
                 index %= _entries.Count;
             }
-            if (IsPlayable(_entries[index])) return _entries[index];
+            var entry = _entries[index];
+            if (eligible?.Invoke(entry) ?? IsPlayable(entry)) return entry;
         }
         return null;
     }
 
-    private Entry? TakeShuffle(bool allowNewCycle, Entry? avoidFirst)
+    private Entry? TakeShuffle(bool allowNewCycle, Entry? avoidFirst, Predicate<Entry>? eligible = null)
     {
-        var next = ShiftPlayable(_playNext) ?? ShiftPlayable(_shuffleBag);
+        var next = ShiftPlayable(_playNext, eligible) ?? ShiftPlayable(_shuffleBag, eligible);
         if (next is not null || !allowNewCycle) return next;
         _shuffleCycle++;
         _cycleVisited.Clear();
         _shuffleBag.Clear();
         _shuffleBag.AddRange(ReservedShuffleCycle(avoidFirst));
+        // Unavailable rows may become playable later in this cycle.
+        var deferredPriorities = _playNext.ToHashSet();
+        _shuffleBag.AddRange(_entries.Where(entry => !IsPlayable(entry) && !deferredPriorities.Contains(entry)));
         _reservedShuffleCycle = null;
-        return ShiftPlayable(_shuffleBag);
+        return ShiftPlayable(_shuffleBag, eligible);
     }
 
     private List<Entry> ReservedShuffleCycle(Entry? avoidFirst)
@@ -381,7 +412,8 @@ internal sealed partial class PlaybackQueue
     private void BuildShuffleBag()
     {
         _shuffleBag.Clear();
-        _shuffleBag.AddRange(_entries.Where(e => IsPlayable(e) && !_cycleVisited.Contains(e.Token)));
+        var priority = _playNext.Select(entry => entry.Token).ToHashSet();
+        _shuffleBag.AddRange(_entries.Where(e => !_cycleVisited.Contains(e.Token) && !priority.Contains(e.Token)));
         for (var i = _shuffleBag.Count - 1; i > 0; i--)
         {
             var swap = _random.Next(i + 1);
@@ -391,32 +423,31 @@ internal sealed partial class PlaybackQueue
 
     private void AddToShuffleBag(Entry entry)
     {
-        if (_shuffle && IsPlayable(entry)) _shuffleBag.Insert(_random.Next(_shuffleBag.Count + 1), entry);
+        if (_shuffle) _shuffleBag.Insert(_random.Next(_shuffleBag.Count + 1), entry);
     }
 
-    private Entry? PopPlayable(List<Entry> stack)
+    private Entry? PopPlayable(List<Entry> stack, Predicate<Entry>? eligible = null, IReadOnlySet<long>? deferred = null)
     {
-        while (stack.Count > 0)
+        for (var index = stack.Count - 1; index >= 0; index--)
         {
-            var entry = stack[^1];
-            stack.RemoveAt(stack.Count - 1);
-            if (IsPlayable(entry)) return entry;
+            var entry = stack[index];
+            if (deferred?.Contains(entry.Token) == true) continue;
+            stack.RemoveAt(index);
+            if (eligible?.Invoke(entry) ?? IsPlayable(entry)) return entry;
         }
         return null;
     }
 
-    private Entry? ShiftPlayable(List<Entry> list)
+    private Entry? ShiftPlayable(List<Entry> list, Predicate<Entry>? eligible = null)
     {
-        while (list.Count > 0)
-        {
-            var entry = list[0];
-            list.RemoveAt(0);
-            if (IsPlayable(entry)) return entry;
-        }
-        return null;
+        var index = list.FindIndex(eligible ?? IsPlayable);
+        if (index < 0) return null;
+        var entry = list[index];
+        list.RemoveAt(index);
+        return entry;
     }
 
-    private bool IsPlayable(Entry entry) => entry.Track.CanPlay && _presentTokens.Contains(entry.Token);
+    private bool IsPlayable(Entry entry) => entry.Track.CanPlayInQueue && _presentTokens.Contains(entry.Token);
 
     private int IndexOfReference(TrackRow track)
     {
@@ -447,7 +478,11 @@ internal sealed partial class PlaybackQueue
     private void Touch(bool itemsChanged = false)
     {
         _reservedShuffleCycle = null;
-        if (itemsChanged) _items = Array.AsReadOnly(_entries.Select(e => e.Track).ToArray());
+        if (itemsChanged)
+        {
+            _items = Array.AsReadOnly(_entries.Select(e => e.Track).ToArray());
+            ItemsVersion++;
+        }
         _history = Array.AsReadOnly(_past.Select(e => e.Track).ToArray());
         Version++;
     }

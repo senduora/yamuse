@@ -50,6 +50,29 @@ internal static partial class Program
                 "status peer did not expose the newly shown text");
             Toast040Invoke(fixture.Window, "SetStatus", "Обновление готово", false);
             Assert(peer.GetName() == "Обновление готово", "status peer retained the previous text");
+            Assert(Toast040Invoke(fixture.Window, "ShowStatusNotification", false) is false,
+                "repeating a visible status opened a second live-region announcement");
+            Toast040Invoke(fixture.Window, "HideStatusNotification");
+            Assert(Toast040Invoke(fixture.Window, "ShowStatusNotification", false) is true && peer.GetName() == "Обновление готово",
+                "showing the same status after dismissal did not reopen its announcement");
+            return Task.CompletedTask;
+        });
+        await Run("ToastPlacement040: global status leaves Home shelf notes and Artist page context intact", () =>
+        {
+            using var fixture = new Toast040Fixture("page-note");
+            var w = fixture.Window;
+            var item = new CatalogItem("fixture-album", "album", "Альбом", "");
+            Toast040Invoke(w, "SetSection", "home", "Главная");
+            Toast040Invoke(w, "ShowHomeSections", (object)new[] { new HomeSection("Подборка", [item], "Пояснение полки") });
+            Toast040Invoke(w, "SetStatus", "Общее уведомление", true);
+            Assert(Control<TextBlock>(w, "HomeStatus").Text == "Пояснение полки" && Control<TextBlock>(w, "StatusText").Text == "Общее уведомление",
+                "global status replaced the Home shelf explanation");
+            Toast040Invoke(w, "SetSection", "artist-detail", "Исполнитель");
+            Toast040Invoke(w, "ClearArtistDetails", "Исполнитель", "Загружаем музыку исполнителя…");
+            Toast040Invoke(w, "SetStatus", "Глобальная ошибка", true);
+            Assert(Control<TextBlock>(w, "ArtistEmpty").Text == "Загружаем музыку исполнителя…"
+                && Control<TextBlock>(w, "ArtistStatus").Visibility == Visibility.Collapsed && Control<TextBlock>(w, "StatusText").Text == "Глобальная ошибка",
+                "global status was duplicated inside the Artist page");
             return Task.CompletedTask;
         });
         await Run("ToastPlacement040: minimum normal and large private layouts keep one line clear of footer links", () =>

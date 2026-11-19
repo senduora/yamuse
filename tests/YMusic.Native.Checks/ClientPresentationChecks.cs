@@ -6,6 +6,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using YMusic.Native;
 
 internal static partial class Program
@@ -15,6 +16,19 @@ internal static partial class Program
         await Run("Presentation: Home cards stay inside their shelves through repeated hover and scrolling", PresentationCards);
         await Run("Presentation: inline live Settings retain changes navigate and scroll while the same player continues", PresentationSettings);
         await Run("Presentation: selection avoids playlist disk reads while explicit refresh observes changed data", PresentationSelection);
+    }
+
+    private static void SeekFixtureAnimation(DependencyObject element, DependencyProperty property, TimeSpan offset)
+    {
+        // The private desktop can render fewer frames than a short transition
+        // lasts. Sample the clock applied by the product at a known time.
+        var storageType = typeof(AnimationClock).Assembly.GetType("System.Windows.Media.Animation.AnimationStorage", throwOnError: true)!;
+        var storage = storageType.GetMethod("GetStorage", BindingFlags.Static | BindingFlags.NonPublic)!
+            .Invoke(null, [element, property]) ?? throw new InvalidOperationException($"no animation for {property.Name}");
+        var clocks = storageType.GetField("_animationClocks", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(storage)!;
+        var clock = (AnimationClock)clocks.GetType().GetProperty("Item", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .GetValue(clocks, [0])!;
+        clock.Controller!.SeekAlignedToLastTick(offset, TimeSeekOrigin.BeginTime);
     }
 
     private static async Task PresentationCards()
@@ -57,14 +71,14 @@ internal static partial class Program
             for (var n = 0; n < 3; n++)
             {
                 first.SetValue(hoverKey, true);
-                await Task.Delay(200);
-                Assert(layer.Opacity > .99 && ClRect(first, parent) == before && first.InputHitTest(new Point(4, first.ActualHeight / 2)) is not null,
-                    "hover changed geometry, lost its edge hit area or failed to settle");
+                await Until(() => layer.Opacity > .99);
+                Assert(ClRect(first, parent) == before && first.InputHitTest(new Point(4, first.ActualHeight / 2)) is not null,
+                    "hover changed geometry or lost its edge hit area");
                 first.SetValue(hoverKey, false);
-                await Task.Delay(200);
-                Assert(layer.Opacity < .01 && ClRect(first, parent) == before, "hover exit did not settle at the same geometry");
+                await Until(() => layer.Opacity < .01);
+                Assert(ClRect(first, parent) == before, "hover exit changed geometry");
             }
-            first.SetValue(hoverKey, true); await Task.Delay(200);
+            first.SetValue(hoverKey, true); await Until(() => layer.Opacity > .99);
             App.Capture(window, Path.Combine(_directory, $"presentation-home-hover-{width}.png"));
             first.SetValue(hoverKey, false);
             scroll.ScrollToEnd(); await Task.Delay(160);
@@ -150,13 +164,13 @@ internal static partial class Program
         Assert(escape.Handled && !Control<Grid>(window, "SettingsPanel").IsVisible, "Escape did not return to music");
         using (var holdLyrics = new CancellationTokenSource())
         {
-            typeof(MainWindow).GetField("_lyricsCts", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(window, holdLyrics);
+            LyricsUiAssignPending(window, holdLyrics);
             SaClick(Control<Button>(window, "SettingsButton"));
             SaClick(Control<Button>(window, "PlayerLyricsButton")); window.UpdateLayout();
             Assert(Control<Grid>(window, "LyricsPanel").IsVisible && !Control<Grid>(window, "SettingsPanel").IsVisible, "lyrics did not replace Settings");
             SaClick(Control<Button>(window, "SettingsButton")); window.UpdateLayout();
             Assert(Control<Grid>(window, "SettingsPanel").IsVisible && !Control<Grid>(window, "LyricsPanel").IsVisible, "Settings did not replace lyrics");
-            typeof(MainWindow).GetField("_lyricsCts", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(window, null);
+            LyricsUiAssignPending(window, null);
         }
         SaClick(Control<Button>(window, "FavoritesNav")); window.UpdateLayout();
         Assert(!Control<Grid>(window, "SettingsPanel").IsVisible && Control<Grid>(window, "ContentGrid").IsVisible && fixture.Queue.Version == version,

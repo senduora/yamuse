@@ -188,13 +188,18 @@ internal sealed partial class MusicApi
 
     private static string LibraryTrackId(JsonElement row, string property)
     {
-        var id = Text(row, property);
-        if (!IsTrackReferencePart(id) || row.GetProperty(property).ValueKind == JsonValueKind.Number && !id.All(char.IsAsciiDigit))
+        if (!TryReadTrackReferencePart(row, property, out var id))
             throw new MusicException("Сервис вернул некорректный идентификатор трека или альбома. Список не был загружен.");
         return id;
     }
 
-    private static bool IsTrackReferencePart(string id) => id.Length is > 0 and <= 512 && id is not ("." or "..")
+    private static bool TryReadTrackReferencePart(JsonElement row, string property, out string id)
+    {
+        id = Text(row, property);
+        return IsTrackReferencePart(id) && (row.GetProperty(property).ValueKind != JsonValueKind.Number || id.All(char.IsAsciiDigit));
+    }
+
+    private static bool IsTrackReferencePart(string? id) => id is { Length: > 0 and <= 512 } && id is not ("." or "..")
         && !id.Any(character => char.IsWhiteSpace(character) || char.IsControl(character) || character is ',' or ':');
 
     private static void LibraryRequireOk(JsonElement result)

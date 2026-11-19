@@ -12,12 +12,15 @@ internal static class Program
 {
     private const uint DesktopAccess = 0x0001 | 0x0002 | 0x0004 | 0x0080;
     private const uint WaitTimeout = 258;
+    private const int HandleListAttribute = 0x00020002;
+    private const int JobListAttribute = 0x0002000D;
     private static readonly IntPtr InvalidHandle = new(-1);
 
     private static int Main(string[] args)
     {
         if (args.Length != 1) { Console.Error.WriteLine("Usage: PrivateDesktopRunner.exe <configuration.json>"); return 125; }
         Configuration? config = null;
+        FileStream? receiptFile = null;
         var receipt = new Dictionary<string, object?>
         {
             ["startedUtc"] = DateTimeOffset.UtcNow, ["launcherPid"] = Environment.ProcessId,
@@ -29,18 +32,21 @@ internal static class Program
             ["status"] = "ERROR"
         };
         IntPtr desktop = IntPtr.Zero, job = IntPtr.Zero, output = InvalidHandle, input = InvalidHandle;
-        IntPtr attributes = IntPtr.Zero, handles = IntPtr.Zero;
+        IntPtr attributes = IntPtr.Zero, handles = IntPtr.Zero, jobs = IntPtr.Zero;
         Native.ProcessInformation process = default;
         bool attributesInitialized = false, processRunning = false;
         int result = 125;
         var watch = Stopwatch.StartNew();
         try
         {
-            config = JsonSerializer.Deserialize<Configuration>(File.ReadAllText(args[0]), new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+            var requested = JsonSerializer.Deserialize<Configuration>(File.ReadAllText(args[0]), new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
                 ?? throw new InvalidDataException("Missing runner configuration.");
-            Validate(config);
-            Directory.CreateDirectory(Path.GetDirectoryName(config.LogPath)!);
+            config = Validate(requested);
             Directory.CreateDirectory(Path.GetDirectoryName(config.ReceiptPath)!);
+            receiptFile = new FileStream(config.ReceiptPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 10240))
+                throw new PlatformNotSupportedException("A creation-time job list requires Windows 10 build 10240 or newer.");
+            Directory.CreateDirectory(Path.GetDirectoryName(config.LogPath)!);
             receipt["executable"] = config.Executable;
             receipt["executableSha256"] = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(config.Executable)));
             var runnerAssembly = typeof(Program).Assembly.Location;
@@ -66,26 +72,31 @@ internal static class Program
             receipt["launcherDesktopAfterCreate"] = CurrentDesktop();
 
             var security = new Native.SecurityAttributes { Length = Marshal.SizeOf<Native.SecurityAttributes>(), InheritHandle = true };
-            output = Native.CreateFileW(config.LogPath, 0x40000000, 0x00000001, ref security, 2, 0x80, IntPtr.Zero);
+            output = Native.CreateFileW(config.LogPath, 0x40000000, 0x00000001, ref security, 1, 0x80, IntPtr.Zero); // CREATE_NEW
             Check(output != InvalidHandle, "CreateFileW(log)");
             input = Native.CreateFileW("NUL", 0x80000000, 0x00000003, ref security, 3, 0x80, IntPtr.Zero);
             Check(input != InvalidHandle, "CreateFileW(NUL)");
-
-            nuint attributeSize = 0;
-            _ = Native.InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attributeSize);
-            Check(attributeSize > 0, "InitializeProcThreadAttributeList(size)");
-            attributes = Marshal.AllocHGlobal(checked((int)attributeSize));
-            Check(Native.InitializeProcThreadAttributeList(attributes, 1, 0, ref attributeSize), "InitializeProcThreadAttributeList");
-            attributesInitialized = true;
-            handles = Marshal.AllocHGlobal(IntPtr.Size * 2);
-            Marshal.WriteIntPtr(handles, 0, input); Marshal.WriteIntPtr(handles, IntPtr.Size, output);
-            Check(Native.UpdateProcThreadAttribute(attributes, 0, new IntPtr(0x00020002), handles,
-                (nuint)(IntPtr.Size * 2), IntPtr.Zero, IntPtr.Zero), "UpdateProcThreadAttribute(HANDLE_LIST)");
 
             job = Native.CreateJobObjectW(IntPtr.Zero, null); Check(job != IntPtr.Zero, "CreateJobObjectW");
             var limits = new Native.JobExtendedLimitInformation(); limits.BasicLimitInformation.LimitFlags = 0x00002000;
             Check(Native.SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<Native.JobExtendedLimitInformation>()), "SetInformationJobObject(KILL_ON_JOB_CLOSE)");
             receipt["jobKillOnClose"] = true;
+
+            nuint attributeSize = 0;
+            _ = Native.InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref attributeSize);
+            Check(attributeSize > 0, "InitializeProcThreadAttributeList(size)");
+            attributes = Marshal.AllocHGlobal(checked((int)attributeSize));
+            Check(Native.InitializeProcThreadAttributeList(attributes, 2, 0, ref attributeSize), "InitializeProcThreadAttributeList");
+            attributesInitialized = true;
+            handles = Marshal.AllocHGlobal(IntPtr.Size * 2);
+            Marshal.WriteIntPtr(handles, 0, input); Marshal.WriteIntPtr(handles, IntPtr.Size, output);
+            Check(Native.UpdateProcThreadAttribute(attributes, 0, new IntPtr(HandleListAttribute), handles,
+                (nuint)(IntPtr.Size * 2), IntPtr.Zero, IntPtr.Zero), "UpdateProcThreadAttribute(HANDLE_LIST)");
+            jobs = Marshal.AllocHGlobal(IntPtr.Size);
+            Marshal.WriteIntPtr(jobs, job);
+            Check(Native.UpdateProcThreadAttribute(attributes, 0, new IntPtr(JobListAttribute), jobs,
+                (nuint)IntPtr.Size, IntPtr.Zero, IntPtr.Zero), "UpdateProcThreadAttribute(JOB_LIST)");
+
             var startup = new Native.StartupInfoEx();
             startup.StartupInfo.Size = Marshal.SizeOf<Native.StartupInfoEx>();
             startup.StartupInfo.Desktop = "WinSta0\\" + desktopName;
@@ -100,8 +111,10 @@ internal static class Program
                 0x00080000 | 0x08000000 | 0x00000004, IntPtr.Zero, config.WorkingDirectory, ref startup, out process), "CreateProcessW");
             processRunning = true; receipt["childCreated"] = true; receipt["childStopped"] = false;
             receipt["childPid"] = process.ProcessId; receipt["childMainThreadId"] = process.ThreadId;
-            Check(Native.AssignProcessToJobObject(job, process.Process), "AssignProcessToJobObject");
+            Check(Native.IsProcessInJob(process.Process, job, out var inOwnJob), "IsProcessInJob");
+            if (!inOwnJob) throw new InvalidOperationException("The child was not created in the owned job.");
             receipt["childAssignedToOwnJob"] = true;
+            receipt["childJobAssignedAtCreation"] = true;
             receipt["childDesktopBeforeResume"] = TryThreadDesktop(process.ThreadId);
             Check(Native.ResumeThread(process.Thread) != uint.MaxValue, "ResumeThread");
             receipt["childResumed"] = true;
@@ -125,11 +138,14 @@ internal static class Program
             Check(Native.GetExitCodeProcess(process.Process, out var childExit), "GetExitCodeProcess");
             processRunning = false; receipt["childStopped"] = true; receipt["childExitCode"] = childExit;
             receipt["childElapsedMs"] = childClock.ElapsedMilliseconds;
-            result = receipt.ContainsKey("timedOut") ? 124 : unchecked((int)childExit);
+            var timedOut = receipt.ContainsKey("timedOut");
+            result = timedOut ? 124 : unchecked((int)childExit);
             receipt["launcherDesktopAfterChild"] = CurrentDesktop(); receipt["inputDesktopAfterChild"] = InputDesktop();
             receipt["inputDesktopNameUnchanged"] = Equals(receipt["inputDesktopAfterChild"], inputBefore);
             receipt["launcherDesktopNameUnchanged"] = Equals(receipt["launcherDesktopAfterChild"], parentBefore);
-            receipt["status"] = result == 0 ? "PASS" : result == 124 ? "TIMEOUT" : "CHILD_FAILED";
+            if (!Equals(receipt["inputDesktopNameUnchanged"], true) || !Equals(receipt["launcherDesktopNameUnchanged"], true))
+                throw new InvalidOperationException("The input or launcher desktop changed during the run.");
+            receipt["status"] = timedOut ? "TIMEOUT" : result == 0 ? "PASS" : "CHILD_FAILED";
         }
         catch (Exception error)
         {
@@ -150,50 +166,91 @@ internal static class Program
                 receipt["ownedChildEmergencyTermination"] = terminated;
                 receipt["childStopped"] = Native.WaitForSingleObject(process.Process, 10000) == 0;
             }
-            if (job != IntPtr.Zero && receipt.ContainsKey("childAssignedToOwnJob"))
+            if (job != IntPtr.Zero && receipt.ContainsKey("childAssignedToOwnJob") &&
+                !VerifyJobCleanup(receipt, () => ReadActiveJobProcesses(job), () => Native.TerminateJobObject(job, 125)))
             {
-                if (Native.QueryInformationJobObject(job, 1, out var accounting, (uint)Marshal.SizeOf<Native.JobBasicAccountingInformation>(), IntPtr.Zero))
-                {
-                    receipt["ownJobActiveProcessesBeforeCleanup"] = accounting.ActiveProcesses;
-                    if (accounting.ActiveProcesses > 0)
-                    {
-                        _ = Native.TerminateJobObject(job, 125);
-                        var cleanup = Stopwatch.StartNew();
-                        do
-                        {
-                            if (!Native.QueryInformationJobObject(job, 1, out accounting, (uint)Marshal.SizeOf<Native.JobBasicAccountingInformation>(), IntPtr.Zero)) break;
-                            if (accounting.ActiveProcesses == 0) break;
-                            Thread.Sleep(25);
-                        } while (cleanup.ElapsedMilliseconds < 10000);
-                    }
-                    receipt["ownJobActiveProcessesAfterCleanup"] = accounting.ActiveProcesses;
-                    if (accounting.ActiveProcesses != 0) { result = 125; receipt["status"] = "CLEANUP_FAILED"; }
-                }
-                else { result = 125; receipt["status"] = "CLEANUP_FAILED"; receipt["jobQueryWin32Error"] = Marshal.GetLastWin32Error(); }
+                result = 125;
+                receipt["status"] = "CLEANUP_FAILED";
             }
             Close(process.Thread); Close(process.Process);
-            Close(job); // Also removes any remaining descendants of our child.
             if (attributesInitialized) Native.DeleteProcThreadAttributeList(attributes);
             if (attributes != IntPtr.Zero) Marshal.FreeHGlobal(attributes);
             if (handles != IntPtr.Zero) Marshal.FreeHGlobal(handles);
+            if (jobs != IntPtr.Zero) Marshal.FreeHGlobal(jobs);
+            Close(job); // Also removes any remaining descendants of our child.
             Close(input); Close(output);
             if (desktop != IntPtr.Zero)
             {
                 var closed = Native.CloseDesktop(desktop); receipt["desktopClosed"] = closed;
                 if (!closed) { receipt["desktopCloseWin32Error"] = Marshal.GetLastWin32Error(); result = 125; receipt["status"] = "CLEANUP_FAILED"; }
             }
-            receipt["finishedUtc"] = DateTimeOffset.UtcNow; receipt["elapsedMs"] = watch.ElapsedMilliseconds; receipt["runnerExitCode"] = result;
-            if (config is not null)
+            if (receiptFile is not null)
             {
-                if (File.Exists(config.LogPath)) receipt["logSha256"] = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(config.LogPath)));
-                try { File.WriteAllText(config.ReceiptPath, JsonSerializer.Serialize(receipt, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false)); }
+                try
+                {
+                    if (output != InvalidHandle)
+                        receipt["logSha256"] = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(config!.LogPath)));
+                }
+                catch (Exception error)
+                {
+                    result = 125;
+                    if (!Equals(receipt["status"], "CLEANUP_FAILED")) receipt["status"] = "ERROR";
+                    receipt["logHashError"] = error.Message;
+                    Console.Error.WriteLine("Log read failed: " + error.Message);
+                }
+                receipt["finishedUtc"] = DateTimeOffset.UtcNow;
+                receipt["elapsedMs"] = watch.ElapsedMilliseconds;
+                receipt["runnerExitCode"] = result;
+                try
+                {
+                    using (receiptFile)
+                        JsonSerializer.Serialize(receiptFile, receipt, new JsonSerializerOptions { WriteIndented = true });
+                }
                 catch (Exception error) { Console.Error.WriteLine("Receipt write failed: " + error.Message); result = 125; }
             }
         }
         return result;
     }
 
-    private static void Validate(Configuration c)
+    private static (uint? Active, int Error) ReadActiveJobProcesses(IntPtr job)
+    {
+        var size = (uint)Marshal.SizeOf<Native.JobBasicAccountingInformation>();
+        if (Native.QueryInformationJobObject(job, 1, out var accounting, size, IntPtr.Zero))
+            return (accounting.ActiveProcesses, 0);
+        return (null, Marshal.GetLastWin32Error());
+    }
+
+    private static bool VerifyJobCleanup(Dictionary<string, object?> receipt, Func<(uint? Active, int Error)> query, Action terminate)
+    {
+        var snapshot = query();
+        if (snapshot.Active is not uint active)
+        {
+            receipt["jobQueryWin32Error"] = snapshot.Error;
+            return false;
+        }
+        receipt["ownJobActiveProcessesBeforeCleanup"] = active;
+        if (active != 0)
+        {
+            terminate();
+            var cleanup = Stopwatch.StartNew();
+            do
+            {
+                snapshot = query();
+                if (snapshot.Active is not uint checkedCount)
+                {
+                    receipt["jobQueryWin32Error"] = snapshot.Error;
+                    return false;
+                }
+                active = checkedCount;
+                if (active == 0) break;
+                Thread.Sleep(25);
+            } while (cleanup.ElapsedMilliseconds < 10000);
+        }
+        receipt["ownJobActiveProcessesAfterCleanup"] = active;
+        return active == 0;
+    }
+
+    private static Configuration Validate(Configuration c)
     {
         foreach (var path in new[] { c.Executable, c.WorkingDirectory, c.LogPath, c.ReceiptPath })
             if (!Path.IsPathFullyQualified(path)) throw new ArgumentException("All runner paths must be absolute.");
@@ -202,8 +259,46 @@ internal static class Program
         if (c.Arguments is null || c.Arguments.Any(argument => argument is null || argument.Contains('\0')))
             throw new ArgumentException("Arguments must be a non-null string array without NUL characters.");
         if (c.TimeoutSeconds is < 1 or > 86400) throw new ArgumentOutOfRangeException(nameof(c.TimeoutSeconds));
+        c = c with
+        {
+            Executable = Path.GetFullPath(c.Executable), WorkingDirectory = Path.GetFullPath(c.WorkingDirectory),
+            LogPath = Path.GetFullPath(c.LogPath), ReceiptPath = Path.GetFullPath(c.ReceiptPath)
+        };
         if (new[] { c.Executable, c.LogPath, c.ReceiptPath }.Distinct(StringComparer.OrdinalIgnoreCase).Count() != 3)
             throw new ArgumentException("Executable, log and receipt paths must differ.");
+        if (c.LogPath.StartsWith(c.ReceiptPath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            || c.ReceiptPath.StartsWith(c.LogPath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("The log and receipt cannot be nested.");
+        ValidateNewOutputPath(c.LogPath);
+        ValidateNewOutputPath(c.ReceiptPath);
+        return c;
+    }
+
+    private static void ValidateNewOutputPath(string path)
+    {
+        var root = Path.GetPathRoot(path)!;
+        if (path.StartsWith(@"\\?\", StringComparison.Ordinal) || path.StartsWith(@"\\.\", StringComparison.Ordinal)
+            || string.IsNullOrEmpty(Path.GetFileName(path)) || path.AsSpan(root.Length).Contains(':'))
+            throw new ArgumentException("The log and receipt must use ordinary file paths.");
+
+        var components = path[root.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+        if (components.Any(component => component.EndsWith(' ') || component.EndsWith('.') ||
+            System.Text.RegularExpressions.Regex.IsMatch(component, @"^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant)))
+            throw new ArgumentException("The log and receipt must use ordinary file paths.");
+        var current = root;
+        for (var i = -1; i < components.Length; i++)
+        {
+            if (i >= 0) current = Path.Combine(current, components[i]);
+            FileAttributes attributes;
+            try { attributes = File.GetAttributes(current); }
+            catch (FileNotFoundException) when (i >= 0) { return; }
+            catch (DirectoryNotFoundException) when (i >= 0) { return; }
+            if (i == components.Length - 1)
+                throw new IOException("Runner output already exists: " + path);
+            if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != FileAttributes.Directory)
+                throw new IOException("Runner output parent is not an ordinary directory: " + current);
+        }
     }
 
     // Windows CRT/CommandLineToArgvW quoting: each argument is quoted; backslashes
@@ -270,7 +365,7 @@ internal static class Program
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool CreateProcessW(string application, StringBuilder command, IntPtr processSecurity, IntPtr threadSecurity, [MarshalAs(UnmanagedType.Bool)] bool inherit, uint flags, IntPtr environment, string directory, ref StartupInfoEx startup, out ProcessInformation process);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] internal static extern IntPtr CreateJobObjectW(IntPtr security, string? name);
         [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JobExtendedLimitInformation info, uint bytes);
-        [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool IsProcessInJob(IntPtr process, IntPtr job, [MarshalAs(UnmanagedType.Bool)] out bool result);
         [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out JobBasicAccountingInformation info, uint bytes, IntPtr returned);
         [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] internal static extern bool TerminateJobObject(IntPtr job, uint code);
         [DllImport("kernel32.dll", SetLastError = true)] internal static extern uint ResumeThread(IntPtr thread);

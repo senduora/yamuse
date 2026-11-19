@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Net;
 using System.Net.Http;
@@ -5,13 +6,19 @@ using System.Net.Http;
 namespace YMusic.Native;
 
 internal sealed record LoudnessResult(double IntegratedLufs, double Peak);
+internal sealed record OfflineAudioEvidence(TimeSpan Duration, Mp3FrameEvidence? Mp3 = null, int? AacBitrate = null, bool ReadFailed = false)
+{
+    internal int? ConfirmedBitrate => Mp3 is { } frames ? (int)Math.Round(frames.KilobitsPerSecond) : AacBitrate;
+}
 
 // An attenuation aid, not a certified meter: BS.1770 K-weighting and two-stage
 // gating for mono/stereo. Peak is a decoded sample peak, not an oversampled true peak.
 internal static class LoudnessAnalysis
 {
     private const uint FirstAudio = 0xfffffffd, AllStreams = 0xfffffffe;
+    private const uint ReaderError = 1, EndOfStream = 2, NativeTypeChanged = 0x10, CurrentTypeChanged = 0x20, StreamTick = 0x100;
     private const int Rate = 48000;
+    private const int MaximumInitialReads = 64;
     private const long MaximumFrames = 30L * 60 * Rate;
     private const long MaximumHttpBytes = 512L * 1024 * 1024;
     private static readonly SemaphoreSlim Gate = new(1, 1);
@@ -21,11 +28,91 @@ internal static class LoudnessAnalysis
     private static readonly Guid Subtype = new("f7e34c9a-42e8-4714-b74b-cb29d72c35e5");
     private static readonly Guid Audio = new("73647561-0000-0010-8000-00aa00389b71");
     private static readonly Guid Float = new("00000003-0000-0010-8000-00aa00389b71");
+    private static readonly Guid Pcm = new("00000001-0000-0010-8000-00aa00389b71");
+    private static readonly Guid Mp3 = new("00000055-0000-0010-8000-00aa00389b71");
+    private static readonly Guid Flac = new("0000f1ac-0000-0010-8000-00aa00389b71");
+    private static readonly Guid Aac = new("00001610-0000-0010-8000-00aa00389b71");
+    private static readonly Guid AudioUserData = new("b6bc765f-4c3b-40a4-bd51-2535b66fe09d");
+    private static readonly Guid PresentationDuration = new("6c990d33-bb8e-477a-8598-0d5d96fcd88a");
     private static readonly Guid Channels = new("37e48bf5-645e-4c5b-89de-ada9e29b696a");
     private static readonly Guid SampleRate = new("5faeeae7-0290-4c31-9e8a-c534f68d9dba");
     private static readonly Guid Bits = new("f2deb57f-40fa-4764-aa33-ed4f2d1ff669");
     private static readonly Guid Alignment = new("322de230-9eeb-43bd-ab7a-ff412251541d");
     private static readonly Guid BytesPerSecond = new("1aab75c8-cfef-451c-ab95-ac034b8e1731");
+
+    internal static OfflineAudioEvidence? ProbeOfflineAudio(string path, string codec, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (!Path.IsPathFullyQualified(path) || !TrySource(path, out var source)
+            || !MatchesAudioContainer(source, codec, out var start, out var measureAac, out var length))
+            return null;
+        var evidence = ReadAudio<OfflineAudioEvidence?>(source, token,
+            (reader, cancellation) => ReadOfflineAudio(reader, codec, measureAac ? length : 0, cancellation),
+            unavailable: null, openLocalStream: true);
+        if (evidence is null || codec != "mp3") return evidence;
+        var (mp3, incompleteFrame) = Mp3FrameEvidence.Read(source, start, token);
+        if (incompleteFrame) return evidence with { ReadFailed = true };
+        if (mp3 is null) return evidence;
+        // A container estimate may include missing frames or trailing metadata.
+        var duration = evidence.Duration == TimeSpan.Zero || mp3.Duration < evidence.Duration ? mp3.Duration : evidence.Duration;
+        return evidence with { Duration = duration, Mp3 = mp3 };
+    }
+
+    private static bool MatchesAudioContainer(string path, string codec, out long start, out bool measureAac, out long length)
+    {
+        start = 0;
+        measureAac = false;
+        using var input = File.OpenRead(path);
+        length = input.Length;
+        Span<byte> header = stackalloc byte[16];
+        if (input.ReadAtLeast(header, 10, false) < 10) return false;
+        if (header[..3].SequenceEqual("ID3"u8))
+        {
+            var size = BinaryPrimitives.ReadUInt32BigEndian(header[6..10]);
+            if ((size & 0x80808080) != 0) return false;
+            start = 10L + ((size >> 24) << 21) + (((size >> 16) & 127) << 14) + (((size >> 8) & 127) << 7) + (size & 127);
+            if (header[3] == 4 && (header[5] & 0x10) != 0) start += 10; // ID3v2.4 footer
+            if (start >= length) return false;
+            input.Position = start;
+            if (input.ReadAtLeast(header, 10, false) < 10) return false;
+        }
+        if (codec is "aac" or "aac-mp4" or "he-aac" or "he-aac-mp4")
+        {
+            measureAac = HasFileTypeBox(input, start);
+            return measureAac || (codec is "aac" or "he-aac") && header[0] == 0xff && (header[1] & 0xf6) == 0xf0;
+        }
+        return codec switch
+        {
+            "mp3" => header[0] == 0xff && (header[1] & 0xe6) == 0xe2,
+            "flac" => header[..4].SequenceEqual("fLaC"u8),
+            "flac-mp4" => HasFileTypeBox(input, start),
+            _ => false
+        };
+    }
+
+    private static bool HasFileTypeBox(FileStream file, long start)
+    {
+        Span<byte> box = stackalloc byte[16];
+        for (var i = 0; i < 16 && file.Length - start >= 8; i++)
+        {
+            file.Position = start;
+            file.ReadExactly(box[..8]);
+            ulong length = BinaryPrimitives.ReadUInt32BigEndian(box);
+            var headerSize = 8;
+            if (length == 1)
+            {
+                if (file.Length - start < 16) return false;
+                file.ReadExactly(box[8..]);
+                length = BinaryPrimitives.ReadUInt64BigEndian(box[8..]);
+                headerSize = 16;
+            }
+            if (length < (ulong)headerSize || length > (ulong)(file.Length - start)) return false;
+            if (box[4..8].SequenceEqual("ftyp"u8)) return length >= (ulong)(headerSize + 8);
+            if (!(box[4..8].SequenceEqual("free"u8) || box[4..8].SequenceEqual("skip"u8) || box[4..8].SequenceEqual("wide"u8))) return false;
+            start += (long)length;
+        }
+        return false;
+    }
 
     internal static async Task<LoudnessResult?> AnalyzeAsync(string source, CancellationToken token)
     {
@@ -91,16 +178,21 @@ internal static class LoudnessAnalysis
         if (string.IsNullOrWhiteSpace(source)) return false;
         try
         {
-            if (Uri.TryCreate(source, UriKind.Absolute, out var uri) && !uri.IsFile)
+            var local = source;
+            if (!Path.IsPathFullyQualified(source) && Uri.TryCreate(source, UriKind.Absolute, out var uri))
             {
-                if (uri.Scheme != Uri.UriSchemeHttp || uri.Host != "127.0.0.1" || uri.Port <= 0
-                    || uri.UserInfo.Length != 0 || uri.Fragment.Length != 0) return false;
-                trusted = uri.AbsoluteUri; return true;
+                if (!uri.IsFile)
+                {
+                    if (uri.Scheme != Uri.UriSchemeHttp || uri.Host != "127.0.0.1" || uri.Port <= 0
+                        || uri.UserInfo.Length != 0 || uri.Fragment.Length != 0) return false;
+                    trusted = uri.AbsoluteUri; return true;
+                }
+                local = uri.LocalPath;
             }
-            var local = uri is { IsFile: true } ? uri.LocalPath : source;
-            if (!Path.IsPathFullyQualified(local) || local.StartsWith("\\\\", StringComparison.Ordinal)) return false;
+            if (!Path.IsPathFullyQualified(local)) return false;
             var file = new FileInfo(Path.GetFullPath(local));
-            if (!file.Exists || file.Length == 0 || (file.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+            if (file.FullName.StartsWith("\\\\", StringComparison.Ordinal) || !file.Exists || file.Length == 0
+                || (file.Attributes & FileAttributes.ReparsePoint) != 0) return false;
             for (var part = file.Directory; part is not null; part = part.Parent)
                 if ((part.Attributes & FileAttributes.ReparsePoint) != 0) return false;
             trusted = file.FullName; return true;
@@ -109,8 +201,12 @@ internal static class LoudnessAnalysis
     }
 
     private static LoudnessResult? AnalyzeCore(string source, CancellationToken token)
+        => ReadAudio<LoudnessResult?>(source, token, Measure, unavailable: null, openLocalStream: true);
+
+    private static TResult ReadAudio<TResult>(string source, CancellationToken token, Func<IntPtr, CancellationToken, TResult> readAudio,
+        TResult unavailable, bool openLocalStream = false)
     {
-        IntPtr reader = IntPtr.Zero, requested = IntPtr.Zero, actual = IntPtr.Zero;
+        IntPtr reader = IntPtr.Zero, stream = IntPtr.Zero;
         var comStarted = false; var mediaStarted = false;
         var cancellationGate = new object();
         var cancellationReader = IntPtr.Zero;
@@ -121,7 +217,13 @@ internal static class LoudnessAnalysis
             token.ThrowIfCancellationRequested();
             Check(CoInitializeEx(IntPtr.Zero, 0)); comStarted = true;
             Check(MFStartup(0x00020070, 0)); mediaStarted = true;
-            Check(MFCreateSourceReaderFromURL(source, IntPtr.Zero, out reader));
+            if (openLocalStream)
+            {
+                // The URL resolver rejects long local paths. Open an existing byte stream read-only.
+                Check(MFCreateFile(1, 0, 0, @"\\?\" + source, out stream)); // MF_ACCESSMODE_READ, MF_OPENMODE_FAIL_IF_NOT_EXIST
+                Check(MFCreateSourceReaderFromByteStream(stream, IntPtr.Zero, out reader));
+            }
+            else Check(MFCreateSourceReaderFromURL(source, IntPtr.Zero, out reader));
             lock (cancellationGate) cancellationReader = reader;
             cancellation = token.UnsafeRegister(_ =>
             {
@@ -143,6 +245,214 @@ internal static class LoudnessAnalysis
             token.ThrowIfCancellationRequested();
             var select = Method<SetStreamSelection>(reader, 4);
             Check(select(reader, AllStreams, 0)); Check(select(reader, FirstAudio, 1));
+            return readAudio(reader, token);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+        catch (Exception ex) when (ex is COMException or DllNotFoundException or EntryPointNotFoundException or IOException
+            or UnauthorizedAccessException or ArgumentException or InvalidDataException or NotSupportedException)
+        { token.ThrowIfCancellationRequested(); return unavailable; }
+        finally
+        {
+            lock (cancellationGate) cancellationReader = IntPtr.Zero;
+            cancellation.Dispose();
+            // Keep the MF platform alive until the cancellation flush has stopped using this reader.
+            flush?.GetAwaiter().GetResult();
+            Release(ref reader);
+            Release(ref stream);
+            if (mediaStarted) _ = MFShutdown();
+            if (comStarted) CoUninitialize();
+        }
+    }
+
+    private static OfflineAudioEvidence? ReadOfflineAudio(IntPtr reader, string codec, long measureAacBytes, CancellationToken token)
+    {
+        var expected = codec switch { "mp3" => Mp3, "flac" or "flac-mp4" => Flac, _ => Aac };
+        IntPtr native = IntPtr.Zero;
+        try
+        {
+            Check(Method<GetNativeMediaType>(reader, 5)(reader, FirstAudio, 0, out native));
+            Check(Method<GetGuid>(native, 10)(native, Subtype, out var observed));
+            if (observed != expected || !ReadFirstSample(reader, token)) return null;
+            if ((codec is "he-aac" or "he-aac-mp4") && !HasHeAacEvidence(reader, native)) return null;
+            var presentation = ReadPresentationDuration(reader);
+            return measureAacBytes > 0
+                ? ReadMp4AacEvidence(reader, native, presentation, measureAacBytes, token)
+                : new(presentation);
+        }
+        finally { Release(ref native); }
+    }
+
+    private static TimeSpan ReadPresentationDuration(IntPtr reader)
+    {
+        const uint mediaSource = uint.MaxValue;
+        PropVariant value = default;
+        try
+        {
+            var status = Method<GetPresentationAttribute>(reader, 12)(reader, mediaSource, PresentationDuration, out value);
+            return status >= 0 && value.Type == 21 && value.Ticks > 0 ? TimeSpan.FromTicks(value.Ticks) : TimeSpan.Zero;
+        }
+        finally { _ = PropVariantClear(ref value); }
+    }
+
+    private static OfflineAudioEvidence ReadMp4AacEvidence(IntPtr reader, IntPtr native, TimeSpan presentation, long fileBytes,
+        CancellationToken token)
+    {
+        // Request the original compressed type and count only this audio track's
+        // delivered samples. Take neither esds bitrate nor whole container size as the rate.
+        if (Method<SetMediaType>(reader, 7)(reader, FirstAudio, IntPtr.Zero, native) < 0
+            || Method<SetCurrentPosition>(reader, 8)(reader, Guid.Empty, new PropVariant { Type = 20 }) < 0) return new(presentation);
+        var read = Method<ReadSample>(reader, 9);
+        var getLength = default(GetCount);
+        var getDuration = default(GetSampleDuration);
+        return ReadAacEvidence(presentation, fileBytes, ReadPacket, token);
+
+        AacPacketRead ReadPacket()
+        {
+            IntPtr sample = IntPtr.Zero;
+            try
+            {
+                var status = read(reader, FirstAudio, 0, out _, out var flags, out _, out sample);
+                if (status < 0 || (flags & ReaderError) != 0 || sample == IntPtr.Zero) return new(status, flags, HasSample: false);
+                getLength ??= Method<GetCount>(sample, 45);
+                getDuration ??= Method<GetSampleDuration>(sample, 37);
+                uint? size = getLength(sample, out var bytes) >= 0 ? bytes : null;
+                long? duration = getDuration(sample, out var ticks) >= 0 ? ticks : null;
+                return new(status, flags, HasSample: true, size, duration);
+            }
+            finally { Release(ref sample); }
+        }
+    }
+
+    internal readonly record struct AacPacketRead(int Status, uint Flags, bool HasSample, uint? Bytes = null, long? DurationTicks = null);
+
+    internal static OfflineAudioEvidence ReadAacEvidence(TimeSpan presentation, long fileBytes, Func<AacPacketRead> read,
+        CancellationToken token)
+    {
+        long bytes = 0, ticks = 0;
+        var durationKnown = true;
+        var rateKnown = true;
+        for (var attempt = 0; attempt < 1_000_000; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            var packet = read();
+            token.ThrowIfCancellationRequested();
+            if (packet.Status < 0 || (packet.Flags & ReaderError) != 0) return new(presentation, ReadFailed: true);
+
+            // Changes or gaps make the rate uncertain. Keep checking the remaining
+            // reads even if an optional sample property was absent.
+            if ((packet.Flags & StreamTick) != 0) durationKnown = false;
+            if ((packet.Flags & (NativeTypeChanged | CurrentTypeChanged)) != 0) rateKnown = false;
+            if (packet.HasSample)
+            {
+                if (packet.Bytes is > 0 && packet.Bytes.Value <= fileBytes - bytes) bytes += packet.Bytes.Value;
+                else rateKnown = false;
+                if (packet.DurationTicks is > 0 && packet.DurationTicks.Value <= long.MaxValue - ticks) ticks += packet.DurationTicks.Value;
+                else durationKnown = false;
+            }
+            if ((packet.Flags & EndOfStream) == 0) continue;
+            if (!durationKnown || ticks == 0) return new(presentation);
+            // Only the selected audio stream's timing is comparable to the catalogue track.
+            var selectedDuration = TimeSpan.FromTicks(ticks);
+            var bitrate = bytes * (8d * TimeSpan.TicksPerSecond / 1000) / ticks;
+            return new(selectedDuration, AacBitrate: rateKnown && bitrate is >= 1 and <= 1536 ? (int)Math.Round(bitrate) : null);
+        }
+        return new(presentation);
+    }
+
+    private static bool HasHeAacEvidence(IntPtr reader, IntPtr native)
+    {
+        const int heaacWaveInfoBytes = 12;
+        if (Method<GetUInt32>(native, 14)(native, AudioUserData, out var size) >= 0
+            && size is > heaacWaveInfoBytes and <= 256)
+        {
+            var bytes = new byte[size];
+            if (Method<GetBlob>(native, 15)(native, AudioUserData, bytes, size, out var read) >= 0
+                && read is > heaacWaveInfoBytes and <= 256 && read <= size
+                && SignalsHeAac(bytes.AsSpan(heaacWaveInfoBytes, (int)read - heaacWaveInfoBytes)))
+                return true;
+        }
+
+        // With no requested PCM frequency, actual SBR doubles the native AAC-LC core rate.
+        IntPtr decoded = IntPtr.Zero;
+        try
+        {
+            Check(Method<GetMediaType>(reader, 6)(reader, FirstAudio, out decoded));
+            var core = GetUInt(native, SampleRate);
+            return core is >= 8000 and <= 24000 && GetUInt(decoded, SampleRate) == core * 2;
+        }
+        finally { Release(ref decoded); }
+    }
+
+    private static bool SignalsHeAac(ReadOnlySpan<byte> config)
+    {
+        var offset = 0;
+        var type = ReadAacBits(config, ref offset, 5);
+        if (!SkipAacFrequency(config, ref offset)) return false;
+        var channels = ReadAacBits(config, ref offset, 4);
+        if (type is 5 or 29)
+            return channels >= 0 && SkipAacFrequency(config, ref offset) && ReadAacBits(config, ref offset, 5) == 2;
+        if (type != 2 || channels <= 0 || ReadAacBits(config, ref offset, 1) < 0) return false;
+        var dependsOnCore = ReadAacBits(config, ref offset, 1);
+        if (dependsOnCore < 0 || (dependsOnCore == 1 && ReadAacBits(config, ref offset, 14) < 0)) return false;
+        var extension = ReadAacBits(config, ref offset, 1);
+        if (extension < 0 || (extension == 1 && ReadAacBits(config, ref offset, 1) != 0)) return false;
+        return ReadAacBits(config, ref offset, 11) == 0x2b7 && ReadAacBits(config, ref offset, 5) == 5
+            && ReadAacBits(config, ref offset, 1) == 1 && SkipAacFrequency(config, ref offset);
+    }
+
+    private static bool SkipAacFrequency(ReadOnlySpan<byte> config, ref int offset)
+    {
+        var index = ReadAacBits(config, ref offset, 4);
+        return index is >= 0 and <= 12 || (index == 15 && ReadAacBits(config, ref offset, 24) > 0);
+    }
+
+    private static int ReadAacBits(ReadOnlySpan<byte> config, ref int offset, int count)
+    {
+        if (offset + count > config.Length * 8) return -1;
+        var value = 0;
+        for (var end = offset + count; offset < end; offset++)
+            value = (value << 1) | ((config[offset / 8] >> (7 - offset % 8)) & 1);
+        return value;
+    }
+
+    private static bool ReadFirstSample(IntPtr reader, CancellationToken token)
+    {
+        IntPtr requested = IntPtr.Zero;
+        try
+        {
+            Check(MFCreateMediaType(out requested));
+            SetGuid(requested, Major, Audio);
+            SetGuid(requested, Subtype, Pcm);
+            Check(Method<SetMediaType>(reader, 7)(reader, FirstAudio, IntPtr.Zero, requested));
+            var read = Method<ReadSample>(reader, 9);
+            for (var attempt = 0; attempt < MaximumInitialReads; attempt++)
+            {
+                token.ThrowIfCancellationRequested();
+                IntPtr sample = IntPtr.Zero;
+                try
+                {
+                    Check(read(reader, FirstAudio, 0, out _, out var flags, out _, out sample));
+                    token.ThrowIfCancellationRequested();
+                    if ((flags & 1) != 0) return false;
+                    if (sample != IntPtr.Zero)
+                    {
+                        Check(Method<GetCount>(sample, 45)(sample, out var bytes)); // IMFSample::GetTotalLength
+                        if (bytes != 0) return true;
+                    }
+                    if ((flags & 2) != 0) return false;
+                }
+                finally { Release(ref sample); }
+            }
+            return false;
+        }
+        finally { Release(ref requested); }
+    }
+
+    private static LoudnessResult? Measure(IntPtr reader, CancellationToken token)
+    {
+        IntPtr requested = IntPtr.Zero, actual = IntPtr.Zero;
+        try
+        {
             Check(Method<GetMediaType>(reader, 6)(reader, FirstAudio, out actual));
             var channels = GetUInt(actual, Channels);
             if (channels is < 1 or > 2) return null;
@@ -185,21 +495,7 @@ internal static class LoudnessAnalysis
                 finally { Release(ref sample); }
             }
         }
-        catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-        catch (Exception ex) when (ex is COMException or DllNotFoundException or EntryPointNotFoundException or IOException
-            or UnauthorizedAccessException or ArgumentException or InvalidDataException or NotSupportedException)
-        { token.ThrowIfCancellationRequested(); return null; }
-        finally
-        {
-            lock (cancellationGate) cancellationReader = IntPtr.Zero;
-            cancellation.Dispose();
-            // Keep the global analysis gate and MF platform alive until the
-            // cancellation flush has stopped using this reader.
-            flush?.GetAwaiter().GetResult();
-            Release(ref actual); Release(ref requested); Release(ref reader);
-            if (mediaStarted) _ = MFShutdown();
-            if (comStarted) CoUninitialize();
-        }
+        finally { Release(ref actual); Release(ref requested); }
     }
 
     private static bool ReadBuffers(IntPtr sample, Meter meter, float[] scratch, CancellationToken token)
@@ -309,12 +605,18 @@ internal static class LoudnessAnalysis
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int SetStreamSelection(IntPtr self, uint stream, int selected);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetMediaType(IntPtr self, uint stream, out IntPtr type);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetNativeMediaType(IntPtr self, uint stream, uint index, out IntPtr type);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetPresentationAttribute(IntPtr self, uint stream, [In] in Guid key, out PropVariant value);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int SetMediaType(IntPtr self, uint stream, IntPtr reserved, IntPtr type);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int SetCurrentPosition(IntPtr self, [In] in Guid format, [In] in PropVariant position);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetSampleDuration(IntPtr self, out long duration);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int ReadSample(IntPtr self, uint stream, uint control, out uint actual, out uint flags, out long timestamp, out IntPtr sample);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int FlushReader(IntPtr self, uint stream);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetUInt32(IntPtr self, [In] in Guid key, out uint value);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int SetUInt32(IntPtr self, [In] in Guid key, uint value);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetGuid(IntPtr self, [In] in Guid key, out Guid value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetBlob(IntPtr self, [In] in Guid key,
+        [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 3)] byte[] data, uint size, out uint read);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int SetGuidValue(IntPtr self, [In] in Guid key, [In] in Guid value);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetCount(IntPtr self, out uint count);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetBuffer(IntPtr self, uint index, out IntPtr buffer);
@@ -323,9 +625,21 @@ internal static class LoudnessAnalysis
 
     [DllImport("ole32.dll", ExactSpelling = true)] private static extern int CoInitializeEx(IntPtr reserved, uint coInit);
     [DllImport("ole32.dll", ExactSpelling = true)] private static extern void CoUninitialize();
+    [DllImport("ole32.dll", ExactSpelling = true)] private static extern int PropVariantClear(ref PropVariant value);
     [DllImport("mfplat.dll", ExactSpelling = true)] private static extern int MFStartup(uint version, uint flags);
     [DllImport("mfplat.dll", ExactSpelling = true)] private static extern int MFShutdown();
     [DllImport("mfplat.dll", ExactSpelling = true)] private static extern int MFCreateMediaType(out IntPtr type);
+    [DllImport("mfplat.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern int MFCreateFile(int accessMode, int openMode, int flags, string source, out IntPtr stream);
     [DllImport("mfreadwrite.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
     private static extern int MFCreateSourceReaderFromURL([MarshalAs(UnmanagedType.LPWStr)] string source, IntPtr attributes, out IntPtr reader);
+    [DllImport("mfreadwrite.dll", ExactSpelling = true)]
+    private static extern int MFCreateSourceReaderFromByteStream(IntPtr stream, IntPtr attributes, out IntPtr reader);
+
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
+    private struct PropVariant
+    {
+        [FieldOffset(0)] internal ushort Type;
+        [FieldOffset(8)] internal long Ticks;
+    }
 }

@@ -1,5 +1,8 @@
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using YMusic.Native;
@@ -123,7 +126,7 @@ internal static partial class Program
             await Throws<JsonException>(() => store.SaveInBackgroundAsync(snapshot with { Tracks = [wide with { Title = new string('X', 4097) }] }));
             await Throws<JsonException>(() => store.SaveInBackgroundAsync(snapshot with { Tracks = [wide with { Artists = Enumerable.Repeat(new ArtistReference("301", "Artist"), 101).ToArray() }] }));
             Assert(before.SequenceEqual(File.ReadAllBytes(store.FilePath("fixture-account-A")))
-                && !Directory.EnumerateFiles(Path.GetDirectoryName(store.FilePath("fixture-account-A"))!, ".favorites-cache-*.tmp").Any(),
+                && !Directory.EnumerateFiles(Path.GetDirectoryName(store.FilePath("fixture-account-A"))!, "*.tmp").Any(),
                 "failed bounded write changed the previous cache or leaked a temporary file");
         });
 
@@ -140,10 +143,64 @@ internal static partial class Program
             }
             Assert(rejected, "locked destination did not reject atomic replacement");
             Assert(before.SequenceEqual(File.ReadAllBytes(path)) && File.ReadAllText(unrelated) == "keep"
-                && Directory.EnumerateFiles(Path.GetDirectoryName(path)!, ".favorites-cache-*.tmp").Single() == unrelated,
+                && Directory.EnumerateFiles(Path.GetDirectoryName(path)!, "*.tmp").Single() == unrelated,
                 "failed rename damaged cache, leaked own temporary or removed another file");
             await store.SaveInBackgroundAsync(FcSnapshot(id: "202"));
             Assert(store.Load("fixture-account-A")!.Tracks[0].Id == "202", "writer did not recover after a locked destination");
+        });
+
+        await Run("FavoritesCacheStore: replacement retains DACL and refuses to discard NTFS metadata streams", async () =>
+        {
+            var store = new FavoritesCacheStore(FcDirectory("file-metadata"));
+            var path = store.FilePath("fixture-account-A");
+            if (new DriveInfo(Path.GetPathRoot(path)!).DriveFormat != "NTFS") return;
+            await store.SaveInBackgroundAsync(FcSnapshot());
+            using (var handle = File.OpenHandle(path))
+                Assert(!FileSecurityPreservation.HasNamedDataStreams(handle), "an ordinary cache has no named streams");
+            var file = new FileInfo(path);
+            var access = file.GetAccessControl(AccessControlSections.Access);
+            access.SetAccessRuleProtection(isProtected: true, preserveInheritance: true);
+            var fixtureSid = new SecurityIdentifier("S-1-5-21-111111111-222222222-333333333-4444");
+            access.AddAccessRule(new FileSystemAccessRule(fixtureSid, FileSystemRights.ReadData, AccessControlType.Deny));
+            file.SetAccessControl(access);
+            var expectedDacl = file.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access);
+            var expectedCreated = new DateTime(2020, 2, 3, 4, 5, 6, DateTimeKind.Utc);
+            File.SetCreationTimeUtc(path, expectedCreated);
+            await store.SaveInBackgroundAsync(FcSnapshot(id: "202"));
+            Assert(store.Load("fixture-account-A")!.Tracks.Single().Id == "202" && File.GetCreationTimeUtc(path) == expectedCreated
+                && file.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access) == expectedDacl,
+                "replacement lost the cached track, creation time or DACL");
+            var streamPath = path + ":yamuse-fixture";
+            File.WriteAllText(streamPath, "synthetic NTFS metadata");
+            using (var handle = File.OpenHandle(path))
+                Assert(FileSecurityPreservation.HasNamedDataStreams(handle), "named stream was not found on the opened file");
+            var before = File.ReadAllBytes(path);
+            await Throws<IOException>(() => store.SaveInBackgroundAsync(FcSnapshot(id: "303")));
+            Assert(before.SequenceEqual(File.ReadAllBytes(path)) && store.Load("fixture-account-A")!.Tracks.Single().Id == "202"
+                && File.ReadAllText(streamPath) == "synthetic NTFS metadata"
+                && !Directory.EnumerateFiles(Path.GetDirectoryName(path)!, "*.tmp").Any(), "refused replacement modified existing data or leaked a stage");
+        });
+
+        await Run("FavoritesCacheStore: explicit Windows integrity policy differs from an unlabeled stage", async () =>
+        {
+            Assert(FcIntegrityPolicy("O:SY").Length == 0 && FcIntegrityPolicy("S:(ML;;NW;;;LW)").Length > 0
+                && !FcIntegrityPolicy("S:(ML;;NW;;;LW)").SequenceEqual(FcIntegrityPolicy("S:(ML;;NRNW;;;LW)")),
+                "security descriptor comparison omitted the explicit integrity level or policy mask");
+            var directory = FcDirectory("integrity-label");
+            var store = new FavoritesCacheStore(directory);
+            var path = store.FilePath("fixture-account-A");
+            if (new DriveInfo(Path.GetPathRoot(path)!).DriveFormat != "NTFS") return;
+            await store.SaveInBackgroundAsync(FcSnapshot());
+            if (!TrySetFixtureIntegrityLabel(path)) return;
+            var originalPolicy = ReadFixtureIntegrityLabel(path);
+            // Some filesystem environments accept the set call without storing the label.
+            if (originalPolicy.Length == 0) return;
+            var original = File.ReadAllBytes(path);
+            var staged = false;
+            var updating = new FavoritesCacheStore(directory, Task.Run, () => staged = true);
+            await Throws<IOException>(() => updating.SaveInBackgroundAsync(FcSnapshot(id: "202")));
+            Assert(!staged && original.SequenceEqual(File.ReadAllBytes(path)) && ReadFixtureIntegrityLabel(path).SequenceEqual(originalPolicy)
+                && !Directory.EnumerateFiles(Path.GetDirectoryName(path)!, "*.tmp").Any(), "replacement bypassed or changed the original integrity policy");
         });
 
         await Run("FavoritesCacheStore: latest admission wins with reversed queued workers and frozen caller data", async () =>
@@ -250,6 +307,27 @@ internal static partial class Program
 
     private static string FcDirectory(string name)
     { var directory = Path.Combine(_directory, "favorites-cache-store", name); Directory.CreateDirectory(directory); return directory; }
+    private static bool TrySetFixtureIntegrityLabel(string path)
+    {
+        var start = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "icacls.exe"))
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true };
+        start.ArgumentList.Add(path);
+        start.ArgumentList.Add("/setintegritylevel");
+        start.ArgumentList.Add("L");
+        using var process = Process.Start(start) ?? throw new IOException("Could not start icacls for the isolated fixture.");
+        return process.WaitForExit(5000) && process.ExitCode == 0;
+    }
+    private static byte[] ReadFixtureIntegrityLabel(string path)
+    {
+        using var handle = File.OpenHandle(path);
+        return FileSecurityPreservation.ReadLabelAndScope(handle);
+    }
+    private static byte[] FcIntegrityPolicy(string sddl)
+    {
+        Assert(FcConvertSecurityDescriptor(sddl, 1, out var descriptor, out _), "could not build synthetic security descriptor");
+        try { return FileSecurityPreservation.ReadPolicyEntries(descriptor); }
+        finally { _ = FcFreeSecurityDescriptor(descriptor); }
+    }
     private static FavoritesCacheSnapshot FcSnapshot(string uid = "fixture-account-A", string id = "101")
         => FavoritesCacheStore.Capture(uid, [FcTrack(id)], DateTimeOffset.UtcNow);
     private static TrackRow FcTrack(string id, string? requestId = null) => new()
@@ -272,4 +350,9 @@ internal static partial class Program
     [DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool FcCreateHardLink(string path, string target, IntPtr securityAttributes);
+    [DllImport("advapi32.dll", EntryPoint = "ConvertStringSecurityDescriptorToSecurityDescriptorW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FcConvertSecurityDescriptor(string text, uint revision, out IntPtr descriptor, out uint size);
+    [DllImport("kernel32.dll", EntryPoint = "LocalFree", ExactSpelling = true)]
+    private static extern IntPtr FcFreeSecurityDescriptor(IntPtr descriptor);
 }

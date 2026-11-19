@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Win32.SafeHandles;
 
 namespace YMusic.Native;
 
@@ -104,22 +105,47 @@ internal sealed class ListSortStore(string directory)
         "catalog:search:playlist" or "catalog:search:collections" or "downloads";
     internal Dictionary<string, ListSortRule> Load()
     {
+        try { return ReadRules(GuardedStoreFile.Read(_path, MaximumFileBytes)); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return []; }
+    }
+
+    internal Dictionary<string, ListSortRule> SaveChanges(IReadOnlyDictionary<string, ListSortRule> changes)
+    {
+        using var storage = GuardedStoreFile.BeginWrite(_path);
+        var rules = ReadRules(storage.ReadExisting(MaximumFileBytes));
+        foreach (var (context, rule) in changes)
+            if (ValidContext(context) && rule is not null && Enum.IsDefined(rule.Field))
+                rules[context] = Normalize(rule);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(rules, Json);
+        if (bytes.Length > MaximumFileBytes) throw new IOException("Слишком большой файл сортировки.");
+        storage.Write(bytes);
+        return rules;
+    }
+
+    private static Dictionary<string, ListSortRule> ReadRules(byte[]? bytes)
+    {
+        if (bytes is null) return [];
         try
         {
-            if (GuardedStoreFile.Read(_path, MaximumFileBytes) is not { } bytes) return [];
             var values = JsonSerializer.Deserialize<Dictionary<string, ListSortRule?>>(bytes, Json);
             return values?.Where(p => ValidContext(p.Key) && p.Value is { } rule && Enum.IsDefined(rule.Field))
                 .ToDictionary(p => p.Key, p => Normalize(p.Value!), StringComparer.Ordinal) ?? [];
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException) { return []; }
+        catch (JsonException) { return []; }
     }
-    internal void Save(IReadOnlyDictionary<string, ListSortRule> rules)
+
+    internal static bool IsOwnedFile(SafeFileHandle file)
     {
-        var safe = rules.Where(p => ValidContext(p.Key) && p.Value is { } rule && Enum.IsDefined(rule.Field))
-            .ToDictionary(p => p.Key, p => Normalize(p.Value), StringComparer.Ordinal);
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(safe, Json);
-        if (bytes.Length > MaximumFileBytes) throw new IOException("Слишком большой файл сортировки.");
-        GuardedStoreFile.Write(_path, bytes);
+        if (GuardedStoreFile.ReadFromHandle(file, MaximumFileBytes) is not { } bytes) return false;
+        try
+        {
+            var options = new JsonSerializerOptions(Json)
+                { AllowDuplicateProperties = false, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow, MaxDepth = 8 };
+            return JsonSerializer.Deserialize<Dictionary<string, ListSortRule?>>(bytes, options) is { Count: > 0 } rules
+                && rules.All(pair => ValidContext(pair.Key) && pair.Value is { } rule && Enum.IsDefined(rule.Field));
+        }
+        catch (JsonException) { return false; }
     }
+
     private static ListSortRule Normalize(ListSortRule rule) => rule.Field == ListSortField.Original ? new() : rule;
 }

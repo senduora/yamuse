@@ -4,6 +4,8 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using YMusic.Native;
 
@@ -13,7 +15,137 @@ internal static partial class Program
     {
         await Run("SmoothScroll016: actual navigation keeps clamped edge packets smooth at both ends", Smooth016NavigationEdges);
         await Run("SmoothScroll016: edge reversal manual scrollbar and changed extent preserve native control", Smooth016Interruptions);
+        await Run("SmoothScroll016: a queued subpixel acknowledgement preserves the next animation", Smooth016PrecisionHandoff);
+        await Run("SmoothScroll016: immediate wheel preserves full and precision movement before layout in both orders", Smooth016WithoutMotion);
         await Run("SmoothScroll016: partial last row reaches exact edge without losing long-list virtualization", Smooth016VirtualizedEdge);
+    }
+
+    private static async Task Smooth016WithoutMotion()
+    {
+        var lines = SystemParameters.WheelScrollLines;
+        var body = new Border { Height = 1500 };
+        var viewer = new ScrollViewer { Content = body, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            CanContentScroll = false, UseLayoutRounding = false };
+        SmoothScroll.SetEnabled(viewer, true);
+        var window = new Window { Content = viewer, Width = 350, Height = 400, Left = -16000, Top = 0,
+            ShowActivated = false, ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.Manual };
+        var previousRenderMode = RenderOptions.ProcessRenderMode;
+        try
+        {
+            RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly;
+            Assert(!Motion.CanAnimate, "fixture did not select the immediate wheel path");
+            window.Show();
+            await Task.Delay(100);
+            window.UpdateLayout();
+            await CheckImmediateWheel(viewer, body, 48);
+
+            using var virtualFixture = new DownloadCenterFixture("smooth016-immediate-virtualized", 1);
+            var rows = Enumerable.Range(0, 400).Select(index => DcTrack("smooth016-immediate-" + index)).ToArray();
+            SaInvoke(virtualFixture.Window, "ShowRows", (object)rows);
+            var list = Control<ListView>(virtualFixture.Window, "TracksList");
+            await Task.Delay(100);
+            virtualFixture.Window.UpdateLayout();
+            var virtualViewer = SaVisuals<ScrollViewer>(list).First();
+            Assert(VirtualizingPanel.GetIsVirtualizing(list) && VirtualizingPanel.GetScrollUnit(list) == ScrollUnit.Pixel,
+                "the immediate wheel fixture did not use the shipped virtualized pixel list");
+            await CheckImmediateWheel(virtualViewer, virtualViewer, lines < 0 ? virtualViewer.ViewportHeight : lines * 16d);
+        }
+        finally
+        {
+            window.Close();
+            RenderOptions.ProcessRenderMode = previousRenderMode;
+        }
+
+        async Task CheckImmediateWheel(ScrollViewer targetViewer, UIElement source, double notch)
+        {
+            var settingsStep = lines < 0 ? targetViewer.ViewportHeight : lines * 16d;
+            await Smooth016Place(targetViewer, 80);
+            var start = targetViewer.VerticalOffset;
+            var state = Smooth016State(targetViewer);
+            var handleWheel = state.GetType().GetMethod("HandleWheel", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            foreach (var delta in new[] { -120, -2, 120 })
+            {
+                var zeroLines = new MouseWheelEventArgs(Mouse.PrimaryDevice, Environment.TickCount, delta)
+                { RoutedEvent = Mouse.PreviewMouseWheelEvent, Source = source };
+                handleWheel.Invoke(state, [zeroLines, 0]);
+                Assert(zeroLines.Handled, "zero wheel lines allowed WPF to apply a native step");
+            }
+            targetViewer.UpdateLayout();
+            Assert(Math.Abs(targetViewer.VerticalOffset - start) <= .1, "zero wheel lines changed the offset");
+            if (lines == 0) return;
+
+            await Smooth016Place(targetViewer, Math.Min(start + notch + 2 * settingsStep / 120, targetViewer.ScrollableHeight));
+            var expected = targetViewer.VerticalOffset;
+            foreach (var fullFirst in new[] { false, true })
+            {
+                await Smooth016Place(targetViewer, start);
+                var first = ScrollWheel(source, fullFirst ? -120 : -2);
+                Assert(first.Handled == !fullFirst, "a standalone full step lost the native route");
+                if (!first.Handled) CompleteNativeWheel(source, first);
+                var second = ScrollWheel(source, fullFirst ? -2 : -120);
+                Assert(first.Handled && second.Handled && !SmoothScroll.IsAnimating(targetViewer),
+                    "fixture did not route both immediate wheel events");
+                targetViewer.UpdateLayout();
+                await Until(() => Math.Abs(targetViewer.VerticalOffset - expected) <= .1);
+            }
+
+            await Smooth016Place(targetViewer, Math.Min(start + notch, targetViewer.ScrollableHeight));
+            var nativeExpected = targetViewer.VerticalOffset;
+            await Smooth016Place(targetViewer, start);
+            SmoothScroll.ScrollTo(targetViewer, Math.Min(start + notch + 350, targetViewer.ScrollableHeight));
+            var native = ScrollWheel(source, -120);
+            Assert(!native.Handled, "manual takeover lost the standalone native route");
+            CompleteNativeWheel(source, native);
+            await Task.Delay(60);
+            targetViewer.UpdateLayout();
+            Assert(native.Handled && !SmoothScroll.IsAnimating(targetViewer) && Math.Abs(targetViewer.VerticalOffset - nativeExpected) <= .1,
+                "the queued programmatic offset replaced a manual wheel step");
+        }
+
+        static void CompleteNativeWheel(UIElement source, MouseWheelEventArgs args)
+        {
+            args.RoutedEvent = Mouse.MouseWheelEvent;
+            source.RaiseEvent(args);
+        }
+    }
+
+    private static async Task Smooth016PrecisionHandoff()
+    {
+        var lines = SystemParameters.WheelScrollLines;
+        if (!Motion.CanAnimate || lines == 0) return;
+        var body = new Border { Height = 1500 };
+        var viewer = new ScrollViewer { Content = body, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            CanContentScroll = false, UseLayoutRounding = false };
+        SmoothScroll.SetEnabled(viewer, true);
+        var window = new Window { Content = viewer, Width = 350, Height = 400, Left = -16000, Top = 0,
+            ShowActivated = false, ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.Manual };
+        window.Show();
+        try
+        {
+            await Task.Delay(100);
+            window.UpdateLayout();
+            var notch = lines < 0 ? viewer.ViewportHeight : lines * 16d;
+            var delta = Math.Max(1, (int)(108 / notch));
+            var precise = delta * notch / 120;
+            var roundTrip = precise > 1 || notch >= viewer.ScrollableHeight - 100;
+            foreach (var programmatic in new[] { false, true })
+            {
+                await Smooth016Place(viewer, roundTrip ? viewer.ScrollableHeight - .8 : 80);
+                var start = viewer.VerticalOffset;
+                var fractionTarget = Math.Min(start + precise, viewer.ScrollableHeight);
+                var target = roundTrip ? Math.Max(0, fractionTarget - notch) : fractionTarget + notch;
+                Assert(fractionTarget - start is > .1 and <= 1, "fixture did not queue a subpixel wheel offset");
+                Assert(ScrollWheel(body, -delta).Handled && !SmoothScroll.IsAnimating(viewer), "fixture did not queue a fine wheel command");
+                if (programmatic) SmoothScroll.ScrollTo(viewer, target);
+                else Assert(ScrollWheel(body, roundTrip ? 120 : -120).Handled, "full wheel division was not handled");
+                Assert(SmoothScroll.IsAnimating(viewer) && viewer.VerticalOffset == start, "layout applied the precision command before the handoff");
+                window.UpdateLayout();
+                await Until(() => !SmoothScroll.IsAnimating(viewer));
+                await Task.Delay(35);
+                Assert(Math.Abs(viewer.VerticalOffset - target) <= .1, "a late precision acknowledgement cancelled the next animation");
+            }
+        }
+        finally { window.Close(); }
     }
 
     private static async Task Smooth016NavigationEdges()

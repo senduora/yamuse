@@ -190,7 +190,7 @@ internal static partial class Program
         var mini = new MiniPlayerWindow { Left = -16000, Top = 0, ShowActivated = false, ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.Manual };
         try
         {
-            mini.Update(current.Title, current.Artist, false, true, true); mini.Show(); mini.UpdateLayout();
+            mini.Update(current.Title, current.Artist, false, true, true, canPlay: true); mini.Show(); mini.UpdateLayout();
             SaInvoke(w, "SetExpandedPlayerVisible", true, false); w.UpdateLayout();
             var expanded = SaVisuals<Button>(Control<ContentControl>(w, "ExpandedPlayerHost")).Single(b => b.Name == "ExpandedPlayerPlayPause");
             // Exercise the same brush reference changes that hover/leave causes,

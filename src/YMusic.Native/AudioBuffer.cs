@@ -1,4 +1,6 @@
 using System.Buffers;
+using System.ComponentModel;
+using System.Globalization;
 using System.Net;
 using System.Net.Http;
 
@@ -14,11 +16,13 @@ internal sealed partial class AudioBuffer : IDisposable
     private readonly HttpClient _http;
     private readonly string _directory;
     private readonly TimeSpan _rangeTimeout;
+    private readonly AudioBufferRecovery _recovery;
     internal string DirectoryPath => _directory;
     internal AudioBuffer(string? directory = null, HttpMessageHandler? handler = null, TimeSpan? rangeTimeout = null)
     {
         _directory = directory ?? Path.Combine(App.DataDirectory, "buffer");
         _rangeTimeout = rangeTimeout ?? TimeSpan.FromSeconds(45);
+        _recovery = AudioBufferRecovery.ForDirectory(_directory);
         _http = new HttpClient(handler ?? new SocketsHttpHandler
         {
             AllowAutoRedirect = false, UseCookies = false, Credentials = null,
@@ -56,10 +60,10 @@ internal sealed partial class AudioBuffer : IDisposable
                 if (response.StatusCode == HttpStatusCode.PartialContent || response.Content.Headers.NonValidated.Contains("Content-Range"))
                     throw new MusicException("Аудиосервер вернул только часть файла. Загрузка не сохранена; повторите действие.");
                 ValidateAudioContent(response.Content);
-                var length = response.Content.Headers.ContentLength;
+                var length = ValidateBodyFraming(response);
                 if (length > MaximumBytes) throw new MusicException("Размер трека превышает лимит буфера прототипа (256 МБ).");
                 await using var input = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
-                file = CreateBufferedFile(audio, FileOptions.SequentialScan);
+                file = await CreateBufferedFileAsync(audio, FileOptions.SequentialScan, timeout.Token).ConfigureAwait(false);
                 var output = file.Stream;
                 var bytes = ArrayPool<byte>.Shared.Rent(65536);
                 long total = 0;
@@ -83,12 +87,30 @@ internal sealed partial class AudioBuffer : IDisposable
             }
             timeout.Token.ThrowIfCancellationRequested();
             file.Seal();
+            timeout.Token.ThrowIfCancellationRequested();
             return file;
         }
         catch { file?.Dispose(); throw; }
     }
-    private BufferedAudioFile CreateBufferedFile(AudioDescriptor audio, FileOptions options)
-        => new(Path.Combine(_directory, "ym-audio-" + Guid.NewGuid().ToString("N") + audio.Extension), options);
+    private async Task<BufferedAudioFile> CreateBufferedFileAsync(AudioDescriptor audio, FileOptions options, CancellationToken token)
+    {
+        await _recovery.RecoverAsync(token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        var file = new BufferedAudioFile(Path.Combine(_directory, "ym-audio-" + Guid.NewGuid().ToString("N") + audio.Extension), options);
+        try
+        {
+            token.ThrowIfCancellationRequested();
+            file.RecordForRecovery(_recovery);
+            token.ThrowIfCancellationRequested();
+            return file;
+        }
+        catch (Exception error)
+        {
+            file.Dispose();
+            if (error is Win32Exception) throw new IOException("Не удалось записать данные для очистки аудиобуфера.", error);
+            throw;
+        }
+    }
 
     private static void ValidateAudioContent(HttpContent content)
     {
@@ -101,6 +123,37 @@ internal sealed partial class AudioBuffer : IDisposable
             || type.Equals("application/json", ignoreCase) || type.Equals("application/xml", ignoreCase)
             || type.EndsWith("+json", ignoreCase) || type.EndsWith("+xml", ignoreCase))
             throw new MusicException("Аудиосервер вернул текстовый ответ вместо аудио.");
+    }
+
+    private static long? ValidateBodyFraming(HttpResponseMessage response)
+    {
+        var content = response.Content.Headers;
+        var hasLength = content.NonValidated.TryGetValues("Content-Length", out var values);
+        if (response.Headers.NonValidated.TryGetValues("Transfer-Encoding", out var codings))
+        {
+            // SocketsHttpHandler handles HTTP/1.1 chunk framing; it does not decode other transfer codings here.
+            if (hasLength || response.Version != HttpVersion.Version11 || codings.Count != 1
+                || !codings.Single().AsSpan().Trim(" \t").Equals("chunked", StringComparison.OrdinalIgnoreCase)
+                || response.Headers.TransferEncodingChunked != true)
+                throw new MusicException("Аудиосервер вернул неподдерживаемое кодирование передачи или неоднозначную длину.");
+            return null;
+        }
+        if (!hasLength) return content.ContentLength;
+
+        long? length = null;
+        foreach (var value in values)
+            foreach (var part in value.Split(','))
+            {
+                var digits = part.AsSpan().Trim(" \t");
+                if (digits.IsEmpty || digits.ContainsAnyExceptInRange('0', '9')
+                    || !long.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out var count)
+                    || (length is { } previous && previous != count))
+                    throw new MusicException("Аудиосервер вернул некорректную длину ответа.");
+                length = count;
+            }
+        if (length is null || content.ContentLength != length)
+            throw new MusicException("Аудиосервер вернул некорректную длину ответа.");
+        return length;
     }
 
     internal static void Delete(string? path)

@@ -10,6 +10,7 @@ public partial class MainWindow
     private ListSourceOrder? _trackOrder, _catalogOrder, _downloadOrder;
     private ListSortStore? _listSortStore;
     private Dictionary<string, ListSortRule> _listSorts = [];
+    private readonly Dictionary<string, ListSortRule> _unsavedListSorts = [];
     private bool _sortingReady, _syncSortUi;
     private bool _downloadedSortRefreshPending;
     private DateTime _lastDownloadSortRefresh;
@@ -102,14 +103,38 @@ public partial class MainWindow
     }
     private void ChangeListSort(ListSortRule rule)
     {
-        if (!_sortingReady || _syncSortUi || !ListSortStore.ValidContext(SortContext)) return;
-        _listSorts[SortContext] = rule;
+        var context = SortContext;
+        if (!_sortingReady || _syncSortUi || !ListSortStore.ValidContext(context)) return;
+        _listSorts[context] = rule;
         ApplyListSorting(true);
-        if (IsPlaybackContextView()) _playbackContextSort = rule;
-        try { _listSortStore?.Save(_listSorts); }
-        catch (Exception e) when (e is System.IO.IOException or UnauthorizedAccessException)
-        { _diagnostics.LastErrorType = "ListSortSave:" + e.GetType().Name; SetStatus("Сортировка применена, но её не удалось сохранить на диске.", true); return; }
+        if (IsPlaybackContextView())
+        {
+            _playbackContextSort = rule;
+        }
+        if (_section == "offline" || IsPlaybackContextView()) UpdateQueuePlayingIndex();
+        if (_listSortStore is not null) _unsavedListSorts[context] = rule;
+        if (!TryFlushUnsavedListSorts())
+        {
+            SetStatus("Сортировка применена, но её не удалось сохранить на диске.", true);
+            return;
+        }
         if (_section == "queue") SetStatus("Список отсортирован · порядок воспроизведения сохранён");
+    }
+
+    private bool TryFlushUnsavedListSorts()
+    {
+        if (_listSortStore is not { } store || _unsavedListSorts.Count == 0) return true;
+        try
+        {
+            _listSorts = store.SaveChanges(_unsavedListSorts);
+            _unsavedListSorts.Clear();
+            return true;
+        }
+        catch (Exception error) when (error is System.IO.IOException or UnauthorizedAccessException)
+        {
+            _diagnostics.LastErrorType = "ListSortSave:" + error.GetType().Name;
+            return false;
+        }
     }
     private void ListSort_Changed(object sender, SelectionChangedEventArgs e)
     {

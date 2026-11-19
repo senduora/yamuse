@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Reflection;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Input;
@@ -23,6 +24,7 @@ internal static partial class Program
         await Run("Library017: track cover single click uses the selected filtered sorted playlist without album navigation", Library017CoverPlay);
         await Run("Library017: transparent Play is visible only over the cover and absent from playlist cards", Library017CoverHover);
         await Run("Library017: saved track cover plays without an account and unavailable covers cannot play", Library017OfflinePlay);
+        await Run("Library017: offline quality marks and stale cover or fullscreen activation belong to the exact saved file", Library017OfflineOccurrence);
         await Run("Library017: cover click retains repeated occurrence and virtualization in a 3900-track queue", Library017LargeQueueCover);
         await Run("Library017: search and artist track covers reuse exact one-click playback", Library017OtherTrackCovers);
         await Run("Library017: offline reads before or during removals use fresh rows", Library017OfflineReadMaintenance);
@@ -234,13 +236,12 @@ internal static partial class Program
             && cover.BorderThickness == new Thickness(0), "idle cover has a Play badge or opaque button background");
         var container = (ListViewItem)list.ItemContainerGenerator.ContainerFromIndex(0);
         var rowHover = (Border)container.Template.FindName("RowHover", container);
-        async Task<double> MidFade(FrameworkElement element)
+        static double MidFade(FrameworkElement element)
         {
-            // WPF starts the clock on the next render tick; reading immediately
-            // after ChangeMouseOver can still return the new base value.
-            await Task.Delay(40);
+            if (!Motion.CanAnimate) return element.Opacity;
+            SeekFixtureAnimation(element, UIElement.OpacityProperty, TimeSpan.FromMilliseconds(40));
             var opacity = element.Opacity;
-            Assert(!Motion.CanAnimate || opacity > 0 && opacity < 1,
+            Assert(opacity > 0 && opacity < 1,
                 $"hover did not render an intermediate opacity: {element.Name}={opacity}");
             return opacity;
         }
@@ -256,13 +257,13 @@ internal static partial class Program
             Assert(!cover.IsMouseOver && glyph.Opacity == 0, "hovering the row reveals the cover Play");
             Assert(!Motion.CanAnimate || rowHover.HasAnimatedProperties,
                 $"row hover appeared without a transition: animated={rowHover.HasAnimatedProperties}, opacity={rowHover.Opacity}, visible={rowHover.IsVisible}, selected={container.IsSelected}, over={container.IsMouseOver}");
-            var rowFadeIn = await MidFade(rowHover);
-            await Task.Delay(250);
+            var rowFadeIn = MidFade(rowHover);
+            await Until(() => rowHover.Opacity == 1);
             Assert(rowHover.Opacity == 1, "row hover did not settle");
             Library017MouseOver(cover);
             Assert(!Motion.CanAnimate || glyph.HasAnimatedProperties, "cover Play appeared without a transition");
-            var coverFadeIn = await MidFade(glyph);
-            await Task.Delay(250);
+            var coverFadeIn = MidFade(glyph);
+            await Until(() => glyph.Opacity == 1);
             Assert(cover.IsMouseOver && glyph.Visibility == Visibility.Visible && glyph.Opacity == 1 && ((SolidColorBrush)cover.Background).Color.A == 0,
                 "cover hover did not reveal a transparent Play");
             var inside = VisualTreeHelper.HitTest(cover, new Point(17, 17));
@@ -271,20 +272,21 @@ internal static partial class Program
             App.Capture(f.Window, Path.Combine(_directory, "track-cover-017-hover.png"));
             SaClick(cover); Library017MouseOver(container);
             Assert(!Motion.CanAnimate || glyph.HasAnimatedProperties, "cover Play disappeared without a transition");
-            var coverFadeOut = await MidFade(glyph);
-            await Task.Delay(250);
+            var coverFadeOut = MidFade(glyph);
+            await Until(() => glyph.Opacity == 0);
             Assert(!cover.IsMouseOver && glyph.Opacity == 0, "click left Play visible after the cursor left the cover");
             await Until(() => f.Player.IsPlaying && !SaField<bool>(f.Window, "_loadingStream"));
             Assert(container.IsSelected && rowHover.Visibility == Visibility.Collapsed, "hover overlay obscures the selected track");
             list.SelectedIndex = -1;
             Library017MouseOver(null);
             Assert(!Motion.CanAnimate || rowHover.HasAnimatedProperties, "row hover disappeared without a transition");
-            var rowFadeOut = await MidFade(rowHover);
-            await Task.Delay(250);
+            var rowFadeOut = MidFade(rowHover);
+            await Until(() => rowHover.Opacity == 0);
             Assert(rowHover.Opacity == 0, "row hover remained after pointer exit");
             File.WriteAllText(Path.Combine(_directory, "track-hover-motion.json"), JsonSerializer.Serialize(new
             { animationAssertionsRun = Motion.CanAnimate, rowFadeIn, rowFadeOut, coverFadeIn, coverFadeOut,
-                rowAndCoverFadeInOut = true, selectedTrackPreserved = true, localWpfHoverOnly = true, nativeInputSent = false }));
+                animationSampleTimeMs = 40, rowAndCoverFadeInOut = true, selectedTrackPreserved = true,
+                localWpfHoverOnly = true, nativeInputSent = false }));
             App.Capture(f.Window, Path.Combine(_directory, "track-cover-017-idle.png"));
         }
         finally { Library017MouseOver(previous); }
@@ -293,6 +295,10 @@ internal static partial class Program
         f.Window.UpdateLayout();
         Assert(!SaVisuals<Button>(Control<ListBox>(f.Window, "CatalogList")).Any(button => button.Name is "TrackCoverPlayButton" or "CatalogCoverPlayButton"),
             "a playlist card still has the incorrectly placed Play");
+        var actions = SaVisuals<Button>(Control<ListBox>(f.Window, "CatalogList")).Where(button => button.Name is "CatalogCoverLink" or "ResultOpenButton").ToArray();
+        Assert(actions.Length == 2 && actions.All(button => AutomationProperties.GetName(button) == "Открыть «Плейлист»")
+            && AutomationProperties.GetName(Control<Button>(f.Window, "PlayerCoverButton")) == "Открыть альбом текущего трека",
+            "image-only Open actions did not expose their purpose and target");
     }
 
     private static async Task Library017OfflinePlay()
@@ -308,6 +314,56 @@ internal static partial class Program
         SaClick(Library017Cover(f.Window, offline)); await Until(() => f.Player.IsPlaying && !SaField<bool>(f.Window, "_loadingStream"));
         Assert(f.Player.SourceLocalPath == f.Library.ResolvePath(saved.FileName) && f.ApiRequests == 0 && offline.IsDownloaded,
             "saved cover required login, used network, or lost its mark across album contexts");
+    }
+
+    private static async Task Library017OfflineOccurrence()
+    {
+        foreach (var expanded in new[] { false, true })
+        {
+            using var f = new Library017Fixture("offline-occurrence-" + expanded);
+            var high = await f.SaveShared();
+            var low = await f.Library.SaveAsync(f.Row("shared", "album-a"),
+                new AudioDescriptor(new Uri("https://s1.vlx.yandex.net/variant.mp3"), "mp3", 192), CancellationToken.None);
+            var highPath = f.Library.ResolvePath(high.FileName);
+            var lowPath = f.Library.ResolvePath(low.FileName);
+            f.Window.SignOut();
+            var scanned = f.Library.Tracks();
+            var stale = scanned.Single(row => row.LocalPath == highPath);
+            var active = scanned.Single(row => row.LocalPath == lowPath);
+            Assert(stale.RequestId == active.RequestId && stale.LocalPath != active.LocalPath, "fixture did not create two qualities of the same occurrence identity");
+            var w = f.Window;
+            SaInvoke(w, "SetSection", "offline", "Скачанное");
+            SaInvoke(w, "ShowRows", (object)new[] { stale, active });
+            w.UpdateLayout();
+            SaClick(Library017Cover(w, active));
+            await Until(() => f.Player.IsPlaying && !SaField<bool>(w, "_loadingStream"));
+            Assert(f.Player.SourceLocalPath == lowPath && w.QueuePlayingIndex == 1 && active.IsPlaying && !stale.IsPlaying,
+                "playing one saved quality highlighted a different file of the same track");
+            var queue = SaField<PlaybackQueue>(w, "_playbackQueue");
+            var token = queue.CurrentOccurrenceToken;
+            var version = queue.Version;
+            var requests = f.MediaRequests;
+            if (expanded)
+            {
+                EpOpen(w); SaInvoke(w, "SetExpandedQueueVisible", true, false);
+                var list = SaField<ListBox>(w, "_expandedQueueList");
+                list.SelectedIndex = 0;
+                File.Delete(highPath);
+                list.RaiseEvent(new KeyEventArgs(new Pk040Keyboard(ModifierKeys.None), new Pk040Source(list), Environment.TickCount, Key.Enter)
+                    { RoutedEvent = Keyboard.PreviewKeyDownEvent });
+            }
+            else
+            {
+                var cover = Library017Cover(w, stale);
+                Assert(cover.IsEnabled, "fixture did not expose a previously valid cover");
+                File.Delete(highPath);
+                SaClick(cover);
+            }
+            Assert(queue.CurrentOccurrenceToken == token && queue.Version == version && ReferenceEquals(queue.Current, active)
+                && f.Player.SourceLocalPath == lowPath && f.Player.IsPlaying && f.MediaRequests == requests && f.ApiRequests == 0,
+                $"activating a vanished local variant changed playback: expanded={expanded}, token={queue.CurrentOccurrenceToken}/{token}, "
+                + $"version={queue.Version}/{version}, sameFile={f.Player.SourceLocalPath == lowPath}, playing={f.Player.IsPlaying}, media={f.MediaRequests}/{requests}, api={f.ApiRequests}");
+        }
     }
 
     private static async Task Library017LargeQueueCover()
@@ -344,6 +400,10 @@ internal static partial class Program
         f.Window.UpdateLayout();
         var catalog = Control<ListBox>(f.Window, "CatalogList");
         var searchCover = SaVisuals<Button>(catalog).Single(button => button.Name == "TrackCoverPlayButton" && ReferenceEquals(button.DataContext, second));
+        var resultPlay = SaVisuals<Button>(catalog).Single(button => button.Name == "ResultOpenButton"
+            && button.DataContext is CatalogItem item && ReferenceEquals(item.Track, second));
+        Assert(AutomationProperties.GetName(searchCover) == $"Слушать «{second.Title}»"
+            && AutomationProperties.GetName(resultPlay) == "Слушать «Второй»", "search cover or play icon has no actionable UIA name");
         SaClick(searchCover); await Until(() => f.Player.IsPlaying && !SaField<bool>(f.Window, "_loadingStream"));
         var queue = SaField<PlaybackQueue>(f.Window, "_playbackQueue");
         Assert(ReferenceEquals(queue.Current, second) && queue.Items.SequenceEqual([first, second])
@@ -451,7 +511,7 @@ internal static partial class Program
         internal Library017Fixture(string name)
         {
             _directoryPath = Path.Combine(_directory, "library017-" + name); Directory.CreateDirectory(_directoryPath);
-            var bytes = File.ReadAllBytes(WriteWave("library017-" + name + ".wav", 4));
+            var bytes = SilentMp3Seconds(4);
             _handler = new FakeHandler(Respond);
             _media = new FakeHandler((_, _) => { MediaRequests++; return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(bytes) }); });
             Library = new OfflineLibrary(Path.Combine(_directoryPath, "offline"), new AudioBuffer(Path.Combine(_directoryPath, "downloads"), _media));

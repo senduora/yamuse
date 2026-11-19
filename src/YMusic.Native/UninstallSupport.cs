@@ -1,15 +1,19 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
-using System.Runtime.InteropServices;
+using System.IO.Pipes;
+using System.Security;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Threading;
+using System.Xml;
 using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
-using Velopack.Locators;
+using Velopack;
+using Velopack.NuGet;
 
 namespace YMusic.Native;
 
@@ -18,13 +22,24 @@ internal static class UninstallSupport
     internal const string RequestArgument = "--uninstall";
     internal const string CompleteArgument = "--complete-full-uninstall";
     private const string PendingReceiptFileName = "full-uninstall.pending.json";
+    private const int MaximumReceiptPathLength = 32767;
+    // Three Windows paths may each expand to six JSON bytes per UTF-16 unit.
+    private const int MaximumReceiptBytes = 640 * 1024;
     private const string StartupPending = "Полное удаление Yamuse уже запрошено или не завершено.";
     private const string StartupMarkerUnavailable = "Не удалось проверить состояние удаления Yamuse. Приложение пока не откроет данные. Проверьте доступ к папке установки и повторите запуск.";
     private const string RecoveryDone = "Запрос сброшен. Теперь можно снова открыть Yamuse. Для полного удаления потребуется новое подтверждение.";
     private const string ConsumedRecovery = "Данные Yamuse уже очищены. Завершите штатное удаление приложения из параметров Windows. Если запись приложения отсутствует или установка повреждена, восстановите установку перед повтором.";
     private const string RecoveryTitle = "Восстановление запуска Yamuse";
     private const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\YMusic.Native";
-    private static string EventName => @"Local\YMusic.Native.FullUninstall." + WindowsIdentity.GetCurrent().User!.Value;
+    private static string RequestPipeName
+    {
+        get
+        {
+            using var process = Process.GetCurrentProcess();
+            using var identity = WindowsIdentity.GetCurrent();
+            return $"YMusic.Native.FullUninstall.{process.SessionId}.{identity.User!.Value}";
+        }
+    }
 
     internal static string ConfirmationText(UninstallPaths paths) =>
         "Полностью удалить Yamuse?\n\nБудут удалены:\n" +
@@ -33,7 +48,7 @@ internal static class UninstallSupport
         "• вся скачанная приложением музыка и локальные плейлисты:\n" + paths.Music +
         (UninstallPathGuard.EntryExists(paths.LegacyData) ? "\n• данные предыдущей версии:\n" + paths.LegacyData : "") +
         (UninstallPathGuard.EntryExists(paths.LegacyMusic) ? "\n• скачанная музыка предыдущей версии:\n" + paths.LegacyMusic : "") +
-        "\n\nПосторонние и изменённые аудиофайлы сохранятся. Восстановить удалённое нельзя.";
+        "\n\nПосторонние файлы и папки, а также изменённая музыка сохранятся. Восстановить удалённое нельзя.";
 
     // Called by ordinary startup after taking the application mutex, without
     // requiring Update.exe/current to remain readable during native removal.
@@ -74,9 +89,9 @@ internal static class UninstallSupport
             // Reopen the exact fixed marker under the application mutex. If it
             // changed while the dialog was open, the previous answer is stale.
             string message;
-            using (var main = new Mutex(true, BrandPaths.LegacyInstanceMutex, out var created))
+            using (var main = App.TryAcquireProfileInstance())
             {
-                message = created && TryResetStartupMarker(localData, candidate)
+                message = main is not null && TryResetStartupMarker(localData, candidate)
                     ? RecoveryDone : "Состояние запроса изменилось или выполняется другая операция. Повторите запуск Yamuse.";
             }
             MessageBox.Show(message, RecoveryTitle, MessageBoxButton.OK, MessageBoxImage.Information);
@@ -99,8 +114,8 @@ internal static class UninstallSupport
     private static bool IsUninstallFailure(Exception error) => error is IOException or UnauthorizedAccessException or InvalidOperationException
         or Win32Exception or JsonException;
 
-    // Called after Velopack.Run, before constructing App. Only explicit
-    // uninstall commands are handled here.
+    // Called before constructing App or running the Velopack startup hooks.
+    // Only explicit Yamuse uninstall commands are handled here.
     internal static bool TryHandleCommand(string[] args)
     {
         if (!args.Contains(RequestArgument, StringComparer.OrdinalIgnoreCase)
@@ -110,18 +125,30 @@ internal static class UninstallSupport
         {
             if (args.Length == 1 && args[0].Equals(RequestArgument, StringComparison.OrdinalIgnoreCase))
             {
-                if (TryForwardToOpenApplication()) return true;
-                using var main = new Mutex(true, BrandPaths.LegacyInstanceMutex, out var mainCreated);
-                if (!mainCreated)
+                if (TryForwardToOpenApplication() is { } forwarded)
+                {
+                    if (forwarded != ForwardedUninstall.Accepted) throw new IOException(ForwardedUninstallMessage(forwarded));
+                    return true;
+                }
+                using var main = App.TryAcquireProfileInstance();
+                if (main is null)
                     throw new IOException("Yamuse открыт. Закройте его обычной командой «Выйти» и повторите удаление.");
+                var localData = LocalDataDirectory();
+                var install = InstallFromLocalData(localData);
+                RequireUpdaterFinished(install);
+                if (IsConsumedMarkerAtInstall(install))
+                {
+                    ConfirmConsumedRetry(localData);
+                    return true;
+                }
                 UninstallPaths paths;
                 try { paths = CurrentInstalledPaths(); }
                 catch (Exception error) when (IsUninstallFailure(error))
                 {
-                    var recovery = RecoverWithoutInstallation(LocalDataDirectory(), () => ConfirmRecovery(
+                    var recovery = RecoverWithoutInstallation(localData, () => ConfirmRecovery(
                         "Не удалось подготовить штатное удаление Yamuse.\n\nСбросить сохранённый запрос, чтобы снова открыть приложение? Сброс затрагивает только файл запроса."));
                     if (recovery == PendingReceiptState.Normal) throw;
-                    if (recovery == PendingReceiptState.Consumed) throw new IOException(ConsumedRecovery, error);
+                    if (recovery == PendingReceiptState.Consumed) ConfirmConsumedRetry(localData);
                     if (recovery == PendingReceiptState.Recovered) ShowRecoveryDone();
                     return true;
                 }
@@ -132,11 +159,10 @@ internal static class UninstallSupport
                 if (receiptState is PendingReceiptState.Recovered or PendingReceiptState.RecoveryDeclined) return true;
                 if (receiptState == PendingReceiptState.Consumed)
                 {
-                    if (MessageBox.Show("Данные Yamuse уже очищены, завершение штатного удаления запрошено.\n\nПовторно запустить удаление приложения?\n\nКнопка «Нет» сохранит защиту от запуска приложения: данные не будут созданы заново.",
-                        "Завершение удаления Yamuse", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes)
-                        ScheduleConsumedRetry(paths, Environment.ProcessId);
+                    ConfirmConsumedRetry(paths.LocalData);
                     return true;
                 }
+                var documents = CaptureDocumentsIdentity(paths);
                 if (MessageBox.Show(ConfirmationText(paths), "Полное удаление Yamuse", MessageBoxButton.YesNo,
                     MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
                 {
@@ -145,14 +171,15 @@ internal static class UninstallSupport
                     CancelPendingReceipt(paths);
                     return true;
                 }
-                var nonce = CreateReceipt(paths);
+                RequireUpdaterFinished(paths.Install);
+                var nonce = CreateReceipt(paths, documents);
                 try { StartAfterExit(paths, Environment.ProcessId, paths.Executable, [CompleteArgument, nonce]); }
                 catch { DeleteReceipt(paths, nonce); throw; }
                 return true;
             }
             if (args.Length == 2 && args[0].Equals(CompleteArgument, StringComparison.OrdinalIgnoreCase))
             {
-                Finish(CurrentInstalledPaths(), args[1]);
+                Finish(args[1]);
                 return true;
             }
             throw new IOException("Некорректная команда удаления. Запустите удаление из настроек Windows или Yamuse.");
@@ -165,113 +192,406 @@ internal static class UninstallSupport
     }
     private static void ShowRecoveryDone() => MessageBox.Show(RecoveryDone, RecoveryTitle, MessageBoxButton.OK, MessageBoxImage.Information);
 
+    internal static void RequireUpdaterFinished(string install, Func<IReadOnlyList<string>, uint, bool>? wait = null)
+    {
+        // A normal start waiter launches the cleanup process and promptly exits.
+        // An updater still applying a package must finish before either stage opens data.
+        if (!(wait ?? Program.WaitForUpdaterExit)([Path.Combine(install, "Update.exe")], 5000))
+            throw new IOException("Дождитесь завершения обновления Yamuse и повторите удаление.");
+    }
+
+    private static void ConfirmConsumedRetry(string localDataDirectory)
+    {
+        try
+        {
+            ScheduleConsumedRetry(localDataDirectory, Environment.ProcessPath!, Environment.ProcessId, () =>
+                MessageBox.Show("Данные Yamuse уже очищены. Завершить штатное удаление приложения?\n\nПри отказе запрос останется сохранённым.",
+                    "Завершение удаления Yamuse", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes);
+        }
+        catch (Exception error) when (IsUninstallFailure(error))
+        { throw new IOException(error.Message + "\n\n" + ConsumedRecovery, error); }
+    }
+
     internal static UninstallPaths CurrentInstalledPaths()
     {
-        var paths = UninstallPaths.ForCurrentUser();
-        var locator = VelopackLocator.IsCurrentSet ? VelopackLocator.Current : VelopackLocator.CreateDefaultForPlatform();
-        ValidateInstallation(paths, locator.AppId, locator.IsPortable, locator.CurrentlyInstalledVersion is not null,
-            locator.RootAppDir, locator.AppContentDir, locator.UpdateExePath, Environment.ProcessPath!);
+        UninstallPaths paths;
+        try { paths = UninstallPaths.ForCurrentUser(); }
+        catch (IOException error) { throw new IOException("Не удалось определить локальную папку «Документы» для полного удаления Yamuse.", error); }
+        VerifyInstalledFiles(paths.Install, Environment.ProcessPath!);
         return paths;
     }
 
-    internal static void ValidateInstallation(UninstallPaths paths, string? appId, bool portable, bool installed,
-        string? installRoot, string? contentDirectory, string? updater, string executable)
+    internal static void ValidateInstallation(string localDataDirectory, string executable)
+        => VerifyInstalledFiles(InstallFromLocalData(localDataDirectory), executable);
+
+    internal static void ValidateCurrentInstallationImage()
+        => ValidateInstallationImage(LocalDataDirectory(), Environment.ProcessPath!);
+
+    internal static void ValidateInstallationImage(string localDataDirectory, string executable,
+        Func<string, FileAttributes>? readCurrentAttributes = null)
+        => VerifyInstalledImage(InstallFromLocalData(localDataDirectory), executable, readCurrentAttributes: readCurrentAttributes);
+
+    internal static void ValidateInstalledUpdateFiles(string install, string executable, string content,
+        string? updater, SemanticVersion version)
     {
-        if (portable || !installed || appId != BrandPaths.LegacyPackageId || installRoot is null || contentDirectory is null || updater is null
-            || !UninstallPathGuard.Canonical(installRoot).Equals(paths.Install, StringComparison.OrdinalIgnoreCase)
-            || !UninstallPathGuard.Canonical(updater).Equals(paths.Updater, StringComparison.OrdinalIgnoreCase))
-            throw new IOException("Полное удаление доступно только для установленного Yamuse в его штатной папке.");
-        using var ancestors = UninstallPathGuard.HoldExistingAncestors(paths.Install);
-        using var root = UninstallPathGuard.HoldDirectory(paths.Install);
-        if (Directory.EnumerateDirectories(paths.Install, "app-*").Any())
-            throw new IOException("Формат установки Yamuse требует обновления. Полное удаление не начато.");
-        using var update = UninstallPathGuard.OpenOwnedFile(paths.Updater, read: false, deleteAccess: false);
-        var expectedDirectory = Path.Combine(paths.Install, "current");
-        var current = ResolvedContent(paths, expectedDirectory);
-        if (!ResolvedContent(paths, contentDirectory).Equals(current, StringComparison.OrdinalIgnoreCase)
-            || !UninstallPathGuard.Canonical(executable).Equals(Path.Combine(current, "YMusic.Native.exe"), StringComparison.OrdinalIgnoreCase)
-                && !UninstallPathGuard.Canonical(executable).Equals(paths.Executable, StringComparison.OrdinalIgnoreCase))
-            throw new IOException("Путь исполняемого файла не соответствует установленному Yamuse.");
-        using var currentParents = UninstallPathGuard.HoldExistingAncestors(Path.Combine(current, "YMusic.Native.exe"));
-        using var application = UninstallPathGuard.OpenOwnedFile(Path.Combine(current, "YMusic.Native.exe"), read: false, deleteAccess: false);
+        VerifyInstalledImage(install, executable, current =>
+        {
+            if (!content.Equals(current, StringComparison.OrdinalIgnoreCase)
+                && !content.Equals(Path.Combine(install, "current"), StringComparison.OrdinalIgnoreCase))
+                throw new IOException("Папка обновления не соответствует установленному Yamuse.");
+            using var updaterParents = updater is null ? null : UninstallPathGuard.HoldExistingAncestors(updater);
+            using var update = updater is null ? null : UninstallPathGuard.OpenOwnedFile(updater, read: true, deleteAccess: false);
+            using var manifest = OpenInstalledManifest(current);
+            if (!version.Equals(ValidateInstalledManifest(manifest)))
+                throw new IOException("Версия установленного Yamuse изменилась.");
+        });
     }
 
-    private static string ResolvedContent(UninstallPaths paths, string directory)
+    internal static bool HasInstalledUpdateLayout(string executable, bool requireManifest = true, string? localData = null,
+        Func<string, FileAttributes>? readCurrentAttributes = null)
+    {
+        try
+        {
+            var image = Program.NormalizeImagePath(executable);
+            if (Path.GetDirectoryName(image) is not { } current
+                || !Path.GetFileName(current).Equals("current", StringComparison.OrdinalIgnoreCase)
+                || Path.GetDirectoryName(current) is not { } install) return false;
+            if (requireManifest) VerifyInstalledFiles(install, image, requireNativeHandoff: false);
+            else
+            {
+                var fixedInstall = !string.IsNullOrEmpty(localData)
+                    && install.Equals(Program.NormalizeImagePath(InstallFromLocalData(localData)), StringComparison.OrdinalIgnoreCase);
+                VerifyInstalledImage(install, image, content =>
+                {
+                    try
+                    {
+                        using var updater = UninstallPathGuard.OpenOwnedFile(Path.Combine(install, "Update.exe"), read: false, deleteAccess: false);
+                    }
+                    catch (Exception error) when (IsUnavailableInstallEvidence(error))
+                    {
+                        // The exact installed image and manifest can identify
+                        // the candidate while the updater is unavailable.
+                        try
+                        {
+                            using var file = OpenInstalledManifest(content);
+                            ValidateInstalledManifest(file);
+                        }
+                        catch (Exception manifestError) when (fixedInstall && IsUnavailableInstallEvidence(manifestError))
+                        {
+                            // Only the fixed installation keeps a retry when
+                            // neither companion file can be inspected.
+                        }
+                    }
+                }, allowUnavailableImage: fixedInstall, readCurrentAttributes: readCurrentAttributes);
+            }
+            return true;
+        }
+        catch (Exception error) when (IsUninstallFailure(error) || error is ArgumentException) { return false; }
+    }
+
+    internal static bool IsUnavailableInstallEvidence(Exception error)
+        => error is FileNotFoundException or DirectoryNotFoundException or UnauthorizedAccessException
+            || NativeIoErrorCode(error) is 2 or 3 or 5 or 32 or 33;
+
+    private static int NativeIoErrorCode(Exception error)
+    {
+        if (error is Win32Exception native) return native.NativeErrorCode;
+        if (error is not IOException) return 0;
+        var code = error.HResult;
+        return unchecked((uint)code) >> 16 == 0x8007 ? code & 0xffff : code;
+    }
+
+    // Starting a listener needs a held image. Only startup of the fixed
+    // installation can defer a transient failure until the next update check.
+    private static void VerifyInstalledImage(string install, string executable, Action<string>? onValidated = null,
+        bool allowUnavailableImage = false, Func<string, FileAttributes>? readCurrentAttributes = null)
+    {
+        var processPath = UninstallPathGuard.Canonical(Program.NormalizeImagePath(executable));
+        if (!UninstallPathGuard.Contains(install, processPath)
+            || !Path.GetFileName(processPath).Equals("YMusic.Native.exe", StringComparison.OrdinalIgnoreCase))
+            throw new IOException("Путь исполняемого файла не соответствует установленному Yamuse.");
+        var expectedDirectory = Path.Combine(install, "current");
+        var exactLauncher = processPath.Equals(Path.Combine(expectedDirectory, "YMusic.Native.exe"), StringComparison.OrdinalIgnoreCase);
+        UninstallPathGuard.AncestorLease ancestors;
+        try { ancestors = UninstallPathGuard.HoldExistingAncestors(install); }
+        catch (Exception error) when (allowUnavailableImage && exactLauncher && IsUnavailableInstallEvidence(error)
+            && CanRetryUnavailableInstallRoot(install, expectedDirectory)) { return; }
+        using var heldAncestors = ancestors;
+        SafeFileHandle root;
+        try { root = UninstallPathGuard.HoldDirectory(install); }
+        catch (Exception error) when (allowUnavailableImage && exactLauncher && IsUnavailableInstallEvidence(error)
+            && CanRetryUnavailableInstallRoot(install, expectedDirectory)) { return; }
+        using var heldRoot = root;
+        if (UninstallPathGuard.EntryExists(Path.Combine(install, ".portable")))
+            throw new IOException("Полное удаление доступно для установленного Yamuse.");
+        string current;
+        try { current = ResolvedContent(install, expectedDirectory, readCurrentAttributes); }
+        catch (Exception error) when (allowUnavailableImage && exactLauncher && IsUnavailableInstallEvidence(error)
+            && UninstallPathGuard.CanInspectOrdinaryDirectory(expectedDirectory)) { return; }
+        var applicationPath = Path.Combine(current, "YMusic.Native.exe");
+        if (!processPath.Equals(applicationPath, StringComparison.OrdinalIgnoreCase)
+            && !exactLauncher)
+            throw new IOException("Путь исполняемого файла не соответствует установленному Yamuse.");
+        UninstallPathGuard.AncestorLease currentParents;
+        try { currentParents = UninstallPathGuard.HoldExistingAncestors(applicationPath); }
+        catch (Exception error) when (allowUnavailableImage && exactLauncher && IsUnavailableInstallEvidence(error)) { return; }
+        using var heldParents = currentParents;
+        SafeFileHandle application;
+        try { application = UninstallPathGuard.OpenOwnedFile(applicationPath, read: true, deleteAccess: false); }
+        catch (Exception error) when (allowUnavailableImage && IsUnavailableInstallEvidence(error)) { return; }
+        using (application) onValidated?.Invoke(current);
+    }
+
+    private static bool CanRetryUnavailableInstallRoot(string install, string expectedDirectory)
+    {
+        if (!OrdinaryDirectories(install) || UninstallPathGuard.EntryExists(Path.Combine(install, ".portable"))) return false;
+        var current = ResolvedContent(install, expectedDirectory);
+        return OrdinaryDirectories(current);
+
+        static bool OrdinaryDirectories(string path)
+        {
+            const FileAttributes kind = FileAttributes.Directory | FileAttributes.ReparsePoint;
+            // Attribute reads only preserve the chance to retry. Walk from
+            // the drive root so a detected link never directs a child probe.
+            var ancestors = new Stack<string>();
+            for (var directory = new DirectoryInfo(path); directory is not null; directory = directory.Parent)
+                ancestors.Push(directory.FullName);
+            return ancestors.All(directory => (File.GetAttributes(directory) & kind) == FileAttributes.Directory);
+        }
+    }
+
+    // The SDK locator also initializes the cache. Registration and uninstall
+    // need held, read-only evidence from the fixed local installation.
+    private static void VerifyInstalledFiles(string install, string executable, Action? onValidated = null, bool requireNativeHandoff = true,
+        Func<string, FileAttributes>? readCurrentAttributes = null)
+    {
+        if (requireNativeHandoff) EnsureNativeInstallPath(install);
+        VerifyInstalledImage(install, executable, current =>
+        {
+            if (requireNativeHandoff && (Directory.EnumerateDirectories(install, "app-*").Any() || HasLegacyStaging(install)))
+                throw new IOException("Формат установки Yamuse требует обновления. Полное удаление не начато.");
+            // Require real read sharing through the handoff. Reading only the
+            // attributes would allow simultaneous changes to the updater bytes.
+            using var update = UninstallPathGuard.OpenOwnedFile(Path.Combine(install, "Update.exe"), read: true, deleteAccess: false);
+            using var manifestFile = OpenInstalledManifest(current);
+            ValidateInstalledManifest(manifestFile);
+            onValidated?.Invoke();
+        }, readCurrentAttributes: readCurrentAttributes);
+    }
+
+    private static FileStream OpenInstalledManifest(string content)
+    {
+        var handle = UninstallPathGuard.OpenOwnedFile(Path.Combine(content, "sq.version"), read: true, deleteAccess: false);
+        try { return new FileStream(handle, FileAccess.Read); }
+        catch { handle.Dispose(); throw; }
+    }
+
+    private static SemanticVersion ValidateInstalledManifest(FileStream file)
+    {
+        if (file.Length is <= 0 or > 65536)
+            throw new IOException("Манифест установленного Yamuse повреждён.");
+        InstalledManifest manifest;
+        try { manifest = new InstalledManifest(file); }
+        catch (Exception error) when (error is InvalidDataException or XmlException or FormatException or ArgumentException)
+        { throw new IOException("Манифест установленного Yamuse повреждён.", error); }
+        if (manifest.Id != BrandPaths.LegacyPackageId || manifest.Version is not { } version)
+            throw new IOException("Манифест не соответствует установленному Yamuse.");
+        return version;
+    }
+
+    private static bool HasLegacyStaging(string install)
+    {
+        var staging = Path.Combine(install, "staging");
+        if (!UninstallPathGuard.EntryExists(staging)) return false;
+        using var directory = UninstallPathGuard.HoldDirectory(staging);
+        return Directory.EnumerateDirectories(staging, "app-*").Any();
+    }
+
+    private sealed class InstalledManifest : PackageManifest
+    {
+        internal InstalledManifest(Stream file) => ReadManifest(file);
+    }
+
+    private static void EnsureNativeInstallPath(string install)
+    {
+        // The pinned native updater uses shell expansion during self-removal.
+        if (install.Contains('%'))
+            throw new IOException("Штатное удаление Yamuse недоступно, если путь установки содержит знак «%». Обратитесь в поддержку, чтобы завершить удаление.");
+    }
+
+    private static string ResolvedContent(string install, string directory, Func<string, FileAttributes>? readAttributes = null)
     {
         var path = UninstallPathGuard.Canonical(directory);
-        if (!UninstallPathGuard.Contains(paths.Install, path) || path.Equals(paths.Install, StringComparison.OrdinalIgnoreCase))
+        if (!UninstallPathGuard.Contains(install, path) || path.Equals(install, StringComparison.OrdinalIgnoreCase))
             throw new IOException("Папка приложения находится за пределами установки.");
         // Velopack may use a current junction to another version in the same
         // package root. Only that one junction is allowed, and its final target
         // must remain inside this exact root with no further redirected parent.
-        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+        if (((readAttributes ?? File.GetAttributes)(path) & FileAttributes.ReparsePoint) != 0)
         {
-            if (!path.Equals(Path.Combine(paths.Install, "current"), StringComparison.OrdinalIgnoreCase))
+            if (!path.Equals(Path.Combine(install, "current"), StringComparison.OrdinalIgnoreCase))
                 throw new IOException("Неожиданная ссылка в установленном приложении.");
             path = UninstallPathGuard.Canonical(new DirectoryInfo(path).ResolveLinkTarget(returnFinalTarget: true)?.FullName
                 ?? throw new IOException("Не удалось проверить папку установленного приложения."));
         }
-        if (!UninstallPathGuard.Contains(paths.Install, path) || path.Equals(paths.Install, StringComparison.OrdinalIgnoreCase))
+        if (!UninstallPathGuard.Contains(install, path) || path.Equals(install, StringComparison.OrdinalIgnoreCase))
             throw new IOException("Ссылка установленного приложения ведёт за пределы установки.");
-        using var parents = UninstallPathGuard.HoldExistingAncestors(Path.Combine(path, "YMusic.Native.exe"));
         return path;
     }
 
     // This changes only the two commands in the existing, exact package key.
     // No key is created and unrelated/custom registry values are untouched.
     internal static bool RegisterWindowsUninstall()
+        => CheckWindowsUninstallRegistration() == WindowsUninstallRegistration.Registered;
+
+    internal static bool RegisterWindowsUninstall(Func<string> localDataDirectory, string executable,
+        Func<string, string, string, bool> updateExistingKey)
+        => CheckWindowsUninstallRegistration(localDataDirectory, executable, updateExistingKey) == WindowsUninstallRegistration.Registered;
+
+    internal enum WindowsUninstallRegistration { Inapplicable, Retryable, Registered }
+
+    internal static WindowsUninstallRegistration CheckWindowsUninstallRegistration()
+        => CheckWindowsUninstallRegistration(LocalDataDirectory, Environment.ProcessPath!, RegisterWindowsUninstallKey);
+
+    internal static WindowsUninstallRegistration CheckWindowsUninstallRegistration(Func<string> localDataDirectory, string executable,
+        Func<string, string, string, bool> updateExistingKey, Func<string, FileAttributes>? readCurrentAttributes = null)
+    {
+        var verified = false;
+        try
+        {
+            var install = InstallFromLocalData(localDataDirectory());
+            var native = Quote(Path.Combine(install, "Update.exe")) + " --uninstall";
+            var wrapper = Quote(Path.Combine(install, "current", "YMusic.Native.exe")) + " " + RequestArgument;
+            var registered = false;
+            VerifyInstalledFiles(install, executable, () =>
+            {
+                verified = true;
+                registered = updateExistingKey(install, native, wrapper);
+            }, requireNativeHandoff: false, readCurrentAttributes: readCurrentAttributes);
+            return registered ? WindowsUninstallRegistration.Registered : WindowsUninstallRegistration.Inapplicable;
+        }
+        catch (Exception error) when (!verified && IsUnavailableInstallEvidence(error))
+        { return WindowsUninstallRegistration.Retryable; }
+        catch (Exception error) when (verified && IsUnavailableRegistryRegistration(error))
+        { return WindowsUninstallRegistration.Retryable; }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or Win32Exception or SecurityException)
+        { return WindowsUninstallRegistration.Inapplicable; }
+    }
+
+    private static bool IsUnavailableRegistryRegistration(Exception error)
+        => error is UnauthorizedAccessException or SecurityException or RegistryRepairIncompleteException
+            || NativeIoErrorCode(error) is 2 or 5 or 6 or 32 or 33 or 1018;
+
+    private static bool RegisterWindowsUninstallKey(string install, string native, string wrapper)
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(RegistryPath, writable: true);
+        if (key is null) return false;
+        return RepairWindowsUninstallCommands(install, native, wrapper, name =>
+        {
+            var value = key.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+            // GetValue also returns the default for unsupported types.
+            if (value is null && !key.GetValueNames().Contains(name, StringComparer.OrdinalIgnoreCase)) return default;
+            var kind = key.GetValueKind(name);
+            if (value is null && kind == RegistryValueKind.String)
+                throw new RegistryRepairIncompleteException();
+            return (kind, value);
+        }, (name, value) => key.SetValue(name, value, RegistryValueKind.String),
+            name => key.DeleteValue(name, throwOnMissingValue: false));
+    }
+
+    internal static bool RepairWindowsUninstallCommands(string install, string native, string wrapper,
+        Func<string, (RegistryValueKind? Kind, object? Value)> read, Action<string, string> writeString, Action<string> delete)
+    {
+        bool KnownQuiet((RegistryValueKind? Kind, object? Value) value)
+            => value == default || value is (RegistryValueKind.String, string quietCommand) && quietCommand == native + " --silent";
+
+        if (read("InstallLocation") is not (RegistryValueKind.String, string location)
+            || !UninstallPathGuard.Canonical(location).Equals(install, StringComparison.OrdinalIgnoreCase)) return false;
+        if (read("UninstallString") is not (RegistryValueKind.String, string command) || command != native && command != wrapper) return false;
+        var quietValue = read("QuietUninstallString");
+        if (!KnownQuiet(quietValue)) return false;
+        if (command != wrapper) writeString("UninstallString", wrapper);
+        if (quietValue != default)
+        {
+            quietValue = read("QuietUninstallString");
+            if (!KnownQuiet(quietValue)) return false;
+            if (quietValue != default) delete("QuietUninstallString");
+        }
+        if (read("UninstallString") is not (RegistryValueKind.String, string written) || written != native && written != wrapper)
+            return false;
+        var remainingQuiet = read("QuietUninstallString");
+        if (!KnownQuiet(remainingQuiet)) return false;
+        if (written == wrapper && remainingQuiet == default) return true;
+        // RegistryKey.DeleteValue can return without surfacing a native error.
+        // A known partial registration is still safe to recheck later.
+        throw new RegistryRepairIncompleteException();
+    }
+
+    private sealed class RegistryRepairIncompleteException() : IOException("Не удалось подтвердить регистрацию удаления Yamuse.");
+
+    internal enum ForwardedUninstall : byte { Accepted = 1, Maintenance, Busy, Closing }
+
+    internal static string ForwardedUninstallMessage(ForwardedUninstall result) => result switch
+    {
+        ForwardedUninstall.Maintenance => "Дождитесь завершения очистки музыки или кэша и повторите удаление.",
+        ForwardedUninstall.Busy => "Yamuse уже обрабатывает запрос на удаление. Переключитесь на его окно или повторите действие позже.",
+        _ => "Открытое окно Yamuse не приняло запрос на удаление. Дождитесь закрытия окна или повторите действие."
+    };
+
+    internal static IDisposable Listen(Window owner, Action<Action<ForwardedUninstall>> request,
+        string? pipeName = null, TimeSpan? dispatchTimeout = null,
+        Func<NamedPipeServerStream, CancellationToken, Task>? waitForConnection = null)
+        => new Listener(owner.Dispatcher, request, pipeName ?? RequestPipeName, dispatchTimeout ?? TimeSpan.FromSeconds(2),
+            waitForConnection ?? ((pipe, token) => pipe.WaitForConnectionAsync(token)));
+
+    internal static ForwardedUninstall? TryForwardToOpenApplication(string? pipeName = null)
+    {
+        using var pipe = new NamedPipeClientStream(".", pipeName ?? RequestPipeName, PipeDirection.InOut,
+            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        try { pipe.Connect(400); }
+        catch (TimeoutException) { return null; }
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var reply = new byte[1];
+        try
+        {
+            if (pipe.ReadAsync(reply.AsMemory(), deadline.Token).AsTask().GetAwaiter().GetResult() == 1
+                && Enum.IsDefined((ForwardedUninstall)reply[0])) return (ForwardedUninstall)reply[0];
+        }
+        catch (Exception error) when (error is IOException or OperationCanceledException) { }
+        return ForwardedUninstall.Closing;
+    }
+
+    internal static UninstallFileIdentity CaptureDocumentsIdentity(UninstallPaths paths, Func<SafeFileHandle, UninstallFileIdentity>? identify = null)
     {
         try
         {
-            var paths = CurrentInstalledPaths();
-            using var key = Registry.CurrentUser.OpenSubKey(RegistryPath, writable: true);
-            if (key is null || key.GetValue("InstallLocation") is not string location
-                || !UninstallPathGuard.Canonical(location).Equals(paths.Install, StringComparison.OrdinalIgnoreCase)) return false;
-            var native = Quote(paths.Updater) + " --uninstall";
-            var wrapper = Quote(paths.Executable) + " " + RequestArgument;
-            if (key.GetValue("UninstallString") is not string command || command != native && command != wrapper) return false;
-            if (key.GetValue("QuietUninstallString") is string quiet && quiet != native + " --silent") return false;
-            key.SetValue("UninstallString", wrapper, RegistryValueKind.String);
-            key.DeleteValue("QuietUninstallString", throwOnMissingValue: false);
-            return Equals(key.GetValue("UninstallString"), wrapper) && key.GetValue("QuietUninstallString") is null;
+            using var parents = paths.HoldDocumentsAncestors();
+            using var documents = UninstallPathGuard.HoldDirectory(paths.Documents);
+            return UninstallPathGuard.RequireDocumentsIdentity(documents, identify);
         }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or System.ComponentModel.Win32Exception)
-        { return false; }
+        catch (Exception error) when (error is not DocumentsIdentityNotSupportedException && IsUninstallFailure(error))
+        { throw new IOException("Не удалось проверить папку «Документы» для полного удаления Yamuse.", error); }
     }
 
-    internal static IDisposable Listen(Window owner, Func<Task> request)
+    internal static string CreateReceipt(UninstallPaths paths, UninstallFileIdentity? confirmedDocuments = null)
     {
-        var signal = new EventWaitHandle(false, EventResetMode.AutoReset, EventName);
-        var registration = ThreadPool.RegisterWaitForSingleObject(signal, (_, _) =>
-        {
-            if (!owner.Dispatcher.HasShutdownStarted)
-                owner.Dispatcher.BeginInvoke(new Action(async () => await request()));
-        }, null, Timeout.Infinite, executeOnlyOnce: false);
-        return new Listener(signal, registration);
-    }
-
-    private static bool TryForwardToOpenApplication()
-    {
-        try { using var signal = EventWaitHandle.OpenExisting(EventName); signal.Set(); return true; }
-        catch (WaitHandleCannotBeOpenedException) { return false; }
-    }
-
-    internal static string CreateReceipt(UninstallPaths paths)
-    {
+        EnsureNativeInstallPath(paths.Install);
+        if (paths.Install.Length > MaximumReceiptPathLength || paths.Data.Length > MaximumReceiptPathLength
+            || paths.Music.Length > MaximumReceiptPathLength)
+            throw new IOException("Пути слишком длинные для записи запроса полного удаления Yamuse.");
+        using var documentsParents = paths.HoldDocumentsAncestors();
+        using var documents = UninstallPathGuard.HoldDirectory(paths.Documents);
+        var documentsIdentity = UninstallPathGuard.RequireDocumentsIdentity(documents);
+        if (confirmedDocuments is not null && documentsIdentity != confirmedDocuments)
+            throw new IOException("Папка «Документы» изменилась. Подтвердите полное удаление заново.");
         var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
         using var ancestors = UninstallPathGuard.HoldExistingAncestors(Path.Combine(paths.Install, "receipt"));
-        if (!CancelPendingReceipt(paths)) throw new IOException("Очистка уже выполнена. Завершите штатное удаление Yamuse через параметры Windows.");
         using var origin = Process.GetCurrentProcess();
         var receipt = new Receipt(nonce, paths.Install, paths.Data, paths.Music, WindowsIdentity.GetCurrent().User!.Value,
-            DateTimeOffset.UtcNow, origin.Id, origin.StartTime.ToUniversalTime().Ticks);
-        var temporary = Path.Combine(paths.Install, "full-uninstall-" + Guid.NewGuid().ToString("N") + ".tmp");
-        try
-        {
-            using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            { JsonSerializer.Serialize(file, receipt); file.Flush(flushToDisk: true); }
-            File.Move(temporary, ReceiptPath(paths, nonce));
-        }
-        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+            DateTimeOffset.UtcNow, origin.Id, origin.StartTime.ToUniversalTime().Ticks, DocumentsIdentity: documentsIdentity);
+        var encoded = EncodeReceipt(receipt);
+        if (!CancelPendingReceipt(paths)) throw new IOException("Очистка уже выполнена. Завершите штатное удаление Yamuse через параметры Windows.");
+        WriteReceipt(paths, nonce, encoded, overwrite: false);
         return nonce;
     }
 
@@ -282,8 +602,12 @@ internal static class UninstallSupport
     {
         _ = ReceiptPath(paths, nonce);
         var receipt = ReadAnyReceipt(paths);
-        if (receipt.Consumed || receipt.Nonce != nonce || requireFresh && receipt.CreatedUtc < DateTimeOffset.UtcNow.AddMinutes(-30))
+        var now = DateTimeOffset.UtcNow;
+        if (receipt.Consumed || receipt.Nonce != nonce
+            || requireFresh && (receipt.CreatedUtc < now.AddMinutes(-30) || receipt.CreatedUtc > now.AddMinutes(1)))
             throw new IOException("Подтверждение удаления истекло или уже использовано. Повторите удаление из настроек Windows.");
+        if (requireFresh && receipt.DocumentsIdentity is null)
+            throw new IOException("Запрос не содержит идентификатор папки «Документы». Подтвердите полное удаление заново.");
         return receipt;
     }
 
@@ -297,7 +621,7 @@ internal static class UninstallSupport
 
     private static Receipt? ReadMarkerReceipt(FileStream file, string install)
     {
-        if (file.Length > 4096) return null;
+        if (file.Length > MaximumReceiptBytes) return null;
         Receipt? receipt;
         try { receipt = JsonSerializer.Deserialize<Receipt>(file); }
         catch (JsonException) { return null; }
@@ -310,10 +634,8 @@ internal static class UninstallSupport
 
     private static bool MatchesReceiptScope(UninstallPaths paths, Receipt receipt)
     {
-        // A consumed receipt only permits the native uninstall retry. Moving
-        // Documents or changing the clock cannot cancel already admitted cleanup.
-        return receipt.Consumed || MatchesReceiptDataPaths(paths, receipt.Data, receipt.Music)
-            && receipt.CreatedUtc <= DateTimeOffset.UtcNow.AddMinutes(1);
+        // Consumed receipts only permit the native uninstall retry, which has no data paths.
+        return receipt.Consumed || MatchesReceiptDataPaths(paths, receipt.Data, receipt.Music);
     }
 
     internal enum PendingReceiptState { Normal, Consumed, RecoveryDeclined, Recovered }
@@ -361,10 +683,8 @@ internal static class UninstallSupport
 
     private static StartupMarkerReset SnapshotMarker(FileStream file, bool consumed)
     {
-        const int fileIdInfo = 18;
         var handle = file.SafeFileHandle;
-        if (!GetFileInformationByHandleEx(handle, fileIdInfo, out var id, (uint)Marshal.SizeOf<MarkerFileId>()))
-            throw new Win32Exception(Marshal.GetLastWin32Error());
+        var id = UninstallPathGuard.GetStableFileIdentity(handle);
         return new(consumed, id.Volume, id.Low, id.High, file.Length, File.GetLastWriteTimeUtc(handle));
     }
 
@@ -410,7 +730,13 @@ internal static class UninstallSupport
         => UninstallPathGuard.EntryExists(Path.Combine(paths.Install, PendingReceiptFileName));
 
     internal static bool IsReceiptConsumed(UninstallPaths paths)
-        => HasPendingReceipt(paths) && ReadAnyReceipt(paths).Consumed;
+        => IsConsumedMarkerAtInstall(paths.Install);
+
+    private static bool IsConsumedMarkerAtInstall(string install)
+    {
+        using var marker = OpenPendingReceipt(install, deleteAccess: false);
+        return marker is not null && ReadMarkerReceipt(marker.File, install)?.Consumed == true;
+    }
 
     internal static bool OriginProcessExited(UninstallPaths paths, string nonce)
         => OriginProcessExited(ReadReceipt(paths, nonce, requireFresh: true));
@@ -438,40 +764,65 @@ internal static class UninstallSupport
         return true;
     }
 
-    internal static void ScheduleConsumedRetry(UninstallPaths paths, int waitPid, Func<ProcessStartInfo, Process?>? start = null)
+    // This command only needs LocalAppData. The consumed receipt attests that
+    // the cleanup already ran, and the checked handle pins it through consent.
+    internal static void ScheduleConsumedRetry(string localDataDirectory, string executable, int waitPid,
+        Func<bool> confirm, Func<ProcessStartInfo, Process?>? start = null)
     {
-        if (!IsReceiptConsumed(paths)) throw new IOException("Очистка данных ещё не завершена. Повторите полное удаление из настроек Windows.");
-        StartAfterExit(paths, waitPid, paths.Updater, ["--uninstall"], start);
+        var install = InstallFromLocalData(localDataDirectory);
+        using var marker = OpenPendingReceipt(install, deleteAccess: false);
+        if (marker is null || ReadMarkerReceipt(marker.File, install)?.Consumed != true)
+            throw new IOException("Очистка данных ещё не завершена. Повторите полное удаление из настроек Windows.");
+        VerifyInstalledFiles(install, executable);
+        if (!confirm()) return;
+        StartAfterExit(install, executable, waitPid, Path.Combine(install, "Update.exe"), ["--uninstall"], start);
     }
 
     // Only called by Finish after cleanup under both mutexes. The age check
     // already ran at admission and must not expire during cleanup or its dialogs.
     internal static void ScheduleNativeHandoffAfterCleanup(UninstallPaths paths, string nonce, int waitPid,
-        Func<ProcessStartInfo, Process?>? start = null)
+        Func<ProcessStartInfo, Process?>? start = null, Action? onCleanupRecorded = null)
     {
+        EnsureNativeInstallPath(paths.Install);
         var receipt = ReadReceipt(paths, nonce, requireFresh: false);
-        WriteReceipt(paths, nonce, receipt with { Consumed = true });
-        try { StartAfterExit(paths, waitPid, paths.Updater, ["--uninstall"], start); }
-        catch { WriteReceipt(paths, nonce, receipt); throw; }
+        WriteReceipt(paths, nonce, EncodeReceipt(receipt with { Consumed = true }), overwrite: true);
+        // Cleanup is complete even if the installed updater cannot start. Keep
+        // the marker so a second request only retries the native stage.
+        onCleanupRecorded?.Invoke();
+        StartAfterExit(paths, waitPid, paths.Updater, ["--uninstall"], start);
     }
 
-    private static void WriteReceipt(UninstallPaths paths, string nonce, Receipt receipt)
+    private static byte[] EncodeReceipt(Receipt receipt)
+    {
+        var encoded = JsonSerializer.SerializeToUtf8Bytes(receipt);
+        if (encoded.Length > MaximumReceiptBytes)
+            throw new IOException("Запрос полного удаления Yamuse слишком велик.");
+        return encoded;
+    }
+
+    private static void WriteReceipt(UninstallPaths paths, string nonce, byte[] receipt, bool overwrite)
     {
         using var ancestors = UninstallPathGuard.HoldExistingAncestors(ReceiptPath(paths, nonce));
         var temporary = Path.Combine(paths.Install, "full-uninstall-" + Guid.NewGuid().ToString("N") + ".tmp");
         try
         {
             using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            { JsonSerializer.Serialize(file, receipt); file.Flush(flushToDisk: true); }
-            File.Move(temporary, ReceiptPath(paths, nonce), overwrite: true);
+            { file.Write(receipt); file.Flush(flushToDisk: true); }
+            File.Move(temporary, ReceiptPath(paths, nonce), overwrite);
         }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
 
     internal static ProcessStartInfo BuildWaitStart(UninstallPaths paths, int waitPid, string target, IReadOnlyList<string> arguments)
+        => BuildWaitStart(paths.Install, waitPid, target, arguments);
+
+    private static ProcessStartInfo BuildWaitStart(string install, int waitPid, string target, IReadOnlyList<string> arguments)
     {
-        if (waitPid <= 0 || target != paths.Executable && target != paths.Updater) throw new IOException("Некорректный этап удаления.");
-        var start = new ProcessStartInfo(paths.Updater) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = paths.Install };
+        EnsureNativeInstallPath(install);
+        var updater = Path.Combine(install, "Update.exe");
+        var application = Path.Combine(install, "current", "YMusic.Native.exe");
+        if (waitPid <= 0 || target != application && target != updater) throw new IOException("Некорректный этап удаления.");
+        var start = new ProcessStartInfo(updater) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = install };
         start.ArgumentList.Add("start");
         start.ArgumentList.Add("--waitPid");
         start.ArgumentList.Add(waitPid.ToString(System.Globalization.CultureInfo.InvariantCulture));
@@ -483,20 +834,29 @@ internal static class UninstallSupport
 
     internal static void StartAfterExit(UninstallPaths paths, int waitPid, string target, IReadOnlyList<string> arguments,
         Func<ProcessStartInfo, Process?>? start = null)
+        => StartAfterExit(paths.Install, paths.Executable, waitPid, target, arguments, start);
+
+    private static void StartAfterExit(string install, string executable, int waitPid, string target, IReadOnlyList<string> arguments,
+        Func<ProcessStartInfo, Process?>? start)
     {
-        var specification = BuildWaitStart(paths, waitPid, target, arguments);
-        using var process = (start ?? Process.Start)(specification) ?? throw new IOException("Не удалось запустить штатный деинсталлятор.");
-        // A start waiter must remain alive while its parent is still alive.
-        // Catch immediate argument/path/startup failures without running a shell.
-        if (process.WaitForExit(200)) throw new IOException("Штатный деинсталлятор завершился до начала удаления. Повторите действие.");
+        var specification = BuildWaitStart(install, waitPid, target, arguments);
+        VerifyInstalledFiles(install, executable, () =>
+        {
+            using var process = (start ?? Process.Start)(specification) ?? throw new IOException("Не удалось запустить штатный деинсталлятор.");
+            // A start waiter must remain alive while its parent is still alive.
+            // Catch immediate argument/path/startup failures without running a shell.
+            if (process.WaitForExit(200)) throw new IOException("Штатный деинсталлятор завершился до начала удаления. Повторите действие.");
+        });
     }
 
-    private static void Finish(UninstallPaths paths, string nonce)
+    private static void Finish(string nonce)
     {
         // Hold the ordinary application mutex as well: a fresh normal launch
         // must not recreate data while the confirmed cleanup is in progress.
-        using var main = new Mutex(true, BrandPaths.LegacyInstanceMutex, out var mainCreated);
-        if (!mainCreated) throw new IOException("Yamuse ещё открыт. Закройте приложение и повторите удаление.");
+        using var main = App.TryAcquireProfileInstance();
+        if (main is null) throw new IOException("Yamuse ещё открыт. Закройте приложение и повторите удаление.");
+        RequireUpdaterFinished(InstallFromLocalData(LocalDataDirectory()));
+        var paths = CurrentInstalledPaths();
         using var single = new Mutex(true, @"Local\YMusic.Native.FullUninstall.Cleanup." + WindowsIdentity.GetCurrent().User!.Value, out var created);
         if (!created) throw new IOException("Полное удаление уже выполняется.");
         var initialReceipt = ReadReceipt(paths, nonce, requireFresh: true);
@@ -520,14 +880,17 @@ internal static class UninstallSupport
             {
                 while (true)
                 {
-                    var result = await Task.Run(() => UninstallCleanup.Execute(paths));
+                    var result = await Task.Run(() => UninstallCleanup.Execute(paths, initialReceipt.DocumentsIdentity));
                     if (result.Complete)
                     {
-                        if (result.PreservedForeignFiles > 0)
-                            MessageBox.Show(progress, $"Данные приложения и его неизменённые скачанные файлы удалены. Посторонних или изменённых файлов/папок сохранено: {result.PreservedForeignFiles}.\n\nПапки музыки:\n{paths.Music}" +
-                                (Directory.Exists(paths.LegacyMusic) ? "\n" + paths.LegacyMusic : "") + "\n\nСейчас будет удалено приложение.",
+                        ScheduleNativeHandoffAfterCleanup(paths, nonce, Environment.ProcessId, onCleanupRecorded: () =>
+                        {
+                            if (result.PreservedForeignFiles == 0) return;
+                            var remaining = new[] { paths.Data, paths.LegacyData, paths.Music, paths.LegacyMusic }.Where(Directory.Exists);
+                            MessageBox.Show(progress, $"Посторонних или изменённых файлов и папок сохранено: {result.PreservedForeignFiles}.\n\nПапки с сохранёнными данными:\n" +
+                                string.Join("\n", remaining) + "\n\nДалее Yamuse передаст удаление приложения штатному деинсталлятору.",
                                 "Удаление Yamuse", MessageBoxButton.OK, MessageBoxImage.Information);
-                        ScheduleNativeHandoffAfterCleanup(paths, nonce, Environment.ProcessId);
+                        });
                         // Keep the consumed marker until Velopack deletes the
                         // install root. It blocks new ordinary application
                         // launches during the final native handover.
@@ -553,19 +916,86 @@ internal static class UninstallSupport
     }
     private static string Quote(string path) => "\"" + path + "\"";
     private sealed record Receipt(string Nonce, string Install, string Data, string Music, string User, DateTimeOffset CreatedUtc,
-        int OriginPid, long OriginStartedUtcTicks, bool Consumed = false);
+        int OriginPid, long OriginStartedUtcTicks, bool Consumed = false, UninstallFileIdentity? DocumentsIdentity = null);
     private sealed class PendingReceiptFile(FileStream file, UninstallPathGuard.AncestorLease ancestors) : IDisposable
     {
         internal FileStream File => file;
         public void Dispose() { try { file.Dispose(); } finally { ancestors.Dispose(); } }
     }
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MarkerFileId { internal ulong Volume, Low, High; }
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetFileInformationByHandleEx(SafeFileHandle file, int kind, out MarkerFileId information, uint size);
-    private sealed class Listener(EventWaitHandle signal, RegisteredWaitHandle registration) : IDisposable
+    private sealed class Listener : IDisposable
     {
-        public void Dispose() { registration.Unregister(null); signal.Dispose(); }
+        private readonly CancellationTokenSource _lifetime = new();
+        private readonly Task _server;
+        private int _disposed;
+
+        internal Listener(Dispatcher dispatcher, Action<Action<ForwardedUninstall>> request, string pipeName, TimeSpan dispatchTimeout,
+            Func<NamedPipeServerStream, CancellationToken, Task> waitForConnection)
+        {
+            _server = ServeAsync(CreatePipe(pipeName), pipeName, dispatcher, request, dispatchTimeout, waitForConnection, _lifetime.Token);
+        }
+
+        private static NamedPipeServerStream CreatePipe(string pipeName) => new(pipeName, PipeDirection.InOut, 1,
+            PipeTransmissionMode.Byte, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+
+        private static async Task ServeAsync(NamedPipeServerStream pipe, string pipeName, Dispatcher dispatcher,
+            Action<Action<ForwardedUninstall>> request, TimeSpan dispatchTimeout,
+            Func<NamedPipeServerStream, CancellationToken, Task> waitForConnection, CancellationToken lifetime)
+        {
+            const int noData = unchecked((int)0x800700E8);
+            try
+            {
+                while (!lifetime.IsCancellationRequested)
+                {
+                    var connected = false;
+                    try
+                    {
+                        await waitForConnection(pipe, lifetime).ConfigureAwait(false);
+                        connected = true;
+                        using var admission = CancellationTokenSource.CreateLinkedTokenSource(lifetime);
+                        admission.CancelAfter(dispatchTimeout);
+                        try
+                        {
+                            await dispatcher.InvokeAsync(() => request(result => pipe.WriteByte((byte)result)),
+                                DispatcherPriority.Normal, admission.Token).Task.ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (!lifetime.IsCancellationRequested)
+                        { pipe.WriteByte((byte)ForwardedUninstall.Closing); }
+                        // Disconnect discards buffered replies. The wrapper closes
+                        // its end immediately after reading the result.
+                        using var read = CancellationTokenSource.CreateLinkedTokenSource(lifetime);
+                        read.CancelAfter(TimeSpan.FromSeconds(2));
+                        await pipe.ReadAsync(new byte[1].AsMemory(), read.Token).ConfigureAwait(false);
+                    }
+                    catch (IOException error) when (!connected && error.HResult == noData)
+                    {
+                        // The client closed before ConnectNamedPipe completed.
+                        // Managed state never reached Connected. Recreate the native endpoint.
+                        pipe.Dispose();
+                        if (lifetime.IsCancellationRequested) return;
+                        pipe = CreatePipe(pipeName);
+                    }
+                    catch (IOException error) when (!connected)
+                    {
+                        Trace.TraceWarning("Yamuse uninstall pipe accept: {0:X8}", error.HResult);
+                        return;
+                    }
+                    catch (Exception error) when (error is IOException or OperationCanceledException) { }
+                    finally
+                    {
+                        if (connected)
+                            try { pipe.Disconnect(); }
+                            catch (IOException) { }
+                    }
+                }
+            }
+            finally { pipe.Dispose(); }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            _lifetime.Cancel();
+            _ = _server.ContinueWith(_ => _lifetime.Dispose(), TaskScheduler.Default);
+        }
     }
 }

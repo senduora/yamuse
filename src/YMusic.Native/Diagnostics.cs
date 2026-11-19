@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -7,6 +8,10 @@ namespace YMusic.Native;
 
 internal sealed class Diagnostics : IDisposable
 {
+    internal sealed class ReplacementUnavailableException(Exception innerException, string message =
+        "Том не поддерживает безопасную замену отчёта. Выберите новое имя или другое расположение. Прежний отчёт сохранён.")
+        : IOException(message, innerException);
+
     private readonly Process _process = Process.GetCurrentProcess();
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private double _lastElapsed;
@@ -18,7 +23,6 @@ internal sealed class Diagnostics : IDisposable
     public int LoadedTracks { get; set; }
     public int TotalTracks { get; set; }
     public string? LastErrorType { get; set; }
-    public string? AutoReportPath { get; private set; }
     public ResourceSample Latest { get; private set; } = new(0, 0, 0, 0, "signed_out");
     public void WindowReady()
     {
@@ -39,7 +43,84 @@ internal sealed class Diagnostics : IDisposable
         while (_samples.Count > 900) _samples.Dequeue();
         return Latest;
     }
-    public void Save(string path)
+    internal Action? BeforeReportPublicationForChecks { get; set; }
+    internal Action? CheckReportCapabilitiesForChecks { get; set; }
+
+    public bool Save(string path, Func<bool>? confirmReplacement = null)
+    {
+        path = Path.GetFullPath(path);
+        var directory = Path.GetDirectoryName(path)!;
+        using var storage = GuardedStoreFile.BeginWrite(path, allowNetworkShare: true);
+        if (storage.Exists && confirmReplacement?.Invoke() != true) return false;
+        var bytes = BuildReport();
+        if (!storage.Exists) return SaveNewReport(storage, directory, path, bytes);
+        try
+        {
+            using var stage = storage.CreateStage(TemporaryReport(directory));
+            CheckReportCapabilitiesForChecks?.Invoke();
+            RandomAccess.Write(stage, bytes, 0);
+            RandomAccess.FlushToDisk(stage);
+            storage.AfterParkForChecks = BeforeReportPublicationForChecks;
+            return storage.Commit(stage);
+        }
+        catch (FileSecurityPreservation.UnsupportedMetadataException error)
+        {
+            var reason = error.Metadata == FileSecurityPreservation.ReplacementMetadata.NamedStreams
+                ? "При замене нельзя безопасно перенести именованные потоки файла."
+                : "При замене нельзя безопасно сохранить специальные свойства файла.";
+            throw new ReplacementUnavailableException(error, $"{reason} Выберите новое имя или другое расположение. Прежний отчёт сохранён.");
+        }
+        catch (Exception error) when (error is GuardedStoreRecovery.ReplacementCapabilityException
+            || FileSecurityPreservation.IsUnsupportedCapability(error))
+        {
+            throw new ReplacementUnavailableException(error);
+        }
+    }
+
+    private bool SaveNewReport(GuardedStoreFile.WriteTransaction storage, string directory, string path, byte[] bytes)
+    {
+        var beforePublish = BeforeReportPublicationForChecks;
+        try
+        {
+            using var stage = storage.CreateStage(TemporaryReport(directory));
+            CheckReportCapabilitiesForChecks?.Invoke();
+            RandomAccess.Write(stage, bytes, 0);
+            RandomAccess.FlushToDisk(stage);
+            beforePublish?.Invoke();
+            beforePublish = null;
+            ManagedCacheCleanup.RenameByHandle(stage, path);
+            UninstallPathGuard.KeepFileOnClose(stage);
+            return true;
+        }
+        catch (Exception error) when (FileSecurityPreservation.IsUnsupportedCapability(error))
+        {
+            // The strict stage has closed. Use classic disposition for a new
+            // report on this volume. Rename still cannot replace another file.
+            try
+            {
+                using var stage = UninstallPathGuard.CreateStagedFile(TemporaryReport(directory), writeThrough: true);
+                var published = false;
+                try
+                {
+                    UninstallPathGuard.SetDeleteDisposition(stage, delete: true);
+                    FileSecurityPreservation.CheckNewReportMetadata(stage);
+                    RandomAccess.Write(stage, bytes, 0);
+                    RandomAccess.FlushToDisk(stage);
+                    beforePublish?.Invoke();
+                    ManagedCacheCleanup.RenameByHandle(stage, path, releaseDeleteDisposition: true);
+                    published = true;
+                    return true;
+                }
+                finally { if (!published) UninstallPathGuard.DiscardStagedFile(stage); }
+            }
+            catch (Win32Exception failure) { throw new IOException("Не удалось сохранить новый отчёт в выбранной папке.", failure); }
+        }
+        catch (Win32Exception error) { throw new IOException("Не удалось сохранить новый отчёт в выбранной папке.", error); }
+    }
+
+    private static string TemporaryReport(string directory) => Path.Combine(directory, $".yamuse-report-{Guid.NewGuid():N}.tmp");
+
+    private byte[] BuildReport()
     {
         Sample();
         var executable = Environment.ProcessPath!;
@@ -55,14 +136,16 @@ internal sealed class Diagnostics : IDisposable
             lastErrorType = LastErrorType, samples = _samples.ToArray(),
             notes = new[] { "Private bytes is process commit, not physical RAM.", "CPU is percent of all logical processors.", "ContentRendered is window readiness, not account/library readiness.", "No tokens, account details, track titles, or media URLs are saved." }
         };
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
-        File.WriteAllText(path, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }));
+        return JsonSerializer.SerializeToUtf8Bytes(report, new JsonSerializerOptions { WriteIndented = true });
     }
+
     public string SaveAuto(string directory)
     {
-        AutoReportPath ??= Path.Combine(directory, "diagnostics", $"session-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Environment.ProcessId}.json");
-        Save(AutoReportPath);
-        return AutoReportPath;
+        var path = Path.Combine(directory, "diagnostics", $"session-{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Environment.ProcessId}-{Guid.NewGuid():N}.json");
+        using var report = GuardedStoreFile.BeginWrite(path);
+        if (report.Exists) throw new IOException("Имя автоматического отчёта уже используется.");
+        report.Write(BuildReport());
+        return path;
     }
     public void Dispose() => _process.Dispose();
 }

@@ -14,6 +14,7 @@ internal static partial class Program
     private static async Task CheckTransferMaintenance015()
     {
         await Run("Transfer015: overall work separates saved errors unavailable partial and unknown bytes", Transfer015Model);
+        await Run("Transfer015: removed rows lose their bytes and stay outside the summary and retry work", Transfer015Removed);
         await Run("Transfer015: playlist button and download center retain real progress through pause resume and completion", Transfer015Playlist);
         await Run("Transfer015: failed and unavailable entries finish work without claiming every track saved", Transfer015Errors);
         await Run("Maintenance015: cache button clears private caches while preserving music and Settings draft", Maintenance015Cache);
@@ -21,6 +22,34 @@ internal static partial class Program
         await Run("Maintenance015: inline artwork cancellation cannot corrupt pending enumeration or retain the clearing state", Maintenance015InlineCancellation);
         await Run("Authors015: server owner names and exact current-owner fallback populate cards and playlist header", Authors015);
     }
+    private static Task Transfer015Removed()
+    {
+        var queue = new DownloadQueueState();
+        queue.Replace(Enumerable.Range(1, 4).Select(id => DcTrack(id.ToString())), "Проверка удаления");
+        var entries = queue.BeginRun(false);
+        entries[0].Complete(100);
+        entries[1].Begin(); entries[1].Progress(new(25, 50)); entries[1].SetState(DownloadEntryState.Failed);
+        entries[2].Complete(60);
+        entries[3].SetState(DownloadEntryState.Unavailable);
+        queue.Removed("1"); queue.EndRun(false);
+        var progress = PlaylistTransferProgress.Read(queue.Entries);
+        Assert(entries[0] is { State: DownloadEntryState.Removed, Bytes: 0, TotalBytes: null, Percent: 0 }
+            && progress is { Total: 3, Completed: 1, Failed: 1, Unavailable: 1, Finished: 3, ReceivedBytes: 85 }
+            && queue.Summary.Contains("сохранено 1/3") && queue.Summary.Contains("85 Б") && queue.Summary.Contains("удалено 1"),
+            "removed audio retained bytes or changed the counters for other states");
+        Assert(queue.CanRetry && queue.BeginRun(true).SequenceEqual(new[] { entries[1] })
+            && PlaylistTransferProgress.Read(queue.Entries).Percent < 100 && PlaylistTransferProgress.Read(queue.Entries).Failed == 0,
+            "retry picked up a removed row or left its failure marked as finished");
+        entries[1].Begin(); entries[1].Complete(40);
+        queue.Removed("4"); queue.EndRun(false);
+        Assert(queue.Notice.Contains("Удалённые треки") && queue.Summary.Contains("сохранено 2/2") && !queue.CanRetry,
+            "completion claimed that removed audio was saved");
+        queue.Removed(null); queue.EndRun(false);
+        Assert(PlaylistTransferProgress.Read(queue.Entries) is { Total: 0, ReceivedBytes: 0, Percent: 0 }
+            && queue.Summary.Contains("удалено 4") && !queue.Summary.Contains("сохранено"), "all-removed queue still claims audio or completion");
+        return Task.CompletedTask;
+    }
+
     private static Task Transfer015Model()
     {
         var queue = new DownloadQueueState(); queue.Replace(Enumerable.Range(1, 5).Select(i => DcTrack(i.ToString())), "Fixture");

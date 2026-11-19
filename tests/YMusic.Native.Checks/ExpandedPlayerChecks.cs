@@ -132,13 +132,14 @@ internal static partial class Program
         var version = f.Queue.Version; var before = f.Handler.Seen.Count;
         EpClick(EpElement<Button>(w, "ExpandedPlayerLyrics"));
         var panel = EpField<Grid>(w, "_expandedLyricsPanel");
-        if (SystemParameters.ClientAreaAnimation)
+        if (Motion.CanAnimate)
         {
-            await Task.Delay(125);
+            SeekFixtureAnimation(panel, FrameworkElement.WidthProperty, TimeSpan.FromMilliseconds(125));
             Assert(panel.Width > 0 && panel.Width < ((FrameworkElement)panel.Parent).ActualWidth * .49, "lyrics did not animate through an intermediate layout");
         }
         await Until(() => EpField<ListBox>(w, "_expandedLyricsList").Items.Count == 50);
-        await Task.Delay(380); w.UpdateLayout();
+        await Until(() => panel.Width == (double)panel.GetAnimationBaseValue(FrameworkElement.WidthProperty));
+        w.UpdateLayout();
         var list = EpField<ListBox>(w, "_expandedLyricsList");
         Assert(ReferenceEquals(list.ItemsSource, Control<ListBox>(w, "LyricsList").ItemsSource) && ReferenceEquals(list.ItemContainerStyle, Control<ListBox>(w, "LyricsList").ItemContainerStyle), "expanded lyrics copied another lyrics state or style");
         Assert(cover.TranslatePoint(new Point(cover.ActualWidth / 2, 0), host).X < center - 150 && panel.IsVisible && panel.ActualWidth > 400, "lyrics did not move the cover left and reveal the right panel");
@@ -146,29 +147,50 @@ internal static partial class Program
         Assert(f.Handler.Seen.Count - before == 3 && f.Lrclib.Seen.Count == 1 && f.Genius.Seen.Count == 0, "expanded lyrics duplicated a provider request or bypassed exact LRCLIB fallback");
         EpClick(EpElement<Button>(w, "ExpandedPlayerPlayPause")); await Until(() => !f.Player.IsPlaying);
         EpInvoke(w, "UpdateLyrics", 7.9d); await Dispatcher.Yield(DispatcherPriority.DataBind);
-        Assert(list.SelectedIndex == 7 && Control<ListBox>(w, "LyricsList").SelectedIndex == 7, "expanded active line differs from the original timed source");
+        Assert(LyricsActiveIndex(w) == 7 && LyricsRowIsCurrent(list.Items[7])
+            && LyricsRowIsCurrent(Control<ListBox>(w, "LyricsList").Items[7]), "expanded active line differs from the original timed source");
         // Manual navigation suspends lyric follow. Bring the exact virtualized
         // index through WPF rather than relying on the item-based request.
         EpInvoke(w, "PauseExpandedLyricsFollow");
         typeof(VirtualizingStackPanel).GetMethod("BringIndexIntoView", BindingFlags.Instance | BindingFlags.NonPublic)!
             .Invoke(EpVisuals<VirtualizingStackPanel>(list).First(), [15]);
         await Until(() => { w.UpdateLayout(); return list.ItemContainerGenerator.ContainerFromIndex(15) is ListBoxItem; });
-        var line = (ListBoxItem)list.ItemContainerGenerator.ContainerFromIndex(15)!;
-        Assert(line is not null, "expanded lyric seek row did not realize");
-        var click = new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left) { RoutedEvent = Mouse.PreviewMouseUpEvent };
-        line!.RaiseEvent(click);
-        Assert(click.Handled && EpField<double?>(w, "_pendingSeek") == 15 && Math.Abs(Control<Slider>(w, "SeekSlider").Value - 15) < .001, "expanded single-click lyric did not seek through the shared CommitSeek");
+        var line = list.ItemContainerGenerator.ContainerFromIndex(15) as ListBoxItem
+            ?? throw new InvalidOperationException("expanded lyric seek row did not realize");
+        LyricsUiMouse(line, down: true);
+        var click = LyricsUiMouse(line, down: false);
+        Assert(!click.Handled && EpField<double?>(w, "_pendingSeek") == 15 && Math.Abs(Control<Slider>(w, "SeekSlider").Value - 15) < .001, "expanded lyric click did not seek or blocked the ListBox MouseUp route");
         EpInvoke(w, "PauseExpandedLyricsFollow");
         var viewer = EpVisuals<ScrollViewer>(list).First(); SmoothScroll.CancelAnimation(viewer); viewer.ScrollToVerticalOffset(viewer.ScrollableHeight * .7); w.UpdateLayout();
         var offset = viewer.VerticalOffset; EpInvoke(w, "UpdateLyrics", 2d); await Task.Delay(120); w.UpdateLayout();
         Assert(Math.Abs(viewer.VerticalOffset - offset) < 1, "native line updates overrode manual expanded lyrics scrolling");
         EpSet(w, "_expandedLyricsFollowUntil", DateTimeOffset.UtcNow.AddMilliseconds(-1)); EpInvoke(w, "UpdateLyrics", 2d);
-        await Task.Delay(350); w.UpdateLayout(); Assert(viewer.VerticalOffset < offset - 30, "expanded lyrics did not resume follow after idle");
+        await Until(() => viewer.VerticalOffset < offset - 30);
         foreach (var (width, height) in new[] { (1050, 680), (1280, 860) })
-        { w.Width = width; w.Height = height; w.UpdateLayout(); await Task.Delay(160); Assert(list.ActualWidth > 350 && list.ActualHeight > 300 && viewer.ScrollableWidth < 1, "lyrics panel is cropped at supported size"); App.Capture(w, Path.Combine(_directory, $"expanded-player-lyrics-{width}x{height}.png")); }
-        EpClick(EpElement<Button>(w, "ExpandedPlayerLyrics")); await Task.Delay(380); w.UpdateLayout();
+        {
+            w.Width = width;
+            w.Height = height;
+            await Dispatcher.Yield(DispatcherPriority.Render);
+            try
+            {
+                await Until(() =>
+                {
+                    w.UpdateLayout();
+                    return Math.Abs(w.ActualWidth - width) < 1 && Math.Abs(w.ActualHeight - height) < 1
+                        && list.ActualWidth > 350 && list.ActualHeight > 300 && viewer.ScrollableWidth < 1;
+                });
+            }
+            catch (OperationCanceledException error)
+            {
+                throw new InvalidOperationException($"Lyrics at {width}x{height}: window {w.ActualWidth:F1}x{w.ActualHeight:F1}, "
+                    + $"list {list.ActualWidth:F1}x{list.ActualHeight:F1}, horizontal overflow {viewer.ScrollableWidth:F1}.", error);
+            }
+            App.Capture(w, Path.Combine(_directory, $"expanded-player-lyrics-{width}x{height}.png"));
+        }
+        EpClick(EpElement<Button>(w, "ExpandedPlayerLyrics")); await Until(() => !panel.IsVisible); w.UpdateLayout();
         Assert(!panel.IsVisible && !EpField<DispatcherTimer>(w, "_lyricsTimer").IsEnabled && Math.Abs(cover.TranslatePoint(new Point(cover.ActualWidth / 2, 0), host).X - center) < 2, "second lyrics click did not restore the centered cover and stop the hidden timer");
-        EpClick(EpElement<Button>(w, "ExpandedPlayerLyrics")); await Task.Delay(380);
+        EpClick(EpElement<Button>(w, "ExpandedPlayerLyrics"));
+        await Until(() => panel.Width == (double)panel.GetAnimationBaseValue(FrameworkElement.WidthProperty));
         Assert(f.Handler.Seen.Count - before == 3 && f.Lrclib.Seen.Count == 1 && f.Queue.Version == version, "cached expanded reopen requested data again or changed the queue");
         await w.PlayTrackAsync(f.Second);
         await Until(() => list.Items.Count == 50 && Control<TextBlock>(w, "LyricsHeading").Text == f.Second.Title);
@@ -182,8 +204,9 @@ internal static partial class Program
         try
         {
             foreach (var expanded in new[] { true, false })
+            foreach (var (temporaryFailures, recoverFromOtherView) in new[] { (1, false), (2, false), (2, true) })
             {
-                var name = expanded ? "same-cover-fullscreen" : "same-cover-lyrics";
+                var name = (expanded ? "same-cover-fullscreen" : "same-cover-lyrics") + $"-{temporaryFailures}-{recoverFromOtherView}";
                 var rendition = expanded ? "1000x1000" : "400x400";
                 var requests = 0;
                 var png = expanded ? EpArtwork() : HomeArtworkPng(Colors.Red);
@@ -192,7 +215,7 @@ internal static partial class Program
                     HomeArtworkAnonymous(request);
                     if (!request.RequestUri!.AbsolutePath.EndsWith('/' + rendition, StringComparison.Ordinal))
                         return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
-                    return Task.FromResult(Interlocked.Increment(ref requests) == 1
+                    return Task.FromResult(Interlocked.Increment(ref requests) <= temporaryFailures
                         ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) : HomeArtworkResponse(png));
                 }));
                 Artwork.Cache = cache;
@@ -202,14 +225,27 @@ internal static partial class Program
                 if (expanded) EpOpen(f.Window);
                 else EpClick(Control<Button>(f.Window, "PlayerLyricsButton"));
                 var cover = expanded ? EpField<Image>(f.Window, "_expandedPlayerCover") : Control<Image>(f.Window, "LyricsCover");
-                await Until(() => Artwork.GetLoadStatus(cover) == ArtworkLoadStatus.Unavailable);
-                Assert(requests == 1, "the original temporary failure did not reach the visible artwork");
+                if (temporaryFailures == 1)
+                {
+                    await Until(() => Artwork.GetLoadStatus(cover) == ArtworkLoadStatus.Ready);
+                    Assert(requests == 2, "the same visible cover did not recover on the bounded automatic retry");
+                }
+                else
+                {
+                    await Until(() => Artwork.GetLoadStatus(cover) == ArtworkLoadStatus.Unavailable);
+                    Assert(requests == 2, "the visible cover exceeded or skipped its automatic retry");
+                    if (recoverFromOtherView)
+                    {
+                        await cache.GetAsync(f.First.CoverUri, expanded ? 1024 : 256, default);
+                        await Until(() => Artwork.GetLoadStatus(cover) == ArtworkLoadStatus.Ready);
+                    }
+                }
 
                 await f.Window.PlayTrackAsync(f.Second);
                 await Until(() => Artwork.GetLoadStatus(cover) == ArtworkLoadStatus.Ready);
-                Assert(Artwork.GetSourceUri(cover) == f.Second.CoverUri && requests == 2
+                Assert(Artwork.GetSourceUri(cover) == f.Second.CoverUri && requests == temporaryFailures + 1
                     && cover.Source is BitmapSource { IsFrozen: true } bitmap && (!expanded || bitmap.PixelWidth > 256),
-                    "the next track did not retry and render the same cover in its intended rendition");
+                    "changing tracks did not retain or recover the same cover in its intended rendition");
             }
         }
         finally { Artwork.Cache = previous; }
@@ -237,6 +273,8 @@ internal static partial class Program
         await Until(() => !f.Player.IsPlaying);
         const int lateIndex = 42;
         EpInvoke(window, "CommitSeek", 42.25d);
+        bool LateIsActive() => LyricsActiveIndex(window) == lateIndex && list.Items.Count > lateIndex
+            && LyricsRowIsCurrent(list.Items[lateIndex]);
         bool LateIsVisible()
         {
             window.UpdateLayout();
@@ -244,7 +282,7 @@ internal static partial class Program
             var top = row.TranslatePoint(new Point(), viewer).Y;
             return top >= 0 && top < viewer.ViewportHeight;
         }
-        await Until(() => list.SelectedIndex == lateIndex && LateIsVisible());
+        await Until(() => LateIsActive() && LateIsVisible());
         var retry = EpVisuals<Button>(EpField<Grid>(window, "_expandedLyricsPanel")).Single(button => Equals(button.Content, "Обновить текст"));
 
         async Task RefreshThroughEmptyViewport()
@@ -257,11 +295,11 @@ internal static partial class Program
                 EpClick(retry);
                 await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
                 await Until(() => { window.UpdateLayout(); return list.Items.Count == 0 && viewer.VerticalOffset < 1; });
-                Assert(EpField<int>(window, "_expandedLyricsFollowIndex") == -1 && !SmoothScroll.IsAnimating(viewer),
-                    "refresh retained the previous list's follow index or automatic scroll");
+                Assert(LyricsActiveIndex(window) == -1 && EpField<int>(window, "_expandedLyricsFollowIndex") == -1
+                    && !SmoothScroll.IsAnimating(viewer), "refresh retained the previous list's timecode, follow index or automatic scroll");
             }
             finally { release.TrySetResult(); }
-            await Until(() => list.Items.Count == 50 && list.SelectedIndex == lateIndex);
+            await Until(() => list.Items.Count == 50 && LateIsActive());
         }
 
         SmoothScroll.ScrollTo(viewer, 0);

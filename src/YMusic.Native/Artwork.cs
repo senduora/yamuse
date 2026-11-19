@@ -7,6 +7,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media.Imaging;
 using System.ComponentModel;
+using Microsoft.Win32.SafeHandles;
 
 namespace YMusic.Native;
 
@@ -89,14 +90,26 @@ public static class Artwork
     private static async Task ApplyAsync(Image image, ImageState state, long generation,
         CancellationTokenSource cancellation, string? source, int size)
     {
+        bool IsCurrent() => !cancellation.IsCancellationRequested && state.Generation == generation
+            && image.IsLoaded && image.IsVisible && GetSourceUri(image) == source && GetPixelSize(image) == size;
+        void Publish(ArtworkCache.ArtworkResult result)
+        {
+            image.Source = result.Bitmap;
+            if (IsCurrent()) image.SetValue(LoadStatusPropertyKey, result.Bitmap is null ? ArtworkLoadStatus.Unavailable : ArtworkLoadStatus.Ready);
+        }
         try
         {
-            var bitmap = await Cache.GetAsync(source, size, cancellation.Token, retryAfterClear: true);
-            if (!cancellation.IsCancellationRequested && state.Generation == generation
-                && image.IsLoaded && image.IsVisible && GetSourceUri(image) == source && GetPixelSize(image) == size)
+            var cache = Cache;
+            while (IsCurrent())
             {
-                image.Source = bitmap;
-                image.SetValue(LoadStatusPropertyKey, bitmap is null ? ArtworkLoadStatus.Unavailable : ArtworkLoadStatus.Ready);
+                image.SetValue(LoadStatusPropertyKey, ArtworkLoadStatus.Loading);
+                var result = await cache.GetResultAsync(source, size, cancellation.Token, retryAfterClear: true);
+                if (!IsCurrent()) return;
+                if (!cache.TryPublish(result, () => Publish(result))) continue;
+                if (!result.TemporaryFailure || !IsCurrent()) return;
+                var recovered = await cache.WaitForCachedArtworkAsync(source, size, result.CacheGeneration!, cancellation.Token);
+                if (!IsCurrent()) return;
+                if (recovered is { } ready && cache.TryPublish(ready, () => Publish(ready))) return;
             }
         }
         catch (Exception ex) when (ex is OperationCanceledException or HttpRequestException or IOException or InvalidDataException
@@ -104,8 +117,7 @@ public static class Artwork
         {
             // A failed current request is distinct from the temporary empty
             // source during a switch. Old/cancelled requests never publish state.
-            if (!cancellation.IsCancellationRequested && state.Generation == generation
-                && image.IsLoaded && image.IsVisible && GetSourceUri(image) == source && GetPixelSize(image) == size)
+            if (IsCurrent())
                 image.SetValue(LoadStatusPropertyKey, ArtworkLoadStatus.Unavailable);
         }
         finally
@@ -164,19 +176,28 @@ internal sealed class ArtworkCache : IDisposable
     private const int MemoryEntryLimit = 128;
     private const long MemoryByteLimit = 16 * 1024 * 1024;
     private const long DiskByteLimit = 128 * 1024 * 1024;
-    private const int DiskEntryLimit = 2048;
+    internal const int DiskEntryLimit = 2048;
+    private const int PruneAttemptsPerWrite = 4;
+    private static readonly TimeSpan DownloadRetryDelay = TimeSpan.FromMilliseconds(500);
     private readonly HttpClient _http;
     private readonly string _directory;
     private readonly TimeSpan _downloadTimeout;
     private readonly SemaphoreSlim _workers = new(4, 4);
     private readonly SemaphoreSlim _diskGate = new(1, 1);
-    private readonly object _sync = new();
+    private readonly Lock _sync = new();
+    private readonly object _publication = new();
     private readonly Dictionary<string, LinkedListNode<MemoryEntry>> _memory = new(StringComparer.Ordinal);
     private readonly LinkedList<MemoryEntry> _lru = new();
     private readonly Dictionary<string, Pending> _pending = new(StringComparer.Ordinal);
+    // An abandoned subscription can leave its file open until the reader returns.
+    private readonly HashSet<Task> _diskReads = [];
+    private readonly Dictionary<string, Recovery> _recoveryWaiters = new(StringComparer.Ordinal);
     private long _memoryBytes;
+    private int _pruneOffset;
     private volatile Task _clearCompletion = Task.CompletedTask;
     private bool _disposed;
+
+    internal Func<Task>? DiskReadOpenedForChecks { private get; init; }
 
     internal ArtworkCache(string directory, HttpMessageHandler? handler = null, TimeSpan? downloadTimeout = null)
     {
@@ -196,13 +217,17 @@ internal sealed class ArtworkCache : IDisposable
 
     internal async Task<BitmapSource?> GetAsync(string? source, int size, CancellationToken cancellationToken,
         bool retryAfterClear = false)
+        => (await GetResultAsync(source, size, cancellationToken, retryAfterClear).ConfigureAwait(false)).Bitmap;
+
+    internal async Task<ArtworkResult> GetResultAsync(string? source, int size, CancellationToken cancellationToken,
+        bool retryAfterClear)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (!ArtworkUri.TryCreate(source, size, out var uri)) return null;
+        if (!ArtworkUri.TryCreate(source, size, out var uri)) return default;
         // Small views still share one bounded decode. The expanded player keeps
         // a distinct large bitmap even when metadata specifies a fixed CDN URL.
         var decodeSize = ArtworkUri.Size(size) > 256 ? 1024 : 256;
-        var key = uri.AbsoluteUri + (decodeSize > 256 ? "|decode1024" : "");
+        var key = CacheKey(uri, size);
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -217,7 +242,7 @@ internal sealed class ArtworkCache : IDisposable
                     if (_memory.TryGetValue(key, out var node))
                     {
                         _lru.Remove(node); _lru.AddFirst(node);
-                        return node.Value.Bitmap;
+                        return new(node.Value.Bitmap, CacheGeneration: clearCompletion);
                     }
                     pending = GetPending(uri, key, decodeSize);
                     pending.Waiters++;
@@ -225,11 +250,11 @@ internal sealed class ArtworkCache : IDisposable
             }
             if (pending is not null)
             {
-                BitmapSource? bitmap;
-                try { bitmap = await pending.Task.WaitAsync(cancellationToken).ConfigureAwait(false); }
+                ArtworkResult result;
+                try { result = await pending.Task.WaitAsync(cancellationToken).ConfigureAwait(false); }
                 catch (OperationCanceledException) when (retryAfterClear && !cancellationToken.IsCancellationRequested
                     && !ReferenceEquals(pending.AdmittedAfterClear, _clearCompletion))
-                { bitmap = null; }
+                { result = default; }
                 finally
                 {
                     lock (_sync)
@@ -240,13 +265,54 @@ internal sealed class ArtworkCache : IDisposable
                 }
                 // Clear may start after the worker returned but before this waiter
                 // resumed. The old result belongs to that earlier cache generation.
-                if (ReferenceEquals(pending.AdmittedAfterClear, clearCompletion)) return bitmap;
+                if (ReferenceEquals(pending.AdmittedAfterClear, clearCompletion)) return result with { CacheGeneration = clearCompletion };
                 if (!retryAfterClear) throw new OperationCanceledException();
             }
             // The image stays in Loading while the cache is being cleared.
             // Hiding or recycling it cancels this wait through its own token.
-            if (!retryAfterClear) return null;
+            if (!retryAfterClear) return default;
             await clearCompletion.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static string CacheKey(Uri uri, int size) => uri.AbsoluteUri + (ArtworkUri.Size(size) > 256 ? "|decode1024" : "");
+
+    // Order WPF publication with cache clearing even if the bitmap spent time
+    // waiting for the dispatcher.
+    internal bool TryPublish(ArtworkResult result, Action publish)
+    {
+        lock (_publication)
+        {
+            if (_disposed || result.CacheGeneration is { } generation && !ReferenceEquals(generation, _clearCompletion)) return false;
+            publish();
+            return true;
+        }
+    }
+
+    // A failed visible binding can reuse a proven result from another consumer.
+    // Clear advances the generation, letting the binding join a fresh request.
+    internal async Task<ArtworkResult?> WaitForCachedArtworkAsync(string? source, int size, Task generation, CancellationToken cancellationToken)
+    {
+        if (!ArtworkUri.TryCreate(source, size, out var uri)) return null;
+        var key = CacheKey(uri, size);
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Recovery recovery;
+            lock (_sync)
+            {
+                if (_disposed || !ReferenceEquals(generation, _clearCompletion)) return null;
+                if (_memory.TryGetValue(key, out var node)) return new(node.Value.Bitmap, CacheGeneration: generation);
+                if (!_recoveryWaiters.TryGetValue(key, out recovery!)) _recoveryWaiters.Add(key, recovery = new());
+                recovery.Waiters++;
+            }
+            try { await recovery.Signal.Task.WaitAsync(cancellationToken).ConfigureAwait(false); }
+            finally
+            {
+                lock (_sync)
+                    if (--recovery.Waiters == 0 && _recoveryWaiters.TryGetValue(key, out var current) && ReferenceEquals(current, recovery))
+                        _recoveryWaiters.Remove(key);
+            }
         }
     }
 
@@ -257,26 +323,31 @@ internal sealed class ArtworkCache : IDisposable
         var pending = new Pending(_clearCompletion);
         _pending[key] = pending;
         pending.Task = Task.Run(() => LoadAsync(uri, key, pending, decodeSize));
-        _ = pending.Task.ContinueWith(_ =>
-        {
-            lock (_sync) if (pending.Waiters == 0) pending.Cancellation.Dispose();
-        }, TaskScheduler.Default);
         return pending;
     }
 
     private void ReleaseWaiter(string key, Pending pending)
     {
-        if (--pending.Waiters != 0) return;
-        if (pending.Task.IsCompleted)
-        {
-            pending.Cancellation.Dispose();
-            return;
-        }
-        pending.Cancellation.Cancel();
+        if (--pending.Waiters != 0 || pending.Finished) return;
         if (_pending.TryGetValue(key, out var current) && ReferenceEquals(current, pending)) _pending.Remove(key);
+        CancelPending(pending);
     }
 
-    private async Task<BitmapSource?> LoadAsync(Uri uri, string key, Pending pending, int decodeSize)
+    // Only schedules callbacks. Cancellation is marked before releasing _sync
+    // so the detached worker cannot publish over a new subscriber's result.
+    private static void CancelPending(Pending pending)
+    {
+        if (!pending.Finished) pending.CancellationCallbacks ??= pending.Cancellation.CancelAsync();
+    }
+
+    private static async Task DisposePendingCancellationAsync(CancellationTokenSource source, Task? callbacks)
+    {
+        try { if (callbacks is not null) await callbacks.ConfigureAwait(false); }
+        catch (AggregateException) { /* The canceled worker no longer serves any consumer. */ }
+        finally { source.Dispose(); }
+    }
+
+    private async Task<ArtworkResult> LoadAsync(Uri uri, string key, Pending pending, int decodeSize)
     {
         var cancellationToken = pending.Cancellation.Token;
         void EnsureCurrent()
@@ -291,31 +362,45 @@ internal sealed class ArtworkCache : IDisposable
             await _workers.WaitAsync(cancellationToken).ConfigureAwait(false);
             acquired = true;
             var path = Path.Combine(_directory, Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))).ToLowerInvariant() + ".img");
-            var (bitmap, encodedBytes) = await ReadDiskAsync(path, decodeSize, cancellationToken).ConfigureAwait(false);
+            var (bitmap, encodedBytes) = await ReadDiskAsync(path, decodeSize, pending.AdmittedAfterClear, cancellationToken).ConfigureAwait(false);
             if (bitmap is null)
             {
-                var bytes = await DownloadAsync(uri, cancellationToken).ConfigureAwait(false);
+                byte[] bytes;
+                try { bytes = await DownloadAsync(uri, cancellationToken).ConfigureAwait(false); }
+                catch (Exception error) when (IsTemporaryDownloadFailure(error)) { return new(null, TemporaryFailure: true); }
                 EnsureCurrent();
                 bitmap = Decode(bytes, decodeSize);
                 encodedBytes = bytes.Length;
                 EnsureCurrent();
                 await WriteDiskAsync(path, bytes, cancellationToken).ConfigureAwait(false);
             }
+            // BitmapImage may retain its original OnLoad stream. Budget both
+            // encoded and decoded bytes before taking the cache state lock.
+            var entry = new MemoryEntry(key, bitmap,
+                encodedBytes + (long)bitmap.PixelWidth * bitmap.PixelHeight * Math.Max(4, (bitmap.Format.BitsPerPixel + 7) / 8));
+            Recovery? recovery;
             lock (_sync)
             {
                 EnsureCurrent();
-                Remember(key, bitmap, encodedBytes);
+                recovery = Remember(entry);
             }
-            return bitmap;
+            recovery?.Signal.SetResult();
+            return new(bitmap);
         }
         catch (Exception ex) when (ex is HttpRequestException or IOException or InvalidDataException or UnauthorizedAccessException
             or InvalidOperationException or NotSupportedException or ArgumentException or FormatException)
-        { return null; }
+        { return default; }
         finally
         {
             if (acquired) _workers.Release();
+            Task? callbacks;
             lock (_sync)
+            {
                 if (_pending.TryGetValue(key, out var current) && ReferenceEquals(current, pending)) _pending.Remove(key);
+                pending.Finished = true;
+                callbacks = pending.CancellationCallbacks;
+            }
+            _ = DisposePendingCancellationAsync(pending.Cancellation, callbacks);
         }
     }
 
@@ -325,7 +410,15 @@ internal sealed class ArtworkCache : IDisposable
         timeout.CancelAfter(_downloadTimeout);
         try
         {
-            return await DownloadCoreAsync(uri, timeout.Token).ConfigureAwait(false);
+            try { return await DownloadCoreAsync(uri, timeout.Token).ConfigureAwait(false); }
+            catch (Exception error) when (IsTemporaryDownloadFailure(error) && !timeout.IsCancellationRequested)
+            {
+                var delay = error is ArtworkHttpFailure { RetryAfter: { } retryAfter } && retryAfter > DownloadRetryDelay
+                    ? retryAfter : DownloadRetryDelay;
+                if (delay >= _downloadTimeout) throw;
+                await Task.Delay(delay, timeout.Token).ConfigureAwait(false);
+                return await DownloadCoreAsync(uri, timeout.Token).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException error) when (!cancellationToken.IsCancellationRequested)
         { throw new HttpRequestException("Artwork download timed out.", error); }
@@ -346,14 +439,15 @@ internal sealed class ArtworkCache : IDisposable
                 uri = next;
                 continue;
             }
-            if (!response.IsSuccessStatusCode) throw new HttpRequestException("Artwork unavailable.");
+            if (!response.IsSuccessStatusCode) throw new ArtworkHttpFailure(response);
             if (response.StatusCode == HttpStatusCode.PartialContent || response.Content.Headers.NonValidated.Contains("Content-Range"))
                 throw new InvalidDataException("Artwork is incomplete.");
             var length = response.Content.Headers.ContentLength;
             if (length > MaximumResponseBytes) throw new InvalidDataException("Artwork is too large.");
             var mediaType = response.Content.Headers.ContentType?.MediaType;
             if (mediaType is not null && !mediaType.StartsWith("image/", StringComparison.OrdinalIgnoreCase)
-                && mediaType != "application/octet-stream") throw new InvalidDataException("Unsupported artwork format.");
+                && !mediaType.Equals("application/octet-stream", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Unsupported artwork format.");
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
             var bytes = await ReadBoundedAsync(stream, cancellationToken).ConfigureAwait(false);
             if (length is { } expected && bytes.Length != expected) throw new InvalidDataException("Artwork is incomplete.");
@@ -361,28 +455,90 @@ internal sealed class ArtworkCache : IDisposable
         }
     }
 
-    private async Task<(BitmapSource? Bitmap, int EncodedBytes)> ReadDiskAsync(string path, int decodeSize,
-        CancellationToken cancellationToken)
+    private static bool IsTemporaryDownloadFailure(Exception error) => error is IOException
+        or HttpRequestException { StatusCode: HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests
+            or HttpStatusCode.InternalServerError or HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout }
+        or HttpRequestException { StatusCode: null, HttpRequestError: HttpRequestError.Unknown or HttpRequestError.ConnectionError
+            or HttpRequestError.NameResolutionError or HttpRequestError.ResponseEnded };
+
+    private sealed class ArtworkHttpFailure(HttpResponseMessage response)
+        : HttpRequestException("Artwork unavailable.", null, response.StatusCode)
     {
+        internal TimeSpan? RetryAfter { get; } = response.Headers.RetryAfter?.Delta
+            ?? (response.Headers.RetryAfter?.Date is { } date ? date - DateTimeOffset.UtcNow : null);
+    }
+
+    private async Task<(BitmapSource? Bitmap, int EncodedBytes)> ReadDiskAsync(string path, int decodeSize,
+        Task generation, CancellationToken cancellationToken)
+    {
+        var read = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_sync)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!ReferenceEquals(generation, _clearCompletion)) throw new OperationCanceledException();
+            _diskReads.Add(read.Task);
+        }
         try
         {
             using var ancestors = UninstallPathGuard.HoldAncestors(path);
-            if (!ancestors.Complete || !UninstallPathGuard.EntryExists(path)) return default;
-            using var handle = UninstallPathGuard.OpenOwnedFile(path, read: true, deleteAccess: false);
+            if (!ancestors.Complete) return default;
+            var recovery = new GuardedStoreRecovery(path, GuardedStoreKind.Artwork);
+            using var handle = OpenDiskRead(path, recovery, out var canTouch);
+            if (handle is null) return default;
             using var file = new FileStream(handle, FileAccess.Read, 16 * 1024, isAsync: false);
+            // Verifying a pending replacement can advance the synchronous handle.
+            if (file.Position != 0) file.Position = 0;
             if (file.Length is <= 0 or > MaximumResponseBytes) return default;
+            if (DiskReadOpenedForChecks is { } opened) await opened().ConfigureAwait(false);
             var bytes = await ReadBoundedAsync(file, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             var bitmap = Decode(bytes, decodeSize);
             cancellationToken.ThrowIfCancellationRequested();
-            try { File.SetLastWriteTimeUtc(path, DateTime.UtcNow); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            try
+            {
+                if (canTouch && !recovery.Pending)
+                {
+                    using var writer = GuardedStoreFile.HoldWriteGate(path);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    // Written is part of the authenticated replacement revision.
+                    if (!recovery.Pending && FileSecurityPreservation.HasSingleLink(handle)) File.SetLastWriteTimeUtc(handle, DateTime.UtcNow);
+                }
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception) { }
             return (bitmap, bytes.Length);
         }
         // A miss can be replaced by a valid download. Deleting by name here
         // could remove a newer generation's cache entry after cancellation.
         catch (Exception error) when (DecodeFailure(error) || error is UnauthorizedAccessException or Win32Exception)
         { return default; }
+        finally
+        {
+            lock (_sync) _diskReads.Remove(read.Task);
+            read.SetResult();
+        }
     }
+
+    private static SafeFileHandle? OpenDiskRead(string path, GuardedStoreRecovery recovery, out bool canTouch)
+    {
+        canTouch = false;
+        try
+        {
+            var handle = UninstallPathGuard.OpenOwnedFile(path, read: true, deleteAccess: false, writeAttributes: true);
+            try
+            {
+                if (!recovery.Pending)
+                {
+                    canTouch = true;
+                    return handle;
+                }
+            }
+            catch { handle.Dispose(); throw; }
+            handle.Dispose();
+        }
+        catch (Win32Exception) { }
+        return GuardedStoreFile.OpenForRead(path, kind: GuardedStoreKind.Artwork);
+    }
+
     private static async Task<byte[]> ReadBoundedAsync(Stream stream, CancellationToken cancellationToken)
     {
         using var result = new MemoryStream();
@@ -428,25 +584,25 @@ internal sealed class ArtworkCache : IDisposable
         var temporary = path[..^4] + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            using var ancestors = UninstallPathGuard.HoldAncestors(path, create: true);
-            var replace = UninstallPathGuard.EntryExists(path);
-            if (replace)
-            {
-                using var existing = UninstallPathGuard.OpenOwnedFile(path, read: false, deleteAccess: false);
-            }
-            using (var handle = UninstallPathGuard.CreateStagedFile(temporary, asynchronous: true))
+            // The disk writer's named gate belongs to this thread. Complete
+            // the guarded replacement before awaiting cache maintenance.
+            using (var storage = GuardedStoreFile.BeginWrite(path, kind: GuardedStoreKind.Artwork))
+            using (var handle = storage.CreateStage(temporary))
             {
                 var published = false;
                 try
                 {
-                    await RandomAccess.WriteAsync(handle, bytes, 0, cancellationToken).ConfigureAwait(false);
                     cancellationToken.ThrowIfCancellationRequested();
-                    ManagedCacheCleanup.RenameByHandle(handle, path, replace);
+                    RandomAccess.Write(handle, bytes, 0);
+                    RandomAccess.FlushToDisk(handle);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    storage.Commit(handle);
                     published = true;
                 }
                 finally { if (!published) UninstallPathGuard.DiscardStagedFile(handle); }
             }
-            PruneDisk();
+            using var ancestors = UninstallPathGuard.HoldAncestors(path);
+            if (ancestors.Complete) PruneDisk(cancellationToken);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception) { }
         finally { _diskGate.Release(); }
@@ -461,7 +617,10 @@ internal sealed class ArtworkCache : IDisposable
     private async Task<CacheCleanupResult> ClearCoreAsync(CancellationToken cancellationToken)
     {
         Pending[] requests;
+        Task[] reads;
+        Recovery[] recoveries;
         var clearing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_publication)
         lock (_sync)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -469,47 +628,50 @@ internal sealed class ArtworkCache : IDisposable
             if (!_clearCompletion.IsCompleted) throw new InvalidOperationException("Очистка кэша уже выполняется.");
             _clearCompletion = clearing.Task;
             requests = _pending.Values.ToArray();
+            reads = _diskReads.ToArray();
             _memory.Clear(); _lru.Clear(); _memoryBytes = 0;
+            recoveries = TakeRecoveryWaiters();
+            foreach (var request in requests) CancelPending(request);
         }
         var acquired = false;
         try
         {
-            // Cancellation can complete an HTTP task inline and re-enter the
-            // pending map. Iterate a snapshot outside the lock and always leave
-            // the clearing state, including a concurrently completed request.
-            foreach (var request in requests)
-            {
-                try { request.Cancellation.Cancel(); }
-                catch (ObjectDisposedException) when (request.Task.IsCompleted) { }
-            }
-            // Canceled loads must leave the disk/memory publish phase before
-            // enumeration; GetAsync cannot admit a new load during this clear.
-            try { await Task.WhenAll(requests.Select(p => p.Task)).WaitAsync(cancellationToken).ConfigureAwait(false); }
+            foreach (var recovery in recoveries) recovery.Signal.SetResult();
+            // A canceled last waiter leaves _pending before its read handle
+            // closes. Drain those reads as well before enumerating the cache.
+            try { await Task.WhenAll(reads.Concat(requests.Select(p => (Task)p.Task))).WaitAsync(cancellationToken).ConfigureAwait(false); }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { }
             await _diskGate.WaitAsync(cancellationToken).ConfigureAwait(false); acquired = true;
             _ = UninstallPathGuard.Canonical(_directory);
             using var ancestors = UninstallPathGuard.HoldAncestors(Path.Combine(_directory, ".cache-clear"));
             if (!ancestors.Complete) return new(0, 0, 0, 0);
             var removed = 0; var preserved = 0; var failed = 0; long bytes = 0;
-            foreach (var path in Directory.EnumerateFileSystemEntries(_directory))
+            var candidates = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var entry in Directory.EnumerateFileSystemEntries(_directory))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!SafeCacheName(Path.GetFileName(path), ".img")) { preserved++; continue; }
+                if (GuardedStoreRecovery.ArtworkImageName(Path.GetFileName(entry)) is { } name) candidates.Add(name);
+                else preserved++;
+            }
+            foreach (var name in candidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var path = Path.Combine(_directory, name);
                 try
                 {
-                    var attributes = File.GetAttributes(path);
-                    if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0) { preserved++; continue; }
-                    if ((attributes & FileAttributes.ReadOnly) != 0) { failed++; continue; }
-                    using var handle = UninstallPathGuard.OpenOwnedFile(path, read: true);
-                    using var file = new FileStream(handle, FileAccess.Read, 16 * 1024, isAsync: false);
-                    if (file.Length is <= 0 or > MaximumResponseBytes) { preserved++; continue; }
-                    var image = await ReadBoundedAsync(file, cancellationToken).ConfigureAwait(false);
-                    try { _ = Decode(image); }
-                    catch (Exception error) when (DecodeFailure(error)) { preserved++; continue; }
+                    using var writer = GuardedStoreFile.HoldWriteGate(path);
                     cancellationToken.ThrowIfCancellationRequested();
-                    UninstallPathGuard.DeleteByHandle(file.SafeFileHandle);
-                    removed++; bytes += image.Length;
+                    using var handle = GuardedStoreFile.OpenCacheForCleanupUnderWriteGate(path, GuardedStoreKind.Artwork, out var recovery);
+                    if (recovery.ArchivedPrevious) preserved++;
+                    if (recovery.PreserveCurrent) { preserved++; continue; }
+                    if (handle is null) continue;
+                    var attributes = File.GetAttributes(handle);
+                    if ((attributes & FileAttributes.ReadOnly) != 0) { failed++; continue; }
+                    var removedBytes = DeleteVerifiedImage(handle, cancellationToken);
+                    if (removedBytes == 0) { preserved++; continue; }
+                    removed++; bytes += removedBytes;
                 }
+                catch (UninstallPathGuard.UnsafeStoragePathException) { preserved++; }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception) { failed++; }
             }
             return new(removed, preserved, failed, bytes);
@@ -520,19 +682,48 @@ internal sealed class ArtworkCache : IDisposable
             clearing.SetResult();
         }
     }
-    private void PruneDisk()
+    private void PruneDisk(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
             var files = new DirectoryInfo(_directory).EnumerateFiles("*.img")
-                .Where(f => SafeCacheName(f.Name, ".img") && (f.Attributes & FileAttributes.ReparsePoint) == 0)
+                .Where(f => SafeCacheName(f.Name, ".img")
+                    && (f.Attributes & (FileAttributes.ReparsePoint | FileAttributes.ReadOnly)) == 0
+                    && f.Length is > 0 and <= MaximumResponseBytes)
                 .OrderByDescending(f => f.LastWriteTimeUtc).ToArray();
             long total = 0;
-            var count = 0;
-            foreach (var file in files)
+            var retained = 0;
+            while (retained < files.Length && retained < DiskEntryLimit)
             {
-                total += file.Length;
-                if (++count > DiskEntryLimit || total > DiskByteLimit) DeleteCacheEntry(file.FullName);
+                total += files[retained].Length;
+                if (total > DiskByteLimit) break;
+                retained++;
+            }
+            var overflow = files.Length - retained;
+            var attempts = Math.Min(overflow, PruneAttemptsPerWrite);
+            var start = overflow == 0 ? 0 : _pruneOffset % overflow;
+            // Start at the oldest overflow entries, rotating past preserved
+            // files. A cache write validates only a few bounded images.
+            _pruneOffset = overflow == 0 ? 0 : (start + attempts) % overflow;
+            for (var index = 0; index < attempts; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var file = files[files.Length - 1 - (start + index) % overflow];
+                try
+                {
+                    using var writer = GuardedStoreFile.HoldWriteGate(file.FullName);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    // A later read may restore the parked image if the primary
+                    // disappears. Leave both versions for normal recovery.
+                    var recovery = new GuardedStoreRecovery(file.FullName, GuardedStoreKind.Artwork);
+                    if (!recovery.Pending)
+                    {
+                        using var handle = UninstallPathGuard.OpenOwnedFile(file.FullName, read: true);
+                        DeleteVerifiedImage(handle, cancellationToken);
+                    }
+                }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception) { }
             }
             foreach (var file in new DirectoryInfo(_directory).EnumerateFiles("*.tmp"))
                 if (file.Name.Length == 101 && file.Name[64] == '.' && SafeCacheName(file.Name[..64] + ".img", ".img")
@@ -542,22 +733,36 @@ internal sealed class ArtworkCache : IDisposable
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
     }
+
+    private static int DeleteVerifiedImage(SafeFileHandle handle, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (GuardedStoreFile.ReadFromHandle(handle, MaximumResponseBytes) is not { } image) return 0;
+        cancellationToken.ThrowIfCancellationRequested();
+        try { _ = Decode(image); }
+        catch (Exception error) when (DecodeFailure(error)) { return 0; }
+        cancellationToken.ThrowIfCancellationRequested();
+        if (FileSecurityPreservation.HasNamedStreamsOrExtendedAttributes(handle)) return 0;
+        cancellationToken.ThrowIfCancellationRequested();
+        UninstallPathGuard.DeleteByHandle(handle);
+        return image.Length;
+    }
+
     private static bool SafeCacheName(string name, string extension) => name.Length == 64 + extension.Length
         && name.EndsWith(extension, StringComparison.Ordinal) && name.AsSpan(0, 64).IndexOfAnyExcept("0123456789abcdef") < 0;
     private static void DeleteCacheEntry(string path)
     {
         try
         {
-            using var handle = UninstallPathGuard.OpenOwnedFile(path, read: false);
-            UninstallPathGuard.DeleteByHandle(handle);
+            using var handle = UninstallPathGuard.OpenOwnedFile(path, read: true);
+            if (!FileSecurityPreservation.HasNamedStreamsOrExtendedAttributes(handle)) UninstallPathGuard.DeleteByHandle(handle);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception) { }
     }
-    private void Remember(string key, BitmapSource bitmap, int encodedBytes)
+    private Recovery? Remember(MemoryEntry entry)
     {
+        var key = entry.Key;
         if (_memory.TryGetValue(key, out var existing)) { _lru.Remove(existing); _memoryBytes -= existing.Value.Bytes; }
-        // BitmapImage may retain its original OnLoad stream; budget both encoded and decoded data.
-        var entry = new MemoryEntry(key, bitmap, encodedBytes + (long)bitmap.PixelWidth * bitmap.PixelHeight * Math.Max(4, (bitmap.Format.BitsPerPixel + 7) / 8));
         _memory[key] = _lru.AddFirst(entry);
         _memoryBytes += entry.Bytes;
         while (_memory.Count > MemoryEntryLimit || _memoryBytes > MemoryByteLimit)
@@ -565,24 +770,44 @@ internal sealed class ArtworkCache : IDisposable
             var last = _lru.Last!;
             _memoryBytes -= last.Value.Bytes; _memory.Remove(last.Value.Key); _lru.RemoveLast();
         }
+        return _recoveryWaiters.Remove(key, out var recovery) ? recovery : null;
     }
     public void Dispose()
     {
+        Recovery[] recoveries;
+        lock (_publication)
         lock (_sync)
         {
             if (_disposed) return;
             _disposed = true;
-            // Inline cancellation can complete a load and remove it from the map.
-            foreach (var pending in _pending.Values.ToArray()) pending.Cancellation.Cancel();
+            recoveries = TakeRecoveryWaiters();
+            foreach (var pending in _pending.Values) CancelPending(pending);
         }
+        foreach (var recovery in recoveries) recovery.Signal.SetResult();
         _http.Dispose();
     }
+
+    private Recovery[] TakeRecoveryWaiters()
+    {
+        var recoveries = _recoveryWaiters.Values.ToArray();
+        _recoveryWaiters.Clear();
+        return recoveries;
+    }
+
     private sealed record MemoryEntry(string Key, BitmapSource Bitmap, long Bytes);
+    internal readonly record struct ArtworkResult(BitmapSource? Bitmap, bool TemporaryFailure = false, Task? CacheGeneration = null);
+    private sealed class Recovery
+    {
+        internal readonly TaskCompletionSource Signal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal int Waiters;
+    }
     private sealed class Pending(Task admittedAfterClear)
     {
         internal readonly CancellationTokenSource Cancellation = new();
         internal readonly Task AdmittedAfterClear = admittedAfterClear;
-        internal Task<BitmapSource?> Task = null!;
+        internal Task<ArtworkResult> Task = null!;
+        internal Task? CancellationCallbacks;
+        internal bool Finished;
         internal int Waiters;
     }
 }

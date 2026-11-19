@@ -98,7 +98,12 @@ internal sealed partial class MusicApi
                     // received queue. No local shuffle or synthesized tracks.
                     batch = await NewWaveBatchAsync(session, state.Received, state.Mode, state.TrackSeedId, state.AlbumSeedId, cancellationToken).ConfigureAwait(false);
                 }
-                else { batch = ReadWaveBatch(result, state.SessionId, state.Mode, state.TrackSeedId, state.AlbumSeedId); }
+                else
+                {
+                    if (result.TryGetProperty("radioSessionId", out var returnedSession) && JsonString(returnedSession) != state.SessionId)
+                        throw WaveFormatError();
+                    batch = ReadWaveBatch(result, state.SessionId, state.Mode, state.TrackSeedId, state.AlbumSeedId);
+                }
             }
             batch = batch with { Station = state.Station };
             CommitWaveBatch(batch, state.Received, state.Owner, generation, cancellationToken, expectedStation: state.Station);
@@ -185,18 +190,16 @@ internal sealed partial class MusicApi
             if (!item.TryGetProperty("track", out var track) || track.ValueKind != JsonValueKind.Object) throw WaveFormatError();
             var id = Text(track, "id");
             if (string.IsNullOrWhiteSpace(id) || id.Length > 512 || id.Any(char.IsControl)) throw WaveFormatError();
-            var albums = track.TryGetProperty("albums", out var albumArray) && albumArray.ValueKind == JsonValueKind.Array
-                ? albumArray.EnumerateArray().ToArray() : [];
-            var albumId = albums.Length > 0 ? Text(albums[0], "id") : "";
+            var album = TrackAlbum(track);
             var artists = track.TryGetProperty("artists", out var artistArray) && artistArray.ValueKind == JsonValueKind.Array
                 ? string.Join(", ", artistArray.EnumerateArray().Select(artist => Text(artist, "name"))) : "";
             tracks.Add(new TrackRow
             {
                 Number = tracks.Count + 1, Id = id,
-                RequestId = IsTrackReferencePart(albumId) && !id.Contains(':') ? $"{id}:{albumId}" : id,
+                RequestId = !id.Contains(':') ? new LikedId(id, album.Id).RequestId : id,
                 Title = TrackTitle(track), Artist = TrackText(artists), Artists = ArtistReferences(track),
                 PrimaryArtistName = PrimaryArtistName(track),
-                Album = albums.Length > 0 ? TrackText(JsonString(albums[0], "title")) : "", CoverUri = TrackArtwork(track),
+                Album = TrackText(album.Title), AlbumId = album.Id, CoverUri = TrackArtwork(track, album.Id),
                 DurationMs = TrackDuration(track),
                 Available = Bool(track, "available") || Bool(track, "availableForPremiumUsers") || Bool(track, "availableFullWithoutPermission")
             });

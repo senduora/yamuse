@@ -22,6 +22,9 @@ internal static partial class Program
             albumName = album, duration, instrumental, plainLyrics = "Synthetic plain fixture", syncedLyrics = lrc
         });
 
+    private static string LrclibUnreadableField(string record, string field) =>
+        record.Replace($"\"{field}\":", $"\"{field}\":\"\\uD800\",\"unused\":", StringComparison.Ordinal);
+
     private static async Task CheckLrclib()
     {
         await Run("LRCLIB: exact anonymous lookup preserves edition and strict LRC timestamps", async () =>
@@ -69,7 +72,7 @@ internal static partial class Program
                 LrclibRecord(lrc: "[ar:Synthetic fixture]"),
                 "{malformed",
                 "[]",
-                LrclibRecord().Replace("\"syncedLyrics\":", "\"syncedLyrics\":\"\\uD800\",\"unused\":", StringComparison.Ordinal),
+                LrclibUnreadableField(LrclibRecord(), "syncedLyrics"),
                 LrclibRecord().Replace("\"instrumental\":false", "\"instrumental\":\"false\"", StringComparison.Ordinal),
                 "{\"trackName\":\"Песня (Live Remix)\",\"artistName\":\"Исполнитель & Гость\",\"duration\":\"180.125\",\"syncedLyrics\":\"[00:01]Fixture\"}"
             };
@@ -123,6 +126,44 @@ internal static partial class Program
             using var rangeClient = new LrclibLyricsClient(rangeHttp);
             Assert((await rangeClient.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics: null, TemporarilyUnavailable: true },
                 "LRCLIB ignored a nonempty malformed Content-Range");
+        });
+
+        await Run("LRCLIB: unreadable advertised strings stay retryable and explicit absence does not", async () =>
+        {
+            var valid = LrclibRecord();
+            foreach (var field in new[] { "syncedLyrics", "albumName" })
+            {
+                var unavailable = LrclibUnreadableField(valid, field);
+                var requests = 0;
+                using var http = new HttpClient(new LrclibHandler((_, _) => Task.FromResult(Json(++requests == 1 ? unavailable : valid))));
+                using var client = new LrclibLyricsClient(http);
+                Assert((await client.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics: null, TemporarilyUnavailable: true },
+                    "an undecodable LRCLIB field was folded into a confirmed miss: " + field);
+                Assert((await client.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics.Synchronized: true, TemporarilyUnavailable: false }
+                    && requests == 2, "valid data did not recover after the unreadable " + field);
+            }
+
+            foreach (var field in new[] { "instrumental", "syncedLyrics", "albumName" })
+            {
+                var incomplete = System.Text.Json.Nodes.JsonNode.Parse(valid)!.AsObject();
+                incomplete.Remove(field);
+                var requests = 0;
+                using var http = new HttpClient(new LrclibHandler((_, _) =>
+                    Task.FromResult(Json(++requests == 1 ? incomplete.ToJsonString() : valid))));
+                using var client = new LrclibLyricsClient(http);
+                Assert((await client.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics: null, TemporarilyUnavailable: true },
+                    "a required missing LRCLIB field was folded into absence: " + field);
+                Assert((await client.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics.Synchronized: true }
+                    && requests == 2, "repair of a missing LRCLIB field was not retried");
+            }
+
+            foreach (var absent in new[] { LrclibRecord(lrc: null), LrclibRecord(lrc: " \t"), LrclibRecord(instrumental: true), LrclibRecord(album: "Other album") })
+            {
+                using var http = new HttpClient(new LrclibHandler((_, _) => Task.FromResult(Json(absent))));
+                using var client = new LrclibLyricsClient(http);
+                Assert((await client.FindSynchronizedAsync(LrclibTrack(), default)) is { Lyrics: null, TemporarilyUnavailable: false },
+                    "a valid absence or album mismatch became a provider error");
+            }
         });
 
         await Run("LRCLIB: cancellation, HTTP errors and redirects never turn into cached success", async () =>

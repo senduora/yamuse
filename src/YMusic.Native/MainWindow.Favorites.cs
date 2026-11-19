@@ -86,11 +86,12 @@ public partial class MainWindow
             if (!_favoritesCacheRead)
             {
                 var likeRevision = _favoritesLikeRevision;
-                var snapshot = FavoritesCacheReader is { } read
-                    ? await read(uid, cts.Token)
-                    : store is null ? null : await Task.Run(() => store.Load(uid), cts.Token);
+                var (status, snapshot) = FavoritesCacheReader is { } read
+                    ? (FavoritesCacheReadStatus.Loaded, await read(uid, cts.Token))
+                    : store is null ? (FavoritesCacheReadStatus.Missing, null)
+                    : await Task.Run(() => store.Read(uid), cts.Token);
                 Guard();
-                _favoritesCacheRead = true;
+                _favoritesCacheRead = status != FavoritesCacheReadStatus.Unavailable;
                 if (snapshot is not null && snapshot.AccountHash == FavoritesCacheStore.AccountHash(uid)
                     && likeRevision == _favoritesLikeRevision && !_favoritesCacheComplete && _favoritesCache.Count == 0)
                 {
@@ -162,13 +163,14 @@ public partial class MainWindow
                     else page[i] = FavoriteNumber(row, number);
                 }
                 var epoch = _offlineViewEpoch;
+                var checks = CurrentOfflineDownloadChecks;
                 OfflineMark[]? marks = null;
                 try
                 {
                     marks = await Task.Run(async () =>
                     {
                         if (FavoritesBeforeOfflineRead is { } before) await before(cts.Token).ConfigureAwait(false);
-                        return ReadOfflineMarks(page, cts.Token);
+                        return ReadOfflineMarks(page, cts.Token, checks);
                     }, cts.Token);
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException or MusicException)
@@ -179,7 +181,8 @@ public partial class MainWindow
                     _diagnostics.LastErrorType = "FavoritesOfflineMarks:" + error.GetType().Name;
                 }
                 Guard();
-                if (marks is not null && epoch == _offlineViewEpoch && !_offlineMaintenance) ApplyOfflineMarks(marks);
+                if (marks is not null && epoch == _offlineViewEpoch && !_offlineMaintenance
+                    && ReferenceEquals(checks, CurrentOfflineDownloadChecks)) ApplyOfflineMarks(marks);
                 ApplyTrackLikeStates(page);
                 for (var i = 0; i < page.Length; i++) ordered[positions[i]] = page[i];
                 if (!hasSnapshot)
@@ -246,8 +249,11 @@ public partial class MainWindow
 
     private void ApplyVerifiedFavoriteIds(IReadOnlyList<LikedId> ids)
     {
+        var order = ids.Select(reference => reference.RequestId);
+        if (_pendingAutoFavorites is { } pending && !pending.Tracks.Select(row => row.RequestId).SequenceEqual(order))
+            _pendingAutoFavorites = null;
         if (_favoritesSnapshotReady && (!_favoritesCacheComplete
-            || !_favoritesCache.Select(row => row.RequestId).SequenceEqual(ids.Select(reference => reference.RequestId))))
+            || !_favoritesCache.Select(row => row.RequestId).SequenceEqual(order)))
         {
             _favoritesSnapshotReady = false;
             UpdatePlaylistDownloadedStatus();

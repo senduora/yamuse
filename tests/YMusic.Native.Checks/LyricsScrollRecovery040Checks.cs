@@ -15,6 +15,8 @@ internal static partial class Program
 {
     public static async Task CheckLyricsScrollRecovery040()
     {
+        await Run("LyricsRecovery040: a delayed wheel frame preserves overlapping rows and the accumulated distance", Lr040DelayedFrame);
+        await Run("LyricsRecovery040: precise wheel input preserves a preceding notch before the first frame", Lr040MixedPackets);
         foreach (var (expanded, width, height) in new[] { (false, 1050d, 680d), (false, 1600d, 1000d), (true, 1600d, 1000d) })
         {
             var name = expanded ? "fullscreen" : "inline-" + width;
@@ -33,6 +35,44 @@ internal static partial class Program
             await Run("LyricsRecovery040: automatic follow reveals the active occurrence of a repeated line in " + name,
                 () => Lr040RepeatedLineFollow(expanded, name));
         }
+    }
+
+    private static async Task Lr040MixedPackets()
+    {
+        using var f = new Lr040Fixture(false, 1050, 680, "mixed-packets");
+        await Dispatcher.Yield(DispatcherPriority.ContextIdle);
+        f.Window.UpdateLayout();
+        var viewer = LyricsUiVisuals<ScrollViewer>(f.List).First();
+        using var trace = new Lr040Trace(f.List, viewer);
+        Assert(ScrollWheel(viewer, -120).Handled && ScrollWheel(viewer, -15).Handled,
+            "mixed wheel packets escaped the lyrics viewer");
+        await Until(() => !SmoothScroll.IsAnimating(viewer));
+        await Dispatcher.Yield(DispatcherPriority.ContextIdle);
+        var expected = 1.125 * SystemParameters.WheelScrollLines * 16d;
+        Assert(trace.MissingAnchors == 0 && Math.Abs(trace.Travelled - expected) <= 1.1,
+            $"mixed wheel input discarded visible movement: expected {expected:F2}, observed {trace.Travelled:F2}");
+    }
+
+    private static async Task Lr040DelayedFrame()
+    {
+        using var f = new Lr040Fixture(false, 1050, 680, "delayed-frame");
+        await Dispatcher.Yield(DispatcherPriority.ContextIdle);
+        f.Window.UpdateLayout();
+        var viewer = LyricsUiVisuals<ScrollViewer>(f.List).First();
+        using var trace = new Lr040Trace(f.List, viewer);
+        const int packets = 18;
+        for (var i = 0; i < packets; i++)
+            Assert(ScrollWheel(viewer, -120).Handled, "accumulated wheel input escaped the lyrics viewer");
+        var state = Smooth016State(viewer);
+        state.GetType().GetField("_started", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(state, Stopwatch.GetTimestamp() - Stopwatch.Frequency);
+        state.GetType().GetMethod("OnRendering", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(state, [null, EventArgs.Empty]);
+        await Until(() => !SmoothScroll.IsAnimating(viewer));
+        await Dispatcher.Yield(DispatcherPriority.ContextIdle);
+        var expected = packets * SystemParameters.WheelScrollLines * 16d;
+        Assert(trace.MissingAnchors == 0 && Math.Abs(trace.Travelled - expected) <= 1.1,
+            $"a delayed frame discarded visible movement: expected {expected:F2}, observed {trace.Travelled:F2}");
     }
 
     private static async Task Lr040Wheel(bool expanded, double width, double height, string name)
@@ -165,7 +205,7 @@ internal static partial class Program
             f.Player.Seek(TimeSpan.FromSeconds(60));
             LyricsUiInvoke(f.Window, "UpdateLyrics", 60d);
             await Task.Delay(250);
-            Assert(f.Player.IsPlaying && f.List.SelectedIndex >= 240, "manual drag paused playback or the active lyric highlight");
+            Assert(f.Player.IsPlaying && LyricsActiveIndex(f.Window) >= 240, "manual drag paused playback or the active lyric highlight");
             Assert(Math.Abs(trace.Travelled) <= 1.1 && !SmoothScroll.IsAnimating(viewer), "held scrollbar lost ownership after the follow deadline");
         }
         thumb.RaiseEvent(new DragCompletedEventArgs(0, 0, false) { RoutedEvent = Thumb.DragCompletedEvent });
@@ -212,12 +252,13 @@ internal static partial class Program
         f.Window.UpdateLayout();
         var viewer = LyricsUiVisuals<ScrollViewer>(f.List).First();
         const int target = 300;
-        var first = f.List.Items.IndexOf(f.List.Items[target]);
+        var labels = f.List.Items.Cast<object>().Select(item => item.ToString()).ToArray();
+        var first = Array.IndexOf(labels, labels[target]);
         Assert(first >= 0 && first < 30 && f.List.ItemContainerGenerator.ContainerFromIndex(target) is null,
             "fixture needs an unrealized occurrence of an earlier line");
 
         LyricsUiInvoke(f.Window, "UpdateLyrics", target * .25);
-        await Until(() => f.List.SelectedIndex == target &&
+        await Until(() => LyricsActiveIndex(f.Window) == target && LyricsRowIsCurrent(f.List.Items[target]) &&
             f.List.ItemContainerGenerator.ContainerFromIndex(target) is ListBoxItem row &&
             row.TranslatePoint(new Point(0, row.ActualHeight), viewer).Y > 0 &&
             row.TranslatePoint(new Point(), viewer).Y < viewer.ViewportHeight);
@@ -283,8 +324,8 @@ internal static partial class Program
                 "Не спеши, посмотри на дорогу, где каждый знакомый фонарь освещает шаги и где ветер приносит далёкие звуки вечерних поездов; мы продолжим идти до рассвета"
             };
             var lines = Enumerable.Range(0, 420).Select(i => new LyricLine(i * .25, i < 16 ? "Вечер " + i : sentences[(i / 9 + i) % sentences.Length])).ToArray();
-            LyricsUiSet(Window, "_lyricLines", lines); LyricsUiSet(Window, "_lyricsCts", _lyrics);
-            var ordinary = Control<ListBox>(Window, "LyricsList"); ordinary.ItemsSource = lines.Select(l => l.Text).ToArray();
+            LyricsUiInvoke(Window, "SetLyricsRows", lines, lines.Select(l => l.Text)); LyricsUiAssignPending(Window, _lyrics);
+            var ordinary = Control<ListBox>(Window, "LyricsList");
             if (expanded)
             {
                 LyricsUiInvoke(Window, "SetExpandedPlayerVisible", true, false);

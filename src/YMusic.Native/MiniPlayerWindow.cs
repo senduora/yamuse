@@ -205,10 +205,10 @@ internal sealed class MiniPlayerWindow : Window
             if (!_syncingVolume) VolumeRequested?.Invoke(VolumeSlider.Value);
         };
         Closed += (_, _) => { ClearCommandError(); _seekGesture.Cancel(); _volumeGesture.Cancel(); PlaybackTimeline.Stop(SeekSlider); Command = null; SeekRequested = null; VolumeRequested = null; ShowMainRequested = null; };
-        Update("", "", false, false, false); UpdateDetails(null, 0, 0, false, false, false, 70);
+        Update("", "", false, false, false, canPlay: false); UpdateDetails(null, 0, 0, false, false, false, 70);
     }
 
-    internal void Update(string title, string artist, bool isPlaying, bool canNext, bool canPrevious)
+    internal void Update(string title, string artist, bool isPlaying, bool canNext, bool canPrevious, bool canPlay)
     {
         VerifyAccess();
         if (_title != title || _artist != artist)
@@ -224,7 +224,7 @@ internal sealed class MiniPlayerWindow : Window
         _playbackStatus.Text = !_hasTrack ? "ВАША МУЗЫКА" : isPlaying ? "СЕЙЧАС ИГРАЕТ" : "НА ПАУЗЕ";
         PlayButton.Content = Glyph(isPlaying ? "\uE769" : "\uE768", 18);
         PlayButton.ToolTip = isPlaying ? "Пауза" : "Играть"; AutomationProperties.SetName(PlayButton, isPlaying ? "Пауза" : "Играть");
-        PlayButton.IsEnabled = _hasTrack; _next.IsEnabled = _hasTrack && canNext; _previous.IsEnabled = _hasTrack && canPrevious;
+        PlayButton.IsEnabled = canPlay; _next.IsEnabled = canNext; _previous.IsEnabled = canPrevious;
         if (!_hasTrack) UpdateDetails(null, 0, 0, false, false, false, VolumeSlider.Value);
     }
 

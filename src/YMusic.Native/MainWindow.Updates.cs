@@ -11,12 +11,13 @@ public partial class MainWindow
     private UpdateSupport? _appUpdatesOverride = null;
     private UpdateSupport AppUpdates => _appUpdatesOverride ?? UpdateSupport.Current;
     private bool _startupUpdateCheckStarted, _startupUpdateDismissed, _appUpdateActionInProgress, _startupUpdateRestartRequested;
+    private bool _startupUpdatePromptDeferred;
     private bool _appUpdatePreparingRestart;
     private Border? _startupUpdatePrompt;
     private TextBlock? _startupUpdateText;
     private Button? _startupUpdateButton, _startupUpdateLater;
     private string? _appUpdateFailure;
-    private bool AppUpdateMaintenanceActive => _offlineMaintenance || _cacheMaintenance;
+    private bool AppUpdateMaintenanceActive => _clearOfflineConfirmationPending || _offlineMaintenance || _cacheMaintenance;
     private const string AppUpdateMaintenanceMessage = "Дождитесь завершения очистки музыки или кэша и повторите обновление.";
     private const string AppUpdateRestoreMessage = "Обновление отложено до восстановления очереди загрузок. После восстановления повторите попытку.";
     private const string AppUpdateDownloadSaveMessage = "Не удалось сохранить очередь загрузок. Обновление отложено.";
@@ -31,19 +32,24 @@ public partial class MainWindow
         try
         {
             var updates = AppUpdates;
-            if (!updates.State.FeedConfigured || !updates.State.IsInstalled && !_restore && !updates.HasPortableCheckOverride) return;
+            if (!UpdateFrequencyKnown || !updates.State.FeedConfigured
+                || !updates.State.IsInstalled && !_restore && !updates.HasPortableCheckOverride) return;
             if (_updateCheckFrequency != UpdateCheckFrequency.Startup)
             { await RunScheduledUpdateCheckAsync(); return; }
-            await CheckAppUpdateNowAsync(updates);
-            if (_closed || _lifetime.IsCancellationRequested || _closeCommitInProgress || _updateCheckFrequency != UpdateCheckFrequency.Startup) return;
-            // Offline startup stays quiet. Only a confirmed available package
-            // creates the invitation; navigation and settings refresh cannot.
-            if (updates.State.IsInstalled && updates.State.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded)
-                CreateStartupUpdatePrompt();
-            RefreshAppUpdateUi();
+            _startupUpdatePending = true;
+            await CheckStartupUpdateNowAsync(updates);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _diagnostics.LastErrorType = "Updates:" + ex.GetType().Name; }
+    }
+
+    private async Task CheckStartupUpdateNowAsync(UpdateSupport updates)
+    {
+        await CheckAppUpdateNowAsync(updates);
+        if (_startupUpdatePending || _closed || _lifetime.IsCancellationRequested || _updateCheckFrequency != UpdateCheckFrequency.Startup) return;
+        if (updates.State.IsInstalled && updates.State.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded)
+            _startupUpdatePromptDeferred = true;
+        RefreshAppUpdateUi();
     }
 
     private void RefreshAppUpdateUi()
@@ -51,6 +57,12 @@ public partial class MainWindow
         if (_closed) return;
         var state = AppUpdates.State;
         var available = state.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded;
+        if (_startupUpdatePromptDeferred && !_closeCommitInProgress)
+        {
+            _startupUpdatePromptDeferred = false;
+            if (!_lifetime.IsCancellationRequested && _updateCheckFrequency == UpdateCheckFrequency.Startup
+                && state.IsInstalled && available) CreateStartupUpdatePrompt();
+        }
         SettingsButton.Content = available ? "Настройки · •" : "Настройки";
         SettingsButton.ToolTip = available ? "Доступно обновление " + state.AvailableVersion : "Настройки";
         RefreshFooterUpdateUi(state);
@@ -62,14 +74,15 @@ public partial class MainWindow
     {
         if (FooterUpdateButton is null) return;
         var available = state.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded;
-        FooterUpdateButton.Content = state.Status switch
+        var unreadableSchedule = !available && _appUpdateFailure == UpdateScheduleReadFailure;
+        FooterUpdateButton.Content = unreadableSchedule ? "!" : state.Status switch
         {
             AppUpdateStatus.Checking => "…", AppUpdateStatus.Downloading => "…",
             AppUpdateStatus.Available or AppUpdateStatus.Downloaded => "↑",
             AppUpdateStatus.NoUpdate => "✓", AppUpdateStatus.Error => "!", _ => "↻"
         };
         FooterUpdateButton.SetResourceReference(Control.ForegroundProperty, available ? "AccentTextBrush" : "MutedBrush");
-        FooterUpdateButton.ToolTip = state.Status switch
+        FooterUpdateButton.ToolTip = unreadableSchedule ? UpdateScheduleReadFailure : state.Status switch
         {
             AppUpdateStatus.Available or AppUpdateStatus.Downloaded => "Доступно обновление " + state.AvailableVersion + (state.IsInstalled ? " — открыть настройки" : " — открыть официальный выпуск"),
             AppUpdateStatus.Checking => "Проверяем обновления…", AppUpdateStatus.Downloading => "Скачиваем обновление…",
@@ -151,7 +164,7 @@ public partial class MainWindow
             // A failed download/apply is retriable. Rechecking also discovers a
             // package that was downloaded successfully before a restart failed.
             if (updates.State.Status is not AppUpdateStatus.Available and not AppUpdateStatus.Downloaded)
-                await CheckAppUpdateNowAsync(updates);
+                await CheckManualUpdateNowAsync(updates);
             if (_closed || _lifetime.IsCancellationRequested) return;
             if (updates.State.Status == AppUpdateStatus.Available)
                 await updates.DownloadAsync(new Progress<int>(_ =>
@@ -163,7 +176,7 @@ public partial class MainWindow
             RefreshAppUpdateUi();
             if (updates.State.Status == AppUpdateStatus.Downloaded)
                 await ApplyAppUpdateAsync(updates);
-            else
+            else if (_appUpdateFailure != UpdateScheduleReadFailure)
                 _appUpdateFailure = updates.State.Status == AppUpdateStatus.Error
                     ? "Не удалось обновить приложение. Проверьте соединение и повторите."
                     : "Обновление сейчас недоступно. Можно проверить его позже в настройках.";
@@ -186,6 +199,7 @@ public partial class MainWindow
         if (_closed || _lifetime.IsCancellationRequested || _closeCommitInProgress || _appUpdatePreparingRestart || _startupUpdateRestartRequested) return false;
         _appUpdateFailure = null;
         if (AppUpdateMaintenanceActive) return false;
+        if (!TryFlushPendingDownloadQueueClears()) return DeferAppUpdate(AppUpdateDownloadSaveMessage);
         if (AppUpdateMustWaitForDownloadRestore) return DeferAppUpdate(AppUpdateRestoreMessage);
         var accountUid = _account?.Uid;
         var accountGeneration = _accountGeneration;
@@ -202,7 +216,9 @@ public partial class MainWindow
             if (_downloadTask is { } pending)
                 try { await pending.WaitAsync(_lifetime.Token); } catch (OperationCanceledException) { }
             await DrainExitWritesAsync().WaitAsync(_lifetime.Token);
+            if (!await SettleUpdateCheckAsync()) return DeferAppUpdate(UpdateCheckStillRunning + " Обновление отложено.");
             if (_closed || _lifetime.IsCancellationRequested || _closeCommitInProgress) return false;
+            if (updates.State.Status != AppUpdateStatus.Downloaded) return false;
             if (AppUpdateMaintenanceActive) return false;
             if (!IsCurrentAdmission() || _downloadCts is not null || _downloadQueue.Running)
                 return DeferAppUpdate("Очередь загрузок или аккаунт изменились. Повторите обновление.");
@@ -212,7 +228,10 @@ public partial class MainWindow
             if (!TrySavePreferencesForUpdate(out var preferencesFailure))
                 return DeferAppUpdate(preferencesFailure ?? "Не удалось сохранить настройки. Обновление отложено.");
             if (!TrySavePlaybackStateForExit())
-                return DeferAppUpdate("Не удалось сохранить очередь воспроизведения и позицию. Обновление отложено.");
+                return DeferAppUpdate(PlaybackStateSaveFailure + " Обновление отложено.");
+            if (!TryFlushUnsavedListSorts())
+                return DeferAppUpdate("Не удалось сохранить сортировку списков. Обновление отложено.");
+            if (!TryCommitUpdateSchedule(updates)) return DeferAppUpdate(UpdateScheduleSaveFailure + " Обновление отложено.");
             updates.ApplyAndRestart();
             _startupUpdateRestartRequested = true;
             return true;
@@ -220,6 +239,7 @@ public partial class MainWindow
         finally
         {
             _appUpdatePreparingRestart = false;
+            ResumeDeferredRestoredArtwork();
             if (!_closed && !_lifetime.IsCancellationRequested && !_startupUpdateRestartRequested)
             {
                 if (IsCurrentAdmission() && !autoWasSuspended && _downloadCts is null && !_downloadQueue.HasPaused && !_downloadQueue.CanResume)
@@ -260,14 +280,21 @@ public partial class MainWindow
                 new { Value = UpdateCheckFrequency.Weekly, Label = "Раз в неделю" },
                 new { Value = UpdateCheckFrequency.Monthly, Label = "Раз в месяц" },
                 new { Value = UpdateCheckFrequency.Off, Label = "Не проверять автоматически" }
-            }, SelectedValue = _updateCheckFrequency };
+            }, SelectedValue = UpdateFrequencyKnown ? _updateCheckFrequency : null };
         _updateFrequencyCombo = frequency;
         frequency.SelectionChanged += (_, _) =>
         {
             if (!CanApplySettingsControl || frequency.SelectedValue is not UpdateCheckFrequency selected || !Enum.IsDefined(selected)) return;
-            _updateCheckFrequency = selected;
+            if (UpdateFrequencyKnown && selected == _updateCheckFrequency && _pendingUpdateFrequency is null) return;
+            RememberPreferenceEdit(PreferenceField.UpdateFrequency);
+            _pendingUpdateFrequency = selected;
             PersistSettingsImmediately();
-            ArmUpdateSchedule();
+            if (_pendingUpdateFrequency is not null)
+            {
+                _pendingUpdateFrequency = null;
+                _pendingPreferenceEdits &= ~PreferenceField.UpdateFrequency;
+            }
+            ShowCommittedUpdateFrequency();
         };
         AutomationProperties.SetName(frequency, "Частота проверки обновлений");
         panel.Children.Add(frequencyLabel); panel.Children.Add(frequency);
@@ -293,8 +320,8 @@ public partial class MainWindow
             button.IsEnabled = state.FeedConfigured
                 && !_closeCommitInProgress && !AppUpdateMaintenanceActive && !_appUpdateActionInProgress && !_updateCheckInProgress && !_startupUpdateRestartRequested
                 && state.Status is not AppUpdateStatus.Checking and not AppUpdateStatus.Downloading;
-            checkActions.Visibility = state.IsInstalled && (state.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded
-                || state.Status == AppUpdateStatus.Checking && checkActions.Visibility == Visibility.Visible)
+            checkActions.Visibility = state.Status is AppUpdateStatus.Available or AppUpdateStatus.Downloaded
+                || state.Status == AppUpdateStatus.Checking && checkActions.Visibility == Visibility.Visible
                 ? Visibility.Visible : Visibility.Collapsed;
             checkButton.IsEnabled = button.IsEnabled;
         }
@@ -303,7 +330,7 @@ public partial class MainWindow
         checkButton.Click += async (_, _) =>
         {
             if (_closed || _closeCommitInProgress || _appUpdateActionInProgress || _updateCheckInProgress || _startupUpdateRestartRequested || AppUpdateMaintenanceActive) return;
-            await CheckAppUpdateNowAsync(updates);
+            await CheckManualUpdateNowAsync(updates);
         };
         button.Click += async (_, _) =>
         {
@@ -329,7 +356,7 @@ public partial class MainWindow
                 else
                 {
                     text.Text = "Проверяем обновления…";
-                    await CheckAppUpdateNowAsync(updates);
+                    await CheckManualUpdateNowAsync(updates);
                 }
             }
             catch (OperationCanceledException) { }
@@ -343,5 +370,24 @@ public partial class MainWindow
         };
         Refresh();
         return panel;
+    }
+
+    private void CommitUpdateFrequency()
+    {
+        if (_pendingUpdateFrequency is not { } frequency) return;
+        _updateCheckFrequency = frequency;
+        _pendingUpdateFrequency = null;
+        _updateFrequencyRecovered = true;
+        ShowCommittedUpdateFrequency();
+        ArmUpdateSchedule();
+    }
+
+    private void ShowCommittedUpdateFrequency()
+    {
+        if (_updateFrequencyCombo is not { } combo) return;
+        var initializing = _settingsInitializing;
+        _settingsInitializing = true;
+        try { combo.SelectedValue = UpdateFrequencyKnown ? _updateCheckFrequency : null; }
+        finally { _settingsInitializing = initializing; }
     }
 }

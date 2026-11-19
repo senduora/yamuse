@@ -24,6 +24,8 @@ internal static partial class Program
         { await LyricsManual040Page(false); await LyricsManual040Page(true); });
         await Run("LyricsManual040: Enter seeks the focused timed line and leaves untimed text alone in both views", async () =>
         { await LyricsManual040KeyboardSeek(false); await LyricsManual040KeyboardSeek(true); });
+        await Run("LyricsManual040: paused native selection is separate from the current timed line in both views", async () =>
+        { await LyricsManual040PausedSelection(false); await LyricsManual040PausedSelection(true); });
     }
 
     private static async Task LyricsManual040Wheel(bool expanded, int delta)
@@ -84,7 +86,7 @@ internal static partial class Program
         LyricsUiSet(f.Window, expanded ? "_expandedLyricsFollowUntil" : "_lyricsFollowUntil", DateTimeOffset.MinValue);
         LyricsUiInvoke(f.Window, "UpdateLyrics", 70d);
         await Task.Delay(120); f.Window.UpdateLayout();
-        Assert(f.List.SelectedIndex == 70, "holding the scrollbar stopped the current lyric highlight");
+        Assert(LyricsActiveIndex(f.Window) == 70, "holding the scrollbar stopped the current lyric highlight");
         Assert(Math.Abs(viewer.VerticalOffset - offset) <= 1 && !SmoothScroll.IsAnimating(viewer),
             "automatic following took the viewport back while the scrollbar was held");
         thumb.RaiseEvent(new DragCompletedEventArgs(0, 0, false) { RoutedEvent = Thumb.DragCompletedEvent });
@@ -126,31 +128,134 @@ internal static partial class Program
     {
         using var f = new LyricsManual040Fixture(expanded, "keyboard-seek");
         var player = LyricsUiField<NativePlayer>(f.Window, "_player")!;
-        await player.OpenPausedAsync(new Uri(WriteWave("lyrics-keyboard-seek-" + expanded + ".wav", 30)), CancellationToken.None);
+        var media = new Uri(WriteWave("lyrics-keyboard-seek-" + expanded + ".wav", 30));
         f.List.ScrollIntoView(f.List.Items[12]); f.Window.UpdateLayout();
         await Dispatcher.Yield(DispatcherPriority.ContextIdle);
         var row = (ListBoxItem)f.List.ItemContainerGenerator.ContainerFromIndex(12);
-        Assert(f.List.SelectedIndex != 12, "fixture did not distinguish a focused line from the playback highlight");
+        Assert(LyricsActiveIndex(f.Window) != 12, "fixture did not distinguish a focused line from the playback highlight");
         var previousFocus = Keyboard.FocusedElement as DependencyObject;
         try
         {
             Pk040Focus(row);
+            var opening = player.OpenPausedAsync(media, CancellationToken.None);
+            Assert(player.HasSource && !opening.IsCompleted && player.Duration == TimeSpan.Zero,
+                "the pending decoder did not present a source without a seek range");
+            Assert(!PressEnter().Handled && Toast040Field<double?>(f.Window, "_pendingSeek") is null,
+                "Enter before the source reported a duration scheduled a seek");
+            await opening;
             Assert(row.IsKeyboardFocused && PressEnter().Handled && Toast040Field<double?>(f.Window, "_pendingSeek") == 12,
                 "Enter did not seek to the focused timed line");
             await Until(() => Math.Abs(player.Position.TotalSeconds - 12) < .4);
-            LyricsUiSet(f.Window, "_lyricLines", Array.Empty<LyricLine>());
             LyricsUiInvoke(f.Window, "UpdateProgress");
-            Assert(!PressEnter().Handled && Toast040Field<double?>(f.Window, "_pendingSeek") is null && !player.IsPlaying,
+            Assert(PressEnter(repeat: true).Handled && Toast040Field<double?>(f.Window, "_pendingSeek") is null,
+                "holding Enter sought to the same lyric after the first seek completed");
+            LyricsUiInvoke(f.Window, "SetLyricsRows", Array.Empty<LyricLine>(), LyricsUiLines(f.Window));
+            f.List.ScrollIntoView(f.List.Items[12]);
+            (System.Windows.Window.GetWindow(f.List) ?? f.Window).UpdateLayout();
+            row = (ListBoxItem)f.List.ItemContainerGenerator.ContainerFromIndex(12);
+            Pk040Focus(row);
+            LyricsUiInvoke(f.Window, "UpdateProgress");
+            Assert(!PressEnter().Handled && LyricsActiveIndex(f.Window) == -1 && !LyricsRowIsCurrent(f.List.Items[12])
+                && Toast040Field<double?>(f.Window, "_pendingSeek") is null && !player.IsPlaying,
                 "Enter on untimed lyrics moved or resumed playback");
         }
         finally { Pk040Focus(previousFocus); }
 
-        KeyEventArgs PressEnter()
+        KeyEventArgs PressEnter(bool repeat = false)
         {
             var args = new KeyEventArgs(new Pk040Keyboard(ModifierKeys.None), new Pk040Source(row), Environment.TickCount, Key.Enter)
             { RoutedEvent = Keyboard.PreviewKeyDownEvent };
+            if (repeat)
+                typeof(KeyEventArgs).GetMethod("SetRepeat", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(args, [true]);
             row.RaiseEvent(args);
             return args;
+        }
+    }
+
+    private static async Task LyricsManual040PausedSelection(bool expanded)
+    {
+        using var f = new LyricsManual040Fixture(expanded, "paused-selection", firstSecond: 1);
+        var w = f.Window;
+        var player = LyricsUiField<NativePlayer>(w, "_player")!;
+        await player.OpenPausedAsync(new Uri(WriteWave("lyrics-paused-selection-" + expanded + ".wav", 30)), CancellationToken.None);
+        LyricsUiInvoke(w, "UpdateProgress");
+        var timer = LyricsUiField<DispatcherTimer>(w, "_lyricsTimer")!;
+        var nativeKeyboard = typeof(ListBox).GetMethod("MakeKeyboardSelection", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var nativeMouse = typeof(ListBox).GetMethod("NotifyListItemClicked", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var previousFocus = Keyboard.FocusedElement as DependencyObject;
+        try
+        {
+            Navigate(0, 1);
+            Assert(f.List.SelectedIndex == 1 && !timer.IsEnabled && Math.Abs(player.Position.TotalSeconds) < .1
+                && Toast040Field<double?>(w, "_pendingSeek") is null, "the paused arrow did not exercise native selection alone");
+            await AssertAccent(-1, 1);
+
+            var canceled = RowAt(2);
+            LyricsUiMouse(canceled, down: true);
+            nativeMouse.Invoke(f.List, [canceled, MouseButton.Left]);
+            f.List.RaiseEvent(new MouseEventArgs(Mouse.PrimaryDevice, Environment.TickCount) { RoutedEvent = Mouse.MouseLeaveEvent });
+            LyricsUiMouse(canceled, down: false);
+            Assert(f.List.SelectedIndex == 2 && Toast040Field<double?>(w, "_pendingSeek") is null
+                && Math.Abs(player.Position.TotalSeconds) < .1, "an abandoned click sought before the first line");
+            await AssertAccent(-1, 2);
+
+            LyricsUiInvoke(w, "CommitSeek", 5d);
+            await Until(() => Math.Abs(player.Position.TotalSeconds - 5) < .35);
+            LyricsUiInvoke(w, "UpdateProgress");
+            Navigate(4, 5);
+            Assert(f.List.SelectedIndex == 5 && Math.Abs(player.Position.TotalSeconds - 5) < .35,
+                "native navigation did not move the paused seek candidate");
+            await AssertAccent(4, 5);
+
+            var candidate = RowAt(5);
+            Assert(Preview(candidate, Key.Enter).Handled && Toast040Field<double?>(w, "_pendingSeek") == 6,
+                "Enter did not commit the focused lyric timecode");
+            await AssertAccent(5);
+            await Until(() => Math.Abs(player.Position.TotalSeconds - 6) < .35);
+
+            var clicked = RowAt(8);
+            LyricsUiMouse(clicked, down: true);
+            nativeMouse.Invoke(f.List, [clicked, MouseButton.Left]);
+            LyricsUiMouse(clicked, down: false);
+            Assert(Toast040Field<double?>(w, "_pendingSeek") == 9, "an accepted click did not commit its exact timestamp");
+            await AssertAccent(8);
+            await Until(() => Math.Abs(player.Position.TotalSeconds - 9) < .35);
+            Assert(!player.IsPlaying && !timer.IsEnabled && f.Requests == 0, "line navigation resumed playback or called a provider");
+        }
+        finally { Pk040Focus(previousFocus); }
+
+        ListBoxItem RowAt(int index)
+        {
+            f.List.ScrollIntoView(f.List.Items[index]);
+            (System.Windows.Window.GetWindow(f.List) ?? w).UpdateLayout();
+            return (ListBoxItem)f.List.ItemContainerGenerator.ContainerFromIndex(index);
+        }
+        void Navigate(int from, int to)
+        {
+            var source = RowAt(from);
+            var target = RowAt(to);
+            Pk040Focus(source);
+            Assert(!Preview(source, Key.Down).Handled, "lyrics consumed the native arrow navigation");
+            // Use WPF's own post-navigation selection step on the inactive test desktop.
+            Pk040Focus(target);
+            nativeKeyboard.Invoke(f.List, [target]);
+        }
+        static KeyEventArgs Preview(ListBoxItem row, Key key)
+        {
+            var args = new KeyEventArgs(new Pk040Keyboard(ModifierKeys.None), new Pk040Source(row), Environment.TickCount, key)
+            { RoutedEvent = Keyboard.PreviewKeyDownEvent };
+            row.RaiseEvent(args);
+            return args;
+        }
+        async Task AssertAccent(int expected, int? candidate = null)
+        {
+            await Dispatcher.Yield(DispatcherPriority.DataBind);
+            Assert(LyricsActiveIndex(w) == expected && Enumerable.Range(0, f.List.Items.Count)
+                .Where(index => LyricsRowIsCurrent(f.List.Items[index])).SequenceEqual(expected < 0 ? [] : new[] { expected }),
+                "navigation changed the timecode accent without an accepted seek");
+            if (expected >= 0) Assert(RowAt(expected).FontWeight == FontWeights.SemiBold, "the timed row lost its accent");
+            if (candidate is int candidateIndex)
+                Assert(RowAt(candidateIndex).FontWeight != FontWeights.SemiBold, "native selection borrowed the timed-line accent");
         }
     }
 
@@ -162,7 +267,7 @@ internal static partial class Program
         private readonly MusicApi _api;
         private readonly NativePlayer _player;
         private readonly CancellationTokenSource _lyrics = new();
-        internal LyricsManual040Fixture(bool expanded, string name)
+        internal LyricsManual040Fixture(bool expanded, string name, double firstSecond = 0)
         {
             var directory = Path.Combine(_directory, "lyrics-manual040-" + expanded + "-" + name);
             var http = new FakeHandler((_, _) => { Requests++; return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)); });
@@ -176,9 +281,9 @@ internal static partial class Program
             { ShowActivated = false, ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.Manual, Left = -18000, Top = 0 };
             Window.Show();
             LyricsUiSet(Window, "_current", new TrackRow { Id = "manual-private", Title = "Private lyrics fixture", Artist = "Fixture", Available = true });
-            var lines = Enumerable.Range(0, 120).Select(i => new LyricLine(i, "Private lyric line " + i)).ToArray();
-            LyricsUiSet(Window, "_lyricLines", lines); LyricsUiSet(Window, "_lyricsCts", _lyrics);
-            var ordinary = Control<ListBox>(Window, "LyricsList"); ordinary.ItemsSource = lines.Select(l => l.Text).ToArray();
+            var lines = Enumerable.Range(0, 120).Select(i => new LyricLine(firstSecond + i, "Private lyric line " + i)).ToArray();
+            LyricsUiInvoke(Window, "SetLyricsRows", lines, lines.Select(l => l.Text)); LyricsUiAssignPending(Window, _lyrics);
+            var ordinary = Control<ListBox>(Window, "LyricsList");
             if (expanded)
             {
                 LyricsUiInvoke(Window, "SetExpandedPlayerVisible", true, false);

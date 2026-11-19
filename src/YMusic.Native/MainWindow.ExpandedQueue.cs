@@ -20,10 +20,16 @@ public partial class MainWindow
     private TextBlock? _expandedQueueNote;
     private bool _expandedQueueOpen;
     private bool _expandedQueueRevealPending;
+    private long _expandedQueueLayoutGeneration;
+    private long _expandedQueueRevealQueue;
     private int _expandedQueueAccountGeneration, _expandedQueueCurrentIndex = -1;
     private long _expandedQueueVersion = -1;
+    private long _expandedQueueShownReplacement;
+    private long? _expandedQueueShownCursor;
     private IReadOnlyList<TrackRow>? _expandedQueueItems;
     private ExpandedQueueRow[] _expandedQueueRows = [];
+    private ExpandedQueuePress? _expandedQueuePress;
+    private sealed record ExpandedQueuePress(int Index, long Token, long Version, Point Origin);
 
     private void PlayerQueue_Click(object sender, RoutedEventArgs e) => ShowQueue();
 
@@ -88,18 +94,66 @@ public partial class MainWindow
         ScrollViewer.SetHorizontalScrollBarVisibility(list, ScrollBarVisibility.Disabled); ScrollViewer.SetVerticalScrollBarVisibility(list, ScrollBarVisibility.Auto);
         ScrollViewer.SetCanContentScroll(list, true); VirtualizingPanel.SetIsVirtualizing(list, true);
         VirtualizingPanel.SetVirtualizationMode(list, VirtualizationMode.Recycling); VirtualizingPanel.SetScrollUnit(list, ScrollUnit.Pixel); SmoothScroll.SetEnabled(list, true);
+        // Opening owns the reveal only until the user starts browsing the list or its scrollbar.
+        list.AddHandler(Mouse.PreviewMouseWheelEvent, new MouseWheelEventHandler((_, _) => _expandedQueueRevealPending = false), true);
+        list.AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler((_, _) => _expandedQueueRevealPending = false), true);
+        list.AddHandler(Keyboard.PreviewKeyDownEvent, new KeyEventHandler((_, args) =>
+        {
+            if (IsTrackRevealNavigationKey(args.Key))
+                _expandedQueueRevealPending = false;
+        }), true);
+        list.PreviewMouseLeftButtonDown += (_, args) =>
+            RememberExpandedQueuePress(list, args.OriginalSource as DependencyObject, args.GetPosition(list), args.ClickCount);
+        list.PreviewMouseMove += (_, args) =>
+        {
+            if (_expandedQueuePress is { } press && ExceededExpandedQueueClickDistance(press.Origin, args.GetPosition(list)))
+                _expandedQueuePress = null;
+        };
+        list.AddHandler(Mouse.LostMouseCaptureEvent, new MouseEventHandler((_, _) =>
+        { if (!list.IsMouseCaptureWithin) _expandedQueuePress = null; }), true);
         list.PreviewMouseLeftButtonUp += async (_, args) =>
         {
-            if (args.ChangedButton != MouseButton.Left || ItemsControl.ContainerFromElement(list, args.OriginalSource as DependencyObject) is not ListBoxItem { Content: ExpandedQueueRow row }) return;
-            args.Handled = true; await PlayExpandedQueueRowAsync(row);
+            if (args.ChangedButton == MouseButton.Left) await ReleaseExpandedQueuePressAsync(list, args.GetPosition(list));
         };
         list.PreviewKeyDown += async (_, args) =>
         {
-            if (args.Key != Key.Enter || list.SelectedItem is not ExpandedQueueRow row) return;
-            args.Handled = true; await PlayExpandedQueueRowAsync(row);
+            var keyboard = args.KeyboardDevice;
+            if (args.Key != Key.Enter || HasTransportModifier(keyboard.Modifiers,
+                keyboard.IsKeyDown(Key.LWin) || keyboard.IsKeyDown(Key.RWin))) return;
+            var row = ReferenceEquals(args.OriginalSource, list) ? list.SelectedItem as ExpandedQueueRow
+                : ExpandedQueueRowAt(list, args.OriginalSource as DependencyObject);
+            if (row is null) return;
+            args.Handled = true;
+            if (!args.IsRepeat) await PlayExpandedQueueRowAsync(row);
         };
         Grid.SetRow(list, 1); panel.Children.Add(list);
     }
+
+    private void RememberExpandedQueuePress(ListBox list, DependencyObject? source, Point origin, int clickCount)
+    {
+        _expandedQueuePress = clickCount == 1 && _expandedQueueVersion == _playbackQueue.Version
+            && ExpandedQueueRowAt(list, source) is { } row && ReferenceEquals(row.Items, _playbackQueue.Items)
+            ? new(row.Index, row.Token, _expandedQueueVersion, origin) : null;
+    }
+
+    private Task ReleaseExpandedQueuePressAsync(ListBox list, Point point)
+    {
+        var press = _expandedQueuePress;
+        _expandedQueuePress = null;
+        if (press is null || press.Version != _playbackQueue.Version || !ReferenceEquals(list, _expandedQueueList)
+            || ExceededExpandedQueueClickDistance(press.Origin, point)
+            || ExpandedQueueRowAt(list, list.InputHitTest(point) as DependencyObject) is not { } row
+            || row.Index != press.Index || row.Token != press.Token) return Task.CompletedTask;
+        return PlayExpandedQueueRowAsync(row);
+    }
+
+    private static ExpandedQueueRow? ExpandedQueueRowAt(ListBox list, DependencyObject? source) =>
+        source is not null && source is not ButtonBase && !FromButton(source)
+        && ItemsControl.ContainerFromElement(list, source) is ListBoxItem { Content: ExpandedQueueRow row } ? row : null;
+
+    private static bool ExceededExpandedQueueClickDistance(Point from, Point to) =>
+        Math.Abs(from.X - to.X) >= SystemParameters.MinimumHorizontalDragDistance
+        || Math.Abs(from.Y - to.Y) >= SystemParameters.MinimumVerticalDragDistance;
 
     private static DataTemplate ExpandedQueueTemplate()
     {
@@ -127,7 +181,11 @@ public partial class MainWindow
         CancelExpandedReveal();
         _expandedQueueOpen = visible;
         _expandedQueueRevealPending = visible;
-        if (visible) _expandedQueueAccountGeneration = _accountGeneration;
+        if (visible)
+        {
+            _expandedQueueAccountGeneration = _accountGeneration;
+            _expandedQueueRevealQueue = _playbackQueue.ReplacementVersion;
+        }
         if (_expandedPlayerQueueButton is not null)
         {
             _expandedPlayerQueueButton.SetResourceReference(Control.ForegroundProperty, visible ? "AccentTextBrush" : "MutedBrush");
@@ -136,41 +194,60 @@ public partial class MainWindow
         }
         if (visible) RefreshExpandedQueue(); else ClearExpandedQueue();
         LayoutExpandedPanes(animate);
-        if (visible) RequestExpandedQueueReveal();
     }
 
     private void RequestExpandedQueueReveal()
     {
         if (!_expandedQueueRevealPending || _expandedQueueList is null) return;
-        var items = _expandedQueueItems;
+        var layout = _expandedQueueLayoutGeneration;
         RequestCurrentTrackReveal(_expandedQueueList, () =>
         {
             RefreshExpandedQueue();
             return _playbackQueue.CurrentIndex;
-        }, () => _expandedQueueOpen && IsExpandedPlayerOpen && _expandedQueueAccountGeneration == _accountGeneration
-            && ReferenceEquals(items, _playbackQueue.Items) && ReferenceEquals(items, _expandedQueueItems),
+        }, () => _expandedQueueRevealPending && _expandedQueueOpen && IsExpandedPlayerOpen && layout == _expandedQueueLayoutGeneration
+            && _expandedQueueAccountGeneration == _accountGeneration
+            && _expandedQueueRevealQueue == _playbackQueue.ReplacementVersion,
             () => _expandedQueueRevealPending = false);
     }
 
-    private void RefreshExpandedQueue()
+    private void RefreshExpandedQueue() => RefreshExpandedQueueCore(null);
+
+    private void RefreshExpandedQueueCore(long? beforeAppend)
     {
-        if (!_expandedQueueOpen || _expandedQueueList is null) return;
+        if (!_expandedQueueOpen || _expandedQueueList is not { } list) return;
         if (_closed || _expandedQueueAccountGeneration != _accountGeneration || _current is null) { SetExpandedQueueVisible(false, false); return; }
+        if (_expandedQueueRevealQueue != _playbackQueue.ReplacementVersion) _expandedQueueRevealPending = false;
         if (_expandedQueueVersion == _playbackQueue.Version) return;
+        var press = _expandedQueuePress;
+        _expandedQueuePress = null;
+        var replacement = _playbackQueue.ReplacementVersion;
+        var cursor = _playbackQueue.CurrentOccurrenceToken;
+        var preserveSelection = _expandedQueueItems is not null && _expandedQueueShownReplacement == replacement
+            && _expandedQueueShownCursor == cursor;
+        // Only a passive append can renew a press, and the pressed occurrence
+        // must still occupy the same row. Release checks the new hit separately.
+        var preservePress = press is not null && beforeAppend == press.Version && _expandedQueueVersion == press.Version
+            && preserveSelection && press.Index < _playbackQueue.Items.Count && _playbackQueue.OccurrenceTokenAt(press.Index) == press.Token;
+        var selection = (_expandedQueueList.SelectedItem as ExpandedQueueRow)?.Token;
         if (!ReferenceEquals(_expandedQueueItems, _playbackQueue.Items))
         {
             _expandedQueueItems = _playbackQueue.Items;
-            _expandedQueueRows = _expandedQueueItems.Select((track, index) => new ExpandedQueueRow(_expandedQueueItems, track, index)).ToArray();
+            _expandedQueueRows = _expandedQueueItems.Select((track, index) =>
+                new ExpandedQueueRow(_expandedQueueItems, track, index, _playbackQueue.OccurrenceTokenAt(index))).ToArray();
             _expandedQueueList.ItemsSource = _expandedQueueRows; _expandedQueueCurrentIndex = -1;
         }
         if (_expandedQueueCurrentIndex >= 0 && _expandedQueueCurrentIndex < _expandedQueueRows.Length) _expandedQueueRows[_expandedQueueCurrentIndex].IsCurrent = false;
         _expandedQueueCurrentIndex = _playbackQueue.CurrentIndex;
         if (_expandedQueueCurrentIndex >= 0 && _expandedQueueCurrentIndex < _expandedQueueRows.Length)
-        {
             _expandedQueueRows[_expandedQueueCurrentIndex].IsCurrent = true;
-            _expandedQueueList.SelectedIndex = _expandedQueueCurrentIndex;
-        }
+        _expandedQueueList.SelectedIndex = preserveSelection
+            ? selection is long token ? Array.FindIndex(_expandedQueueRows, row => row.Token == token) : -1
+            : _expandedQueueCurrentIndex;
+        _expandedQueueShownReplacement = replacement;
+        _expandedQueueShownCursor = cursor;
         _expandedQueueVersion = _playbackQueue.Version;
+        if (preservePress && press is not null && _expandedQueueOpen && ReferenceEquals(list, _expandedQueueList))
+            _expandedQueuePress = press with { Version = _expandedQueueVersion };
         _expandedQueueNote!.Text = (_playbackQueue.Shuffle ? "Порядок очереди · перемешивание включено" : "Порядок воспроизведения") + $" · {_expandedQueueItems!.Count:N0}";
     }
 
@@ -178,15 +255,29 @@ public partial class MainWindow
     {
         // The displayed occurrence must still belong to this account and exact
         // snapshot. SelectAt keeps duplicate instances and the queue origin intact.
-        if (_expandedCollapse is not null || !_expandedQueueOpen || !IsExpandedPlayerOpen || _closed || _expandedQueueAccountGeneration != _accountGeneration
-            || _expandedQueueVersion != _playbackQueue.Version || !ReferenceEquals(row.Items, _playbackQueue.Items)
-            || row.Index < 0 || row.Index >= _playbackQueue.Items.Count || !ReferenceEquals(row.Track, _playbackQueue.Items[row.Index]) || !row.Track.CanPlay) return;
-        if (!_playbackQueue.SelectAt(row.Index)) return;
-        await PlayTrackAsync(row.Track);
+        bool OwnsRow() => _expandedCollapse is null && _expandedQueueOpen && IsExpandedPlayerOpen && !_closed
+            && _expandedQueueAccountGeneration == _accountGeneration && _expandedQueueVersion == _playbackQueue.Version
+            && ReferenceEquals(row.Items, _playbackQueue.Items) && row.Index >= 0 && row.Index < _playbackQueue.Items.Count
+            && ReferenceEquals(row.Track, _playbackQueue.Items[row.Index]);
+        if (!OwnsRow()) return;
+        if (!CanNavigateToTrack(row.Track, requireExactOfflineVariant: true))
+        {
+            await RetryExactOfflineRowAsync(row.Track, allowUnavailableCatalog: true, OwnsRow, PlayAsync);
+            return;
+        }
+        await PlayAsync(null);
+
+        async Task PlayAsync(NativePlayer.LocalPlaybackAdmission? admission)
+        {
+            if (!OwnsRow() || !CanSelectWhileRemovingAudio(row.Track, requireExactOfflineVariant: true)
+                || !_playbackQueue.SelectAt(row.Index)) return;
+            await PlayTrackCoreAsync(row.Track, null, false, requireExactOfflineVariant: true, localAdmission: admission);
+        }
     }
 
     private void ClearExpandedQueue()
     {
+        _expandedQueuePress = null;
         _expandedQueueRevealPending = false;
         if (_expandedQueueList is not null)
         { if (FindViewer(_expandedQueueList) is { } viewer) SmoothScroll.CancelAnimation(viewer); _expandedQueueList.ItemsSource = null; }
@@ -205,30 +296,39 @@ public partial class MainWindow
 
     private void AnimateExpandedPane(Grid panel, double target, bool visible, bool animate)
     {
+        var queue = ReferenceEquals(panel, _expandedQueuePanel);
+        var layout = queue ? ++_expandedQueueLayoutGeneration : 0;
         var from = panel.ActualWidth; var opacity = panel.Opacity;
         panel.BeginAnimation(WidthProperty, null); panel.BeginAnimation(OpacityProperty, null);
         panel.Width = target; panel.Opacity = visible ? 1 : 0;
         if (visible) panel.Visibility = Visibility.Visible;
         if (!animate || !Motion.CanAnimate)
-        { panel.Visibility = visible ? Visibility.Visible : Visibility.Collapsed; return; }
+        {
+            panel.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+            if (queue && visible) RequestExpandedQueueReveal();
+            return;
+        }
+        // Measuring a row during the width animation can realize it in a temporary viewport.
         var duration = TimeSpan.FromMilliseconds(320);
         var width = new DoubleAnimation(from, target, duration) { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut }, FillBehavior = FillBehavior.Stop };
         width.Completed += (_, _) =>
         {
-            var stillVisible = ReferenceEquals(panel, _expandedLyricsPanel) ? _expandedLyricsOpen : _expandedQueueOpen;
+            if (queue && layout != _expandedQueueLayoutGeneration) return;
+            var stillVisible = queue ? _expandedQueueOpen : _expandedLyricsOpen;
             if (!stillVisible) panel.Visibility = Visibility.Collapsed;
-            else if (ReferenceEquals(panel, _expandedLyricsPanel)) { _expandedLyricsFollowIndex = -1; RefreshExpandedLyrics(); }
-            else if (_expandedQueueRevealPending) RequestExpandedQueueReveal();
+            else if (queue) RequestExpandedQueueReveal();
+            else { _expandedLyricsFollowIndex = -1; RefreshExpandedLyrics(); }
         };
         panel.BeginAnimation(WidthProperty, width);
         panel.BeginAnimation(OpacityProperty, new DoubleAnimation(opacity, visible ? 1 : 0, duration) { FillBehavior = FillBehavior.Stop });
     }
 
-    private sealed class ExpandedQueueRow(IReadOnlyList<TrackRow> items, TrackRow track, int index) : INotifyPropertyChanged
+    private sealed class ExpandedQueueRow(IReadOnlyList<TrackRow> items, TrackRow track, int index, long token) : INotifyPropertyChanged
     {
         public IReadOnlyList<TrackRow> Items { get; } = items;
         public TrackRow Track { get; } = track;
         public int Index { get; } = index;
+        public long Token { get; } = token;
         public string Position => IsCurrent ? "▶" : (Index + 1).ToString();
         public string AccessibleName => $"{Index + 1}. {Track.Title} · {Track.Artist}" + (IsCurrent ? " · Сейчас играет" : "");
         private bool _isCurrent;

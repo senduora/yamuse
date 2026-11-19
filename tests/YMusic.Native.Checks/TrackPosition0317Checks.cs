@@ -26,7 +26,10 @@ internal static partial class Program
             File.AppendAllText(Path.Combine(Tp0317DirectoryPath, "evidence.jsonl"), JsonSerializer.Serialize(new
             {
                 name, evidence, productSha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(typeof(MainWindow).Assembly.Location))),
-                runtime = Environment.Version.ToString(), fixture = "private generated 60-second per-position frequency WAV", externalRequests = 0,
+                runtime = Environment.Version.ToString(),
+                fixture = name.StartsWith("Delayed obsolete quality", StringComparison.Ordinal) ? "private generated 60-second MP3 with confirmed bitrate"
+                    : "private generated 60-second per-position frequency WAV",
+                externalRequests = 0,
                 realAccountUsed = false, userProfileRead = false, userMusicRead = false, applicationWindowsShown = false
             }) + Environment.NewLine);
         });
@@ -117,7 +120,7 @@ internal static partial class Program
         await Tp0317Run("Delayed obsolete quality completion after seek cannot move the newest occurrence",async()=>
         {
             using var delayed=new Tp0317DelayedResolve(); using var f=new Tp0317Fixture("delayed-quality", delayed:delayed);
-            f.Queue.SetItems([f.A],f.A);await f.Window.PlayTrackAsync(f.A);
+            f.Queue.SetItems([f.A],f.A);await f.Window.PlayTrackAsync(f.A).WaitAsync(TimeSpan.FromSeconds(5));
             f.Queue.SetItems([f.A,f.B,f.A],f.A);
             Tp0317Invoke(f.Window,"CommitSeek",30d);await Tp0317Until(()=>f.Player.Position.TotalSeconds>=29.8);
             var obsolete=Tp0317Call(f.Window,"AdvanceAsync",1,false);await delayed.Entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
@@ -159,9 +162,12 @@ internal static partial class Program
         {
             var directory=Path.Combine(Tp0317DirectoryPath,name); Directory.CreateDirectory(directory);
             var music=Path.Combine(directory,"offline");Directory.CreateDirectory(music);
-            A=Row("A",music,440);B=Row("B",music,880);Network=delayed is null?new Tp0317RejectNetwork():delayed;
+            A=Row("A",music,440,delayed is null ? null : 320);
+            B=Row("B",music,880,delayed is null ? null : 128);
+            Network=delayed is null?new Tp0317RejectNetwork():delayed;
             var diagnostics=Path.Combine(directory,"diagnostics");
-            WriteFixtureAudioIndex(music, [A, B], index => delayed is not null && index == 1 ? 128 : 320);
+            WriteFixtureAudioIndex(music, [A, B], index => delayed is not null && index == 1 ? 128 : 320,
+                confirmedMp3: delayed is not null);
             if(restored)
             {
                 var saved=new PlaybackQueue();saved.SetItems([A],A);saved.Repeat=RepeatMode.All;
@@ -180,10 +186,13 @@ internal static partial class Program
             }
             if(delayed is not null) Tp0317Set(Window,"_session",new Session("private-fake-token",null,DateTimeOffset.UtcNow.AddHours(1),"fixture",MusicApi.RequiredScopes));
         }
-        static TrackRow Row(string id,string directory,int hz)
+        static TrackRow Row(string id,string directory,int hz,int? bitrate = null)
         {
-            var path=Path.Combine(directory,id+".wav"); Tp0317WriteWave(path,hz);
-            return new TrackRow{Id=id,RequestId=id,Title=id,Artist="private generated fixture",DurationMs=60000,Available=true,LocalPath=path,LocalQuality="private WAV"};
+            var path=Path.Combine(directory,id+(bitrate is null ? ".wav" : ".mp3"));
+            if (bitrate is { } rate) File.WriteAllBytes(path, SilentMp3Seconds(60, rate));
+            else Tp0317WriteWave(path,hz);
+            return new TrackRow{Id=id,RequestId=id,Title=id,Artist="private generated fixture",DurationMs=60000,Available=true,LocalPath=path,
+                LocalQuality=bitrate is null ? "private WAV" : "private MP3"};
         }
         public async Task Prepared() { if(Tp0317Get<Task?>(Window,"_preloadTask") is {} t)await t; await Tp0317Until(()=>Player.HasPrepared); }
         public void Views()
@@ -194,7 +203,7 @@ internal static partial class Program
         public void UpdateMini()
         {
             if(Mini is null)return;
-            var current=Tp0317Get<TrackRow?>(Window,"_current");Mini.Update(current?.Title??"",current?.Artist??"",Player.IsPlaying,true,true);
+            var current=Tp0317Get<TrackRow?>(Window,"_current");Mini.Update(current?.Title??"",current?.Artist??"",Player.IsPlaying,true,true,canPlay:current is not null);
             Mini.UpdateDetails(null,((TimeSpan)Tp0317Invoke(Window,"DisplayPosition",Player.Position)!).TotalSeconds,Player.Duration.TotalSeconds,Main.IsEnabled,false,false,0,$"{Tp0317Get<int>(Window,"_playbackGeneration")}:{current?.RequestId}");
         }
         public object State()=>new { nativeSeconds=Player.Position.TotalSeconds, mainSeconds=Main.Value, mainBaseSeconds=(double)Main.GetAnimationBaseValue(Slider.ValueProperty), positionText=((TextBlock)Window.FindName("PositionText")).Text,

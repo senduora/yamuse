@@ -213,7 +213,7 @@ internal static partial class Program
         var mini = new MiniPlayerWindow { Left = -16000, Top = -16000, ShowActivated = false, ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.Manual };
         try
         {
-            mini.Update(current.Title, current.Artist, false, true, true); mini.UpdateDetails(cover, 0, 180, true, true, true, 0, current.RequestId); mini.Show(); mini.UpdateLayout();
+            mini.Update(current.Title, current.Artist, false, true, true, canPlay: true); mini.UpdateDetails(cover, 0, 180, true, true, true, 0, current.RequestId); mini.Show(); mini.UpdateLayout();
             Assert(ReferenceEquals(mini.PlayButton.Background, accent) && ReferenceEquals(mini.LikeButton.Foreground, accentText), "mini play or like kept a stale accent");
             Assert(SaVisuals<System.Windows.Shapes.Ellipse>(mini.SeekSlider).Any(e => ReferenceEquals(e.Fill, accent)), "mini seek handle kept hardcoded orange");
             SaInvoke(w, "SetExpandedPlayerVisible", true, false); w.UpdateLayout();

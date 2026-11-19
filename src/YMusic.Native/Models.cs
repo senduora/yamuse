@@ -1,10 +1,23 @@
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Text.Json.Serialization;
 
 namespace YMusic.Native;
 
-internal sealed record Session(string AccessToken, string? RefreshToken, DateTimeOffset ExpiresAtUtc, string DeviceId, string? Scope = null);
-internal sealed record DeviceCode(string Code, string UserCode, Uri VerificationUri, int IntervalSeconds, int ExpiresInSeconds);
+internal sealed record Session(string AccessToken, string? RefreshToken, DateTimeOffset ExpiresAtUtc, string DeviceId, string? Scope = null)
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool DeviceProfilePending { get; init; }
+
+    [JsonPropertyName("DeviceProfileRefreshValidated")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool ProfileRefreshValidated { get; init; }
+}
+internal sealed record DeviceCode(string Code, string UserCode, Uri VerificationUri, int IntervalSeconds, int ExpiresInSeconds)
+{
+    internal long ReceivedAtTimestamp { get; init; } = System.Diagnostics.Stopwatch.GetTimestamp();
+    internal TimeSpan RemainingLifetime => TimeSpan.FromSeconds(ExpiresInSeconds) - System.Diagnostics.Stopwatch.GetElapsedTime(ReceivedAtTimestamp);
+}
 internal sealed record Account(string Uid, string DisplayName, bool Plus, string? AvatarUri = null);
 internal enum AudioQuality { Economical, Optimal, Excellent }
 internal sealed record AudioDescriptor(Uri Uri, string Codec, int Bitrate, string? Key = null)
@@ -52,6 +65,17 @@ internal sealed class TrackRow : INotifyPropertyChanged
     internal bool HasTrackMetadata { get; init; } = true;
     public string? LocalPath { get; init; }
     public string? LocalQuality { get; init; }
+    internal string? LocalSourceRequestId { get; init; }
+    internal string? LocalSourceCodec { get; init; }
+    internal int? LocalSourceBitrate { get; init; }
+    internal int? LocalSourceConfirmedBitrate { get; init; }
+    internal string? LocalSourceSha256 { get; init; }
+    // An index expectation kept separately from the digest of a verified opening.
+    internal string? RestoredLocalSha256 { get; init; }
+    internal LocalAudioVariant? OpenedLocalVariant { get; set; }
+    internal (string? RequestId, string? Codec, int? Bitrate, int? ConfirmedBitrate, string? Sha256) PreferredLocalVariant =>
+        OpenedLocalVariant is { } opened ? (opened.RequestId, opened.Codec, opened.Bitrate, opened.ConfirmedBitrate, opened.Sha256)
+            : (LocalSourceRequestId, LocalSourceCodec, LocalSourceBitrate, LocalSourceConfirmedBitrate, LocalSourceSha256);
     internal bool IsOfflineLibraryRow { get; init; }
     private bool _isLiked, _likeStateKnown, _canToggleLike;
     public bool IsLiked { get => _isLiked; set { if (_isLiked == value) return; _isLiked = value; Changed(); } }
@@ -63,6 +87,8 @@ internal sealed class TrackRow : INotifyPropertyChanged
     public string? DownloadedQuality { get => _downloadedQuality; set { if (_downloadedQuality == value) return; _downloadedQuality = value; Changed(); } }
     public bool IsDownloaded => DownloadedPath is not null;
     public bool CanPlay => IsDownloaded || Available && !IsOfflineLibraryRow;
+    internal bool HasOfflineQueueVariant { get; set; }
+    internal bool CanPlayInQueue => CanPlay || HasOfflineQueueVariant;
     public string DownloadBadge => IsDownloaded ? "✓" : "";
     public string Duration => DurationMs > 0 ? TimeSpan.FromMilliseconds(DurationMs).ToString(@"m\:ss") : "—";
     public double RowOpacity => CanPlay ? 1 : 0.45;
@@ -73,10 +99,23 @@ internal sealed class TrackRow : INotifyPropertyChanged
         || Album.Contains(query, StringComparison.CurrentCultureIgnoreCase);
     public event PropertyChangedEventHandler? PropertyChanged;
     private void Changed([CallerMemberName] string? name = null) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
+    internal TrackRow CopyForQueueOccurrence()
+    {
+        var copy = (TrackRow)MemberwiseClone();
+        copy.PropertyChanged = null;
+        copy._isPlaying = false;
+        return copy;
+    }
 }
 
-internal sealed class MusicException(string message, bool authentication = false) : Exception(message)
+internal class MusicException(string message, bool authentication = false) : Exception(message)
 {
     public bool Authentication { get; } = authentication;
+    internal System.Net.HttpStatusCode? ApiStatusCode { get; init; }
+    internal TimeSpan? ApiRetryAfter { get; init; }
     internal bool UntrustedMediaAddress { get; init; }
+    internal bool OfflineStorageRetryable { get; init; }
 }
+
+internal sealed class RefreshGrantRejectedException() : MusicException("Не удалось продлить вход. Войдите заново.", true);

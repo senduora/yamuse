@@ -127,6 +127,11 @@ internal static partial class Program
             Assert(!File.Exists(fixture.Library.ResolvePath(ib.FileName)) && fixture.Player.SourceLocalPath == fixture.Library.ResolvePath(ia.FileName) && fixture.Player.IsPlaying, "prepared deletion stopped unrelated current or left locked file");
             await PreloadAwaitPrepared(fixture.Window); await Call(fixture.Window, "AdvanceAsync", 1, true);
             Assert(fixture.Player.FadingLocalPath == fixture.Library.ResolvePath(ia.FileName) && fixture.Player.SourceLocalPath == fixture.Library.ResolvePath(ic.FileName), "expected managed outgoing/current not active");
+            var retired = PlaybackInput.FileUri(fixture.Library.ResolvePath(ia.FileName));
+            fixture.Player.AfterDecoderCloseForChecks = uri =>
+            {
+                if (uri == retired) throw new InvalidOperationException("Synthetic fading decoder close error");
+            };
             await PreloadDelete(fixture.Window, a, [a, b, c]);
             Assert(!File.Exists(fixture.Library.ResolvePath(ia.FileName)) && fixture.Player.FadingLocalPath is null
                 && fixture.Player.SourceLocalPath == fixture.Library.ResolvePath(ic.FileName) && fixture.Player.IsPlaying, "fading deletion stopped unrelated current or left locked file");
@@ -301,7 +306,8 @@ internal static partial class Program
                 Interlocked.Increment(ref _mediaCalls);
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(_media) });
             });
-            var libraryHandler = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(_media) }));
+            var libraryMedia = SilentMp3Seconds(12);
+            var libraryHandler = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(libraryMedia) }));
             Library = new OfflineLibrary(Path.Combine(DirectoryPath, "Music"), new AudioBuffer(Path.Combine(DirectoryPath, "library-buffer"), libraryHandler));
             Player = new NativePlayer(new AudioBuffer(Path.Combine(DirectoryPath, "player-buffer"), mediaHandler)); Player.SetVolume(0);
             Window = new MainWindow(api: new MusicApi(handler), store: new SessionStore(Path.Combine(DirectoryPath, "store")), restore: false, diagnosticsDirectory: DirectoryPath, offline: Library, player: Player)

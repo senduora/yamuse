@@ -18,21 +18,26 @@ internal static partial class Program
     private static async Task CheckPlaybackKeys040()
     {
         await Run("PlaybackKeys040: routed F11 toggles the separate fullscreen host and Escape closes it", Pk040Fullscreen);
+        await Run("PlaybackKeys040: cached fullscreen keeps one media subscription until final close", Pk040FullscreenMediaRegistration);
+        await Run("PlaybackKeys040: raw and routed Previous remain available during fullscreen collapse", Pk040MediaDuringCollapse);
         await Run("PlaybackKeys040: text password rich text editable combo and modifier keys retain input", Pk040Input);
         await Run("PlaybackKeys040: retired local search shortcut and smart navigation stay absent", Pk040RetiredLocalSearch);
         await Run("PlaybackKeys040: main and numpad volume clamp persist and mute restores the last nonzero level", Pk040Volume);
         await Run("PlaybackKeys040: routed P Space brackets and media keys use shared asynchronous playback", Pk040Transport);
+        await Run("PlaybackKeys040: Previous uses accepted pending and restored positions", Pk040AcceptedPrevious);
         await Run("PlaybackKeys040: focused buttons keep native Space and Enter activation", Pk040ButtonActivation);
         await Run("PlaybackKeys040: autorepeat does not toggle playback mute or fullscreen", Pk040Repeat);
         await Run("PlaybackKeys040: Enter and double click activate the exact available row while Listen can fall back", Pk040TrackActivation);
+        await Run("PlaybackKeys040: catalog Enter opens the focused card and ignores repeat", Pk040CatalogEnter);
         await Run("PlaybackKeys040: queue undo leaves the hidden queue alone under overlays", Pk040QueueUndoOverlays);
         await Run("PlaybackKeys040: SMTC Play and Pause are idempotent and its inactive session allows local media keys", Pk040WindowsMediaTransport);
+        await Run("PlaybackKeys040: application media commands reach focused main fullscreen and mini controls once", Pk040ApplicationMediaCommands);
         await Run("PlaybackKeys040: L captures current track and reuses confirmed account mutation guards", Pk040Like);
         File.WriteAllText(Path.Combine(_directory, "playback-keys040-scope.json"), JsonSerializer.Serialize(new
         {
             fixtureWindowsShown = false, nativeHandlesCreated = false, desktopInputUsed = false,
             realAccountUsed = false, externalNetworkRequests = 0, keyboardLayoutChanged = false,
-            keyEvents = "WPF routed PreviewKeyDown with an isolated KeyboardDevice",
+            keyEvents = "WPF routed PreviewKeyDown and MediaCommands targeted at fixture controls",
             audio = "private generated WAV at zero volume for transport checks",
             fullscreenClose = "production request route; never-shown surface uses its immediate fallback"
         }, new JsonSerializerOptions { WriteIndented = true }));
@@ -165,11 +170,81 @@ internal static partial class Program
         Assert(f.Key(Key.MediaNextTrack, f.Fullscreen).Handled, "media next was not handled");
         await Until(() => !Pk040Field<bool>(f.Window, "_loadingStream") && ReferenceEquals(Pk040Field<TrackRow?>(f.Window, "_current"), f.Rows[2]));
         Assert(Pk040Field<PlaybackQueue>(f.Window, "_playbackQueue").CurrentIndex == 2, "media next changed direction");
-        f.Player.Seek(TimeSpan.FromSeconds(8));
-        Assert(f.Key(Key.MediaPreviousTrack).Handled, "media previous was not handled");
-        await Until(() => !Pk040Field<bool>(f.Window, "_loadingStream") && ReferenceEquals(Pk040Field<TrackRow?>(f.Window, "_current"), f.Rows[1]));
-        Assert(Pk040Field<PlaybackQueue>(f.Window, "_playbackQueue").CurrentIndex == 1 && f.Player.Position.TotalSeconds < 3, "media previous changed direction");
+        var q = Pk040Field<PlaybackQueue>(f.Window, "_playbackQueue");
+        await CheckMediaPrevious(f.ExpandedVolume);
+        Assert(f.Key(Key.Escape, f.Fullscreen).Handled, "fullscreen did not close before main-window media checks");
+        await CheckMediaPrevious(f.Volume);
+        Assert(f.Key(Key.MediaPreviousTrack).Handled, "media previous was not handled at the beginning");
+        await Until(() => q.CurrentIndex == 1 && !Pk040Field<bool>(f.Window, "_loadingStream"));
         f.Key(Key.P); Assert(!f.Player.IsPlaying && f.Http.Requests == 0, "P pause performed network or failed");
+
+        async Task CheckMediaPrevious(UIElement focus)
+        {
+            foreach (var raw in new[] { false, true })
+            {
+                var token = q.CurrentOccurrenceToken;
+                f.Player.Seek(TimeSpan.FromSeconds(8));
+                await Until(() => f.Player.Position.TotalSeconds > 6);
+                Previous();
+                Assert(q.CurrentOccurrenceToken == token, "media previous moved off the current occurrence past the threshold");
+                await Until(() => f.Player.Position.TotalSeconds < 2);
+                Previous();
+                await Until(() => q.CurrentIndex == 1 && f.Player.IsPlaying && !Pk040Field<bool>(f.Window, "_loadingStream"));
+                Assert(f.Key(Key.MediaNextTrack, focus).Handled, "media next did not restore the successor for the other route");
+                await Until(() => q.CurrentOccurrenceToken == token && f.Player.IsPlaying && !Pk040Field<bool>(f.Window, "_loadingStream"));
+
+                void Previous()
+                {
+                    if (raw) Assert(f.Key(Key.MediaPreviousTrack, focus).Handled, "raw Previous was ignored");
+                    else
+                    {
+                        Assert(MediaCommands.PreviousTrack.CanExecute(null, focus), "routed Previous was ignored");
+                        MediaCommands.PreviousTrack.Execute(null, focus);
+                    }
+                }
+            }
+        }
+    }
+
+    private static async Task Pk040AcceptedPrevious()
+    {
+        using (var f = new Pk040Fixture("accepted-previous-pending"))
+        {
+            var w = f.Window;
+            var q = Pk040Field<PlaybackQueue>(w, "_playbackQueue");
+            await w.PlayTrackAsync(f.Rows[0]);
+            await Call(w, "AdvanceAsync", 1, false);
+            var target = q.CurrentOccurrenceToken;
+            var sample = TimeSpan.FromSeconds(1);
+            f.Player.ReadWpfPositionForChecks = _ => sample;
+            Pk040Call(w, "CommitSeek", 8d);
+            Assert(Pk040Field<double?>(w, "_pendingSeek") == 8d && f.Player.Position == sample,
+                "fixture did not hold a pending seek ahead of the native sample");
+            Assert(f.Key(Key.MediaPreviousTrack).Handled && q.CurrentOccurrenceToken == target
+                && Pk040Field<double?>(w, "_pendingSeek") == 0d,
+                "raw Previous abandoned the accepted seek instead of rewinding the same occurrence");
+            sample = TimeSpan.FromSeconds(8);
+            Assert(MediaCommands.PreviousTrack.CanExecute(null, f.Volume), "routed Previous is unavailable");
+            MediaCommands.PreviousTrack.Execute(null, f.Volume);
+            await Until(() => ReferenceEquals(q.Current, f.Rows[0]) && f.Player.IsPlaying);
+            Assert(q.CurrentOccurrenceToken != target, "second Previous used stale native position instead of the accepted rewind");
+        }
+
+        using (var f = new Pk040Fixture("accepted-previous-restored"))
+        {
+            var w = f.Window;
+            f.SetCurrent(f.Rows[1]);
+            var q = Pk040Field<PlaybackQueue>(w, "_playbackQueue");
+            var target = q.CurrentOccurrenceToken;
+            Pk040Set(w, "_restoredPlaybackOccurrence", target);
+            Pk040Set(w, "_restoredPlaybackSeconds", 17d);
+            Pk040Call(w, "UpdateControls");
+            Assert(Control<TextBlock>(w, "PositionText").Text == "0:17" && !f.Player.HasSource, "fixture did not restore the paused offset");
+            await Call(w, "HandleShellCommandAsync", ShellAction.Previous);
+            Assert(q.CurrentOccurrenceToken == target && Pk040Field<double?>(w, "_restoredPlaybackSeconds") == 0d
+                && Control<TextBlock>(w, "PositionText").Text == "0:00" && !f.Player.HasSource && !f.Player.IsPlaying,
+                "Previous opened or changed the exact source-free occurrence instead of rewinding it");
+        }
     }
 
     private static async Task Pk040WindowsMediaTransport()
@@ -193,7 +268,9 @@ internal static partial class Program
         await Until(() => !Pk040Field<bool>(f.Window, "_loadingStream") && ReferenceEquals(Pk040Field<TrackRow?>(f.Window, "_current"), f.Rows[1]));
         Assert(text.Text == "Поиск" && combo.SelectedIndex == 0, "a media key changed text or combo selection");
 
-        typeof(WindowsIntegration).GetField("_hasMedia", flags)!.SetValue(media, true);
+        Assert(!media.HandlesMediaKeys, "a disconnected SMTC reserved local keys");
+        // Simulate a bridge binding without creating a window handle or registering with Windows.
+        typeof(WindowsIntegration).GetField("<WindowHandle>k__BackingField", flags)!.SetValue(media, (nint)1);
         Assert(media.HandlesMediaKeys && !f.Key(Key.MediaPlayPause, text).Handled && !f.Key(Key.MediaNextTrack, combo).Handled
             && !f.Key(Key.MediaPreviousTrack, f.Volume).Handled && f.Player.IsPlaying, "active SMTC allowed a duplicate local media action");
         var commands = new List<DesktopMediaAction>();
@@ -221,6 +298,185 @@ internal static partial class Program
         Assert(commands.Count == 2 && f.Key(Key.MediaPlayPause).Handled, "inactive SMTC handled Play or prevented the local key");
         await Until(() => f.Player.IsPlaying && !Pk040Field<bool>(f.Window, "_loadingStream"));
         Assert(f.Player.Position.TotalSeconds < 3, "Play after Stop resumed from the old paused position");
+    }
+
+    private static async Task Pk040MediaDuringCollapse()
+    {
+        if (!Motion.CanAnimate) return;
+        foreach (var raw in new[] { false, true })
+        {
+            using var f = new Fr0317Fixture("collapse-media-previous-" + raw);
+            var w = f.Window;
+            var first = new TrackRow { Id = "collapse-media-a", RequestId = "collapse-media-a", Title = "Fixture A",
+                Available = true, DurationMs = 30000, LocalPath = PlaybackOptionsSilentWave("collapse-media-a-" + raw, 30) };
+            var second = new TrackRow { Id = "collapse-media-b", RequestId = "collapse-media-b", Title = "Fixture B",
+                Available = true, DurationMs = 30000, LocalPath = PlaybackOptionsSilentWave("collapse-media-b-" + raw, 30) };
+            var queue = Pk040Field<PlaybackQueue>(w, "_playbackQueue");
+            var player = Pk040Field<NativePlayer>(w, "_player");
+            player.SetVolume(0);
+            queue.SetItems([first, second], first);
+            await w.PlayTrackAsync(first);
+            await Call(w, "AdvanceAsync", 1, false);
+            player.Seek(TimeSpan.FromSeconds(8));
+            await Until(() => player.Position.TotalSeconds > 6);
+            Pk040Call(w, "SetExpandedPlayerVisible", true, true);
+            Pk040Field<Image>(w, "_expandedPlayerCover").Source = f.Artwork;
+            var host = Pk040Field<object>(w, "_expandedFullscreenHost");
+            var fullscreen = (Window)host.GetType().GetProperty("Window", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(host)!;
+            Fc040Begin(f, f.SourceBounds);
+            Fc040Clock(Pk040Field<object>(w, "_expandedCollapse")).Controller!.Pause();
+            var stage = Pk040Field<Grid>(w, "_expandedRevealStage");
+            Assert(!stage.IsEnabled && !stage.IsHitTestVisible, "fixture did not freeze the closing fullscreen contents");
+            var token = queue.CurrentOccurrenceToken;
+            Previous();
+            Assert(queue.CurrentOccurrenceToken == token && !stage.IsHitTestVisible,
+                "Previous past the threshold changed the closing occurrence or restored pointer input");
+            await Until(() => player.Position.TotalSeconds < 2);
+            Previous();
+            await Until(() => ReferenceEquals(queue.Current, first) && player.IsPlaying);
+            Assert(queue.CurrentOccurrenceToken != token, "Previous before the threshold did not move to the prior occurrence");
+
+            void Previous()
+            {
+                if (!raw)
+                {
+                    Assert(MediaCommands.PreviousTrack.CanExecute(null, fullscreen), "routed Previous was rejected during collapse");
+                    MediaCommands.PreviousTrack.Execute(null, fullscreen);
+                    return;
+                }
+                var press = new KeyEventArgs(new Pk040Keyboard(ModifierKeys.None), new Pk040Source(fullscreen), Environment.TickCount, Key.MediaPreviousTrack)
+                    { RoutedEvent = Keyboard.PreviewKeyDownEvent };
+                fullscreen.RaiseEvent(press);
+                Assert(press.Handled, "raw Previous missed the closing fullscreen host");
+            }
+        }
+    }
+
+    private static Task Pk040FullscreenMediaRegistration()
+    {
+        using var f = new Pk040Fixture("cached-fullscreen-media-registration");
+        f.SetCurrent(f.Rows[0]);
+        Window? cached = null;
+        for (var opening = 0; opening < 4; opening++)
+        {
+            Assert(f.Key(Key.F11).Handled, "F11 did not open the cached fullscreen fixture");
+            var window = f.Fullscreen;
+            cached ??= window;
+            Assert(ReferenceEquals(window, cached)
+                && HandlerCount(window, CommandManager.PreviewCanExecuteEvent) == 1
+                && HandlerCount(window, CommandManager.PreviewExecutedEvent) == 1,
+                $"fullscreen opening {opening + 1} changed its window or media subscription count");
+            Assert(f.Key(Key.Escape, window).Handled && Pk040Field<object?>(f.Window, "_expandedFullscreenHost") is null,
+                "Escape did not release the temporary fullscreen host");
+        }
+
+        var closed = cached ?? throw new InvalidOperationException("fixture never created a fullscreen window");
+        Pk040Call(f.Window, "DestroyExpandedFullscreenWindow", f.Window, EventArgs.Empty);
+        Assert(Pk040Field<object?>(f.Window, "_expandedFullscreenWindow") is null
+            && HandlerCount(closed, CommandManager.PreviewCanExecuteEvent) == 0
+            && HandlerCount(closed, CommandManager.PreviewExecutedEvent) == 0,
+            "destroying the cached window retained media subscriptions");
+        return Task.CompletedTask;
+
+        static int HandlerCount(Window window, RoutedEvent routedEvent)
+        {
+            var store = typeof(UIElement).GetProperty("EventHandlersStore", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window);
+            if (store is null) return 0;
+            var registrations = store.GetType().GetMethod("GetRoutedEventHandlers")!.Invoke(store, [routedEvent]);
+            return (registrations as Array)?.Length ?? 0;
+        }
+    }
+
+    private static async Task Pk040ApplicationMediaCommands()
+    {
+        using var f = new Pk040Fixture("app-media-routed");
+        var w = f.Window;
+        var queue = Pk040Field<PlaybackQueue>(w, "_playbackQueue");
+        f.SetCurrent(f.Rows[0]);
+        var editor = new TextBox { Text = "Поиск" };
+        ((Grid)w.Content).Children.Add(editor); f.Layout();
+
+        Execute(MediaCommands.Play, editor);
+        await Until(() => f.Player.IsPlaying && !Pk040Field<bool>(w, "_loadingStream"));
+        var first = queue.CurrentOccurrenceToken;
+        Execute(MediaCommands.Play, editor);
+        Assert(f.Player.IsPlaying && queue.CurrentOccurrenceToken == first, "explicit routed Play toggled or advanced the active source");
+        Execute(MediaCommands.Pause, editor);
+        Execute(MediaCommands.Pause, editor);
+        Assert(!f.Player.IsPlaying && f.Player.HasSource && editor.Text == "Поиск", "explicit routed Pause was not idempotent");
+        var version = queue.Version;
+        Execute(MediaCommands.NextTrack, editor);
+        await Until(() => queue.CurrentIndex == 1 && f.Player.IsPlaying && !Pk040Field<bool>(w, "_loadingStream"));
+        Assert(queue.Version == version + 1, "the preview and bubble routes both advanced the queue");
+
+        Assert(f.Key(Key.F11).Handled, "fixture could not open the fullscreen host");
+        Execute(MediaCommands.PreviousTrack, f.ExpandedVolume);
+        await Until(() => queue.CurrentOccurrenceToken == first && f.Player.IsPlaying);
+        Execute(MediaCommands.Stop, f.ExpandedVolume);
+        Assert(!f.Player.HasSource && queue.CurrentOccurrenceToken == first, "routed Stop discarded the exact occurrence or left it active");
+
+        var mini = new MiniPlayerWindow();
+        mini.Update("Fixture", "", false, true, true, canPlay: true);
+        w.AttachMediaCommands(mini);
+        try
+        {
+            Execute(MediaCommands.TogglePlayPause, mini.PlayButton);
+            await Until(() => f.Player.IsPlaying && !Pk040Field<bool>(w, "_loadingStream"));
+            Assert(queue.CurrentOccurrenceToken == first, "mini routed Play changed the selected occurrence");
+            Execute(MediaCommands.Pause, mini.PlayButton);
+            Assert(!f.Player.IsPlaying, "mini did not route explicit Pause");
+            Execute(MediaCommands.Stop, mini.PlayButton);
+            Assert(!f.Player.HasSource && !f.Key(Key.Space, mini.PlayButton).Handled
+                && f.Key(Key.MediaPlayPause, mini.PlayButton).Handled, "mini did not preserve ordinary keys or route raw Play after Stop");
+            await Until(() => f.Player.IsPlaying && !Pk040Field<bool>(w, "_loadingStream"));
+            foreach (var raw in new[] { false, true })
+            {
+                Assert(f.Key(Key.MediaNextTrack, mini.PlayButton).Handled, "mini did not take the raw Next key");
+                await Until(() => queue.CurrentIndex == 1 && f.Player.IsPlaying && !Pk040Field<bool>(w, "_loadingStream"));
+                var second = queue.CurrentOccurrenceToken;
+                f.Player.Seek(TimeSpan.FromSeconds(6));
+                await Until(() => f.Player.Position.TotalSeconds > 4);
+                Previous();
+                Assert(queue.CurrentOccurrenceToken == second, "mini Previous past the threshold moved to another occurrence");
+                await Until(() => f.Player.Position.TotalSeconds < 2);
+                Previous();
+                await Until(() => queue.CurrentOccurrenceToken == first && f.Player.IsPlaying && !Pk040Field<bool>(w, "_loadingStream"));
+
+                void Previous()
+                {
+                    if (raw) Assert(f.Key(Key.MediaPreviousTrack, mini.PlayButton).Handled, "mini did not take the raw Previous key");
+                    else Execute(MediaCommands.PreviousTrack, mini.PlayButton);
+                }
+            }
+
+            var gate = (WindowsIntegration)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(WindowsIntegration));
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            typeof(WindowsIntegration).GetField("_window", flags)!.SetValue(gate, w);
+            typeof(WindowsIntegration).GetField("<IsAvailable>k__BackingField", flags)!.SetValue(gate, true);
+            typeof(WindowsIntegration).GetField("<WindowHandle>k__BackingField", flags)!.SetValue(gate, (nint)1);
+            Pk040Set(w, "_windows", gate);
+            f.SetCurrent(f.Rows[0]);
+            Assert(gate.HandlesMediaKeys && !MediaCommands.NextTrack.CanExecute(null, f.ExpandedVolume)
+                && !MediaCommands.NextTrack.CanExecute(null, mini.PlayButton)
+                && !f.Key(Key.MediaPlayPause, mini.PlayButton).Handled && !f.Key(Key.MediaNextTrack, mini.PlayButton).Handled
+                && !f.Key(Key.MediaPreviousTrack, mini.PlayButton).Handled,
+                "a local routed command or raw mini key still claims an active SMTC action");
+            MediaCommands.NextTrack.Execute(null, mini.PlayButton);
+            Assert(queue.CurrentOccurrenceToken == first && f.Player.IsPlaying, "the local route duplicated active SMTC");
+
+            Task observed = Task.CompletedTask;
+            gate.Command += action => observed = w.HandleDesktopMediaCommandAsync(action);
+            typeof(WindowsIntegration).GetMethod("DispatchButton", flags)!.Invoke(gate, [Windows.Media.SystemMediaTransportControlsButton.Next]);
+            await observed.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert(queue.CurrentIndex == 1 && f.Player.IsPlaying, "a single SMTC Next did not own the transition");
+        }
+        finally { mini.Close(); }
+
+        static void Execute(RoutedCommand command, IInputElement focus)
+        {
+            Assert(command.CanExecute(null, focus), $"local route rejected {command.Name}");
+            command.Execute(null, focus);
+        }
     }
 
     private static Task Pk040ButtonActivation()
@@ -309,6 +565,8 @@ internal static partial class Program
 
             var duplicateRow = (ListViewItem)list.ItemContainerGenerator.ContainerFromIndex(3);
             Pk040Focus(duplicateRow);
+            Assert(f.Key(Key.Enter, duplicateRow, repeat: true).Handled && !f.Player.HasSource && !Pk040Field<bool>(w, "_loadingStream"),
+                "held Enter started the newly focused track");
             Assert(f.Key(Key.Enter, duplicateRow).Handled, "fixture missed its focused duplicate row");
             var queue = Pk040Field<PlaybackQueue>(w, "_playbackQueue");
             await Until(() => f.Player.HasSource && !Pk040Field<bool>(w, "_loadingStream"));
@@ -344,6 +602,31 @@ internal static partial class Program
         Assert(f.Key(Key.Z, modifiers: ModifierKeys.Control).Handled && !queue.CanUndoRemoval && queue.Items.Count == 3,
             "Ctrl+Z no longer restores the removed row in Queue");
         return Task.CompletedTask;
+    }
+
+    private static async Task Pk040CatalogEnter()
+    {
+        using var f = new Pk040Fixture("catalog-enter");
+        f.Account();
+        var displayed = new[] { new CatalogItem("91", "album", "Selected album", "Fixture"),
+            new CatalogItem("92", "album", "Focused album", "Fixture") };
+        Pk040Call(f.Window, "ShowCatalogItems", displayed, false);
+        var catalog = Control<ListBox>(f.Window, "CatalogList");
+        catalog.SelectedIndex = 0;
+        f.Layout();
+        var row = (ListBoxItem)catalog.ItemContainerGenerator.ContainerFromIndex(1);
+        var previousFocus = Keyboard.FocusedElement as DependencyObject;
+        try
+        {
+            Pk040Focus(row);
+            var requests = f.Http.Requests;
+            Assert(f.Key(Key.Enter, row, repeat: true).Handled && f.Http.Requests == requests,
+                "held Enter opened the focused catalog card");
+            Assert(f.Key(Key.Enter, row).Handled, "catalog Enter missed its focused container");
+            await Until(() => f.Http.Requests > requests);
+            Assert(Pk040Field<CatalogItem?>(f.Window, "_openedCatalogItem")?.Id == "92", "catalog Enter opened the old selection");
+        }
+        finally { Pk040Focus(previousFocus); }
     }
 
     private static void Pk040Focus(DependencyObject? target)
@@ -429,8 +712,7 @@ internal static partial class Program
             Rows = Enumerable.Range(0, 3).Select(index => new TrackRow { Id = "keys-" + index, RequestId = "keys-" + index + ":91", AlbumId = "91",
                 Title = "Private keyboard " + index, Artist = "Fixture", Available = true, DurationMs = 30000, LocalPath = wav }).ToArray();
             Pk040Call(Window, "ShowRows", (object)Rows); Pk040Field<PlaybackQueue>(Window, "_playbackQueue").SetItems(Rows, Rows[0]);
-            // Keep lyric discovery inside this never-shown keyboard fixture.
-            Pk040Set(Window, "_lyricsCts", new CancellationTokenSource()); Layout();
+            Layout();
             Assert(!Window.IsVisible && PresentationSource.FromVisual(Window) is null && new WindowInteropHelper(Window).Handle == 0, "keyboard fixture created an HWND");
         }
         internal void Account() { Pk040Set(Window, "_session", FakeSession); Pk040Set(Window, "_account", new Account("12345", "Fixture", true)); }
@@ -467,6 +749,7 @@ internal static partial class Program
             Requests++; Assert(request.RequestUri!.Host == "api.music.yandex.net", "keyboard fixture left its fake API");
             var path = request.RequestUri.AbsolutePath;
             if (path == "/account/status") return Json(Profile);
+            if (path == "/albums/92/with-tracks") return Json("{\"result\":{\"id\":92,\"title\":\"Focused album\",\"volumes\":[]}}");
             if (path == "/users/12345/likes/tracks") return Json(JsonSerializer.Serialize(new { result = new { library = new { tracks = Likes.Select(id => new { id, albumId = "91" }).ToArray() } } }));
             if (path.StartsWith("/users/12345/likes/tracks/", StringComparison.Ordinal))
             {

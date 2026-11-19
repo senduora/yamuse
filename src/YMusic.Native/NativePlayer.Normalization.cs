@@ -16,7 +16,7 @@ internal sealed partial class NativePlayer
     internal void SetNormalization(bool enabled)
     {
         _normalizeVolume = enabled;
-        foreach (var slot in new[] { _current, _prepared, _fading }.OfType<Slot>().Distinct())
+        foreach (var slot in new[] { _current, _prepared, _fading, _waveFallback }.OfType<Slot>().Distinct())
         {
             slot.SetGain(enabled ? slot.MeasuredGain : 1);
             if (enabled) BeginNormalization(slot);
@@ -46,9 +46,10 @@ internal sealed partial class NativePlayer
             try
             {
                 if (slot.Input is { } input) await input.Completion.WaitAsync(slot.NormalizationCancellation.Token);
-                var path = slot.Input?.Path ?? (slot.OpenedSource?.IsFile == true ? slot.OpenedSource.LocalPath : null);
+                var path = slot.LocalAudioPath ?? slot.Input?.Path ?? (slot.OpenedSource?.IsFile == true ? slot.OpenedSource.LocalPath : null);
                 if (path is null) return;
-                var result = await Task.Run(() => _loudnessCache.MeasureAsync(path, slot.NormalizationCancellation.Token), slot.NormalizationCancellation.Token);
+                var result = await Task.Run(() => _loudnessCache.MeasureAsync(path, slot.NormalizationCancellation.Token, slot.VerifiedLocalDigest),
+                    slot.NormalizationCancellation.Token);
                 if (slot.Closed) return;
                 slot.MeasuredGain = LoudnessAnalysis.Gain(result);
                 if (_normalizeVolume) slot.SetGain(slot.MeasuredGain);

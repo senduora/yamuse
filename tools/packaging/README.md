@@ -8,12 +8,13 @@
 
 Номер выпуска выбирается и согласуется по [политике `X.Y.Z`](../../docs/VERSIONING.md). Для упаковки нужна стабильная версия. До подготовки пакета скрипт сверяет `-Version` с `Version` и `AssemblyVersion` исходного проекта или с `InformationalVersion` и `AssemblyVersion` готовой DLL.
 
-Нужны Windows x64, PowerShell и .NET SDK 10.0.404. Выполняйте пример из корня репозитория для согласованного пакета. Укажите `RunName` уже пройденной полной проверки `tools/Verify-Project.ps1 -Full`. Номер и SHA-256 берутся из её квитанции, где записаны `InformationalVersion` и хеш проверенной DLL.
+Нужны Windows x64, PowerShell и .NET SDK 10.0.404. Выполняйте пример из корня репозитория для согласованного пакета. Укажите `RunName` уже пройденной полной проверки `tools/Verify-Project.ps1 -Full`. В её квитанции записаны папка publish, `InformationalVersion` и SHA-256 проверенных DLL и EXE.
 
 ```powershell
 $runName = Read-Host 'RunName пройденной полной проверки'
 $verifiedRun = Join-Path (Join-Path $PWD 'work') $runName
-$receipt = Get-Content -LiteralPath (Join-Path $verifiedRun 'verification.json') -Raw | ConvertFrom-Json
+$receiptPath = Join-Path $verifiedRun 'verification.json'
+$receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
 if ($receipt.status -cne 'PASS' -or !$receipt.full) { throw 'Требуется квитанция полной проверки.' }
 
 $version = ([string]$receipt.productVersion).Split('+')[0]
@@ -27,7 +28,7 @@ $pack = @{
     OutputFolder = $outputFolder
     WorkFolder = $packageWork
     PublishedFolder = Join-Path $verifiedRun 'publish'
-    ExpectedProductSha256 = $receipt.productDllSha256
+    VerificationReceipt = $receiptPath
 }
 # Для локального SDK добавьте $pack.DotnetPath с полным путём к dotnet.exe.
 # При наличии локального кэша добавьте $pack.PackageCache с путём к папке с nupkg.
@@ -36,11 +37,15 @@ $pack = @{
 
 Без `PublishedFolder` скрипт копирует исходники и global.json в отдельный staging, не трогает активный `app`, публикует self-contained WPF `win-x64`, затем вызывает закреплённый `vpk pack`. В staging создаётся RID-specific lock; основная блокировка зависимостей не переписывается. `PinnedRuntime.targets` задаёт WindowsSdkPackageVersion отдельно: глобальная RuntimeFrameworkVersion несовместима с Windows profile references SDK 10. Transitive framework downloads не отключаются. Итоговые Core и WPF runtime 10.0.15 обязательно сверяются в runtimeconfig; ASP.NET может быть загружен SDK в build cache, но не поставляется WPF-приложением.
 
-`-PublishedFolder <проверенная папка>` упаковывает копию без пересборки. Проверяются assembly version, наличие WPF/CoreCLR и точная версия bundled runtime. `-ExpectedProductSha256` связывает пакет с проверенным DLL; тот же хеш затем сравнивается с DLL внутри full.nupkg. В обеих ветках кладутся согласованный публичный `update-feed.json` и `Legal` notices, без подмены DLL.
+`-PublishedFolder <проверенная папка>` упаковывает копию без пересборки. Скрипт сверяет папку, версию и SHA-256 полной описи файлов с `-VerificationReceipt`, затем повторно сверяет опись скопированной папки перед добавлением публичного `update-feed.json` и документов `Legal`. Опись учитывает относительные пути, размеры и SHA-256 всех файлов, включая DLL, EXE и `.deps.json`. Для отдельных локальных проверок SHA-256 DLL и EXE можно передать через `-ExpectedProductSha256` и `-ExpectedAppHostSha256`. Скрипт проверяет привязку закреплённого x64 apphost к `YMusic.Native.dll`. Ожидаемая опись для обоих архивов и встроенного пакета Setup формируется до вызова Velopack из проверенного publish и точных замен feed и Legal. Её SHA-256 записывается в `build-provenance.json` как `stagePublishInventorySha256`.
 
 Для получения одинакового product DLL при проверках и publish держите один project/obj/RID: сначала `build -c Release -r win-x64 --self-contained false`, затем restore/publish с тем же RID и `--self-contained true`. В обеих фазах импортируйте `-p:DirectoryBuildTargetsPath=<полный путь к PinnedRuntime.targets>`. Между фазами нельзя менять исходники; после publish сравните SHA-256 DLL с проверенным. На synthetic WPF с App.xaml и embedded PDB идентичность подтверждена, но это не заменяет сравнения реальной финальной сборки.
 
-На выходе: `Yamuse-win-Setup.exe`, `Yamuse-<version>-full.nupkg`, `Yamuse-win-Portable.zip`, `releases.win.json`, контрольные метаданные и хеши. Скрипт **не** запускает Setup, не создаёт Release/репозиторий, не делает commit/push и не удаляет предыдущие сборки. `OutputFolder` и `WorkFolder` должны быть новыми/пустыми. Удаление промежуточных файлов не выполняется автоматически.
+На выходе: `Yamuse-win-Setup.exe`, `Yamuse-<version>-full.nupkg`, `Yamuse-win-Portable.zip`, `releases.win.json`, контрольные метаданные и хеши. Скрипт **не** запускает Setup, не создаёт Release/репозиторий, не делает commit/push и не удаляет предыдущие сборки. `OutputFolder` и `WorkFolder` должны быть новыми или пустыми. Для `OutputFolder`, `WorkFolder` и `PublishedFolder` используйте отдельные папки без вложенности. Удаление промежуточных файлов не выполняется автоматически.
+
+По умолчанию кэш NuGet хранится в `<WorkFolder>\packages`. Если задаёте другой `-PackageCache`, выделите ему отдельную папку без пересечения с исходным publish, рабочей папкой и выходом. Скрипты проверяют существующие компоненты этих путей и содержимое publish перед копированием или записью.
+
+При сборке из исходников с буквальным `%HH` в пути `WorkFolder` (например, `%2E`) SDK использует отдельный каталог `.yamuse-sdk-…` под ближайшим подходящим предком или в `work` репозитория. Его путь записывается в `build-provenance.json` как `sdkWorkFolder`. Проверенный publish, RID lock и выбранный кэш `.nupkg` по-прежнему доступны по своим обычным путям.
 
 Набор self-contained содержит runtime для компьютеров без установленного .NET. Это увеличивает установщик и место на диске; оно не означает, что все файлы runtime одновременно загружаются в RAM. Отдельного updater-сервиса в фоне нет. RAM/startup реального клиента после упаковки отдельно не измерены.
 
@@ -70,18 +75,21 @@ $pack = @{
 
 ## Проверка пакетов
 
-`Pack-Installer.ps1` получает только фиксированные файлы NuGet по официальным HTTPS URL, сравнивает встроенные SHA-256 и запускает `dotnet nuget verify --all`. Затем CLI ставится из проверенного локального пакета, restore staging использует локальный feed. Источники/версии/хеши сохраняются в `build-provenance.json`; runtime/host Microsoft проверены по author+repository signature, Velopack/vpk — по repository signature NuGet.
+`Pack-Installer.ps1` получает только фиксированные файлы NuGet по официальным HTTPS URL. Он скачивает пакет во временный файл в кэше и присваивает окончательное имя после сверки SHA-256. Если другой запуск уже записал пакет, скрипт сверяет его хеш и сохраняет файл на месте. Затем `dotnet nuget verify --all` проверяет подписи, CLI ставится из проверенного локального пакета, а restore staging использует локальный feed. Источники, версии и хеши сохраняются в `build-provenance.json`.
 
-`Pack-Installer.ps1` проверяет состав `.deps.json` для win-x64 и SHA-256 всего закреплённого runtime, включая Velopack, Windows projection и локализованные сборки WPF. `Inspect-Package.ps1` сверяет полную запись в `releases.win.json` по ID пакета, версии, имени, размеру и хешам. Он также сверяет три записи в `assets.win.json` и строку полного пакета в `RELEASES` по имени, размеру и SHA-1. Файлы nupkg и Portable ZIP сверяются побайтно с `-ReferencePublishedFolder`. Velopack может пропустить `createdump.exe` и добавляет известные служебные файлы. Три общих служебных файла дополнительно сверяются между архивами. Манифест и иконка Setup читаются как PE DATAFILE, а SHA-256 подтверждает соответствие встроенного nupkg. Скрипт пишет `package-evidence.json`, `package.nuspec.xml` и `setup.manifest.xml`.
+`Pack-Installer.ps1` проверяет точный SHA-256 `runtimeconfig.json` и состав `.deps.json` для win-x64. Байты `.deps.json` сверяются с описью и разбираются как строгий JSON в UTF-8, в том числе с UTF-8 BOM. Проверка охватывает пути и метаданные, по которым .NET находит библиотеки. Также сверяется SHA-256 закреплённого runtime, включая Velopack, Windows projection и локализованные сборки WPF. `Inspect-Package.ps1` сверяет полную запись в `releases.win.json` по ID пакета, версии, имени, размеру и хешам. Он также сверяет три записи в `assets.win.json` и строку полного пакета в `RELEASES` по имени, размеру и SHA-1. Файлы nupkg и Portable ZIP сверяются побайтно с `-ReferencePublishedFolder`. Velopack может пропустить `createdump.exe` и добавляет известные служебные файлы. Три общих служебных файла дополнительно сверяются между архивами. Манифест и иконка Setup читаются как PE DATAFILE, а SHA-256 подтверждает соответствие встроенного nupkg. Скрипт пишет `package-evidence.json`, `package.nuspec.xml` и `setup.manifest.xml`.
 
-При упаковке `Pack-Installer.ps1` сам передаёт инспектору обязательный `-ReferencePublishedFolder`. Для отдельной повторной проверки сохраните и укажите папку `<WorkFolder>\publish`. В ней лежит точная копия файлов, переданных Velopack, включая подготовленные `update-feed.json` и `Legal`. С переменными из примера упаковки команда выглядит так.
+При упаковке `Pack-Installer.ps1` передаёт инспектору папку stage и утверждённый SHA-256 её описи. Для повторной проверки сохраните `<WorkFolder>\publish` и `build-provenance.json`. С переменными из примера упаковки команда выглядит так.
 
 ```powershell
+$provenance = Get-Content -LiteralPath (Join-Path $outputFolder 'build-provenance.json') -Raw | ConvertFrom-Json
 & .\tools\packaging\Inspect-Package.ps1 `
     -OutputFolder $outputFolder `
     -ExpectedVersion $version `
     -ReferencePublishedFolder (Join-Path $packageWork 'publish') `
-    -ExpectedProductSha256 $receipt.productDllSha256
+    -ExpectedStageInventorySha256 $provenance.stagePublishInventorySha256 `
+    -ExpectedProductSha256 $receipt.productDllSha256 `
+    -ExpectedAppHostSha256 $receipt.mainExecutableSha256
 ```
 
 `Legal/Velopack-LICENSE.txt` — точный first-party [LICENSE](https://github.com/velopack/velopack/blob/92d6a1c91716729d449034df5c50307dcce39493/LICENSE) commit из nuspec Velopack 1.2.161, с copyright Caelan Sayler/Velopack Ltd. Также поставляются точные NETCore LICENSE/THIRD-PARTY-NOTICES и WindowsDesktop LICENSE из подписанных runtime nupkg 10.0.15. Csproj копирует их в output/publish, packscript — в staging. Эти лицензии относятся к зависимостям; собственный код Yamuse распространяется по лицензии MIT (см. LICENSE). Vendor notices сохраняются побайтно; Git не нормализует их line endings или upstream whitespace. Инспектор сверяет SHA-256.

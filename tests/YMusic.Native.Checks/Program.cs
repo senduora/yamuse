@@ -357,8 +357,8 @@ internal static partial class Program
         });
         await Run("Offline: selected download, safe file name, full hash readback, deduplication and preserved files", async () =>
         {
-            var wave = File.ReadAllBytes(WriteWave("offline-source.wav", 3));
-            var handler = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(wave) }));
+            var media = SilentMp3Seconds(3);
+            var handler = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(media) }));
             var directory = Path.Combine(_directory, "offline-library");
             using var library = new OfflineLibrary(directory, new AudioBuffer(Path.Combine(_directory, "offline-temp"), handler));
             var track = new TrackRow { Id = "99", RequestId = "99:3", Title = "Bad:/title?", Artist = "Fixture", Album = "Album", DurationMs = 3000, Available = true };
@@ -378,8 +378,8 @@ internal static partial class Program
         await Run("Offline: corrupt index is not overwritten; UI plays a local file with no account/network", async () =>
         {
             var directory = Path.Combine(_directory, "offline-ui");
-            var wave = File.ReadAllBytes(WriteWave("offline-ui-source.wav", 3));
-            var mediaHandler = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(wave) }));
+            var media = SilentMp3Seconds(3);
+            var mediaHandler = new FakeHandler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(media) }));
             var library = new OfflineLibrary(directory, new AudioBuffer(Path.Combine(_directory, "offline-ui-temp"), mediaHandler));
             var track = new TrackRow { Id = "88", RequestId = "88", Title = "Offline fixture", DurationMs = 3000, Available = true };
             var saved = await library.SaveAsync(track, new AudioDescriptor(new Uri("https://s1.vlx.yandex.net/full.mp3"), "mp3", 320), default);
@@ -586,6 +586,84 @@ internal static partial class Program
             Assert(json.RootElement.GetProperty("executableSha256").GetString()!.Length == 64 && json.RootElement.GetProperty("samples").GetArrayLength() >= 1, "missing measurement evidence");
             return Task.CompletedTask;
         });
+        await Run("Diagnostics preserve previous reports and require permission for an existing destination", async () =>
+        {
+            var directory = Path.Combine(_directory, "diagnostics-manual-publish");
+            Directory.CreateDirectory(directory);
+            var previous = Path.Combine(directory, "previous.json");
+            var later = Path.Combine(directory, "later.json");
+            File.WriteAllText(previous, "previous report");
+            using var diagnostics = new Diagnostics();
+            Assert(!diagnostics.Save(previous, () => false) && File.ReadAllText(previous) == "previous report", "declined replacement changed the report");
+            using (File.Open(previous, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                await Throws<IOException>(() => { diagnostics.Save(previous, () => true); return Task.CompletedTask; });
+                Assert(File.ReadAllText(previous) == "previous report", "a refused publication removed the previous report");
+            }
+
+            diagnostics.BeforeReportPublicationForChecks = () => File.WriteAllText(later, "separate report");
+            await Throws<IOException>(() => { diagnostics.Save(later); return Task.CompletedTask; });
+            Assert(File.ReadAllText(later) == "separate report", "a late destination was overwritten without permission");
+            diagnostics.BeforeReportPublicationForChecks = null;
+            var created = DateTime.UtcNow.AddDays(-2).Date;
+            File.SetCreationTimeUtc(previous, created);
+            File.SetAttributes(previous, FileAttributes.Hidden | FileAttributes.Archive);
+            Assert(diagnostics.Save(previous, () => true) && !Directory.EnumerateFiles(directory, "*.tmp").Any(), "approved replacement did not publish or clean up");
+            Assert(File.GetCreationTimeUtc(previous) == created && File.GetAttributes(previous).HasFlag(FileAttributes.Hidden)
+                && !Directory.EnumerateFiles(directory, "*.previous").Any(), "approved export lost basic metadata or left a backup");
+            using var json = JsonDocument.Parse(File.ReadAllBytes(previous));
+            Assert(json.RootElement.GetProperty("schema").GetInt32() == 1, "replacement did not contain a complete report");
+        });
+        await Run("Diagnostics preserve the confirmed report when the selected destination is republished", async () =>
+        {
+            var directory = Path.Combine(_directory, "diagnostics-concurrent-publish");
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(directory, "report.json");
+            File.WriteAllText(path, "confirmed report");
+            using var diagnostics = new Diagnostics();
+            diagnostics.BeforeReportPublicationForChecks = () => File.WriteAllText(path, "new independent report");
+            await Throws<IOException>(() => { diagnostics.Save(path, () => true); return Task.CompletedTask; });
+            var previous = Directory.EnumerateFiles(directory, "*.previous").Single();
+            Assert(File.ReadAllText(path) == "new independent report" && File.ReadAllText(previous) == "confirmed report"
+                && !Directory.EnumerateFiles(directory, "*.tmp").Any(), "the concurrent export or the confirmed revision did not survive");
+        });
+        await Run("Diagnostics refuse replacement of a report with additional metadata", async () =>
+        {
+            var path = Path.Combine(_directory, "diagnostics-with-annotations.json");
+            File.WriteAllText(path, "existing report");
+            File.WriteAllText(path + ":annotation", "report annotation");
+            using var diagnostics = new Diagnostics();
+            await Throws<IOException>(() => { diagnostics.Save(path, () => true); return Task.CompletedTask; });
+            Assert(File.ReadAllText(path) == "existing report" && File.ReadAllText(path + ":annotation") == "report annotation",
+                "a refused export modified the existing report or its named stream");
+        });
+        await Run("Diagnostics recover the confirmed report at its selected name before another save", () =>
+        {
+            var directory = Path.Combine(_directory, "diagnostics-interrupted-publish");
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(directory, "report.json");
+            File.WriteAllText(path, "previous diagnostic report");
+            var recovery = new GuardedStoreRecovery(path);
+            using (var previous = UninstallPathGuard.OpenOwnedFile(path, read: true))
+            using (var staged = UninstallPathGuard.CreateStagedFile(Path.Combine(directory, "incomplete.tmp"), deleteOnClose: true))
+            using (recovery.Record(previous, staged))
+                ManagedCacheCleanup.RenameByHandle(previous, recovery.Previous);
+            Assert(!File.Exists(path) && recovery.Pending, "fixture did not leave a recoverable previous report");
+            using var diagnostics = new Diagnostics();
+            var asked = false;
+            Assert(!diagnostics.Save(path, () => { asked = true; return false; }) && asked
+                && File.ReadAllText(path) == "previous diagnostic report" && !recovery.Pending,
+                "the previous report was not recovered before asking for replacement permission");
+            return Task.CompletedTask;
+        });
+        await Run("Diagnostics allow ordinary share syntax without admitting device paths to guarded stores", async () =>
+        {
+            const string share = @"\\fixture-server\reports\report.json";
+            Assert(UninstallPathGuard.Canonical(share, allowNetworkShare: true) == share, "an ordinary report share was rejected");
+            await Throws<IOException>(() => Task.FromResult(UninstallPathGuard.Canonical(share)));
+            await Throws<IOException>(() => Task.FromResult(UninstallPathGuard.Canonical(@"\\?\UNC\fixture-server\reports\report.json", allowNetworkShare: true)));
+            await Throws<IOException>(() => Task.FromResult(UninstallPathGuard.Canonical(@"\\.\C:\report.json", allowNetworkShare: true)));
+        });
         if (online)
         {
             await Run("LIVE native MP3 decoder with anonymously fetched public fixture, muted", async () =>
@@ -687,11 +765,26 @@ internal static partial class Program
         const int rate = 44100;
         var samples = (int)(rate * seconds);
         using var writer = new BinaryWriter(File.Create(path));
-        writer.Write(Encoding.ASCII.GetBytes("RIFF")); writer.Write(36 + samples * 2); writer.Write(Encoding.ASCII.GetBytes("WAVEfmt "));
-        writer.Write(16); writer.Write((short)1); writer.Write((short)1); writer.Write(rate); writer.Write(rate * 2); writer.Write((short)2); writer.Write((short)16);
-        writer.Write(Encoding.ASCII.GetBytes("data")); writer.Write(samples * 2);
+        WritePcmWaveHeader(writer, rate, samples * 2);
         for (var i = 0; i < samples; i++) writer.Write((short)(Math.Sin(i * 2 * Math.PI * 220 / rate) * 1200));
         return path;
+    }
+
+    private static byte[] CreateSilentPcmWave(int size)
+    {
+        const int headerBytes = 44;
+        if (size < headerBytes || (size - headerBytes) % 2 != 0) throw new ArgumentOutOfRangeException(nameof(size));
+        var bytes = new byte[size];
+        using var writer = new BinaryWriter(new MemoryStream(bytes, writable: true));
+        WritePcmWaveHeader(writer, 44100, size - headerBytes);
+        return bytes;
+    }
+
+    private static void WritePcmWaveHeader(BinaryWriter writer, int rate, int dataBytes)
+    {
+        writer.Write("RIFF"u8); writer.Write(36 + dataBytes); writer.Write("WAVEfmt "u8);
+        writer.Write(16); writer.Write((short)1); writer.Write((short)1); writer.Write(rate); writer.Write(rate * 2); writer.Write((short)2); writer.Write((short)16);
+        writer.Write("data"u8); writer.Write(dataBytes);
     }
 
     private sealed record RequestSnapshot(Uri Uri, string? Authorization, string Body, string? MusicClient);
@@ -707,6 +800,7 @@ internal static partial class Program
     }
     private sealed class CatalogFixture
     {
+        internal const int TrackDurationSeconds = 180;
         public FakeHandler Handler { get; }
         public List<int> BatchSizes { get; } = [];
         public bool BlockLibrary { get; set; }
@@ -732,7 +826,7 @@ internal static partial class Program
                 var body = await request.Content!.ReadAsStringAsync(cancellationToken);
                 var ids = Uri.UnescapeDataString(body.Split('&')[0].Split('=')[1]).Split(',').Select(s => s.Split(':')[0]).ToArray();
                 BatchSizes.Add(ids.Length);
-                return Json(JsonSerializer.Serialize(new { result = ids.Reverse().Select(id => new { id, title = "Fixture track " + id, available = true, durationMs = 180000, artists = new[] { new { name = "Fixture Artist" } }, albums = new[] { new { title = "Fixture Album" } } }) }));
+                return Json(JsonSerializer.Serialize(new { result = ids.Reverse().Select(id => new { id, title = "Fixture track " + id, available = true, durationMs = TrackDurationSeconds * 1000, artists = new[] { new { name = "Fixture Artist" } }, albums = new[] { new { title = "Fixture Album" } } }) }));
             }
             if (Extra is not null) return await Extra(request, cancellationToken);
             throw new InvalidOperationException("Unexpected fixture endpoint " + path);

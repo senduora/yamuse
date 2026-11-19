@@ -49,7 +49,7 @@ internal static partial class Program
         var window = MiniFixtureWindow();
         try
         {
-            window.Update("Долгое название трека · проверка адаптивного мини-плеера", "Исполнитель с длинным именем · альбом", true, true, true);
+            window.Update("Долгое название трека · проверка адаптивного мини-плеера", "Исполнитель с длинным именем · альбом", true, true, true, canPlay: true);
             window.UpdateDetails(MiniCover(), 4321, 9876, true, true, true, 64, "responsive-017");
             var commands = new List<ShellAction>(); var seeks = new List<double>(); var volumes = new List<double>();
             window.Command += commands.Add; window.SeekRequested += seeks.Add; window.VolumeRequested += volumes.Add;
@@ -82,7 +82,7 @@ internal static partial class Program
         var window = MiniFixtureWindow();
         try
         {
-            window.Update("Artwork fixture", "Artist", true, true, true);
+            window.Update("Artwork fixture", "Artist", true, true, true, canPlay: true);
             var cover = MiniCover(); window.UpdateDetails(cover, 20, 180, true, true, true, 42, "artwork-017");
             var commands = new List<ShellAction>(); var seeks = new List<double>(); var volumes = new List<double>(); var opened = 0;
             window.Command += commands.Add; window.SeekRequested += seeks.Add; window.VolumeRequested += volumes.Add; window.ShowMainRequested += () => opened++;
@@ -106,7 +106,7 @@ internal static partial class Program
             window.VolumeSlider.Value = 83; MiniClick(MiniButton(window, "Открыть основное окно"));
             Assert(commands.SequenceEqual(new[] { ShellAction.PlayPause, ShellAction.Previous, ShellAction.Next, ShellAction.ToggleLike })
                 && volumes.SequenceEqual(new[] { 83d }) && opened == 1, "controls changed their contracts after resizing/toggling artwork");
-            MiniClick(window.ArtworkButton); window.Update("", "", false, false, false);
+            MiniClick(window.ArtworkButton); window.Update("", "", false, false, false, canPlay: false);
             MiniClick(window.ArtworkButton); window.UpdateLayout();
             Assert(window.CoverImage.Source is null && !window.PlayButton.IsEnabled && !window.LikeButton.IsEnabled && seeks.Count == 1,
                 "artwork toggle restored stale track state");
@@ -121,7 +121,7 @@ internal static partial class Program
         var accent = resources["AccentBrush"]; var foreground = resources["AccentForegroundBrush"]; var accentText = resources["AccentTextBrush"];
         try
         {
-            window.Update("Accent fixture", "Artist", true, true, true); window.UpdateDetails(null, 20, 180, true, true, true, 42);
+            window.Update("Accent fixture", "Artist", true, true, true, canPlay: true); window.UpdateDetails(null, 20, 180, true, true, true, 42);
             window.PinButton.IsChecked = true;
             var replacement = new SolidColorBrush(Color.FromRgb(61, 197, 153));
             var text = new SolidColorBrush(Color.FromRgb(16, 24, 28));
@@ -140,7 +140,7 @@ internal static partial class Program
         var window = MiniFixtureWindow();
         try
         {
-            window.Update("Компактный режим без пустого места", "Первый исполнитель, второй исполнитель, ещё один участник", false, true, true);
+            window.Update("Компактный режим без пустого места", "Первый исполнитель, второй исполнитель, ещё один участник", false, true, true, canPlay: true);
             window.UpdateDetails(MiniCover(), 61, 240, true, true, true, 64, "compact-footprint");
             window.Width = 484; window.Height = 300; window.UpdateLayout(); await Task.Delay(20);
             var expanded = window.RenderSize;
@@ -177,7 +177,7 @@ internal static partial class Program
         try
         {
             const string artists = "Первый исполнитель, второй исполнитель с длинным именем, третий участник записи";
-            window.Update("Длинное название композиции для проверки переноса", artists, true, true, true);
+            window.Update("Длинное название композиции для проверки переноса", artists, true, true, true, canPlay: true);
             window.UpdateDetails(MiniCover(), 61, 240, true, true, true, 64, "layout-reflow");
             var commands = new List<ShellAction>(); var seeks = new List<double>(); var volumes = new List<double>();
             window.Command += commands.Add; window.SeekRequested += seeks.Add; window.VolumeRequested += volumes.Add;

@@ -37,7 +37,7 @@ internal static partial class Program
 
     private static async Task R4ActiveMaintenance()
     {
-        foreach (var flag in new[] { "_offlineMaintenance", "_cacheMaintenance" })
+        foreach (var flag in new[] { "_offlineMaintenance", "_cacheMaintenance", "_clearOfflineConfirmationPending" })
         {
             using var f = new R4UpdateFixture("active-" + flag);
             R4Set(f.Window, flag, true);
@@ -50,13 +50,14 @@ internal static partial class Program
             await R4Task(f.Window, "InstallStartupUpdateAsync");
             await R4Task(f.Window, "InstallStartupUpdateAsync");
             Assert(f.Backend.Applies == 1 && R4Get<bool>(f.Window, "_startupUpdateRestartRequested")
-                && R4Get<bool>(f.Window, "_autoFavoritesEnabled"), "retry did not apply exactly once or changed automatic downloads");
+                && R4Get<bool>(f.Window, "_autoFavoritesEnabled") && f.LastErrorType is null,
+                $"retry did not apply exactly once or changed automatic downloads ({f.LastErrorType ?? "no recorded error"})");
         }
     }
 
     private static async Task R4MaintenanceDuringWait()
     {
-        foreach (var flag in new[] { "_offlineMaintenance", "_cacheMaintenance" })
+        foreach (var flag in new[] { "_offlineMaintenance", "_cacheMaintenance", "_clearOfflineConfirmationPending" })
         {
             using var f = new R4UpdateFixture("late-" + flag);
             var pending = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -69,7 +70,8 @@ internal static partial class Program
                 && R4Get<bool>(f.Window, "_autoFavoritesEnabled"), "cleanup that began during download wait was bypassed");
             R4Set(f.Window, flag, false); R4Set(f.Window, "_downloadTask", null); R4Call(f.Window, "RefreshMaintenanceActions");
             await R4Task(f.Window, "InstallStartupUpdateAsync"); await R4Task(f.Window, "InstallStartupUpdateAsync");
-            Assert(f.Backend.Applies == 1, "late-blocked update was not retriable exactly once");
+            Assert(f.Backend.Applies == 1 && f.LastErrorType is null,
+                $"late-blocked update was not retriable exactly once ({f.LastErrorType ?? "no recorded error"})");
         }
     }
 
@@ -99,7 +101,7 @@ internal static partial class Program
         panel.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
         try
         {
-            foreach (var flag in new[] { "_offlineMaintenance", "_cacheMaintenance" })
+            foreach (var flag in new[] { "_offlineMaintenance", "_cacheMaintenance", "_clearOfflineConfirmationPending" })
             {
                 R4Set(f.Window, flag, true); R4Call(f.Window, "RefreshMaintenanceActions");
                 Assert(!button.IsEnabled && !f.StartupButton.IsEnabled && text.Text.Contains("Дождитесь", StringComparison.Ordinal)
@@ -678,11 +680,13 @@ internal static partial class Program
             R4Set(f.Window, "_account", null); R4Set(f.Window, "_session", null);
             var store = R4Get<SessionStore>(f.Window, "_store");
             store.Save(FakeSession);
+            var observed = store.Load();
+            Assert(observed == FakeSession, "fixture did not verify the saved guest session");
             var replacement = FakeSession with { AccessToken = "fake-rotated-guest-token-DO-NOT-USE" };
             R4Set(f.Window, "_unactivatedSession", replacement);
             using (var locked = new FileStream(Path.Combine(f.DirectoryPath, "session.dpapi"), FileMode.Open, FileAccess.Read, FileShare.Read))
             {
-                Assert(!(bool)R4Call(f.Window, "PersistSessionChange", replacement)!, "fixture did not block the guest session write");
+                Assert(!(bool)R4Call(f.Window, "TrySaveSession", replacement, observed!)!, "fixture did not block the guest session write");
                 await R4Task(f.Window, "InstallStartupUpdateAsync");
                 Assert(f.Backend.Applies == 0 && R4Get<string>(f.Window, "_appUpdateFailure").Contains("сохранить обновлённый вход", StringComparison.Ordinal),
                     "update ignored an unwritten rotation without an active account");
@@ -701,6 +705,9 @@ internal static partial class Program
             await contentReady.Task.WaitAsync(TimeSpan.FromSeconds(5));
             var store = R4Get<SessionStore>(f.Window, "_store");
             store.Save(FakeSession);
+            var observed = store.Load();
+            Assert(observed == FakeSession, "fixture did not verify the saved login before sign-out");
+            R4Set(f.Window, "_ownedStoredSession", observed);
             using var locked = new FileStream(Path.Combine(f.DirectoryPath, "session.dpapi"), FileMode.Open, FileAccess.Read, FileShare.Read);
             f.Window.SignOut();
             var prompts = 0;
@@ -858,9 +865,11 @@ internal static partial class Program
         internal string DirectoryPath { get; }
         private readonly NativePlayer _player;
         private readonly OfflineLibrary _offline;
+        private readonly Diagnostics _diagnostics = new();
         private readonly string _preferencesPath;
         private readonly byte[] _preferencesBefore;
         internal bool PreferencesUnchanged => File.ReadAllBytes(_preferencesPath).SequenceEqual(_preferencesBefore);
+        internal string? LastErrorType => _diagnostics.LastErrorType;
 
         internal R4UpdateFixture(string name)
         {
@@ -878,6 +887,10 @@ internal static partial class Program
                 new AudioBuffer(Path.Combine(directory, "offline-buffer"), new R4NoNetwork()));
             Window = (MainWindow)RuntimeHelpers.GetUninitializedObject(typeof(MainWindow));
             R4Set(Window, "_lifetime", Lifetime); R4Set(Window, "_downloadQueue", new DownloadQueueState());
+            R4Set(Window, "_pendingUpdateSchedule", new UpdateSchedulePatch());
+            R4Set(Window, "_diagnostics", _diagnostics);
+            R4Set(Window, "_sessionRefreshWrite", Task.CompletedTask);
+            R4Set(Window, "_deviceTokenWrite", Task.CompletedTask);
             R4Set(Window, "_pendingConfirmedFavorites", new Dictionary<string, TrackRow>(StringComparer.Ordinal));
             R4Set(Window, "_appUpdatesOverride", Updates); R4Set(Window, "_player", _player); R4Set(Window, "_offline", _offline);
             R4Set(Window, "_preferencesReady", true); R4Set(Window, "_preferenceStore", preferences);
@@ -890,7 +903,7 @@ internal static partial class Program
             R4Set(Window, "_startupUpdateButton", StartupButton); R4Set(Window, "_startupUpdateLater", new Button());
             R4Set(Window, "_settingsOpen", true); R4Set(Window, "SettingsAccentHex", new TextBox { Text = "#20A0B0" });
         }
-        public void Dispose() { Lifetime.Cancel(); _offline.Dispose(); _player.Dispose(); Lifetime.Dispose(); }
+        public void Dispose() { Lifetime.Cancel(); _offline.Dispose(); _player.Dispose(); _diagnostics.Dispose(); Lifetime.Dispose(); }
     }
     private sealed class R4UpdateBackend : IAppUpdateBackend
     {

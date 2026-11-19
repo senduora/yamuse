@@ -22,7 +22,11 @@ public partial class MainWindow
         _openedCatalogItem = new(id, "artist", name ?? "Исполнитель", "");
         NavigateSection("artist-detail", name ?? "Исполнитель", remember: false);
         ClearArtistDetails(name ?? "Исполнитель", "Загружаем музыку исполнителя…");
-        await CatalogReadAsync(async (session, token, isCurrent) =>
+        await ReadArtistDetailAsync(id);
+    }
+
+    private Task ReadArtistDetailAsync(string id)
+        => CatalogReadAsync(async (session, token, isCurrent) =>
         {
             var details = await _api.GetArtistDetailsAsync(session, id, token);
             if (!isCurrent()) return;
@@ -30,7 +34,6 @@ public partial class MainWindow
             SetStatus("Популярные треки · " + details.TopTracks.Count.ToString("N0"));
             await RefreshArtistMembershipAsync(id, session, token);
         });
-    }
 
     private async Task RefreshArtistMembershipAsync(string id, Session? session = null, CancellationToken navigationToken = default)
     {
@@ -143,14 +146,16 @@ public partial class MainWindow
                 if (_resolvedArtists.Count >= 256) _resolvedArtists.Remove(_resolvedArtists.Keys.First());
                 _resolvedArtists[track.RequestId] = artists;
             }
+            if (!ReferenceEquals(button.Tag, track) || !lookup.IsCurrent()) return;
             if (artists.Count == 1) await OpenArtistAsync(artists[0].Id, artists[0].Name);
             else if (artists.Count > 1)
             {
-                ShowTrackArtistsMenu(button, artists);
+                ShowTrackArtistsMenu(button, track, artists);
             }
             else SetStatus("У этого трека Яндекс не указал карточку исполнителя.");
         }
         catch (Exception ex) { if (lookup.IsCurrent()) ShowError(ex); }
+        finally { lookup.Finish(); }
     }
 
     private async void ArtistPlay_Click(object sender, RoutedEventArgs e) => await PlayArtistTopAsync(null);
@@ -165,8 +170,13 @@ public partial class MainWindow
     }
     private async void ArtistTop_DoubleClick(object sender, MouseButtonEventArgs e)
     {
-        if (FromButton(e.OriginalSource as DependencyObject)) return;
-        if (ArtistTopTracks.SelectedItem is TrackRow row) await PlayArtistTopAsync(row);
+        var source = e.OriginalSource as DependencyObject;
+        if (e.ChangedButton != MouseButton.Left || source is null || FromButton(source)
+            || ItemsControl.ContainerFromElement(ArtistTopTracks, source) is not ListBoxItem item) return;
+        var index = ArtistTopTracks.ItemContainerGenerator.IndexFromContainer(item);
+        if (index < 0 || index >= ArtistTopTracks.Items.Count || ArtistTopTracks.Items[index] is not TrackRow row) return;
+        e.Handled = true;
+        await PlayArtistTopAsync(row);
     }
     private async Task PlayArtistTopAsync(TrackRow? selected)
     {
@@ -188,10 +198,19 @@ public partial class MainWindow
         NavigateSection("artist-tracks", artist.Title + " · все треки", remember: false);
         _artistPage = 0;
         ShowRows([]);
-        await CatalogReadAsync(async (session, token, isCurrent) =>
+        await ReadInitialArtistTracksAsync(artist.Id);
+    }
+
+    private bool _artistTracksLoaded;
+
+    private Task ReadInitialArtistTracksAsync(string id)
+    {
+        _artistTracksLoaded = false;
+        return CatalogReadAsync(async (session, token, isCurrent) =>
         {
-            var rows = await _api.GetArtistTracksAsync(session, artist.Id, 0, token);
+            var rows = await _api.GetArtistTracksAsync(session, id, 0, token);
             if (!isCurrent()) return;
+            _artistTracksLoaded = true;
             ShowRows(rows);
             ShowArtistPagination(rows.Count == 100);
             SetStatus($"Треки исполнителя · {rows.Count:N0}");
