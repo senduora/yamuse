@@ -2230,8 +2230,22 @@ internal static partial class Program
             if (useCover) PaInvoke(fixture.Window, "BeginOfflineMaintenance");
             if (entireDirectory)
             {
+                UninstallFileIdentity ReadParkedIdentity()
+                {
+                    using var directoryHandle = UninstallPathGuard.HoldDirectory(parked);
+                    return UninstallPathGuard.GetStableFileIdentity(directoryHandle);
+                }
+
+                var parkedIdentity = ReadParkedIdentity();
                 File.WriteAllBytes(Path.Combine(parked, exact.FileName), data);
-                Directory.Move(parked, music);
+                try { Directory.Move(parked, music); }
+                catch (IOException error) when ((error.HResult & 0xffff) is 5 or 32 or 33)
+                {
+                    await Task.Delay(100);
+                    if (UninstallPathGuard.EntryExists(music) || ReadParkedIdentity() != parkedIdentity) throw;
+                    Console.WriteLine($"NOTE PlaybackArtwork fixture: retrying the offline directory move after Windows error {error.HResult & 0xffff}.");
+                    Directory.Move(parked, music);
+                }
             }
             else if (renameRoot) Directory.Move(parked, music);
             else if (renameExisting) File.Move(parkedFile, path);

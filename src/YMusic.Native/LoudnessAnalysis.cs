@@ -31,6 +31,8 @@ internal static class LoudnessAnalysis
     private static readonly Guid Pcm = new("00000001-0000-0010-8000-00aa00389b71");
     private static readonly Guid Mp3 = new("00000055-0000-0010-8000-00aa00389b71");
     private static readonly Guid Flac = new("0000f1ac-0000-0010-8000-00aa00389b71");
+    // The MPEG-4 source represents the 'fLaC' sample entry using MFMPEG4Format_Base.
+    private static readonly Guid FlacInMp4 = new("664c6143-767a-494d-b478-f29d25dc9037");
     private static readonly Guid Aac = new("00001610-0000-0010-8000-00aa00389b71");
     private static readonly Guid AudioUserData = new("b6bc765f-4c3b-40a4-bd51-2535b66fe09d");
     private static readonly Guid PresentationDuration = new("6c990d33-bb8e-477a-8598-0d5d96fcd88a");
@@ -266,13 +268,19 @@ internal static class LoudnessAnalysis
 
     private static OfflineAudioEvidence? ReadOfflineAudio(IntPtr reader, string codec, long measureAacBytes, CancellationToken token)
     {
-        var expected = codec switch { "mp3" => Mp3, "flac" or "flac-mp4" => Flac, _ => Aac };
         IntPtr native = IntPtr.Zero;
         try
         {
             Check(Method<GetNativeMediaType>(reader, 5)(reader, FirstAudio, 0, out native));
             Check(Method<GetGuid>(native, 10)(native, Subtype, out var observed));
-            if (observed != expected || !ReadFirstSample(reader, token)) return null;
+            var codecMatches = codec switch
+            {
+                "mp3" => observed == Mp3,
+                "flac" => observed == Flac,
+                "flac-mp4" => observed == Flac || observed == FlacInMp4,
+                _ => observed == Aac
+            };
+            if (!codecMatches || !ReadFirstSample(reader, token)) return null;
             if ((codec is "he-aac" or "he-aac-mp4") && !HasHeAacEvidence(reader, native)) return null;
             var presentation = ReadPresentationDuration(reader);
             return measureAacBytes > 0

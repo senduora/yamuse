@@ -11,6 +11,7 @@ outputs/
 *.dpapi
 *.mp3
 *.m4a
+!/tests/YMusic.Native.Checks/Fixtures/silent-flac-in-mp4.m4a
 *.flac
 *.wav
 *.nupkg

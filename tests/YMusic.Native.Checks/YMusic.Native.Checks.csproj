@@ -7,4 +7,8 @@
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="..\..\src\YMusic.Native\YMusic.Native.csproj" /></ItemGroup>
   <ItemGroup><EmbeddedResource Include="..\..\src\YMusic.Native\App.xaml" LogicalName="YMusic.Native.Checks.AppStyles.xaml" /></ItemGroup>
+  <ItemGroup>
+    <!-- Generated 48 kHz stereo silence encoded as FLAC in MP4. -->
+    <EmbeddedResource Include="Fixtures\silent-flac-in-mp4.m4a" LogicalName="YMusic.Native.Checks.SilentFlacInMp4.m4a" />
+  </ItemGroup>
 </Project>

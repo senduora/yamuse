@@ -3,6 +3,7 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -18,6 +19,7 @@ internal static partial class Program
         await Run("Download center: bounded workers, individual progress, pause and explicit resume preserve completed files", DownloadCenterPauseResume);
         await Run("Download center: limits one and ten bound active requests and cancellation admission", DownloadCenterLimits);
         await Run("Download center: retry only failed tracks and indexed storage excludes foreign files", DownloadCenterRetry);
+        await Run("Download center: retry restores a zero-filled cached FLAC in MP4", DownloadCenterRetryFlacInMp4);
         await Run("Download center: logout and clear never restart a suspended queue", DownloadCenterAccountAndClear);
     }
 
@@ -127,6 +129,55 @@ internal static partial class Program
         var view = fixture.Window.DownloadCenterView; view.Measure(new Size(1100, 500)); view.Arrange(new Rect(0, 0, 1100, 500)); view.UpdateLayout();
         Assert(SaVisuals<ListView>(view).Single().Items.Count == 3, "center does not expose every track");
     }
+    private static async Task DownloadCenterRetryFlacInMp4()
+    {
+        using var sample = typeof(Program).Assembly.GetManifestResourceStream("YMusic.Native.Checks.SilentFlacInMp4.m4a")
+            ?? throw new InvalidOperationException("Missing FLAC in MP4 fixture");
+        using var bytes = new MemoryStream();
+        await sample.CopyToAsync(bytes);
+        var media = bytes.ToArray();
+        var digest = Convert.ToHexString(SHA256.HashData(media)).ToLowerInvariant();
+        var intact = DcTrack("1");
+        var damaged = DcTrack("2");
+        var zeros = new byte[media.Length];
+        using var fixture = new DownloadCenterFixture("retry-flac-in-mp4", 2, media) { FailTrack = damaged.Id };
+        var library = fixture.Library;
+        Directory.CreateDirectory(library.DirectoryPath);
+
+        OfflineItem WriteLegacyCopy(TrackRow track, byte[] content)
+        {
+            var fileName = $"{track.Artist} — {track.Title} [{track.Id}-flac-mp4-0].m4a";
+            File.WriteAllBytes(library.ResolvePath(fileName), content);
+            return new(track.Id, track.RequestId, track.Title, track.Artist, track.Album, track.DurationMs,
+                fileName, "flac-mp4", 0, media.Length, digest, DateTimeOffset.UtcNow);
+        }
+
+        var intactCopy = WriteLegacyCopy(intact, media);
+        var damagedCopy = WriteLegacyCopy(damaged, zeros);
+        var index = Path.Combine(library.DirectoryPath, "library.index.json");
+        File.WriteAllText(index, JsonSerializer.Serialize(new[] { intactCopy, damagedCopy }));
+        var originalIndex = File.ReadAllBytes(index);
+
+        await fixture.Start([intact, damaged]);
+        Assert(fixture.Queue.Entries.Select(entry => entry.State).SequenceEqual([DownloadEntryState.Completed, DownloadEntryState.Failed])
+            && fixture.Requests.GetValueOrDefault(intact.Id) == 0 && fixture.Requests.GetValueOrDefault(damaged.Id) == 1
+            && File.ReadAllBytes(index).SequenceEqual(originalIndex), "the intact or damaged legacy copy was handled incorrectly");
+
+        fixture.FailTrack = null;
+        await Call(fixture.Window, "RetryFailedDownloads");
+        var retried = fixture.Queue.Entries.Single(entry => entry.Track.Id == damaged.Id);
+        Assert(retried is { State: DownloadEntryState.Completed, Attempts: 2, Error: "" },
+            "valid FLAC in MP4 failed offline verification on retry: " + retried.Error);
+        var saved = await library.FindVerifiedAsync(damaged, default);
+        var rows = library.Read();
+        Assert(saved is { Codec: "flac-mp4" } && saved.FileName != damagedCopy.FileName
+            && saved.Sha256 == digest && File.ReadAllBytes(library.ResolvePath(saved.FileName)).SequenceEqual(media)
+            && rows.Count == 2 && rows.Any(item => item.FileName == intactCopy.FileName)
+            && File.ReadAllBytes(library.ResolvePath(intactCopy.FileName)).SequenceEqual(media)
+            && File.ReadAllBytes(library.ResolvePath(damagedCopy.FileName)).SequenceEqual(zeros)
+            && fixture.Requests.GetValueOrDefault(intact.Id) == 0 && fixture.Requests[damaged.Id] == 2,
+            "retry did not publish a verified replacement while preserving the existing files");
+    }
     private static async Task DownloadCenterLimits()
     {
         foreach (var limit in new[] { 1, 10 })
@@ -183,15 +234,18 @@ internal static partial class Program
         private int _active, _peak;
         internal int Active => Volatile.Read(ref _active);
         internal int Peak => Volatile.Read(ref _peak);
-        internal DownloadCenterFixture(string name, int concurrency)
+        internal DownloadCenterFixture(string name, int concurrency, byte[]? flacInMp4 = null)
         {
             DirectoryPath = Path.Combine(_directory, "download-center-" + name); Directory.CreateDirectory(DirectoryPath);
             BufferPath = Path.Combine(DirectoryPath, "buffer");
+            var body = flacInMp4 ?? Media;
+            var (codec, bitrate, extension) = flacInMp4 is null ? ("mp3", "320", ".mp3") : ("flac-mp4", "0", ".m4a");
             var api = new FakeHandler((request, _) =>
             {
                 Assert(request.RequestUri!.AbsolutePath == "/get-file-info", "unexpected download API request");
                 var id = request.RequestUri.Query.TrimStart('?').Split('&').Select(part => part.Split('=', 2)).Single(part => part[0] == "trackId")[1];
-                return Task.FromResult(Json("{\"result\":{\"downloadInfo\":{\"quality\":\"lossless\",\"codec\":\"mp3\",\"bitrate\":320,\"transport\":\"raw\",\"url\":\"https://s1.vlx.yandex.net/" + id + ".mp3\"}}}"));
+                return Task.FromResult(Json("{\"result\":{\"downloadInfo\":{\"quality\":\"lossless\",\"codec\":\"" + codec +
+                    "\",\"bitrate\":" + bitrate + ",\"transport\":\"raw\",\"url\":\"https://s1.vlx.yandex.net/" + id + extension + "\"}}}"));
             });
             var media = new FakeHandler((request, _) =>
             {
@@ -201,8 +255,8 @@ internal static partial class Program
                 var active = Interlocked.Increment(ref _active);
                 int peak; while (active > (peak = Volatile.Read(ref _peak)) && Interlocked.CompareExchange(ref _peak, active, peak) != peak) { }
                 var hold = HoldFirstAttempts && attempt == 1 && id != "1";
-                var content = new StreamContent(new DownloadCenterStream(Media, hold, () => Interlocked.Decrement(ref _active)));
-                if (id != "3") content.Headers.ContentLength = Media.Length;
+                var content = new StreamContent(new DownloadCenterStream(body, hold, () => Interlocked.Decrement(ref _active)));
+                if (id != "3") content.Headers.ContentLength = body.Length;
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
             });
             Library = new OfflineLibrary(Path.Combine(DirectoryPath, "Music"), new AudioBuffer(BufferPath, media));
