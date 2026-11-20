@@ -239,6 +239,7 @@ public partial class MainWindow
     {
         ++_downloadQueueAdmissionRevision;
         _downloadsAutoSuspended = true; ClearPendingAutoFavorites();
+        _downloadQueue.KeepPausedAfterRestart();
         _downloadQueue.Pause(); _downloadCts!.Cancel();
         RemoveUnstartedAutomaticFavorites();
         RefreshDownloadCenter();
@@ -257,9 +258,11 @@ public partial class MainWindow
             SetStatus(AutomaticDownloadAdmissionMessage, true);
         if (_downloadQueue.Running || _downloadQueue.CanResume || _downloadCts is not null)
         {
+            var allowAutomaticResume = _autoFavoritesEnabled && !_downloadsAutoSuspended;
             _downloadsAutoSuspended = true;
             ClearPendingAutoFavorites();
-            _downloadQueue.Pause(); _downloadCts?.Cancel(); RefreshDownloadCenter();
+            _downloadQueue.Pause(allowAutomaticResume, _downloadQueueAutomatic && _downloadQueue.FavoritesBatch);
+            _downloadCts?.Cancel(); RefreshDownloadCenter();
         }
         return admissionRevision;
     }

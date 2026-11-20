@@ -113,6 +113,44 @@ internal static partial class Program
                 "normal VBR bitrate or duration rounding prevented saving a valid variant");
         });
 
+        await Run("Quality offline 017: full legacy fallback after a wrong track id saves the measured MP3 rate", async () =>
+        {
+            using var api = new MusicApi(new FakeHandler((request, _) => Task.FromResult(
+                Uri.UnescapeDataString(request.RequestUri!.AbsolutePath) switch
+                {
+                    "/get-file-info" => Json("""{"result":{"downloadInfo":{"trackId":987,"codec":"mp3","bitrate":320,"transport":"raw","url":"https://s1.vlx.yandex.net/wrong.mp3"}}}"""),
+                    "/tracks/42:7/download-info" => Json("""{"result":[{"codec":"mp3","preview":false,"bitrateInKbps":320,"downloadInfoUrl":"https://s1.vlx.yandex.net/info.xml"}]}"""),
+                    "/info.xml" => Xml(),
+                    _ => throw new InvalidOperationException("Unexpected fallback fixture request")
+                })));
+            static TrackRow Track(long durationMs) => new()
+                { Id = "42", RequestId = "42:7", Title = "Fallback fixture", DurationMs = durationMs, Available = true };
+            var track = Track(72_000);
+            var audio = await api.ResolveAudioAsync(FakeSession, track.RequestId, AudioQuality.Excellent, default);
+            Assert(audio.LegacyMp3Fallback && audio.Bitrate == 320 && audio.Uri.AbsolutePath.EndsWith("/test/file.mp3", StringComparison.Ordinal),
+                "a descriptor for another track displaced the legacy fallback");
+
+            var directory = Path.Combine(_directory, "quality-offline017-measured-fallback");
+            var full = SilentMp3Seconds(72, 192);
+            var supplied = full;
+            using var library = new OfflineLibrary(Path.Combine(directory, "Music"), new AudioBuffer(Path.Combine(directory, "buffer"), new FakeHandler((request, _) =>
+            {
+                Assert(request.RequestUri == audio.Uri, "transferred the wrong track instead of the fallback");
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(supplied) });
+            })));
+            await Throws<MusicException>(() => library.SaveAsync(Track(0), audio, default));
+            supplied = SilentMp3Seconds(30, 192);
+            await Throws<MusicException>(() => library.SaveAsync(track, audio, default));
+            supplied = full[..^1];
+            await Throws<MusicException>(() => library.SaveAsync(track, audio, default));
+            Assert(library.Read().Count == 0, "unconfirmed or incomplete fallback was published");
+
+            supplied = full;
+            var saved = await library.SaveAsync(track, audio, default);
+            Assert(saved.Bitrate == 320 && saved.ConfirmedBitrate == 192 && OfflineLibrary.QualityLabel(saved) == "MP3 · 192 кбит/с"
+                && File.ReadAllBytes(library.ResolvePath(saved.FileName)).SequenceEqual(full), "full fallback lost bytes or used the advertised bitrate");
+        });
+
         await Run("Quality offline 017: a truncated MP3 frame cannot publish without catalogue metadata", async () =>
         {
             var directory = Path.Combine(_directory, "quality-offline017-mp3-tail");

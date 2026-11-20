@@ -22,6 +22,7 @@ internal sealed record Account(string Uid, string DisplayName, bool Plus, string
 internal enum AudioQuality { Economical, Optimal, Excellent }
 internal sealed record AudioDescriptor(Uri Uri, string Codec, int Bitrate, string? Key = null)
 {
+    internal bool LegacyMp3Fallback { get; init; }
     public bool IsLossless => Codec is "flac" or "flac-mp4";
     public string Extension => Codec switch { "flac" => ".flac", "flac-mp4" or "aac-mp4" or "he-aac-mp4" or "aac" or "he-aac" => ".m4a", _ => ".mp3" };
     public string QualityLabel => IsLossless ? "Lossless · FLAC" : Codec.ToUpperInvariant() + (Bitrate > 0 ? $" · {Bitrate} кбит/с" : "");

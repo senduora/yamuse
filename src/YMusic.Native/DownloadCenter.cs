@@ -18,6 +18,7 @@ internal sealed class DownloadEntry(TrackRow track, AudioQuality? automaticFavor
     internal TrackRow Track { get; private set; } = track;
     internal AudioQuality? AutomaticFavoriteQuality { get; private set; } = automaticFavoriteQuality;
     internal DeferredFavoriteState? DeferredFavorite { get; private set; }
+    internal bool ResumeAutomaticallyOnStartup { get; private set; }
     public string Title => Track.Title;
     public string Artist => Track.Artist;
     public DownloadEntryState State { get; private set; } = DownloadEntryState.Queued;
@@ -40,12 +41,14 @@ internal sealed class DownloadEntry(TrackRow track, AudioQuality? automaticFavor
         DownloadEntryState.Paused => "Пауза", DownloadEntryState.Suspended => "Остановлен",
         DownloadEntryState.Removed => "Удалён", _ => ""
     };
-    internal void SetState(DownloadEntryState state, string error = "")
+    internal void SetState(DownloadEntryState state, string error = "", bool resumeAutomaticallyOnStartup = false)
     {
         VerifyAccess();
         if (state == DownloadEntryState.Removed) { Bytes = 0; TotalBytes = null; }
         if (state is not (DownloadEntryState.Queued or DownloadEntryState.Paused or DownloadEntryState.Suspended)) DeferredFavorite = null;
-        State = state; Error = error; Changed();
+        State = state; Error = error;
+        ResumeAutomaticallyOnStartup = state == DownloadEntryState.Paused && resumeAutomaticallyOnStartup;
+        Changed();
     }
     internal void Begin()
     { VerifyAccess(); Attempts = Math.Min(Attempts + 1, DownloadQueueStore.MaximumAttempts); Bytes = 0; TotalBytes = null; SetState(DownloadEntryState.Resolving); }
@@ -77,12 +80,12 @@ internal sealed class DownloadEntry(TrackRow track, AudioQuality? automaticFavor
     internal void Complete(long bytes)
     { VerifyAccess(); Bytes = Math.Max(0, bytes); TotalBytes = Bytes > 0 ? Bytes : null; SetState(DownloadEntryState.Completed); }
     internal void Restore(DownloadEntryState state, long bytes, int attempts, string error, bool removedFromCollection,
-        bool skipFavoritesDownload, DeferredFavoriteState? deferredFavorite = null)
+        bool skipFavoritesDownload, DeferredFavoriteState? deferredFavorite = null, bool resumeAutomaticallyOnStartup = false)
     {
         VerifyAccess(); Bytes = Math.Max(0, bytes); TotalBytes = state == DownloadEntryState.Completed && Bytes > 0 ? Bytes : null;
         Attempts = attempts; RemovedFromCollection = removedFromCollection; SkipFavoritesDownload = skipFavoritesDownload;
         DeferredFavorite = deferredFavorite;
-        SetState(state, DownloadFailure.RestorableReason(error));
+        SetState(state, DownloadFailure.RestorableReason(error), resumeAutomaticallyOnStartup);
     }
     internal bool SetCollectionLike(bool liked, bool favoritesBatch)
     {
@@ -251,7 +254,8 @@ internal sealed class DownloadQueueState
         foreach (var item in restored.Entries)
         {
             var entry = new DownloadEntry(item.Track, item.AutomaticFavoriteQuality);
-            entry.Restore(item.State, item.Bytes, item.Attempts, item.Error, item.RemovedFromCollection, item.SkipFavoritesDownload, item.DeferredFavorite);
+            entry.Restore(item.State, item.Bytes, item.Attempts, item.Error, item.RemovedFromCollection,
+                item.SkipFavoritesDownload, item.DeferredFavorite, item.ResumeAutomaticallyOnStartup);
             AddEntry(entry);
         }
         Label = restored.Label; FavoritesBatch = restored.FavoritesBatch; Suspended = false;
@@ -278,12 +282,20 @@ internal sealed class DownloadQueueState
         StateChanged?.Invoke();
         return selected;
     }
-    internal void Pause()
+    internal void Pause(bool allowAutomaticResume = false, bool automaticBatch = false)
     {
         VerifyAccess();
-        foreach (var entry in Entries.Where(e => e.Active || e.State == DownloadEntryState.Queued)) entry.SetState(DownloadEntryState.Paused);
+        foreach (var entry in Entries.Where(e => e.Active || e.State == DownloadEntryState.Queued))
+            entry.SetState(DownloadEntryState.Paused, resumeAutomaticallyOnStartup:
+                allowAutomaticResume && (automaticBatch || entry.AutomaticFavoriteQuality is not null));
         Notice = "Очередь на паузе. Нажмите «Продолжить»: сохранённые треки не скачиваются повторно.";
         StateChanged?.Invoke();
+    }
+    internal void KeepPausedAfterRestart()
+    {
+        VerifyAccess();
+        foreach (var entry in Entries.Where(entry => entry.ResumeAutomaticallyOnStartup))
+            entry.SetState(DownloadEntryState.Paused);
     }
     internal void Suspend()
     {

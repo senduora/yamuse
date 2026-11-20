@@ -189,6 +189,40 @@ internal static partial class Program
                 }
             }
         });
+        await Run("AutoFavoritesLive060: login resumes only interrupted automatic downloads still in verified favorites", async () =>
+        {
+            using var f = new Af060Fixture("login-resume-interrupted");
+            var rows = new[] { Af060Row("101"), Af060Row("102"), Af060Row("103"), Af060Row("104") };
+            f.Queue.Replace(rows, "Автоскачивание «Мне нравится»", favoritesBatch: true);
+            f.Queue.Entries[0].SetState(DownloadEntryState.Downloading);
+            f.Queue.Entries[1].SetState(DownloadEntryState.Resolving);
+            f.Queue.Entries[2].SetState(DownloadEntryState.Paused);
+            f.Queue.Entries[3].SetState(DownloadEntryState.Failed);
+            var store = new DownloadQueueStore(Path.Combine(f.DirectoryPath, "diagnostics"));
+            store.Save(DownloadQueueStore.Capture("12345", f.Queue, AudioQuality.Excellent, true,
+                new PlaylistDetails("local:favorites", "liked", "Мне нравится", "", 0, rows)));
+            UlSet(f.Window, "_downloadQueueStore", store);
+            f.AddServerFavorite("101");
+            f.AddServerFavorite("103");
+            f.AddServerFavorite("104");
+
+            var login = Call(f.Window, "ActivateSessionAsync", FakeSession, CancellationToken.None, true, false);
+            await Task.WhenAny(login, f.RefreshEntered.Task).WaitAsync(TimeSpan.FromSeconds(5));
+            if (login.IsCompleted) await login;
+            Assert(f.RefreshEntered.Task.IsCompleted && f.Queue.CanResume && f.Queue.CanRetry && f.Downloads.IsEmpty && f.Resolves.IsEmpty,
+                "login started audio before verifying the account's favorite IDs");
+            SaInvoke(f.Window, "TrySaveDownloadQueueCheckpoint");
+            Assert(store.Load("12345")!.Entries[0].State == DownloadEntryState.Queued,
+                "an interruption became an explicit pause while waiting for verification");
+
+            f.RefreshReleased.TrySetResult();
+            await login.WaitAsync(TimeSpan.FromSeconds(10));
+            await Af061DownloadsIdle(f);
+            Assert(f.Downloads.Count == 1 && f.Downloads.GetValueOrDefault("101") == 1
+                && f.Library.Read().Single().Id == "101" && f.Queue.Entries[1].SkipFavoritesDownload
+                && f.Queue.Entries[2].State == DownloadEntryState.Paused && f.Queue.Entries[3].State == DownloadEntryState.Failed,
+                "auto-resume missed a current favorite or started unliked, paused or failed work");
+        });
         await Run("AutoFavoritesLive060: pausing or disabling appended favorites keeps a valid checkpoint and full offline playlist", async () =>
         {
             foreach (var disabling in new[] { false, true })
@@ -316,8 +350,9 @@ internal static partial class Program
                     await manual.WaitAsync(TimeSpan.FromSeconds(5));
                     SaInvoke(f.Window, "TrySaveDownloadQueueCheckpoint");
                     var checkpoint = store.Load("12345");
-                    Assert(checkpoint is { Entries.Count: 2 } && checkpoint.Entries.All(entry => entry.State == DownloadEntryState.Paused)
-                        && checkpoint.Entries.Single(entry => entry.Track.Id == "101").AutomaticFavoriteQuality is not null
+                    Assert(checkpoint is { Entries.Count: 2 }
+                        && checkpoint.Entries.Single(entry => entry.Track.Id == "900").State == DownloadEntryState.Paused
+                        && checkpoint.Entries.Single(entry => entry.Track.Id == "101") is { State: DownloadEntryState.Queued, AutomaticFavoriteQuality: not null }
                         && f.Downloads.GetValueOrDefault("101") == 0, "update pause lost or started a pending confirmed like");
                     if (action != "reopen")
                     {
@@ -341,8 +376,15 @@ internal static partial class Program
                 if (action != "reopen") continue;
                 using var reopened = new Af060Fixture(name);
                 UlSet(reopened.Window, "_downloadQueueStore", store);
+                reopened.AddServerFavorite("101");
                 await Call(reopened.Window, "RestoreDownloadQueueAsync", "12345");
-                Assert(reopened.Queue.CanResume && reopened.Downloads.Count == 0, "restored pending work started without Continue");
+                Assert(reopened.Queue.CanResume && reopened.Downloads.IsEmpty, "restored pending work started before favorite verification");
+                reopened.RefreshReleased.TrySetResult();
+                await reopened.Window.RefreshLibraryAsync();
+                await Af061DownloadsIdle(reopened);
+                Assert(reopened.Downloads.Count == 1 && reopened.Downloads.GetValueOrDefault("101") == 1
+                    && reopened.Queue.Entries.Single(entry => entry.Track.Id == "900").State == DownloadEntryState.Paused,
+                    "verified favorites did not resume independently of manual work");
                 await Call(reopened.Window, "ResumeDownloadQueue");
                 Assert(reopened.Downloads.GetValueOrDefault("900") == 1 && reopened.Downloads.GetValueOrDefault("101") == 1,
                     "the reopened queue lost the pending confirmed like");
@@ -780,7 +822,7 @@ internal static partial class Program
                     await running.WaitAsync(TimeSpan.FromSeconds(5));
                     SaInvoke(f.Window, "TrySaveDownloadQueueCheckpoint");
                     var saved = store.Load("12345");
-                    Assert(saved?.Entries[0] is { State: DownloadEntryState.Paused, Track.Available: true, DeferredFavorite.PreviousState: DownloadEntryState.Unavailable }
+                    Assert(saved?.Entries[0] is { State: DownloadEntryState.Queued, Track.Available: true, DeferredFavorite.PreviousState: DownloadEntryState.Unavailable }
                         && f.Downloads.GetValueOrDefault("101") == 0, "pause lost or started the new metadata before continuation");
 
                     if (action != "reopen")
@@ -805,7 +847,7 @@ internal static partial class Program
                 using var reopened = new Af060Fixture(name);
                 UlSet(reopened.Window, "_downloadQueueStore", store);
                 await Call(reopened.Window, "RestoreDownloadQueueAsync", "12345");
-                Assert(reopened.Queue.CanResume && reopened.Downloads.Count == 0, "the reopened queue started before Continue");
+                Assert(reopened.Queue.CanResume && reopened.Downloads.Count == 0, "the reopened queue started before favorite verification or Continue");
                 await Call(reopened.Window, "ResumeDownloadQueue");
                 Assert(reopened.Downloads.GetValueOrDefault("101") == 1, "restored Continue did not download the confirmed row once");
             }
@@ -1550,6 +1592,7 @@ internal static partial class Program
             {
                 Assert(request.RequestUri!.Host == "api.music.yandex.net", "fixture API escaped its host"); var path = request.RequestUri.AbsolutePath;
                 if (path == "/account/status") return Json(Profile);
+                if (path == "/account/about") return Json(ProfileAboutWithoutAvatar);
                 if (path is "/users/12345/likes/tracks/add-multiple" or "/users/12345/likes/tracks/remove")
                 {
                     if (FailWrite) return Json("{}", HttpStatusCode.ServiceUnavailable);

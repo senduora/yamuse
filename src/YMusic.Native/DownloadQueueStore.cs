@@ -42,7 +42,7 @@ internal sealed record DownloadQueueSnapshot(
     DownloadPlaylistSnapshot? Playlist = null);
 internal sealed record RestoredDownloadEntry(TrackRow Track, DownloadEntryState State, long Bytes, int Attempts,
     string Error, bool RemovedFromCollection, bool SkipFavoritesDownload, AudioQuality? AutomaticFavoriteQuality = null,
-    DeferredFavoriteState? DeferredFavorite = null);
+    DeferredFavoriteState? DeferredFavorite = null, bool ResumeAutomaticallyOnStartup = false);
 internal sealed record RestoredDownloadQueue(string Label, AudioQuality Quality, bool Automatic, bool FavoritesBatch,
     IReadOnlyList<RestoredDownloadEntry> Entries, PlaylistDetails? Playlist, bool PlaylistHistoryOnly = false, bool PlaylistOccurrencesRecorded = false,
     DownloadPlaylistPersistence? PlaylistPersistence = null);
@@ -466,8 +466,11 @@ internal sealed class DownloadQueueStore
         AudioQuality quality, bool automatic, bool favoritesBatch, PlaylistDetails? playlist, bool playlistHistoryOnly,
         bool recordPlaylistOccurrences, DownloadPlaylistPersistence? playlistPersistence)
     {
+        // Shutdown pauses the live workers. Save their automatic work as queued,
+        // so the checkpoint still distinguishes an interruption from a user pause.
         var entries = queueEntries.Select(entry => new DownloadEntrySnapshot(ToSavedTrack(entry.Track),
-            entry.State, entry.Attempts, DownloadFailure.RestorableReason(entry.Error), entry.RemovedFromCollection,
+            entry.ResumeAutomaticallyOnStartup ? DownloadEntryState.Queued : entry.State,
+            entry.Attempts, DownloadFailure.RestorableReason(entry.Error), entry.RemovedFromCollection,
                 entry.SkipFavoritesDownload, entry.AutomaticFavoriteQuality, entry.DeferredFavorite)).ToArray();
         playlist = playlistPersistence?.Playlist ?? playlist;
         var context = playlist is null ? null : new DownloadPlaylistSnapshot(playlist.Owner, playlist.Kind, playlist.Title,
@@ -561,10 +564,14 @@ internal sealed class DownloadQueueStore
                 var state = saved.State is DownloadEntryState.Failed or DownloadEntryState.Unavailable or DownloadEntryState.Removed
                     ? saved.State : DownloadEntryState.Paused;
                 if (local is not null) state = DownloadEntryState.Completed;
+                var resumeAutomatically = state == DownloadEntryState.Paused
+                    && saved.State is (DownloadEntryState.Queued or DownloadEntryState.Resolving or DownloadEntryState.Downloading)
+                    && (snapshot.Automatic && snapshot.FavoritesBatch || saved.AutomaticFavoriteQuality is not null);
                 // Partial bytes do not survive a process restart.
                 entries.Add(new(row, state, local?.Bytes ?? 0, saved.Attempts,
                     state is DownloadEntryState.Failed or DownloadEntryState.Unavailable ? saved.Error : "",
-                    saved.RemovedFromCollection, saved.SkipFavoritesDownload, saved.AutomaticFavoriteQuality, saved.DeferredFavorite));
+                    saved.RemovedFromCollection, saved.SkipFavoritesDownload, saved.AutomaticFavoriteQuality, saved.DeferredFavorite,
+                    resumeAutomatically));
             }
         }
         var byId = entries.ToDictionary(entry => entry.Track.Id, entry => entry.Track, StringComparer.Ordinal);

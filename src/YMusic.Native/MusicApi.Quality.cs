@@ -26,7 +26,7 @@ internal sealed partial class MusicApi
             var mp3 = await ResolveStreamAsync(session, trackId, cancellationToken, quality == AudioQuality.Economical ? 64 : quality == AudioQuality.Optimal ? 192 : 320).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             return preferred is null || AudioQualityPolicy.IsBetter("mp3", mp3.Bitrate, preferred.Codec, preferred.Bitrate)
-                ? new(mp3.Uri, "mp3", mp3.Bitrate) : preferred;
+                ? new(mp3.Uri, "mp3", mp3.Bitrate) { LegacyMp3Fallback = preferred is null } : preferred;
         }
         // Failure of the optional legacy alternative must not discard a valid
         // modern response or trigger the very same legacy request a second time.

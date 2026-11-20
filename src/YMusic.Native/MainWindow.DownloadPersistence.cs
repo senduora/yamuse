@@ -162,7 +162,11 @@ public partial class MainWindow
             _downloadQueuePlaylistPersistence = restored.PlaylistPersistence;
             _downloadQueuePlaylistHistoryOnly = restored.PlaylistHistoryOnly;
             _downloadQueueRecordPlaylistOccurrences = restored.PlaylistOccurrencesRecorded;
-            if (!_autoFavoritesEnabled) RemoveUnstartedAutomaticFavorites();
+            if (!_autoFavoritesEnabled)
+            {
+                _downloadQueue.KeepPausedAfterRestart();
+                RemoveUnstartedAutomaticFavorites();
+            }
             _downloadQueueAutomatic = restored.Automatic;
             _downloadQueueAccountUid = accountUid; _downloadQueueAccountGeneration = generation;
             ReconcileDownloadQueueWithVerifiedFavorites();
@@ -171,7 +175,9 @@ public partial class MainWindow
             _downloadsAutoSuspended = false;
             _downloadPersistenceDirty = true;
             RefreshDownloadCenter(); UpdatePlaylistDownloadedStatus();
-            if (_downloadQueue.Entries.Count > 0) SetStatus(_downloadQueue.CanResume
+            if (_downloadQueue.Entries.Count > 0) SetStatus(_downloadQueue.Entries.Any(entry => entry.ResumeAutomaticallyOnStartup && !entry.SkipFavoritesDownload)
+                ? "Очередь восстановлена. Автоскачивание продолжится после проверки списка «Мне нравится»."
+                : _downloadQueue.CanResume
                 ? "Очередь загрузок восстановлена на паузе. Продолжите её в «Центре загрузок»."
                 : _downloadQueue.CanRetry ? "История загрузок восстановлена. Неудачные загрузки можно повторить в «Центре загрузок»."
                 : "История загрузок восстановлена.");
@@ -280,7 +286,7 @@ public partial class MainWindow
         if (_downloadQueue.Entries.Count == 0) return true;
         try
         {
-            // Active and queued entries are restored paused by the store.
+            // Restored automatic entries wait for the collection to be verified.
             if (!_downloadQueueStore!.Save(CaptureDownloadQueue(), _downloadCheckpointProtection, _downloadCheckpointExplicitBatch))
                 return !HasUnfinishedDownloads;
             if (_downloadCheckpointProtection is not null) FinishProtectedDownloadCheckpoint();

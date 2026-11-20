@@ -60,7 +60,10 @@ internal static class OfflineAudioProbe
         if (observed.Duration > TimeSpan.Zero
             && durationMs - observed.Duration.TotalMilliseconds > Math.Clamp(durationMs * .03, 2000, 8000))
             throw new MusicException("Длительность скачанного аудио существенно меньше полной длительности трека.");
-        if (audio.Codec == "mp3" && audio.Bitrate > 0 && !ConfirmsMp3Bitrate(audio.Bitrate, observed.Mp3))
+        // The legacy endpoint can overstate the rate of the only available
+        // rendition. A verified full MP3 can be stored at its measured rate.
+        if (audio.Codec == "mp3" && audio.Bitrate > 0 && !ConfirmsMp3Bitrate(audio.Bitrate, observed.Mp3)
+            && (!audio.LegacyMp3Fallback || observed.Mp3 is null || durationMs <= 0))
             throw new MusicException("Не подтверждён заявленный битрейт скачанного MP3.");
         return observed.ConfirmedBitrate;
     }

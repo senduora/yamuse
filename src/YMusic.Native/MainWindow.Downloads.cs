@@ -601,8 +601,9 @@ public partial class MainWindow
             TryStartPendingAutoFavorites();
             return;
         }
-        if (_downloadsAutoSuspended || _downloadQueue.HasPaused) return;
-        _pendingAutoFavorites = FavoritesDownloadSnapshot();
+        if (_downloadsAutoSuspended) return;
+        if (!_downloadQueue.HasPaused) _pendingAutoFavorites = FavoritesDownloadSnapshot();
+        else if (!_downloadQueue.Entries.Any(entry => entry.ResumeAutomaticallyOnStartup)) return;
         TryStartPendingAutoFavorites();
     }
     private bool CanRestartAutoFavoritesAfterRemoval() => _autoFavoritesRemovalRestart is { } restart
@@ -637,7 +638,20 @@ public partial class MainWindow
                 return;
             }
         }
-        var waitingForVerifiedCollection = _downloadsAutoSuspended || _downloadQueue.HasPaused;
+        var hasPaused = _downloadQueue.HasPaused;
+        if (hasPaused && !_downloadsAutoSuspended && _favoritesSnapshotReady && _verifiedFavoritesGeneration == _accountGeneration
+            && _favoritesAccountUid == _account?.Uid && DownloadQueueBelongsToActiveAccount && !_downloadQueue.Suspended)
+        {
+            var resumeEntries = _downloadQueue.Entries.Where(entry => entry.ResumeAutomaticallyOnStartup
+                && !entry.SkipFavoritesDownload && _favoriteTrackIds.Contains(entry.Track.Id)
+                && !IsAutoRedownloadBlocked(entry.Track.Id)).ToHashSet();
+            if (resumeEntries.Count > 0)
+            {
+                _ = RunDownloadQueueAsync(retryFailed: false, resumeEntries: resumeEntries);
+                return;
+            }
+        }
+        var waitingForVerifiedCollection = _downloadsAutoSuspended || hasPaused;
         if (waitingForVerifiedCollection && !restartAfterRemoval) return;
         if (_pendingConfirmedFavorites.Count > 0)
         {
@@ -671,6 +685,7 @@ public partial class MainWindow
         else
         {
             ClearPendingAutoFavorites();
+            _downloadQueue.KeepPausedAfterRestart();
             if (_downloadIsAutomatic) PauseDownloadQueue();
             else if (DownloadQueueBelongsToActiveAccount)
             {
