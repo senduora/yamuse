@@ -4,6 +4,7 @@
 
 | Выпуск | Опубликован (UTC) | Предыдущий опубликованный выпуск |
 | --- | --- | --- |
+| [0.8.1](RELEASE-NOTES-0.8.1.md) · [GitHub](https://github.com/senduora/yamuse/releases/tag/v0.8.1) | 2026-11-20 16:33:41 | 0.8.0 |
 | [0.8.0](RELEASE-NOTES-0.8.0.md) · [GitHub](https://github.com/senduora/yamuse/releases/tag/v0.8.0) | 2026-11-19 01:38:29 | 0.7.0 |
 | [0.7.0](RELEASE-NOTES-0.7.0.md) · [GitHub](https://github.com/senduora/yamuse/releases/tag/v0.7.0) | 2026-11-18 06:10:47 | 0.6.2 |
 | [0.6.2](RELEASE-NOTES-0.6.2.md) · [GitHub](https://github.com/senduora/yamuse/releases/tag/v0.6.2) | 2026-11-02 14:18:53 | 0.6.1 |
