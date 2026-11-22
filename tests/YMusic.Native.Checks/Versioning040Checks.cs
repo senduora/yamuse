@@ -51,7 +51,7 @@ internal static partial class Program
     private static Task V040Metadata()
     {
         var assembly = typeof(UpdateSupport).Assembly;
-        const string expected = "0.9.0";
+        const string expected = "0.9.1";
         var numericVersion = new Version(expected + ".0");
         Assert(assembly.GetName().Version == numericVersion, "numeric assembly identity drifted");
         Assert(assembly.GetCustomAttribute<AssemblyFileVersionAttribute>()?.Version == numericVersion.ToString(), "numeric file identity drifted");

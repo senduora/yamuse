@@ -334,8 +334,9 @@ public partial class MainWindow : Window
         RestorePlaybackState(account.Uid);
         _ = RetryPlaybackRestoreAfterRecoveryAsync();
         ReloadLyricsAfterAccountChange(lyricsToReload);
-        await RestoreDownloadQueueAsync(account.Uid);
-        await RefreshLibraryAsync();
+        // Admit queue recovery first so automatic downloads wait for it while favorites can load.
+        var downloadRestore = RestoreDownloadQueueAsync(account.Uid);
+        await Task.WhenAll(downloadRestore, RefreshLibraryAsync());
     }
 
     private async Task<Session> EnsureSessionAsync(CancellationToken cancellationToken)

@@ -51,7 +51,7 @@ public partial class MainWindow
         }, DispatcherPriority.Background);
 
         bool CanRefresh() => _section == "favorites" && _session is not null && !_demo && !SessionWriteAdmissionClosed
-            && !DownloadQueueRestorePending && _libraryCts is not { IsCancellationRequested: false };
+            && _libraryCts is not { IsCancellationRequested: false };
     }
 
     internal async Task RefreshLibraryAsync(bool refreshMetadata = false)

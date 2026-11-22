@@ -16,6 +16,7 @@ internal static partial class Program
 {
     private static async Task CheckFavoritesCache()
     {
+        await Run("FavoritesCache: saved session loads favorites while the download queue is still being restored", FcStartupWithPendingDownloads);
         await Run("FavoritesCache: 3900 cached rows render during held IDs and repeated refresh reuses metadata without Reset", FcWarm);
         await Run("FavoritesCache: reopening and Back show current rows immediately and coalesce a held ID check", FcOpen);
         await Run("FavoritesCache: only verified IDs change restored favorite download eligibility", FcVerifiedDownloadEligibility);
@@ -32,6 +33,58 @@ internal static partial class Program
         await Run("FavoritesCache: owner switch discards a late mutation and the close drain waits for all admitted owners", FcMutationAndDrain);
         await Run("FavoritesCache: cold 100-row IO stays off dispatcher while cooperative appends preserve queue and UI marks", FcColdWorker);
         await Run("FavoritesCache: replacement retains sort filter selection viewport and exact active queue occurrence", FcPresentation);
+    }
+
+    private static async Task FcStartupWithPendingDownloads()
+    {
+        const int count = 8;
+        foreach (var hasCache in new[] { true, false })
+        {
+            using var fixture = await FcFixture.Create("startup-pending-downloads-" + hasCache, hasCache ? count : 0);
+            var rows = Enumerable.Range(0, count).Select(index => FcRow(index)).ToArray();
+            fixture.Http.Likes = rows.Select(FcLiked).ToArray();
+            FcSet(fixture.Window, "_session", null);
+            FcSet(fixture.Window, "_account", null);
+            new SessionStore(Path.Combine(fixture.DirectoryPath, "session")).Save(FakeSession);
+
+            var store = new DownloadQueueStore(fixture.DirectoryPath);
+            var queue = new DownloadQueueState();
+            queue.Replace([rows[0]], "Сохранённая загрузка");
+            store.Save(DownloadQueueStore.Capture(fixture.Uid, queue, AudioQuality.Excellent, false, null));
+            FcSet(fixture.Window, "_downloadQueueStore", store);
+            var queueGate = fixture.Gate();
+            fixture.Window.DownloadQueueRestorePrepareAsync = async snapshot =>
+            {
+                queueGate.Entered.TrySetResult();
+                await queueGate.Release.Task;
+                return await DownloadQueueStore.PrepareRestoreAsync(snapshot, fixture.Offline, default);
+            };
+            var idsGate = fixture.Http.HoldIds();
+            var startup = Call(fixture.Window, "RestoreAsync");
+            try
+            {
+                await FcEntered(queueGate);
+                await FcEntered(idsGate);
+                if (hasCache)
+                    Assert(fixture.Source.Count == count && fixture.List.Items.Count == count && fixture.Http.MetadataBatches.IsEmpty,
+                        "the saved favorites did not render before either the IDs or the queue were ready");
+
+                idsGate.Release.TrySetResult();
+                await FcUntil(() => SaField<bool>(fixture.Window, "_favoritesSnapshotReady"));
+                Assert(!startup.IsCompleted && fixture.List.Items.Count == count && fixture.Http.IdRequests == 1
+                    && fixture.Http.MetadataBatches.Count == (hasCache ? 0 : 1),
+                    "the startup collection was missing or fetched twice while queue restoration was held");
+            }
+            finally
+            {
+                idsGate.Release.TrySetResult();
+                queueGate.Release.TrySetResult();
+                await FcComplete(startup);
+            }
+            await fixture.Saved();
+            Assert(SaField<DownloadQueueState>(fixture.Window, "_downloadQueue").CanResume && fixture.Source.Count == count,
+                "releasing the queue restore lost the favorites or the saved manual queue");
+        }
     }
 
     private static async Task FcWarm()
@@ -727,6 +780,7 @@ internal static partial class Program
             Assert(request.RequestUri!.Host == "api.music.yandex.net", "favorites fixture left its in-process API");
             var path = request.RequestUri.AbsolutePath;
             if (path == "/account/status") return Json(Profile);
+            if (path == "/account/about") return Json(ProfileAboutWithoutAvatar);
             if ((path is "/users/12345/likes/tracks/add-multiple" or "/users/12345/likes/tracks/remove") && request.Method == HttpMethod.Post)
             {
                 MutationRequest = Uri.UnescapeDataString(await request.Content!.ReadAsStringAsync(token));

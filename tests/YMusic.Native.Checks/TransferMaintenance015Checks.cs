@@ -85,9 +85,11 @@ internal static partial class Program
         Assert(bar.Width == 18 && bar.Height == 18 && bar.ActualWidth is >= 16 and <= 20 && bar.ActualHeight is >= 16 and <= 20
             && !bar.IsIndeterminate, "progress ring is not compact and finite");
         App.Capture(w, Path.Combine(_directory, "transfer015-playlist-running-1280.png"));
-        SaInvoke(w, "PauseDownloadQueue"); await task;
+        SaInvoke(w, "PauseDownloadQueue"); await task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert(SaField<TextBlock>(w, "_compactDownloadCaption").Text.Contains("паузе") && f.Library.Read().Count == 1, "pause lost saved tracks or progress");
-        await Call(w, "ResumeDownloadQueue");
+        // A queued track can make its first request after Continue.
+        f.HoldFirstAttempts = false;
+        await Call(w, "ResumeDownloadQueue").WaitAsync(TimeSpan.FromSeconds(10));
         Assert(bar.Value == 100 && f.Library.Read().Count == 3 && Control<TextBlock>(w, "PlaylistTransferTitle").Text == "Плейлист скачан", "resume did not reach a confirmed saved state");
         SaInvoke(w, "DownloadCenter_Click", w, new RoutedEventArgs()); App.Capture(w, Path.Combine(_directory, "transfer015-downloads-complete-1280.png"));
         SaInvoke(w, "SetSection", "favorites", "Мне нравится");
