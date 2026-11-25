@@ -10,6 +10,7 @@ namespace YMusic.Native;
 public partial class MainWindow
 {
     private static readonly TimeSpan FavoritesMetadataLifetime = TimeSpan.FromHours(24);
+    private const int MaximumFavoritesMetadataRecoveryRequests = 32;
     private FavoritesCacheStore? _favoritesStore;
     private string? _favoritesAccountUid;
     private bool _favoritesCacheRead, _favoritesCacheComplete;
@@ -145,11 +146,13 @@ public partial class MainWindow
             }
             _diagnostics.LoadedTracks = ordered.Count(row => row is not null);
             UpdateCount();
+            var recoveryRequests = MaximumFavoritesMetadataRecoveryRequests;
+            var rejectedMetadata = new HashSet<string>(StringComparer.Ordinal);
             for (var offset = 0; offset < missing.Count; offset += 100)
             {
                 var positions = missing.Skip(offset).Take(100).ToArray();
                 var references = positions.Select(index => ids[index]).ToArray();
-                var rows = await _api.GetTracksAsync(session, references, 0, cts.Token);
+                var rows = await ReadMetadataAsync(references);
                 Guard();
                 if (!rows.Select(row => row.RequestId).SequenceEqual(references.Select(reference => reference.RequestId)))
                     throw new MusicException("Ответ не соответствует запрошенной странице избранного.");
@@ -158,7 +161,8 @@ public partial class MainWindow
                 {
                     var row = rows[i];
                     var number = positions[i] + 1;
-                    if (!row.HasTrackMetadata && metadata.TryGetValue(row.RequestId, out var cached))
+                    if (!row.HasTrackMetadata && metadata.TryGetValue(row.RequestId, out var cached)
+                        && (!rejectedMetadata.Contains(row.RequestId) || references[i].AlbumId is not { } albumId || cached.AlbumId == albumId))
                         page[i] = FavoriteNumber(cached, number, available: false, hasTrackMetadata: false);
                     else page[i] = FavoriteNumber(row, number);
                 }
@@ -212,15 +216,66 @@ public partial class MainWindow
             Guard();
             var complete = ordered.Where(row => row is not null && !removed.Contains(row.Id))
                 .Select((row, index) => FavoriteNumber(row!, index + 1)).ToArray();
+            var unconfirmed = complete.Count(row => !row.HasTrackMetadata && rejectedMetadata.Contains(row.RequestId));
+            if (unconfirmed > 0 && !complete.Any(row => row.HasTrackMetadata)) throw new MusicApi.TrackMetadataException();
             if (!reuse || metadata.Count == 0) _favoritesMetadataSavedUtc = DateTimeOffset.UtcNow;
             PublishFavoritesSnapshot(complete);
             PersistFavoritesCache();
             _diagnostics.Timing("favorites_all_ms", clock.Elapsed.TotalMilliseconds);
             _diagnostics.Stage = _player.IsPlaying ? "playing" : "library_ready";
-            if (_section == "favorites") SetStatus($"Избранное обновлено · {complete.Length:N0} треков");
+            if (unconfirmed > 0)
+            {
+                _favoritesSnapshotReady = false;
+                _pendingAutoFavorites = null;
+                _diagnostics.LastErrorType = nameof(MusicApi.TrackMetadataException);
+            }
+            if (_section == "favorites")
+            {
+                var summary = $"Избранное обновлено · {complete.Length:N0} треков";
+                if (unconfirmed > 0) summary += $" · для {unconfirmed:N0} не удалось подтвердить данные";
+                SetStatus(summary, error: unconfirmed > 0);
+            }
             UpdateCount();
             if (_section == "favorites") PlaybackContextViewShown();
-            ScheduleAutoFavoritesDownloads();
+            if (unconfirmed == 0) ScheduleAutoFavoritesDownloads();
+
+            async Task<IReadOnlyList<TrackRow>> ReadMetadataAsync(LikedId[] batch, bool recovering = false)
+            {
+                Guard();
+                try
+                {
+                    var rows = await _api.GetTracksAsync(session, batch, 0, cts.Token);
+                    Guard();
+                    // A narrower response can hide the ambiguity that caused the original rejection.
+                    return rows.Select((row, index) =>
+                    {
+                        var reference = batch[index];
+                        var exactEdition = recovering || metadata.TryGetValue(reference.RequestId, out var prior) && !prior.HasTrackMetadata;
+                        var wrongEdition = exactEdition && row.HasTrackMetadata && reference.AlbumId is { } albumId && row.AlbumId != albumId;
+                        var omittedDuringRecovery = recovering && !row.HasTrackMetadata;
+                        return wrongEdition || omittedDuringRecovery ? UnconfirmedMetadata(reference) : row;
+                    }).ToArray();
+                }
+                catch (MusicApi.TrackMetadataException)
+                {
+                    Guard();
+                    if (batch.Length == 1) return [UnconfirmedMetadata(batch[0])];
+                    if (recoveryRequests < 2) throw;
+                    recoveryRequests -= 2;
+                    var middle = batch.Length / 2;
+                    var first = await ReadMetadataAsync(batch[..middle], recovering: true);
+                    var second = await ReadMetadataAsync(batch[middle..], recovering: true);
+                    return [.. first, .. second];
+                }
+            }
+
+            TrackRow UnconfirmedMetadata(LikedId reference)
+            {
+                // Keep the confirmed favorite reference and let the missing-metadata path
+                // reuse any trusted description.
+                rejectedMetadata.Add(reference.RequestId);
+                return new TrackRow { Id = reference.Id, RequestId = reference.RequestId, HasTrackMetadata = false };
+            }
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested || !Current()) { }
         catch (Exception error)

@@ -194,13 +194,16 @@ internal static partial class Program
             foreach (var restoreFirst in new[] { true, false })
             {
                 using var f = new Af060Fixture("login-resume-interrupted-" + restoreFirst);
-                var rows = new[] { Af060Row("101"), Af060Row("102"), Af060Row("103"), Af060Row("104") };
+                var missingMetadata = Af060Row("105");
+                f.OmittedMetadataRequestId = missingMetadata.RequestId;
+                var rows = new[] { Af060Row("101"), Af060Row("102"), Af060Row("103"), Af060Row("104"), missingMetadata };
                 var saved = new DownloadQueueState();
                 saved.Replace(rows, "Автоскачивание «Мне нравится»", favoritesBatch: true);
                 saved.Entries[0].SetState(DownloadEntryState.Downloading);
                 saved.Entries[1].SetState(DownloadEntryState.Resolving);
                 saved.Entries[2].SetState(DownloadEntryState.Paused);
                 saved.Entries[3].SetState(DownloadEntryState.Failed);
+                saved.Entries[4].SetState(DownloadEntryState.Downloading);
                 var store = new DownloadQueueStore(Path.Combine(f.DirectoryPath, "diagnostics"));
                 store.Save(DownloadQueueStore.Capture("12345", saved, AudioQuality.Excellent, true,
                     new PlaylistDetails("local:favorites", "liked", "Мне нравится", "", 0, rows)));
@@ -208,6 +211,7 @@ internal static partial class Program
                 f.AddServerFavorite("101");
                 f.AddServerFavorite("103");
                 f.AddServerFavorite("104");
+                f.AddServerFavorite(missingMetadata.Id);
 
                 var releaseRestore = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 if (restoreFirst) releaseRestore.TrySetResult();
@@ -249,6 +253,11 @@ internal static partial class Program
                     && f.Library.Read().Single().Id == "101" && f.Queue.Entries[1].SkipFavoritesDownload
                     && f.Queue.Entries[2].State == DownloadEntryState.Paused && f.Queue.Entries[3].State == DownloadEntryState.Failed,
                     "auto-resume missed a current favorite or started unliked, paused or failed work");
+                var favorite = SaField<List<TrackRow>>(f.Window, "_favoritesCache")
+                    .Single(row => row.RequestId == missingMetadata.RequestId);
+                Assert(!favorite.HasTrackMetadata && f.Queue.Entries[4].ResumeAutomaticallyOnStartup
+                    && !f.Resolves.ContainsKey(missingMetadata.Id),
+                    "auto-resume resolved an interrupted favorite without confirmed metadata or discarded its checkpoint");
             }
         });
         await Run("AutoFavoritesLive060: pausing or disabling appended favorites keeps a valid checkpoint and full offline playlist", async () =>
@@ -1610,6 +1619,7 @@ internal static partial class Program
         internal string? FailMediaTrack;
         internal string? HeldUnlikeFailure;
         internal string? HeldFollowUpMedia;
+        internal string? OmittedMetadataRequestId;
         private readonly HashSet<string> _liked = new(StringComparer.Ordinal);
         private int _readback;
 
@@ -1653,7 +1663,8 @@ internal static partial class Program
                         await Task.Delay(Timeout.InfiniteTimeSpan, token);
                     }
                     var fields = Af060Form(await request.Content!.ReadAsStringAsync(token));
-                    return Json(JsonSerializer.Serialize(new { result = fields["track-ids"].Split(',').Select(key => new { id = key.Split(':')[0],
+                    return Json(JsonSerializer.Serialize(new { result = fields["track-ids"].Split(',')
+                        .Where(key => key != OmittedMetadataRequestId).Select(key => new { id = key.Split(':')[0],
                         title = "Тестовый трек", available = true, durationMs = Af060TrackSeconds * 1000, albums = new[] { new { id = "91", title = "Альбом" } } }).ToArray() }));
                 }
                 if (path == "/get-file-info")

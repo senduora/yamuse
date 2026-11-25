@@ -642,8 +642,16 @@ public partial class MainWindow
         if (hasPaused && !_downloadsAutoSuspended && _favoritesSnapshotReady && _verifiedFavoritesGeneration == _accountGeneration
             && _favoritesAccountUid == _account?.Uid && DownloadQueueBelongsToActiveAccount && !_downloadQueue.Suspended)
         {
+            // A verified like can include an edition whose metadata is still missing.
+            var idsWithMissingMetadata = _favoritesCache.Where(track => !track.HasTrackMetadata)
+                .Select(track => track.Id).ToHashSet(StringComparer.Ordinal);
+            var verifiedEditions = _favoritesCache.Where(track => idsWithMissingMetadata.Contains(track.Id)
+                && track.HasTrackMetadata && track.Available && TryTrackReference(track) is { } reference
+                && (reference.AlbumId is null || reference.AlbumId == track.AlbumId))
+                .Select(track => track.RequestId).ToHashSet(StringComparer.Ordinal);
             var resumeEntries = _downloadQueue.Entries.Where(entry => entry.ResumeAutomaticallyOnStartup
                 && !entry.SkipFavoritesDownload && _favoriteTrackIds.Contains(entry.Track.Id)
+                && (!idsWithMissingMetadata.Contains(entry.Track.Id) || verifiedEditions.Contains(entry.Track.RequestId))
                 && !IsAutoRedownloadBlocked(entry.Track.Id)).ToHashSet();
             if (resumeEntries.Count > 0)
             {

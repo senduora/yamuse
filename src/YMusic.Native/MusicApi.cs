@@ -300,7 +300,10 @@ internal sealed partial class MusicApi : IDisposable
         }
     }
 
-    private static MusicException TrackMetadataError() => new("Сервис вернул некорректные или противоречивые сведения о треках. Список не был загружен.");
+    private static TrackMetadataException TrackMetadataError() => new();
+
+    internal sealed class TrackMetadataException()
+        : MusicException("Сервис вернул некорректные или противоречивые сведения о треках. Список не был загружен.");
 
     private static long TrackDuration(JsonElement track)
         => long.TryParse(Text(track, "durationMs"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var duration)

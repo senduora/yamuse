@@ -30,6 +30,11 @@ internal static partial class Program
         await Run("FavoritesCache: confirmed like preserves canonical order despite failed follow-up refresh", FcLike);
         await Run("FavoritesCache: unlike publishes the full readback order and discards an older in-flight response", FcUnlikeReadback);
         await Run("FavoritesCache: failed pages preserve the validated snapshot and an omitted track retains safe metadata", FcMetadataPages);
+        await Run("FavoritesCache: a conflicting metadata page is split without rereading earlier pages", FcSplitMetadataPage);
+        await Run("FavoritesCache: a persistent track conflict retains confirmed membership and retries only that track", FcRetryConflictingTrack);
+        await Run("FavoritesCache: metadata recovery rejects a replacement from another album", FcRejectWrongAlbumDuringMetadataRecovery);
+        await Run("FavoritesCache: metadata recovery discards a cached description from another album", FcRejectWrongCachedAlbumDuringMetadataRecovery);
+        await Run("FavoritesCache: the metadata recovery budget spans pages and preserves the validated cache", FcMetadataRecoveryBudget);
         await Run("FavoritesCache: owner switch discards a late mutation and the close drain waits for all admitted owners", FcMutationAndDrain);
         await Run("FavoritesCache: cold 100-row IO stays off dispatcher while cooperative appends preserve queue and UI marks", FcColdWorker);
         await Run("FavoritesCache: replacement retains sort filter selection viewport and exact active queue occurrence", FcPresentation);
@@ -565,6 +570,161 @@ internal static partial class Program
         }
     }
 
+    private static async Task FcSplitMetadataPage()
+    {
+        using var f = await FcFixture.Create("split-conflicting-metadata-page", 225);
+        var expected = f.Http.Likes.Select(reference => reference.RequestId).ToArray();
+        var conflictedPage = expected[100..200];
+        var conflictedReferences = conflictedPage.ToHashSet(StringComparer.Ordinal);
+        f.Http.MetadataOverride = batch => batch.Contains(expected[120]) && batch.Contains(expected[180])
+            ? """{"result":[{"id":"fc-120","albums":[{"id":"91"}],"title":"Version A"},{"id":"fc-120","albums":[{"id":"91"}],"title":"Version B"}]}"""
+            : null;
+
+        await FcComplete(f.Window.RefreshLibraryAsync(refreshMetadata: true)); await f.Saved();
+
+        var batches = f.Http.MetadataBatches.ToArray();
+        Assert(f.Http.IdRequests == 1 && batches.Length is > 3 and <= 35
+            && batches[0].SequenceEqual(expected[..100]) && batches[1].SequenceEqual(conflictedPage)
+            && batches[^1].SequenceEqual(expected[200..])
+            && batches[2..^1].All(batch => batch.Length < conflictedPage.Length && batch.All(conflictedReferences.Contains))
+            && conflictedReferences.SetEquals(batches[2..^1].SelectMany(batch => batch)),
+            "metadata recovery reread an unaffected page or did not cover the rejected page");
+        var saved = f.Store.Load(f.Uid)!;
+        Assert(f.Source.Select(row => row.RequestId).SequenceEqual(expected)
+            && f.Source.All(row => row.Available && row.HasTrackMetadata && row.Title.Contains("Live", StringComparison.Ordinal))
+            && saved.Tracks.Select(row => row.RequestId).SequenceEqual(expected) && saved.Tracks.All(row => !row.MissingMetadata),
+            "validated subpages did not publish and persist the complete collection in server order");
+    }
+
+    private static async Task FcRetryConflictingTrack()
+    {
+        using var f = await FcFixture.Create("isolated-metadata-conflict", 225);
+        await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+        var before = f.Source.ToArray();
+        const int conflictPosition = 135;
+        var prior = before[conflictPosition];
+        f.Http.MetadataOverride = batch => batch.Contains(prior.RequestId)
+            ? """{"result":[{"id":"fc-99999","title":"Unrelated track","available":true}]}"""
+            : null;
+
+        await FcComplete(f.Window.RefreshLibraryAsync(refreshMetadata: true)); await f.Saved();
+
+        var row = f.Source[conflictPosition];
+        var saved = f.Store.Load(f.Uid)!;
+        var savedRow = saved.Tracks[conflictPosition];
+        Assert(f.Http.MetadataBatches.Any(batch => batch.SequenceEqual([prior.RequestId]))
+            && f.Source.Select(track => track.RequestId).SequenceEqual(before.Select(track => track.RequestId))
+            && f.Source.Count(track => track.Available && track.HasTrackMetadata) == before.Length - 1
+            && saved.Tracks.Count(track => track.MissingMetadata) == 1
+            && saved.Tracks.Select(track => track.RequestId).SequenceEqual(before.Select(track => track.RequestId)),
+            "an isolated invalid response blocked the rest of the confirmed collection");
+        Assert(row.Id == prior.Id && row.RequestId == prior.RequestId && row.Number == prior.Number
+            && row.Title == prior.Title && row.Artist == prior.Artist && row.AlbumId == prior.AlbumId && row.DurationMs == prior.DurationMs
+            && !row.Available && !row.HasTrackMetadata && savedRow.Title == prior.Title && !savedRow.Available && savedRow.MissingMetadata,
+            "the isolated conflict replaced confirmed membership or discarded safe cached metadata");
+        Assert(!SaField<bool>(f.Window, "_favoritesSnapshotReady"), "an unresolved conflict admitted automatic favorites downloads");
+
+        var requestsBeforeRetry = f.Http.MetadataBatches.Count;
+        var uid = f.Uid;
+        f.Window.SignOut(); f.Account(uid);
+        f.Http.MetadataOverride = null;
+        await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+
+        Assert(f.Http.MetadataBatches.Count == requestsBeforeRetry + 1
+            && f.Http.MetadataBatches.Last().SequenceEqual([prior.RequestId])
+            && f.Source[conflictPosition] is { Available: true, HasTrackMetadata: true } recovered
+            && recovered.RequestId == prior.RequestId && recovered.Title.Contains("Live", StringComparison.Ordinal)
+            && f.Store.Load(uid)!.Tracks.All(track => track.Available && !track.MissingMetadata)
+            && SaField<bool>(f.Window, "_favoritesSnapshotReady"),
+            "the next warm load did not retry only the unresolved reference or failed to persist its recovery");
+    }
+
+    private static async Task FcRejectWrongAlbumDuringMetadataRecovery()
+    {
+        using var f = await FcFixture.Create("wrong-album-during-metadata-recovery", 3);
+        var prior = FcRow(1);
+        f.Http.MetadataOverride = batch => !batch.Contains(prior.RequestId) ? null : batch.Length switch
+        {
+            3 => """{"result":[{"id":"fc-99999"}]}""",
+            2 => """{"result":[{"id":"fc-1","title":"Wrong edition","available":true,"albums":[{"id":"92"}]},{"id":"fc-2","title":"Confirmed sibling","available":true,"albums":[{"id":"91"}]}]}""",
+            _ => """{"result":[{"id":"fc-1","title":"Wrong edition","available":true,"albums":[{"id":"92"}]}]}"""
+        };
+
+        await FcComplete(f.Window.RefreshLibraryAsync(refreshMetadata: true)); await f.Saved();
+
+        var row = f.Source[1];
+        var saved = f.Store.Load(f.Uid)!.Tracks[1];
+        Assert(f.Http.MetadataBatches.Any(batch => batch.Length == 2 && batch.Contains(prior.RequestId))
+            && row.RequestId == prior.RequestId && row.AlbumId == prior.AlbumId && row.Title == prior.Title
+            && !row.Available && !row.HasTrackMetadata && saved.AlbumId == prior.AlbumId && saved.MissingMetadata
+            && f.Source.Count(track => track.Available && track.HasTrackMetadata) == 2,
+            "a matching base ID from a different album supplied metadata for the confirmed track reference");
+
+        var requestsBeforeRetry = f.Http.MetadataBatches.Count;
+        await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+
+        Assert(f.Http.MetadataBatches.Count == requestsBeforeRetry + 1 && f.Http.MetadataBatches.Last().SequenceEqual([prior.RequestId])
+            && f.Source[1] is { Available: false, HasTrackMetadata: false } && f.Source[1].AlbumId == prior.AlbumId,
+            "a warm retry accepted the wrong album or reread confirmed metadata");
+    }
+
+    private static async Task FcRejectWrongCachedAlbumDuringMetadataRecovery()
+    {
+        var liked = FcRow(1);
+        var wrongCachedRow = new TrackRow
+        {
+            Number = liked.Number, Id = liked.Id, RequestId = liked.RequestId,
+            Title = "Old description from another edition", Album = "Another edition", AlbumId = "92", Available = true
+        };
+        using var f = await FcFixture.Create("wrong-cached-album-during-metadata-recovery", [FcRow(0), wrongCachedRow, FcRow(2)]);
+        f.Http.Likes = [FcLiked(FcRow(0)), FcLiked(liked), FcLiked(FcRow(2))];
+        var cached = f.Store.Load(f.Uid)!.Tracks[1];
+        Assert(cached.RequestId == liked.RequestId && cached.AlbumId == wrongCachedRow.AlbumId,
+            "the fixture did not create a legacy cache row with mismatched album metadata");
+        f.Http.MetadataOverride = batch => batch.Contains(liked.RequestId)
+            ? """{"result":[{"id":"fc-99999"}]}""" : null;
+
+        await FcComplete(f.Window.RefreshLibraryAsync(refreshMetadata: true)); await f.Saved();
+
+        var row = f.Source[1];
+        var saved = f.Store.Load(f.Uid)!.Tracks[1];
+        Assert(f.Http.MetadataBatches.Any(batch => batch.SequenceEqual([liked.RequestId]))
+            && row.RequestId == liked.RequestId && !row.Available && !row.HasTrackMetadata
+            && row.AlbumId != cached.AlbumId && row.Title != cached.Title && row.Album != cached.Album
+            && saved.RequestId == liked.RequestId && saved.MissingMetadata && !saved.Available
+            && saved.AlbumId != cached.AlbumId && saved.Title != cached.Title && saved.Album != cached.Album
+            && f.Source.Count(track => track.Available && track.HasTrackMetadata) == 2,
+            "metadata recovery reused the wrong cached album even though only the exact favorite reference was confirmed");
+    }
+
+    private static async Task FcMetadataRecoveryBudget()
+    {
+        using var f = await FcFixture.Create("bounded-metadata-conflicts", 300);
+        await FcComplete(f.Window.RefreshLibraryAsync()); await f.Saved();
+        var before = f.Source.ToArray();
+        var beforeHash = f.CacheHash();
+        var references = before.Select(row => row.RequestId).ToArray();
+        var invalid = new[] { references[121], references[173], references[221], references[273] }.ToHashSet(StringComparer.Ordinal);
+        f.Http.MetadataOverride = batch =>
+        {
+            var malformed = batch.FirstOrDefault(invalid.Contains);
+            return malformed is null ? null : JsonSerializer.Serialize(new
+            {
+                result = new[] { new { id = malformed.Split(':')[0], artists = new[] { false } } }
+            });
+        };
+
+        await FcComplete(f.Window.RefreshLibraryAsync(refreshMetadata: true)); await f.Saved();
+
+        var batches = f.Http.MetadataBatches.ToArray();
+        Assert(batches.Length is > 3 and <= 35 && batches[0].SequenceEqual(references[..100])
+            && batches[1].SequenceEqual(references[100..200]) && batches.Any(batch => batch.SequenceEqual(references[200..])),
+            "metadata recovery did not share its budget of 32 additional requests across two failing pages");
+        Assert(f.Source.SequenceEqual(before) && f.CacheHash() == beforeHash
+            && SaField<Diagnostics>(f.Window, "_diagnostics").Stage == "library_partial_or_error",
+            "exhausting metadata recovery published or persisted an unvalidated collection");
+    }
+
     private static async Task FcMutationAndDrain()
     {
         using var f = await FcFixture.Create("mutation-owner-switch", 2);
@@ -767,6 +927,7 @@ internal static partial class Program
         internal int IdRequests, FailIdsAtRequest;
         internal LikedId[]? NextMutationReadback;
         internal string? MutationRequest, OmittedMetadata, InvalidMetadata;
+        internal Func<string[], string?>? MetadataOverride;
         private FcGate? _idsGate, _metadataGate;
         private int _skipHeldIds;
         internal FcGate HoldIds(int skip = 0)
@@ -802,7 +963,7 @@ internal static partial class Program
                 var ids = body.Split('&').Single(part => part.StartsWith("track-ids=", StringComparison.Ordinal))[10..].Split(',');
                 MetadataBatches.Enqueue(ids); var failure = FailMetadata;
                 var json = ids.Contains(InvalidMetadata) ? """{"result":[{"title":"no ID"}]}"""
-                    : JsonSerializer.Serialize(new { result = ids.Where(reference => reference != OmittedMetadata).Select(reference =>
+                    : MetadataOverride?.Invoke(ids) ?? JsonSerializer.Serialize(new { result = ids.Where(reference => reference != OmittedMetadata).Select(reference =>
                 {
                     var parts = reference.Split(':'); var index = int.Parse(parts[0][3..]); var album = parts.Length > 1 ? parts[1] : "91";
                     return new { id = parts[0], title = (index % 3 == 0 ? "match " : "") + "Live " + index.ToString("D6"), available = true, durationMs = 1000L * (index + 1),
